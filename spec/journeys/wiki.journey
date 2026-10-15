@@ -1,0 +1,264 @@
+-- Journeys through wiki.allium: starting a wiki, editing pages, history,
+-- permissions and administration.
+
+world {
+    cast:
+        ada:  accounts/User
+        bob:  accounts/User
+        repo: repositories/Repository
+        wiki: Wiki
+    given:
+        repo.is_archived = false
+        repo.is_mirror = false
+        wiki.repository = repo
+        repo.wiki_branch = "main"
+        wiki.status = uninitialised
+}
+
+-- The happy path: first page, then an edit, then history.
+journey AMaintainerStartsTheWiki {
+    goal: Ada's project has no wiki content yet. She writes the Home page,
+          which brings the wiki into being, then improves it. Bob, a reader,
+          reads it and its history.
+
+    1. she writes Home
+        stipulate wiki_unit_enabled(repo) = true
+        stipulate can_write_wiki(ada, repo) = true
+        stipulate page_name_for("Home") = "Home"
+        stipulate kind_of_page("Home") = regular
+        stipulate wiki_quota_allows(repo) = true
+        ada does UserCreatesWikiPage(ada, wiki, "Home", "Welcome", "") on WikiEditing
+            creating home: WikiPage
+        then UserCreatesWikiPage fires
+        then wiki.status = initialised
+        then home.name = "Home"
+        then home.content = "Welcome"
+
+    2. she improves it with a commit message
+        ada does UserEditsWikiPage(ada, home, "Home", "Welcome to the project", "Expand intro") on WikiEditing
+        then UserEditsWikiPage fires
+        then home.content = "Welcome to the project"
+        then home.last_author = ada
+
+    3. bob reads it
+        stipulate can_read_wiki(bob, repo) = true
+        bob sees home.content on WikiReading in wiki
+        bob sees home.title on WikiReading in wiki
+
+    ends: The wiki is initialised with a Home page that has two revisions.
+}
+
+-- Renaming a page by giving it a new title.
+journey AnEditorRenamesAPage {
+    goal: Ada renames "Install" to "Getting Started" while editing it.
+
+    cast:
+        page: WikiPage
+    given:
+        wiki.status = initialised
+        page.wiki = wiki
+        page.name = "Install"
+        page.title = "Install"
+        page.kind = regular
+        page.content = "Run make"
+
+    1. she saves the page under a new title
+        stipulate wiki_unit_enabled(repo) = true
+        stipulate can_write_wiki(ada, repo) = true
+        stipulate page_name_for("Getting Started") = "Getting-Started"
+        stipulate kind_of_page("Getting-Started") = regular
+        stipulate wiki_quota_allows(repo) = true
+        ada does UserEditsWikiPage(ada, page, "Getting Started", "Run make install", "") on WikiEditing
+        then page.name = "Getting-Started"
+        then page.title = "Getting Started"
+
+    ends: One page, now named Getting-Started, with the rename recorded as a revision.
+}
+
+-- Reserved names are refused.
+journey ReservedPageNamesAreRefused {
+    goal: The names _pages, _new, _edit and raw belong to the wiki's own
+          views. Ada cannot create a page called "raw".
+
+    1. she tries
+        stipulate wiki_unit_enabled(repo) = true
+        stipulate can_write_wiki(ada, repo) = true
+        stipulate page_name_for("raw") = "raw"
+        stipulate wiki_quota_allows(repo) = true
+        ada cannot do UserCreatesWikiPage(ada, wiki, "raw", "x", "") on WikiEditing
+
+    ends: No page was created.
+}
+
+-- A page name can only be used once.
+journey ADuplicatePageIsRefused {
+    goal: "FAQ" already exists. Creating another FAQ is refused rather than
+          overwriting it.
+
+    cast:
+        faq: WikiPage
+    given:
+        wiki.status = initialised
+        faq.wiki = wiki
+        faq.name = "FAQ"
+        faq.kind = regular
+
+    1. she tries to create FAQ again
+        stipulate wiki_unit_enabled(repo) = true
+        stipulate can_write_wiki(ada, repo) = true
+        stipulate page_name_for("FAQ") = "FAQ"
+        stipulate wiki_quota_allows(repo) = true
+        ada cannot do UserCreatesWikiPage(ada, wiki, "FAQ", "dup", "") on WikiEditing
+
+    ends: The original FAQ is untouched.
+}
+
+-- Readers cannot edit.
+journey AReaderCannotEditTheWiki {
+    goal: Bob can read the public wiki but has no write access to it.
+
+    cast:
+        home: WikiPage
+    given:
+        wiki.status = initialised
+        home.wiki = wiki
+        home.name = "Home"
+        home.content = "Welcome"
+
+    1. he reads the page
+        stipulate can_read_wiki(bob, repo) = true
+        bob sees home.content on WikiReading in wiki
+
+    2. he tries to edit it
+        stipulate wiki_unit_enabled(repo) = true
+        stipulate can_write_wiki(bob, repo) = false
+        bob cannot do UserEditsWikiPage(bob, home, "Home", "vandalised", "") on WikiEditing
+
+    3. and to delete it
+        bob cannot do UserDeletesWikiPage(bob, home) on WikiEditing
+
+    ends: The page is unchanged.
+}
+
+-- A globally writeable wiki lets any signed-in user edit (access decides).
+journey AGloballyWriteableWikiAcceptsOutsiders {
+    goal: The repository's wiki is marked "anyone may edit". Bob, who is not
+          a collaborator, fixes a typo.
+
+    cast:
+        home: WikiPage
+    given:
+        wiki.status = initialised
+        home.wiki = wiki
+        home.name = "Home"
+        home.title = "Home"
+        home.kind = regular
+        home.content = "Welcom"
+
+    1. he edits it
+        stipulate wiki_unit_enabled(repo) = true
+        stipulate can_write_wiki(bob, repo) = true
+        stipulate page_name_for("Home") = "Home"
+        stipulate kind_of_page("Home") = regular
+        stipulate wiki_quota_allows(repo) = true
+        ada sees home.content on WikiReading in wiki
+        bob does UserEditsWikiPage(bob, home, "Home", "Welcome", "typo") on WikiEditing
+        then home.content = "Welcome"
+        then home.last_author = bob
+
+    ends: Bob's fix is a revision authored by him.
+}
+
+-- Archived repositories make the wiki read-only.
+journey AnArchivedWikiIsReadOnly {
+    goal: The repository is archived; Ada, a writer, cannot delete a page.
+
+    cast:
+        page: WikiPage
+    given:
+        repo.is_archived = true
+        wiki.status = initialised
+        page.wiki = wiki
+        page.name = "Old"
+
+    1. she tries to delete it
+        stipulate wiki_unit_enabled(repo) = true
+        stipulate can_write_wiki(ada, repo) = true
+        ada cannot do UserDeletesWikiPage(ada, page) on WikiEditing
+
+    ends: The page remains.
+}
+
+-- Deleting a page.
+journey AnEditorDeletesAPage {
+    goal: Ada removes an obsolete page; it disappears from the page list.
+
+    cast:
+        page: WikiPage
+    given:
+        wiki.status = initialised
+        page.wiki = wiki
+        page.name = "Obsolete"
+        page.title = "Obsolete"
+
+    1. she deletes it
+        stipulate wiki_unit_enabled(repo) = true
+        stipulate can_write_wiki(ada, repo) = true
+        ada does UserDeletesWikiPage(ada, page) on WikiEditing
+        then UserDeletesWikiPage fires
+        then page does not exist
+
+    ends: The page is gone; its history remains in the wiki's revisions.
+}
+
+-- Cloning over SSH initialises an empty wiki; pushing makes it real.
+journey ADeveloperWorksOnTheWikiWithGit {
+    goal: Ada prefers her editor. She clones the empty wiki over SSH, which
+          initialises it, then pushes pages.
+
+    1. she clones
+        stipulate wiki_unit_enabled(repo) = true
+        stipulate can_read_wiki(ada, repo) = true
+        ada does UserOpensWikiOverGit(ada, wiki) on WikiReading
+        then GitAccessInitialisesWiki fires
+        then wiki.status = initialised
+
+    2. she pushes
+        stipulate can_write_wiki(ada, repo) = true
+        stipulate wiki_quota_allows(repo) = true
+        ada does UserPushesToWiki(ada, wiki) on WikiEditing
+        then UserPushesToWiki fires
+
+    3. bob, a reader, cannot push
+        stipulate can_write_wiki(bob, repo) = false
+        bob cannot do UserPushesToWiki(bob, wiki) on WikiEditing
+
+    ends: The wiki holds Ada's pushed pages; Bob could only clone.
+}
+
+-- Owners can wipe the wiki.
+journey AnOwnerDeletesAllWikiData {
+    goal: Ada owns the repository and wants to start the wiki over. Bob, a
+          mere writer, may not.
+
+    cast:
+        page: WikiPage
+    given:
+        wiki.status = initialised
+        page.wiki = wiki
+        page.name = "Home"
+
+    1. bob cannot
+        stipulate is_repo_owner(bob, repo) = false
+        stipulate repository_full_name(repo) = "ada/project"
+        bob cannot do OwnerDeletesWiki(bob, wiki, "ada/project") on WikiAdministration
+
+    2. ada confirms with the repository name
+        stipulate is_repo_owner(ada, repo) = true
+        ada does OwnerDeletesWiki(ada, wiki, "ada/project") on WikiAdministration
+        then OwnerDeletesWiki fires
+        then wiki.status = uninitialised
+        then page does not exist
+
+    ends: The wiki is empty and uninitialised; the wiki unit is switched off by repositories.
+}

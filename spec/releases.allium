@@ -1,0 +1,990 @@
+-- allium: 3
+-- releases.allium — releases, the tag records behind them, and their downloadable assets.
+--
+-- Scope: everything a repository shows on its Releases page (and the release
+--        half of its Tags page) that is not git itself: the release record
+--        kept for each tag, its lifecycle (tag-only -> draft -> published and
+--        back), release notes, downloadable assets (uploaded files and
+--        external links), download counting, the "latest release" rule, and
+--        keeping the release records in step with the tags that exist in git.
+-- Includes:
+--   - Release (tag-only record, draft, published; pre-release flag)
+--   - release assets: issues/Attachment rows linked to a release (stored
+--     files and external links)
+--   - creating a release on a new tag (the tag is created on a target branch
+--     or commit, optionally annotated) or on an existing tag
+--   - editing, publishing, un-publishing, re-targeting drafts, deleting a
+--     release (the tag stays)
+--   - asset upload / external link / rename / URL change / delete / download
+--     counting
+--   - latest release determination and the "latest" download alias
+--   - hide-archive-links option
+--   - reconciliation of release records with git tags: on push, after a
+--     mirror sync, after adoption / fork / migration, and on an admin request
+-- Excludes:
+--   - the git tag ref, bare tag creation/deletion (web "tag only", tags page
+--     delete, API /tags), tag protection and signature verification — code /
+--     keys own Tag, ProtectedTag, CommitVerification; we react to code's
+--     TagCreated / TagUpdated / TagDeleted and ask code to create the tag
+--     when a release is published
+--   - source archive generation and per-release archive download counters
+--     (repositories owns RepoArchive; we only decide whether links are shown)
+--   - the upload/storage of file bytes and the generic attachment model
+--     (issues owns Attachment; we own its release linkage rules)
+--   - release RSS/Atom feeds, release mails, activity-feed entries
+--     (notifications reacts to our triggers)
+--   - release webhooks and the `release` Actions event (webhooks / actions)
+--   - the release summary card image and the latest-release badge SVG
+--     (presentation only; they read `latest_release_of`)
+--   - re-attribution of migrated releases to local accounts (migrations addon)
+--   - Gitea/GitHub API compatibility quirks: `upload_url` template suffix,
+--     GitHub-format responses, legacy `/attachments/{uuid}` route
+--   - the pull-mirror "fast path" that leaves full releases untouched when
+--     their tag disappears upstream (an optimisation that diverges from the
+--     push path; this spec uses the push-path behaviour everywhere)
+--   - quota accounting itself (quota owns rules; we ask `release_quota_allows`)
+--
+-- Emits:
+--   ReleasePublished(release)              -- a release became visible to readers (publisher = release.publisher)
+--   ReleaseUpdated(release, doer)          -- a published release was edited
+--   ReleaseDeleted(release, doer)          -- a published release was deleted (the record survives as tag-only)
+--   ReleaseTagRequested(release, doer)     -- publishing needs the git tag created at release.target;
+--                                          -- code creates it as a tag push (TagCreated follows)
+-- Reacts to:
+--   code/TagCreated(tag, by), code/TagUpdated(tag, by), code/TagDeleted(repository, tag_name, by)
+--   repositories/PullMirrorSynced(mirror)
+--   repositories/RepositoryAdopted(repository, doer)
+--   repositories/RepositoryForked(source, fork, doer)
+--   migrations/RepositoryMigrated(repository)
+
+use "./accounts.allium" as accounts
+use "./repositories.allium" as repositories
+use "./access.allium" as access
+use "./code.allium" as code
+use "./issues.allium" as issues
+use "./migrations.allium" as migrations
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- What the git repository says about one tag when it is inspected.
+-- from: modules/repository/repo.go:125
+value TagSnapshot {
+    tag_name: String
+    commit_sha: String
+    tagger: accounts/User?          -- resolved from the tagger (else author, else committer) e-mail; null when no account matches
+    tagged_at: Timestamp            -- tagger date for annotated tags, else commit author date
+    subject: String                 -- first line of the annotation message
+    body: String                    -- remainder of the annotation message
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ReleaseRecordState {
+    tag_only        -- a git tag with no release written for it (Tags page only)
+    | draft         -- a release being prepared; invisible to readers; its tag may not exist yet
+    | published     -- a visible release; its tag exists in git
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- One record per tag name per repository. A tag pushed without ceremony gets
+-- a tag-only record; writing release notes for it turns the same record into
+-- a draft or published release. Deleting the release (but not the tag) turns
+-- it back into a tag-only record.
+-- from: models/repo/release.go:67
+entity Release {
+    repository: repositories/Repository
+    tag_name: String                    -- unique per repository, case-insensitively; max 255 chars
+    target: String                      -- branch name or commit sha the tag is (to be) created on; empty means the default branch
+    title: String                       -- max 255 chars; defaults to tag_name
+    note: String                        -- release notes, Markdown
+    publisher: accounts/User?           -- who wrote the release (or who tagged, for tag-only records); null shows as a ghost user
+    original_author: String?            -- imported releases whose author has no local account (set by migrations)
+    state: ReleaseRecordState
+    is_prerelease: Boolean
+    hide_archive_links: Boolean         -- do not offer source archive downloads for this release
+    commit_sha: String?                 -- the commit the tag points at; null while a draft's tag does not exist
+    num_commits: Integer                -- commit count reachable from the tagged commit (0 when no tag)
+    created_at: Timestamp               -- publication / tag time; drives ordering and "latest"
+
+    transitions state {
+        tag_only -> draft
+        tag_only -> published
+        draft -> published
+        published -> draft
+        published -> tag_only
+        draft -> tag_only
+        terminal: tag_only
+    }
+
+    -- Relationships
+    assets: issues/Attachment with release = this
+
+    -- Derived
+    display_name: if title = "": tag_name else: title
+    is_release: state in {draft, published}
+    is_visible_to_readers: state != draft
+    has_tag: commit_sha != null
+    is_latest_candidate: state = published and not is_prerelease
+    shows_archive_links: state = published and not hide_archive_links
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [attachment] ENABLED — when false no asset can be added (stored or external)
+    attachments_enabled: Boolean = true
+    -- [attachment] MAX_SIZE, in MiB, per uploaded file
+    max_asset_size_mb: Integer = 2048
+    -- [attachment] MAX_FILES — files per web upload batch
+    max_assets_per_upload: Integer = 5
+    -- [repository.release] ALLOWED_TYPES — comma list of extensions / mime types / wildcards; empty allows everything
+    release_allowed_types: String = ""
+    -- [repository.release] DEFAULT_PAGING_NUM — releases per page on the web list
+    releases_page_size: Integer = 10
+    -- [repository] DISABLE_DOWNLOAD_SOURCE_ARCHIVES — hides archive links on every release
+    source_archives_disabled: Boolean = false
+    -- form validation limits (not app.ini; domain limits a user hits)
+    max_tag_name_length: Integer = 255
+    max_title_length: Integer = 255
+}
+
+------------------------------------------------------------
+-- Rules: creating releases
+------------------------------------------------------------
+
+-- A new tag name with no record yet, saved as a draft. No git tag is created
+-- until the draft is published.
+-- from: services/release/release.go:137
+rule UserCreatesDraftRelease {
+    when: UserCreatesRelease(user, repository, tag_name, target, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
+    requires: not repository.is_empty
+    requires: is_valid_tag_name(tag_name)
+    requires: not exists Release{repository: repository, tag_name: tag_name}
+    requires: is_draft
+    ensures: Release.created(
+        repository: repository,
+        tag_name: tag_name,
+        target: target,
+        title: if title = "": tag_name else: title,
+        note: note,
+        publisher: user,
+        original_author: null,
+        state: draft,
+        is_prerelease: is_prerelease,
+        hide_archive_links: hide_archive_links,
+        commit_sha: null,
+        num_commits: 0,
+        created_at: now
+    )
+    @guidance
+        -- Web: POST /{owner}/{repo}/releases/new (draft button).
+        -- API: POST /repos/{owner}/{repo}/releases with draft=true.
+        -- Web requires a non-empty title; the API defaults the title to the
+        -- tag name. Files uploaded in the form are linked in the same step
+        -- (UserLinksUploadToRelease); external links likewise.
+}
+
+-- A new tag name with no record yet, published immediately: the tag is
+-- created on the target, then the release becomes visible.
+-- from: services/release/release.go:38
+rule UserCreatesPublishedRelease {
+    when: UserCreatesRelease(user, repository, tag_name, target, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
+    requires: not repository.is_empty
+    requires: is_valid_tag_name(tag_name)
+    requires: not exists Release{repository: repository, tag_name: tag_name}
+    requires: not is_draft
+    requires: may_control_tag(user, repository, tag_name)
+    requires: target_resolves(repository, target)
+    requires: release_quota_allows(repository)
+    ensures:
+        let release = Release.created(
+            repository: repository,
+            tag_name: tag_name,
+            target: target,
+            title: if title = "": tag_name else: title,
+            note: note,
+            publisher: user,
+            original_author: null,
+            state: published,
+            is_prerelease: is_prerelease,
+            hide_archive_links: hide_archive_links,
+            commit_sha: commit_of(repository, target),
+            num_commits: commit_count_of(repository, target),
+            created_at: now
+        )
+        ReleaseTagRequested(release: release, doer: user)
+        ReleasePublished(release: release)
+    @guidance
+        -- If "add tag message" is chosen (web only), the tag is annotated with
+        -- "<title>\n\n<note>"; otherwise it is lightweight.
+        -- The target may be a branch name or a full commit sha; when empty the
+        -- repository's default branch is used (API).
+        -- If a git tag of that name already exists but has no record (records
+        -- out of step), it is used as is.
+}
+
+-- Writing a release for a tag that already exists (a tag-only record).
+-- from: routers/web/repo/release.go:634
+rule UserCreatesReleaseOnExistingTag {
+    when: UserCreatesRelease(user, repository, tag_name, target, title, note, is_draft, is_prerelease, hide_archive_links)
+    let existing = Release{repository: repository, tag_name: tag_name}
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
+    requires: not repository.is_empty
+    requires: exists existing
+    requires: existing.state = tag_only
+    requires: release_quota_allows(repository)
+    ensures: existing.title = if title = "": tag_name else: title
+    ensures: existing.note = note
+    ensures: existing.target = target
+    ensures: existing.publisher = user
+    ensures: existing.is_prerelease = is_prerelease
+    ensures: existing.hide_archive_links = hide_archive_links
+    ensures:
+        if is_draft:
+            existing.state = draft
+        else:
+            existing.state = published
+            ReleasePublished(release: existing)
+    @guidance
+        -- Web: /releases/new?tag=<tag> pre-fills the form from the tag record.
+        -- A tag that already has a draft or published release is refused
+        -- ("release for this tag already exists") — no rule fires.
+}
+
+------------------------------------------------------------
+-- Rules: editing, publishing, un-publishing
+------------------------------------------------------------
+
+-- Editing a draft that stays a draft. Nobody is told.
+-- from: services/release/release.go:248
+rule UserEditsDraftRelease {
+    when: UserEditsRelease(user, release, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: can_write_releases(user, release.repository)
+    requires: not release.repository.is_archived
+    requires: release.state = draft
+    requires: is_draft
+    requires: release_quota_allows(release.repository)
+    ensures: release.title = title
+    ensures: release.note = note
+    ensures: release.is_prerelease = is_prerelease
+    ensures: release.hide_archive_links = hide_archive_links
+}
+
+-- Publishing a draft. Its tag is created now if it does not exist yet.
+-- from: services/release/release.go:248
+rule UserPublishesDraftRelease {
+    when: UserEditsRelease(user, release, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: can_write_releases(user, release.repository)
+    requires: not release.repository.is_archived
+    requires: release.state = draft
+    requires: not is_draft
+    requires: release.has_tag or may_control_tag(user, release.repository, release.tag_name)
+    requires: release.has_tag or target_resolves(release.repository, release.target)
+    requires: release_quota_allows(release.repository)
+    let tag_was_missing = not release.has_tag
+    ensures: release.title = title
+    ensures: release.note = note
+    ensures: release.is_prerelease = is_prerelease
+    ensures: release.hide_archive_links = hide_archive_links
+    ensures: release.state = published
+    ensures:
+        if tag_was_missing:
+            release.commit_sha = commit_of(release.repository, release.target)
+            release.num_commits = commit_count_of(release.repository, release.target)
+            release.created_at = now
+            ReleaseTagRequested(release: release, doer: user)
+    ensures: ReleasePublished(release: release)
+}
+
+-- Editing a published release that stays published.
+-- from: services/release/release.go:368
+rule UserEditsPublishedRelease {
+    when: UserEditsRelease(user, release, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: can_write_releases(user, release.repository)
+    requires: not release.repository.is_archived
+    requires: release.state = published
+    requires: not is_draft
+    requires: release_quota_allows(release.repository)
+    ensures: release.title = title
+    ensures: release.note = note
+    ensures: release.is_prerelease = is_prerelease
+    ensures: release.hide_archive_links = hide_archive_links
+    ensures: ReleaseUpdated(release: release, doer: user)
+}
+
+-- Turning a published release back into a draft. The tag stays.
+-- from: routers/web/repo/release.go:817
+rule UserUnpublishesRelease {
+    when: UserEditsRelease(user, release, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: can_write_releases(user, release.repository)
+    requires: not release.repository.is_archived
+    requires: release.state = published
+    requires: is_draft
+    ensures: release.title = title
+    ensures: release.note = note
+    ensures: release.is_prerelease = is_prerelease
+    ensures: release.hide_archive_links = hide_archive_links
+    ensures: release.state = draft
+}
+
+-- API only: moving a draft to another tag name and/or target before its tag exists.
+-- from: routers/api/v1/repo/release.go:353
+rule UserRetargetsDraftRelease {
+    when: UserRetargetsRelease(user, release, tag_name, target)
+    requires: can_write_releases(user, release.repository)
+    requires: not release.repository.is_archived
+    requires: release.state = draft
+    requires: not release.has_tag
+    requires: is_valid_tag_name(tag_name)
+    requires: tag_name = release.tag_name or not exists Release{repository: release.repository, tag_name: tag_name}
+    ensures: release.tag_name = tag_name
+    ensures: release.target = target
+    @guidance
+        -- PATCH /repos/{owner}/{repo}/releases/{id} with tag_name / target_commitish.
+}
+
+------------------------------------------------------------
+-- Rules: deleting
+------------------------------------------------------------
+
+-- Deleting a release but keeping its tag: the record reverts to tag-only and
+-- all its assets are removed. A draft whose tag never existed disappears.
+-- from: services/release/release.go:390
+rule UserDeletesRelease {
+    when: UserDeletesRelease(user, release)
+    requires: can_write_releases(user, release.repository)
+    requires: not release.repository.is_archived
+    requires: release.is_release
+    let was_published = release.state = published
+    ensures:
+        for a in release.assets:
+            not exists a
+    ensures:
+        if release.has_tag:
+            release.state = tag_only
+        else:
+            not exists release
+    ensures:
+        if was_published:
+            ReleaseDeleted(release: release, doer: user)
+    @guidance
+        -- Web: POST /{owner}/{repo}/releases/delete?id=.
+        -- API: DELETE /repos/{owner}/{repo}/releases/{id} and
+        --      DELETE /repos/{owner}/{repo}/releases/tags/{tag}.
+        -- Title and notes are kept on the tag-only record (Tags page).
+        -- Deleting the tag itself is code's UserDeletesTag; the record then
+        -- follows via TagVanished.
+}
+
+------------------------------------------------------------
+-- Rules: assets
+------------------------------------------------------------
+
+-- Uploading a file straight onto a release (API), or into the release form
+-- for linking on save (web: the release is chosen when the form is saved).
+-- from: routers/api/v1/repo/release_attachment.go:190
+rule UserUploadsReleaseAsset {
+    when: UserUploadsReleaseAsset(user, release, name, size, head_bytes)
+    requires: config.attachments_enabled
+    requires: can_write_releases(user, release.repository)
+    requires: not release.repository.is_archived
+    requires: release.is_release
+    requires: name != ""
+    requires: file_type_allowed(name, head_bytes, config.release_allowed_types)
+    requires: size <= config.max_asset_size_mb * 1048576
+    requires: asset_quota_allows(release.repository)
+    ensures: issues/Attachment.created(
+        repository: release.repository,
+        uploader: user,
+        name: name,
+        size: size,
+        issue: null,
+        comment: null,
+        release: release,
+        external_url: null,
+        download_count: 0,
+        created_at: now
+    )
+    @guidance
+        -- Web: POST /{owner}/{repo}/releases/attachments (needs releases
+        --      write; the upload is unlinked until the form is saved, see
+        --      UserLinksUploadToRelease), at most max_assets_per_upload files.
+        -- API: POST /repos/{owner}/{repo}/releases/{id}/assets (multipart
+        --      "attachment" or raw body; "name" query overrides the file name).
+        -- The type check accepts a matching extension or the mime type
+        -- sniffed from the first bytes.
+}
+
+-- Web: the uploads listed in the saved release form become its assets.
+-- from: models/repo/release.go:235
+rule UserLinksUploadToRelease {
+    when: UserLinksUploadToRelease(user, release, file)
+    requires: can_write_releases(user, release.repository)
+    requires: not release.repository.is_archived
+    requires: release.is_release
+    requires: file.repository = release.repository
+    requires: file.uploader = user
+    requires: not file.is_linked
+    ensures: file.release = release
+}
+
+-- Adding a link to a file hosted elsewhere.
+-- from: services/attachment/attachment.go:50
+rule UserAddsExternalAsset {
+    when: UserAddsExternalAsset(user, release, name, url)
+    requires: config.attachments_enabled
+    requires: can_write_releases(user, release.repository)
+    requires: not release.repository.is_archived
+    requires: release.is_release
+    requires: is_valid_url(url)
+    requires: name != ""
+    ensures: issues/Attachment.created(
+        repository: release.repository,
+        uploader: user,
+        name: name,
+        size: 0,
+        issue: null,
+        comment: null,
+        release: release,
+        external_url: url,
+        download_count: 0,
+        created_at: now
+    )
+    @guidance
+        -- API: POST .../releases/{id}/assets?external_url=...; the name
+        -- defaults to the last path segment of the URL (or its host).
+        -- Web: "attachment-new-name-*" / "attachment-new-exturl-*" fields.
+        -- An upload and an external_url in the same API call are refused.
+}
+
+-- from: services/release/release.go:340
+rule UserRenamesReleaseAsset {
+    when: UserRenamesReleaseAsset(user, asset, name)
+    requires: asset.release != null
+    requires: can_write_releases(user, asset.repository)
+    requires: not asset.repository.is_archived
+    requires: name != ""
+    ensures: asset.name = name
+    @guidance
+        -- Web: "attachment-edit-name-*"; API: PATCH .../releases/{id}/assets/{asset_id}.
+}
+
+-- from: routers/api/v1/repo/release_attachment.go:395
+rule UserChangesExternalAssetUrl {
+    when: UserChangesExternalAssetUrl(user, asset, url)
+    requires: asset.release != null
+    requires: can_write_releases(user, asset.repository)
+    requires: not asset.repository.is_archived
+    requires: asset.external_url != null
+    requires: is_valid_url(url)
+    ensures: asset.external_url = url
+    @guidance
+        -- API: PATCH .../assets/{asset_id} with browser_download_url;
+        -- refused for stored assets ("existing attachment is not external").
+}
+
+-- from: routers/api/v1/repo/release_attachment.go:460
+rule UserDeletesReleaseAsset {
+    when: UserDeletesReleaseAsset(user, asset)
+    requires: asset.release != null
+    requires: can_write_releases(user, asset.repository)
+    requires: not asset.repository.is_archived
+    ensures: not exists asset
+    @guidance
+        -- Web: "attachment-del-*" on the edit form; API DELETE .../assets/{asset_id}.
+        -- The stored bytes are removed too (best effort).
+}
+
+-- Downloading a stored asset counts; following an external link does not.
+-- from: routers/web/repo/attachment.go:83
+rule VisitorDownloadsReleaseAsset {
+    when: VisitorDownloadsReleaseAsset(viewer, asset)
+    requires: asset.release != null
+    requires: can_read_releases(viewer, asset.repository)
+    requires: asset.release.is_visible_to_readers or can_write_releases(viewer, asset.repository)
+    ensures:
+        if asset.external_url = null:
+            asset.download_count = asset.download_count + 1
+    @guidance
+        -- Web: GET /{owner}/{repo}/releases/download/{tag}/{name} (by name
+        --      when names are unique within the release, else by uuid),
+        --      GET /attachments/{uuid}. Tag "latest" resolves to
+        --      latest_release_of(repository) when no tag is literally named "latest".
+        -- External assets redirect to their URL.
+        -- A token needs the read:repository scope.
+}
+
+------------------------------------------------------------
+-- Rules: keeping records in step with git tags
+------------------------------------------------------------
+
+-- A tag pushed (or found by a sync) that has no record yet.
+-- from: services/repository/push.go:377
+rule TagAppearsWithoutRecord {
+    when: TagObserved(repository, tag_name, commit_sha, tagger, tagged_at, subject, body)
+    requires: not exists Release{repository: repository, tag_name: tag_name}
+    ensures: Release.created(
+        repository: repository,
+        tag_name: tag_name,
+        target: "",
+        title: subject,
+        note: body,
+        publisher: tagger,
+        original_author: null,
+        state: tag_only,
+        is_prerelease: false,
+        hide_archive_links: false,
+        commit_sha: commit_sha,
+        num_commits: commit_count_of(repository, commit_sha),
+        created_at: tagged_at
+    )
+}
+
+-- A tag-only record whose tag moved or was re-pushed.
+-- from: services/repository/push.go:399
+rule TagOnlyRecordRefreshed {
+    when: TagObserved(repository, tag_name, commit_sha, tagger, tagged_at, subject, body)
+    let existing = Release{repository: repository, tag_name: tag_name}
+    requires: exists existing
+    requires: existing.state = tag_only
+    ensures: existing.commit_sha = commit_sha
+    ensures: existing.num_commits = commit_count_of(repository, commit_sha)
+    ensures: existing.created_at = tagged_at
+    ensures: existing.title = subject
+    ensures: existing.note = body
+    ensures:
+        if tagger != null:
+            existing.publisher = tagger
+}
+
+-- The tag of a written release appeared (again). A draft that was waiting for
+-- its tag is published by the push.
+-- from: services/repository/push.go:399
+rule ReleaseTagArrives {
+    when: TagObserved(repository, tag_name, commit_sha, tagger, tagged_at, subject, body)
+    let existing = Release{repository: repository, tag_name: tag_name}
+    requires: exists existing
+    requires: existing.is_release
+    let was_draft = existing.state = draft
+    ensures: existing.commit_sha = commit_sha
+    ensures: existing.num_commits = commit_count_of(repository, commit_sha)
+    ensures: existing.created_at = tagged_at
+    ensures: existing.state = published
+    ensures:
+        if was_draft:
+            ReleasePublished(release: existing)
+}
+
+-- A tag disappeared from git: a tag-only record goes; a written release is
+-- demoted to a draft that waits for its tag to come back.
+-- from: models/repo/release.go:533
+rule TagDisappears {
+    when: TagVanished(repository, tag_name)
+    let existing = Release{repository: repository, tag_name: tag_name}
+    requires: exists existing
+    ensures:
+        if existing.state = tag_only:
+            not exists existing
+        else:
+            existing.state = draft
+            existing.commit_sha = null
+            existing.num_commits = 0
+}
+
+-- code reports tags created or moved — by a push, or by its own tag creation
+-- (including the one requested when a release is published).
+-- from: services/repository/push.go:306
+rule CodeTagCreatedIsObserved {
+    when: code/TagCreated(tag, by)
+    ensures: TagObserved(
+        repository: tag.repository,
+        tag_name: tag.name,
+        commit_sha: tag.commit_sha,
+        tagger: tag.tagger,
+        tagged_at: tag.created_at,
+        subject: message_subject(tag.message),
+        body: message_body(tag.message)
+    )
+}
+
+-- from: services/repository/push.go:399
+rule CodeTagUpdatedIsObserved {
+    when: code/TagUpdated(tag, by)
+    ensures: TagObserved(
+        repository: tag.repository,
+        tag_name: tag.name,
+        commit_sha: tag.commit_sha,
+        tagger: tag.tagger,
+        tagged_at: tag.created_at,
+        subject: message_subject(tag.message),
+        body: message_body(tag.message)
+    )
+}
+
+-- from: services/repository/push.go:298
+rule CodeTagDeletedIsObserved {
+    when: code/TagDeleted(repository, tag_name, by)
+    ensures: TagVanished(repository: repository, tag_name: tag_name)
+}
+
+-- A full reconciliation of one repository against its git tags.
+-- from: modules/repository/repo.go:64
+rule RepositoryTagsReconciled {
+    when: RepositoryTagSyncRequested(repository)
+    requires: not repository.is_empty
+    ensures:
+        for t in git_tags(repository):
+            TagObserved(
+                repository: repository,
+                tag_name: t.tag_name,
+                commit_sha: t.commit_sha,
+                tagger: t.tagger,
+                tagged_at: t.tagged_at,
+                subject: t.subject,
+                body: t.body
+            )
+    ensures:
+        for r in Releases where repository = repository and commit_sha != null:
+            if not tag_exists(repository, r.tag_name):
+                TagVanished(repository: repository, tag_name: r.tag_name)
+    @guidance
+        -- Records whose sha still matches git are left alone; only new or
+        -- moved tags produce TagObserved in practice.
+}
+
+-- from: services/mirror/mirror_pull.go:444
+rule MirrorSyncReconcilesTags {
+    when: repositories/PullMirrorSynced(mirror)
+    ensures: RepositoryTagSyncRequested(repository: mirror.repository)
+}
+
+-- from: services/repository/adopt.go:149
+rule AdoptionReconcilesTags {
+    when: repositories/RepositoryAdopted(repository, doer)
+    ensures: RepositoryTagSyncRequested(repository: repository)
+}
+
+-- from: services/repository/fork.go:205
+rule ForkReconcilesTags {
+    when: repositories/RepositoryForked(source, fork, doer)
+    ensures: RepositoryTagSyncRequested(repository: fork)
+}
+
+-- from: services/repository/migrate.go:169
+rule MigrationReconcilesTags {
+    when: migrations/RepositoryMigrated(repository)
+    ensures: RepositoryTagSyncRequested(repository: repository)
+}
+
+-- Site admin dashboard: "Synchronise tags from git data to database" for
+-- every non-empty repository (queued, one repository at a time).
+-- from: routers/web/admin/admin.go:198
+rule AdminResynchronisesAllTags {
+    when: AdminResynchronisesAllTags(admin)
+    requires: admin.is_admin
+    ensures:
+        for repository in repositories/Repositories where not is_empty:
+            RepositoryTagSyncRequested(repository: repository)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- At most one record per tag name per repository (case-insensitive).
+-- from: models/repo/release.go:69
+invariant OneRecordPerTag {
+    for a in Releases:
+        for b in Releases:
+            a != b and a.repository = b.repository
+                implies not same_tag_name(a.tag_name, b.tag_name)
+}
+
+-- A published release or a tag-only record always points at an existing commit.
+invariant VisibleRecordsHaveATag {
+    for r in Releases:
+        r.state in {published, tag_only} implies r.commit_sha != null
+}
+
+-- Assets hang only off written releases, never off tag-only records.
+invariant AssetsOnlyOnReleases {
+    for r in Releases:
+        r.state = tag_only implies r.assets.count = 0
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Anyone who may read the releases unit of the repository in view
+-- (includes the anonymous visitor of a public repository via access).
+actor ReleaseReader {
+    within: repositories/Repository
+    identified_by: accounts/User where can_read_releases(this, within)
+}
+
+-- Repository writer for the releases unit (collaborator / team with write,
+-- repo admin, org owner, site admin).
+actor ReleaseWriter {
+    within: repositories/Repository
+    identified_by: accounts/User where can_write_releases(this, within)
+}
+
+-- Whoever caused git tags to change (pusher, mirror owner, admin); the push
+-- hook and sync jobs relay tag changes on their behalf.
+actor TagSource {
+    within: repositories/Repository
+    identified_by: accounts/User where can_write_code(this, within)
+}
+
+actor ReleaseSyncAdmin {
+    identified_by: accounts/User where is_admin = true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- What readers see on the Releases page, a single release page, the latest
+-- release and the release API.
+surface ReleaseCatalogue {
+    facing viewer: ReleaseReader
+    context repository: repositories/Repository
+
+    exposes:
+        for r in Releases where repository = repository and state = published:
+            r.tag_name
+            r.display_name
+            r.note
+            r.is_prerelease
+            r.publisher
+            r.original_author
+            r.created_at
+            r.commit_sha
+            r.shows_archive_links
+            commits_since(r)
+        for a in issues/Attachments where repository = repository and release != null:
+            a.name
+            a.size
+            a.external_url
+            a.download_count
+            a.release.tag_name
+        latest_release_of(repository)
+
+    provides:
+        VisitorDownloadsReleaseAsset(viewer, asset)
+
+    @guarantee DraftsAreInvisibleToReaders
+        -- A draft never appears in lists, single views, the latest lookup,
+        -- the API (by id, by tag, list) or asset downloads for anyone without
+        -- releases write access; to them it does not exist.
+
+    @guarantee LatestIsTheNewestStableRelease
+        -- latest_release_of(repository) is the published, non-pre-release
+        -- release with the greatest created_at (ties: most recently created
+        -- record). Tag-only records, drafts and pre-releases never count.
+
+    @guidance
+        -- Web: GET /{o}/{r}/releases (paged by releases_page_size, ?q=
+        --      searches tag name, title and notes), /releases/tag/{tag} (also
+        --      shows tag-only records), /releases/latest (redirect),
+        --      /releases/download/{tag}/{file}. All need a non-empty repository.
+        -- API: GET /repos/{o}/{r}/releases (?draft, ?pre-release, ?q, paging),
+        --      /releases/latest, /releases/{id}, /releases/tags/{tag},
+        --      /releases/{id}/assets, /releases/{id}/assets/{asset_id}.
+        -- Assets of drafts are listed only to writers.
+        -- Archive links are shown only when shows_archive_links, the instance
+        -- has not disabled source archives, and the viewer can read code.
+        -- Commit status and tag signature verification of commit_sha are
+        -- shown from code / keys (commit statuses only to actions readers).
+}
+
+-- What a releases writer can see and do.
+surface ReleaseManagement {
+    facing writer: ReleaseWriter
+    context repository: repositories/Repository
+
+    exposes:
+        for r in Releases where repository = repository and state in {draft, published}:
+            r.tag_name
+            r.target
+            r.title
+            r.note
+            r.state
+            r.is_prerelease
+            r.hide_archive_links
+            r.has_tag
+        for a in issues/Attachments where repository = repository and release != null:
+            a.name
+            a.external_url
+            a.download_count
+
+    provides:
+        UserCreatesRelease(writer, repository, tag_name, target, title, note, is_draft, is_prerelease, hide_archive_links)
+            when not repository.is_archived and not repository.is_empty
+        UserEditsRelease(writer, release, title, note, is_draft, is_prerelease, hide_archive_links)
+            when not repository.is_archived
+        UserRetargetsRelease(writer, release, tag_name, target)
+            when not repository.is_archived
+        UserDeletesRelease(writer, release)
+            when not repository.is_archived
+        UserUploadsReleaseAsset(writer, release, name, size, head_bytes)
+            when not repository.is_archived and config.attachments_enabled
+        UserLinksUploadToRelease(writer, release, file)
+            when not repository.is_archived
+        UserAddsExternalAsset(writer, release, name, url)
+            when not repository.is_archived and config.attachments_enabled
+        UserRenamesReleaseAsset(writer, asset, name)
+            when not repository.is_archived
+        UserChangesExternalAssetUrl(writer, asset, url)
+            when not repository.is_archived
+        UserDeletesReleaseAsset(writer, asset)
+            when not repository.is_archived
+        VisitorDownloadsReleaseAsset(writer, asset)
+
+    @guarantee ArchivedRepositoriesAreFrozen
+        -- No release or asset of an archived repository can be created,
+        -- changed or deleted.
+
+    @guidance
+        -- Web: GET/POST /{o}/{r}/releases/new (?tag= pre-fills from a
+        --      tag-only record; hide_archive_links pre-filled from the latest
+        --      release), GET/POST /releases/edit/{tag}, POST /releases/delete,
+        --      POST /releases/attachments, POST /releases/attachments/remove
+        --      (only the uploader may remove an unlinked upload — issues'
+        --      UserDeletesAttachment).
+        -- API: POST /repos/{o}/{r}/releases, PATCH/DELETE /releases/{id},
+        --      DELETE /releases/tags/{tag}, POST/PATCH/DELETE
+        --      /releases/{id}/assets[/{asset_id}].
+}
+
+-- The integration boundary through which git tag changes reach this module:
+-- code's push hook and tag operations, mirror sync, adoption, fork,
+-- migration and the admin resync all end up here.
+surface TagReconciliation {
+    facing source: TagSource
+    context repository: repositories/Repository
+
+    exposes:
+        for r in Releases where repository = repository:
+            r.tag_name
+            r.commit_sha
+            r.state
+
+    provides:
+        TagObserved(repository, tag_name, commit_sha, tagger, tagged_at, subject, body)
+            when can_write_code(source, repository)
+        TagVanished(repository, tag_name)
+            when can_write_code(source, repository)
+        RepositoryTagSyncRequested(repository)
+
+    @guarantee RecordsFollowGit
+        -- After reconciliation every git tag has exactly one record, every
+        -- tag-only record has a git tag, and every written release whose tag
+        -- is gone is a draft.
+}
+
+surface ReleaseSyncAdministration {
+    facing admin: ReleaseSyncAdmin
+
+    provides:
+        AdminResynchronisesAllTags(admin)
+
+    @guidance
+        -- Site admin dashboard operation "sync_repo_tags"; also
+        -- `forgejo admin repo-sync-releases` on the command line.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred is_valid_tag_name    -- see: code.allium (git ref-format rules for refs/tags/<name>, max 255 chars)
+deferred file_type_allowed    -- see: issues.allium (is_allowed_file: extension or sniffed mime type)
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Publishing a draft whose tag already exists emits only 'release updated' in Forgejo (not 'published'); this spec emits ReleasePublished on every draft -> published. Confirm."
+open question "Un-publishing (published -> draft) and tag-deletion-by-push (published -> draft) are silent in Forgejo; should webhooks/feeds get a 'release unpublished' event?"
+open question "A push that brings back the tag of a draft release publishes it; Forgejo does so silently. This spec emits ReleasePublished. Intended?"
+open question "Forgejo lets the API change tag_name/target of a published release, which creates a second tag and leaves the old one; this spec restricts retargeting to drafts without a tag. Confirm."
+open question "Deleting a draft that never had a tag leaves a tag-less 'tag' record in Forgejo; this spec removes the record entirely. Confirm."
+open question "Forgejo's tags-page delete removes a tag together with its published release (and emits release-deleted); code.allium refuses deleting a tag that carries a published release. Which is intended?"
+open question "[attachment] MAX_SIZE is enforced only by the web upload widget in Forgejo; this spec enforces it on every upload path. Confirm."
+open question "Archived repositories: Forgejo's API still allows deleting releases/assets of an archived repository; this spec freezes all release mutations. Confirm."
+open question "Creating a bare tag needs releases-write on the web release form ('tag only') but code-write on the API; should one permission govern both?"
+open question "Should pull-mirrors' releases be read-only (mirror owners cannot meaningfully write releases for upstream tags)?"
+
+------------------------------------------------------------
+-- Functions this module provides to others
+------------------------------------------------------------
+-- release_exists(repository, tag_name)        = exists Release{repository, tag_name} where is_release
+-- has_published_release(repository, tag_name) = exists Release{repository, tag_name} where state = published
+-- latest_release_of(repository)               = newest Release where is_latest_candidate (by created_at, then creation order)
+
+------------------------------------------------------------
+-- Black-box functions used (non-normative index)
+------------------------------------------------------------
+-- can_read_releases(user, repository)   = access/can_read(user, repository, releases)
+-- can_write_releases(user, repository)  = access/can_write(user, repository, releases)
+-- can_write_code(user, repository)      = access/can_write(user, repository, code)
+-- may_control_tag(user, repository, tag_name)
+--                                       = no code/ProtectedTag matching tag_name forbids user
+-- target_resolves(repository, target)   = target names a branch or an existing commit
+-- commit_of(repository, target), commit_count_of(repository, rev)
+-- git_tags(repository) -> Set<TagSnapshot>, tag_exists(repository, tag_name)
+-- message_subject(message), message_body(message)
+--                                       = first line / remainder of a tag annotation ("" when none)
+-- same_tag_name(a, b)                   = case-insensitive equality
+-- commits_since(release)                = commits on target (or default branch) since the tag
+-- release_quota_allows(repository)      = quota subject size:repos:all
+-- asset_quota_allows(repository)        = quota subject size:assets:attachments:releases
+-- is_valid_url(url)                     = absolute http(s) URL
+
+------------------------------------------------------------
+-- Requests to other modules
+------------------------------------------------------------
+-- REQUEST access/can_read, access/can_write: the journey simulator cannot evaluate a
+--   qualified call or one whose argument is an enum literal; this module wraps them in
+--   2-argument local functions (index above). Integration may unify the names.
+-- REQUEST code: react to releases/ReleaseTagRequested(release, doer) by creating the tag
+--   release.tag_name at release.target (annotated with "<title>\n\n<note>" when asked) as an
+--   internal tag push, so TagCreated, push notifications and Actions events follow.
+-- REQUEST code/Tag.tagger, .message, .created_at, .commit_sha: used to build TagObserved.
+-- REQUEST code/ProtectedTag: a predicate equivalent to may_control_tag(user, repository, tag_name).
+-- REQUEST code/UserDeletesTag: Forgejo deletes the tag's release record with it (see open question).
+-- REQUEST issues/Attachment.release, .external_url, .download_count, .is_linked: as already
+--   declared; issues/Attachments collection; the release upload endpoint uses
+--   [repository.release] ALLOWED_TYPES and needs releases write, not tracker read.
+-- REQUEST repositories/PullMirrorSynced, RepositoryAdopted, RepositoryForked: emit after the
+--   git data is in place (used to reconcile release records with tags).
+-- REQUEST repositories/RepoArchive download counting (ReaderDownloadsArchive): find the release
+--   of a tag with Release{repository, tag_name}.
+-- REQUEST repositories/Repositories: entity collection used by the admin resync.
+-- REQUEST repositories/RepoArchive: per-release archive download counters (shown on the
+--   release, summed into its total downloads unless hide_archive_links); drop them when
+--   the release's tag is deleted.
+-- REQUEST migrations: ImportRelease should set releases/Release.state (draft | published)
+--   instead of is_draft, plus commit_sha (tag commit, null for drafts without a tag) and
+--   original_author (exists here). Imported release assets are issues/Attachment rows with
+--   release set (there is no releases/ReleaseAsset entity).
+-- REQUEST keys/CommitVerification: signature verification of the tag shown on release/tag pages.
+-- REQUEST notifications: ReleasePublished now carries only (release); use release.publisher.
+-- REQUEST webhooks / actions: react to ReleasePublished(release) / ReleaseUpdated(release, doer)
+--   / ReleaseDeleted(release, doer) (release event actions published / updated / deleted).

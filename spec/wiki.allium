@@ -1,0 +1,540 @@
+-- allium: 3
+-- wiki.allium — a repository's wiki: a separate git repository of Markdown pages.
+--
+-- Scope: the internal wiki unit of a repository — its pages, their names, the
+--        special sidebar/footer pages, editing through the web and API (each
+--        edit is a commit with a message), the revision history of a page,
+--        content search, git clone/push access to the wiki repository, the
+--        wiki's branch, and deleting all wiki data.
+-- Includes:
+--   - Wiki (one per repository; uninitialised until first written)
+--   - WikiPage (regular, sidebar, footer) and its naming rules
+--   - WikiRevision (one per commit touching a page)
+--   - create / edit (incl. rename) / delete page with commit message
+--   - reading: view (rendered with sidebar and footer), page list, raw,
+--     revisions, search
+--   - git transport to the wiki repository (clone with read, push with write)
+--   - changing / normalising the wiki branch, deleting the wiki
+--   - external wiki: when the repository uses an external wiki, readers are
+--     sent to its URL instead
+-- Excludes:
+--   - enabling/disabling the wiki and external-wiki units, the external wiki
+--     URL and the "anyone may edit" (globally writeable) option
+--     (repositories owns RepoUnit; access computes the resulting permission)
+--   - commit signing policy for wiki commits ([repository.signing] WIKI)
+--     (keys owns signing policies; wiki commits ask keys whether to sign)
+--   - Markdown rendering, table of contents, escaping of invisible/ambiguous
+--     characters (shared rendering, not wiki-specific)
+--   - the commit diff pages of the wiki (/wiki/commit/{sha}) — code's diff view
+--   - wiki mirroring for pull and push mirrors, wiki import during migration,
+--     wiki move on repository rename/transfer, wiki removal on repository
+--     deletion (repositories / migrations own those lifecycles)
+--   - quota accounting (quota owns it; we ask `wiki_quota_allows`)
+--   - legacy un-escaped file name lookup kept for old wikis (compatibility)
+--   - non-Markdown pages ("rendered as Markdown" warning; compatibility)
+--
+-- Emits:
+--   WikiPageCreated(repository, doer, page)          -- page: WikiPage
+--   WikiPageEdited(repository, doer, page)           -- page: WikiPage; includes renames
+--   WikiPageDeleted(repository, doer, page)          -- page: the deleted page's name (String)
+--   WikiDeleted(wiki, deleter)                       -- repositories reacts by disabling the wiki unit
+--   (the commit message of each change is the newest WikiRevision.message of the page)
+-- Reacts to:
+--   repositories/RepositoryCreated(repository, doer)
+
+use "./accounts.allium" as accounts
+use "./repositories.allium" as repositories
+use "./access.allium" as access
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum WikiPageKind {
+    regular
+    | sidebar       -- the page named "_Sidebar": rendered beside every other page
+    | footer        -- the page named "_Footer": rendered below every other page
+}
+
+enum WikiRevisionKind { created | edited | deleted | pushed }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The wiki of one repository. It exists conceptually from the moment the
+-- repository exists; its git repository is only created ("initialised") by
+-- the first write or the first SSH access to it.
+-- from: models/repo/wiki.go:80
+entity Wiki {
+    repository: repositories/Repository  -- the wiki's single branch is repository.wiki_branch (repositories sets it at creation)
+    status: uninitialised | initialised
+
+    transitions status {
+        uninitialised -> initialised
+        initialised -> uninitialised
+        terminal: initialised
+    }
+
+    -- Relationships
+    pages: WikiPage with wiki = this
+    revisions: WikiRevision with wiki = this
+
+    -- Derived
+    is_empty: pages.count = 0
+}
+
+-- One page = one Markdown file at the top of the wiki branch.
+-- from: services/wiki/wiki_path.go:20
+entity WikiPage {
+    wiki: Wiki
+    name: String                         -- canonical page name derived from the title (see page_name_for)
+    title: String                        -- what users see: name with dashes shown as spaces, unescaped
+    content: String                      -- Markdown
+    kind: WikiPageKind
+    last_author: accounts/User?          -- null when the last commit's author maps to no account
+    updated_at: Timestamp
+
+    -- Derived
+    is_special: kind in {sidebar, footer}
+}
+
+-- A commit on the wiki branch that touched a page.
+-- from: routers/web/repo/wiki.go:357
+entity WikiRevision {
+    wiki: Wiki
+    page_name: String
+    kind: WikiRevisionKind
+    author: accounts/User?
+    message: String
+    created_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [repository] DEFAULT_BRANCH — target of "normalise wiki branch"
+    default_wiki_branch: String = repositories/config.default_branch
+    -- [git] COMMITS_RANGE_SIZE — revisions per page of a page's history
+    revisions_page_size: Integer = 50
+    -- hard-coded search limits (not app.ini)
+    search_max_files: Integer = 10
+    search_max_matches_per_file: Integer = 3
+}
+
+------------------------------------------------------------
+-- Rules: lifecycle of the wiki itself
+------------------------------------------------------------
+
+-- from: services/repository/create.go:177
+rule RepositoryGetsAWiki {
+    when: repositories/RepositoryCreated(repository, doer)
+    ensures: Wiki.created(
+        repository: repository,
+        status: uninitialised
+    )
+}
+
+-- Opening the wiki over SSH initialises an empty wiki repository so it can be
+-- cloned and pushed to.
+-- from: routers/private/serv.go:416
+rule GitAccessInitialisesWiki {
+    when: UserOpensWikiOverGit(user, wiki)
+    requires: wiki_unit_enabled(wiki.repository)
+    requires: can_read_wiki(user, wiki.repository)
+    requires: wiki.status = uninitialised
+    ensures: wiki.status = initialised
+}
+
+-- Pushing to the wiki repository with git. Pages are whatever Markdown files
+-- the pushed branch holds. No feed entries or notifications are produced.
+-- from: routers/web/repo/githttp.go:93
+rule UserPushesToWiki {
+    when: UserPushesToWiki(user, wiki)
+    requires: wiki_unit_enabled(wiki.repository)
+    requires: can_write_wiki(user, wiki.repository)
+    requires: not wiki.repository.is_archived
+    requires: not wiki.repository.is_mirror
+    requires: wiki_quota_allows(wiki.repository)
+    ensures: wiki.status = initialised
+    ensures: WikiRevision.created(
+        wiki: wiki,
+        page_name: "",
+        kind: pushed,
+        author: user,
+        message: "",
+        created_at: now
+    )
+    @guidance
+        -- Clone URL: <repo clone URL>.wiki.git over HTTP(S) and SSH.
+        -- Write access over HTTP is checked up front for wiki pushes (there
+        -- is no AGit flow on the wiki); "pull requests are not supported on
+        -- the wiki". Pushing before the repository itself exists is refused.
+        -- Page set after a push = the top-level *.md files of the wiki branch.
+}
+
+-- A repository owner deletes all wiki data. The wiki unit is switched off.
+-- from: services/wiki/wiki.go:381
+rule OwnerDeletesWiki {
+    when: OwnerDeletesWiki(user, wiki, confirmation)
+    requires: is_repo_owner(user, wiki.repository)
+    requires: confirmation = repository_full_name(wiki.repository)
+    ensures:
+        for p in wiki.pages:
+            not exists p
+    ensures:
+        for r in wiki.revisions:
+            not exists r
+    ensures: wiki.status = uninitialised
+    ensures: WikiDeleted(wiki: wiki, deleter: user)
+    @guidance
+        -- Web: repository settings, danger zone, "delete wiki data" (the
+        -- full repository name must be typed to confirm).
+}
+
+-- Renaming the wiki branch: to the instance default ("normalise", web) or to
+-- any name (API repository edit).
+-- from: services/wiki/wiki.go:50
+rule AdminChangesWikiBranch {
+    when: AdminChangesWikiBranch(user, wiki, new_branch)
+    requires: can_admin_repository(user, wiki.repository)
+    requires: not wiki.repository.is_archived
+    requires: new_branch != ""
+    ensures: wiki.repository.wiki_branch = new_branch
+    @guidance
+        -- Web: settings danger zone "rename wiki branch to <default>" (repo
+        -- owner). API: PATCH /repos/{o}/{r} with wiki_branch (repo admin).
+        -- The git branch is renamed and HEAD moved when the old branch exists
+        -- and the new one does not; an uninitialised wiki just records it.
+}
+
+------------------------------------------------------------
+-- Rules: pages
+------------------------------------------------------------
+
+-- Creating a page. The first page written initialises the wiki.
+-- from: services/wiki/wiki.go:124
+rule UserCreatesWikiPage {
+    when: UserCreatesWikiPage(user, wiki, title, content, message)
+    let name = page_name_for(title)
+    requires: wiki_unit_enabled(wiki.repository)
+    requires: can_write_wiki(user, wiki.repository)
+    requires: not wiki.repository.is_archived
+    requires: title != ""
+    requires: name not in {"_pages", "_new", "_edit", "raw"}
+    requires: not exists WikiPage{wiki: wiki, name: name}
+    requires: wiki_quota_allows(wiki.repository)
+    let commit_message = if message = "": "Add " + title else: message
+    ensures: wiki.status = initialised
+    ensures:
+        let page = WikiPage.created(
+            wiki: wiki,
+            name: name,
+            title: title,
+            content: content,
+            kind: kind_of_page(name),
+            last_author: user,
+            updated_at: now
+        )
+        WikiRevision.created(
+            wiki: wiki,
+            page_name: name,
+            kind: created,
+            author: user,
+            message: commit_message,
+            created_at: now
+        )
+        WikiPageCreated(repository: wiki.repository, doer: user, page: page)
+    @guidance
+        -- Web: GET/POST /{o}/{r}/wiki?action=_new (a missing wiki offers
+        -- "Home" as the first title). API: POST /repos/{o}/{r}/wiki/new with
+        -- title, content_base64, message.
+        -- The commit is authored and committed by the user (or signed by the
+        -- instance key per keys' wiki signing policy).
+}
+
+-- Editing a page; a different title renames it in the same commit.
+-- from: services/wiki/wiki.go:290
+rule UserEditsWikiPage {
+    when: UserEditsWikiPage(user, page, title, content, message)
+    let new_name = if title = "": page.name else: page_name_for(title)
+    requires: wiki_unit_enabled(page.wiki.repository)
+    requires: can_write_wiki(user, page.wiki.repository)
+    requires: not page.wiki.repository.is_archived
+    requires: new_name not in {"_pages", "_new", "_edit", "raw"}
+    requires: new_name = page.name or not exists WikiPage{wiki: page.wiki, name: new_name}
+    requires: wiki_quota_allows(page.wiki.repository)
+    let commit_message = if message = "": "Update " + page.title else: message
+    ensures: page.name = new_name
+    ensures:
+        if title != "":
+            page.title = title
+    ensures: page.content = content
+    ensures: page.kind = kind_of_page(new_name)
+    ensures: page.last_author = user
+    ensures: page.updated_at = now
+    ensures: WikiRevision.created(
+        wiki: page.wiki,
+        page_name: new_name,
+        kind: edited,
+        author: user,
+        message: commit_message,
+        created_at: now
+    )
+    ensures: WikiPageEdited(repository: page.wiki.repository, doer: user, page: page)
+    @guidance
+        -- Web: GET /{o}/{r}/wiki/{page}?action=_edit, POST /wiki/{page}.
+        -- API: PATCH /repos/{o}/{r}/wiki/page/{pageName} (empty title keeps
+        -- the name).
+        -- There is no conflict detection: the last save wins.
+}
+
+-- from: services/wiki/wiki.go:296
+rule UserDeletesWikiPage {
+    when: UserDeletesWikiPage(user, page)
+    requires: wiki_unit_enabled(page.wiki.repository)
+    requires: can_write_wiki(user, page.wiki.repository)
+    requires: not page.wiki.repository.is_archived
+    let page_name = page.name
+    let the_wiki = page.wiki
+    ensures: not exists page
+    ensures: WikiRevision.created(
+        wiki: the_wiki,
+        page_name: page_name,
+        kind: deleted,
+        author: user,
+        message: "Delete page \"" + page_name + "\"",
+        created_at: now
+    )
+    ensures: WikiPageDeleted(repository: the_wiki.repository, doer: user, page: page_name)
+    @guidance
+        -- Web: POST /{o}/{r}/wiki/{page}?action=_delete.
+        -- API: DELETE /repos/{o}/{r}/wiki/page/{pageName}.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Page names are unique within a wiki.
+invariant UniquePageNames {
+    for a in WikiPages:
+        for b in WikiPages:
+            a != b and a.wiki = b.wiki implies a.name != b.name
+}
+
+-- No page uses a name reserved for the wiki's own views.
+invariant NoReservedPageNames {
+    for p in WikiPages:
+        p.name not in {"_pages", "_new", "_edit", "raw"}
+}
+
+-- Special pages are exactly the ones with the special names.
+invariant SpecialPagesByName {
+    for p in WikiPages:
+        (p.kind = sidebar implies p.name = "_Sidebar")
+            and (p.kind = footer implies p.name = "_Footer")
+}
+
+-- An uninitialised wiki has no pages.
+invariant UninitialisedWikiIsEmpty {
+    for w in Wikis:
+        w.status = uninitialised implies w.pages.count = 0
+}
+
+-- One wiki per repository.
+invariant OneWikiPerRepository {
+    for a in Wikis:
+        for b in Wikis:
+            a != b implies a.repository != b.repository
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Anyone who may read the wiki unit: collaborators and team members with
+-- read, signed-in users and anonymous visitors of a public repository
+-- (access computes this, including restricted-user rules).
+actor WikiReader {
+    within: Wiki
+    identified_by: accounts/User where can_read_wiki(this, within.repository)
+}
+
+-- Write on the wiki unit: collaborators/teams with write, repo admins,
+-- org owners, site admins — and every signed-in non-restricted user when the
+-- repository is public and its wiki is marked globally writeable.
+actor WikiEditor {
+    within: Wiki
+    identified_by: accounts/User where can_write_wiki(this, within.repository)
+}
+
+actor WikiAdministrator {
+    within: Wiki
+    identified_by: accounts/User where can_admin_repository(this, within.repository)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- Reading the wiki on the web and through the API.
+surface WikiReading {
+    facing reader: WikiReader
+    context wiki: Wiki
+
+    exposes:
+        wiki.status
+        wiki.is_empty
+        for p in WikiPages where wiki = wiki:
+            p.title
+            p.name
+            p.content
+            p.kind
+            p.last_author
+            p.updated_at
+        for r in WikiRevisions where wiki = wiki:
+            r.page_name
+            r.author
+            r.message
+            r.created_at
+        search_wiki(wiki, query)
+        external_wiki_url(wiki.repository)
+
+    provides:
+        UserOpensWikiOverGit(reader, wiki)
+
+    @guarantee ExternalWikiRedirects
+        -- When the repository uses an external wiki, every wiki page view
+        -- sends the reader to the external wiki URL instead.
+
+    @guarantee SidebarAndFooterFrameEveryPage
+        -- Viewing any regular page also renders the _Sidebar and _Footer
+        -- pages when they exist; they are left out of the page list shown
+        -- beside a page, but listed on the "all pages" view.
+
+    @guarantee EmptyWikiInvitesAFirstPage
+        -- An uninitialised or empty wiki shows a welcome state; writers are
+        -- offered to create the first page, titled "Home" by default. A
+        -- missing page redirects to the page list.
+
+    @guidance
+        -- Web: GET /{o}/{r}/wiki[/{page}] (default page "Home"),
+        --      ?action=_pages (list with last-updated), ?action=_revision
+        --      (history, paged by revisions_page_size), /wiki/raw/{page},
+        --      /wiki/search?q= (literal match over the wiki branch, at most
+        --      search_max_files files and search_max_matches_per_file
+        --      matches each), /wiki/commit/{sha} (diff; code's view).
+        -- API: GET /repos/{o}/{r}/wiki/pages (paged), /wiki/page/{pageName}
+        --      (content base64, sidebar, footer, commit count, last commit),
+        --      /wiki/revisions/{pageName}.
+        -- Git: clone <repo>.wiki.git over HTTP(S)/SSH needs wiki read.
+}
+
+-- Editing pages.
+surface WikiEditing {
+    facing editor: WikiEditor
+    context wiki: Wiki
+
+    exposes:
+        for p in WikiPages where wiki = wiki:
+            p.name
+            p.title
+            p.content
+
+    provides:
+        UserCreatesWikiPage(editor, wiki, title, content, message)
+            when not wiki.repository.is_archived
+        UserEditsWikiPage(editor, page, title, content, message)
+            when not wiki.repository.is_archived
+        UserDeletesWikiPage(editor, page)
+            when not wiki.repository.is_archived
+        UserPushesToWiki(editor, wiki)
+            when not wiki.repository.is_archived and not wiki.repository.is_mirror
+
+    @guarantee ArchivedWikisAreReadOnly
+        -- The edit controls are hidden and every write is refused while the
+        -- repository is archived.
+
+    @guidance
+        -- Web routes take the action from ?action=_new|_edit|_delete; the
+        -- API under /repos/{o}/{r}/wiki needs a token with repository write
+        -- scope.
+}
+
+surface WikiAdministration {
+    facing admin: WikiAdministrator
+    context wiki: Wiki
+
+    exposes:
+        wiki.repository.wiki_branch
+        wiki.status
+
+    provides:
+        OwnerDeletesWiki(admin, wiki, confirmation)
+        AdminChangesWikiBranch(admin, wiki, new_branch)
+            when not wiki.repository.is_archived
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred page_name_for    -- see: services/wiki/wiki_path.go (title -> page name escaping)
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Renaming a page onto the name of another existing page silently overwrites it in Forgejo; this spec refuses the rename. Confirm."
+open question "Saving an edit has no conflict detection (last write wins). Should a rebuild require the base revision and refuse stale edits?"
+open question "The web form requires non-empty content but the API accepts an empty page. Which is intended?"
+open question "Pushing to the wiki with git produces no activity-feed entry, notification or webhook (TODO in Forgejo). Should it emit WikiPageEdited per changed page?"
+open question "Deleting wiki data is restricted to repository owners on the web, while changing the wiki branch is allowed to repo admins via the API but only owners on the web. Unify on repo admin?"
+open question "Forgejo's API PATCH on a page that does not exist creates it; this spec requires the page to exist (create is a separate operation). Confirm."
+open question "Wiki pages are flat (a '/' in a title is escaped into the name). Should a rebuild support nested page directories?"
+
+------------------------------------------------------------
+-- Black-box functions used (non-normative index)
+------------------------------------------------------------
+-- can_read_wiki(user, repository)        = access/can_read(user, repository, wiki)
+-- can_write_wiki(user, repository)       = access/can_write(user, repository, wiki)
+-- can_admin_repository(user, repository) = access/is_repo_admin(user, repository)
+-- is_repo_owner(user, repository)        = owner-level access (owner, org owner, site admin)
+-- wiki_unit_enabled(repository)          = repositories/RepoUnit{kind: wiki}.enabled (internal wiki, not external)
+-- external_wiki_url(repository)          = repositories/RepoUnit{kind: external_wiki}.external_wiki_url, or null
+--   (the "anyone may edit" option is repositories/RepoUnit.everyone_can_write; access applies it)
+-- repository_full_name(repository)       = "<owner>/<name>"
+-- wiki_quota_allows(repository)          = quota subject size:wiki
+-- search_wiki(wiki, query)               = up to search_max_files pages whose content contains query literally
+-- kind_of_page(name)                     = sidebar for "_Sidebar", footer for "_Footer", else regular
+-- page_name_for(title):
+--   trim the title; if it contains "-" or ends in ".md", keep dashes and mark
+--   the name with a trailing ".-"; otherwise spaces become "-"; the result is
+--   URL-query-escaped (so "/" becomes "%2F"); an empty result is "unnamed".
+--   The page file is <name>.md with "%20"/"+" shown as spaces. The displayed
+--   title reverses this (dashes back to spaces unless marked).
+
+------------------------------------------------------------
+-- Requests to other modules
+------------------------------------------------------------
+-- REQUEST repositories/RepositoryCreated(repository, doer): emit on every creation path
+--   (new, fork, template, migration, adoption) so the Wiki record exists.
+-- REQUEST repositories/Repository.wiki_branch: changed only through wiki/AdminChangesWikiBranch.
+-- REQUEST repositories: react to wiki/WikiDeleted by disabling the wiki unit.
+-- REQUEST repositories/RepoUnit: expose the external wiki URL and the "globally
+--   writeable" default permission of the wiki unit (access must grant wiki write to
+--   every signed-in non-restricted user of a public repository when set).
+-- REQUEST repositories: rename/transfer must carry the wiki git data; repository
+--   deletion removes it; pull/push mirrors also sync the wiki; migration may import a
+--   wiki, setting Repository.wiki_branch to the imported default branch and Wiki.status initialised.
+-- REQUEST access/can_read, access/can_write, access/is_repo_admin: wrapped here as
+--   2-argument local functions (simulator limitation with enum-literal arguments).
+-- REQUEST keys: a wiki signing policy ([repository.signing] WIKI, default never)
+--   deciding whether wiki commits are signed and who appears as committer.
+-- REQUEST notifications / webhooks: react to WikiPageCreated / WikiPageEdited /
+--   WikiPageDeleted (feed entries, `wiki` webhook event with created/edited/deleted).
+-- REQUEST code: git transport must route "<repo>.wiki" to the wiki repository with
+--   wiki-unit permissions and emit wiki/UserPushesToWiki / UserOpensWikiOverGit.
