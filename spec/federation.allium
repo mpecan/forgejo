@@ -53,9 +53,14 @@
 --   themselves.
 -- Reacts to:
 --   repositories/Star.created                         -- local star -> outbound Like
---   notifications/Activity.created                    -- public local activity -> Create(Note) to remote followers
---   accounts/UserDeleted(user)                        -- forget the federated-user record
---   repositories/RepositoryDeleted(repository)        -- forget its following repos
+--   notifications/ActivityRecorded(activity)          -- public local activity -> Create(Note) to remote followers
+--   accounts/UserAccountDeleted(user, purge, delete_contributions)  -- forget the federated-user record
+--   repositories/RepositoryDeleted(repository, doer)  -- forget its following repos
+--
+-- Black-box predicates. Qualified calls into sibling modules cannot yet be
+-- simulated, so the predicate this module needs is named locally:
+--   is_repo_admin(user, repository)       -- access/is_repo_admin(user, repository)
+-- Surfaces face the shared actors access/RepoAdmin and access/SiteAdmin.
 
 use "./accounts.allium" as accounts
 use "./repositories.allium" as repositories
@@ -367,7 +372,7 @@ rule ResolveSigningActor {
     requires: signer.kind in {person, application}
     requires: signer.public_key != null
     requires: signer.key_id = peer.signing_key_id
-    ensures: RemoteActorReferenced(signer)
+    ensures: RemoteActorReferenced(remote: signer)
     @guidance
         -- Cached keys short-circuit this: if peer.signing_key_id already
         -- matches a FederatedUser or FederationHost key, nothing is fetched.
@@ -438,7 +443,7 @@ rule MaterialiseFederatedUser {
             key_id: remote.key_id,
             public_key: remote.public_key
         )
-        FederatedUserMaterialised(federated)
+        FederatedUserMaterialised(federated_user: federated)
     @guidance
         -- handle = "@<preferredUsername>@<host>" with ":<port>" appended for a
         -- non-default port; it must match the fediverse-handle pattern
@@ -493,7 +498,7 @@ rule AcceptFederatedLike {
     ensures:
         if not already_starred:
             repositories/Star.created(user: actor.user, repository: repository)
-            FederatedStarReceived(actor, repository)
+            FederatedStarReceived(federated_user: actor, repository)
     ensures: actor.host.latest_activity = published_at
     ensures: actor.host.updated_at = now
     @guidance
@@ -538,7 +543,7 @@ rule AcceptRemoteUnfollow {
     let existing = FederatedFollower{followed: user, follower: actor}
     requires: exists existing
     ensures: not exists existing
-    ensures: RemoteUserUnfollowedUser(user, actor)
+    ensures: RemoteUserUnfollowedUser(user, federated_user: actor)
 }
 
 -- Accept(Follow) answering a follow a local user sent: acknowledged and
@@ -547,7 +552,7 @@ rule AcceptRemoteUnfollow {
 rule AcknowledgeFollowAccepted {
     when: RemoteActorAcceptsFollow(peer, actor, user)
     requires: not config.signature_enforced or peer.signature_valid
-    ensures: RemoteFollowAccepted(user, actor)
+    ensures: RemoteFollowAccepted(user, federated_user: actor)
 }
 
 -- Create(Note) addressed to a local user: kept in that user's federated
@@ -661,7 +666,7 @@ rule UserFollowsRemoteActor {
 -- non-public or hides their activity.
 -- from: services/federation/user_activity.go:62
 rule FederateLocalActivity {
-    when: activity: notifications/Activity.created
+    when: notifications/ActivityRecorded(activity)
     requires: config.enabled
     requires: activity_is_public(activity)
     let actor = activity.act_user
@@ -697,7 +702,7 @@ rule FederateLocalStar {
     when: star: repositories/Star.created
     requires: config.enabled
     requires: star.user.kind != activitypub
-    ensures: ActorKeyPairNeeded(star.user)
+    ensures: ActorKeyPairNeeded(user: star.user)
     ensures:
         for target in FollowingRepos where repository = star.repository:
             Delivery.created(
@@ -751,7 +756,7 @@ rule AttemptDelivery {
 -- from: routers/web/repo/setting/setting.go:397
 rule RepoAdminSetsFollowingRepos {
     when: RepoAdminSetsFollowingRepos(admin, target, remotes)
-    requires: access/is_repo_admin(admin, target)
+    requires: is_repo_admin(admin, target)
     requires: following_input_length(remotes) <= config.max_following_repos_input_length
     requires: remotes.all(r => r.kind = repository)
     requires: remotes.all(r => r.host_software in {forgejo, gitea})
@@ -761,8 +766,8 @@ rule RepoAdminSetsFollowingRepos {
             not exists old
     ensures:
         for r in remotes:
-            RemoteActorReferenced(r)
-            FollowingRepoResolvable(target, r)
+            RemoteActorReferenced(remote: r)
+            FollowingRepoResolvable(target, remote: r)
 }
 
 -- from: services/federation/repository_inbox_like.go:86
@@ -784,7 +789,7 @@ rule RecordFollowingRepo {
 
 -- from: services/repository/delete.go:342
 rule ForgetFollowingReposOfDeletedRepository {
-    when: repositories/RepositoryDeleted(repository)
+    when: repositories/RepositoryDeleted(repository, doer)
     let following = FollowingRepos where repository = repository
     ensures:
         for f in following:
@@ -795,7 +800,7 @@ rule ForgetFollowingReposOfDeletedRepository {
 -- (in the rebuild) its follow relations and received notes with it.
 -- from: services/user/user.go:282
 rule ForgetFederatedUserOfDeletedAccount {
-    when: accounts/UserDeleted(user)
+    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
     let federated = FederatedUser{user: user}
     requires: exists federated
     ensures:
@@ -810,7 +815,7 @@ rule ForgetFederatedUserOfDeletedAccount {
 -- A deleted local user stops being followed and loses received notes.
 -- from: services/user/user.go:282
 rule ForgetFederationStateOfDeletedLocalUser {
-    when: accounts/UserDeleted(user)
+    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
     requires: user.kind != activitypub
     let followers = FederatedFollowers where followed = user
     let notes = FederatedActivities where recipient = user
@@ -907,14 +912,8 @@ actor LocalUser {
     identified_by: accounts/User where kind != activitypub and prohibit_login = false
 }
 
-actor RepositoryAdmin {
-    within: repositories/Repository
-    identified_by: accounts/User where access/is_repo_admin(this, within) = true
-}
-
-actor SiteAdmin {
-    identified_by: accounts/User where is_admin = true
-}
+-- Repository and site administrators are the shared actors access/RepoAdmin
+-- and access/SiteAdmin.
 
 ------------------------------------------------------------
 -- Surfaces
@@ -1108,7 +1107,7 @@ surface FederationForLocalUser {
 -- Repository settings > Federation.
 -- from: templates/repo/settings/options.tmpl:67
 surface RepositoryFederationSettings {
-    facing admin: RepositoryAdmin
+    facing admin: access/RepoAdmin
     context repository: repositories/Repository
 
     exposes:
@@ -1128,7 +1127,7 @@ surface RepositoryFederationSettings {
 -- Site administration > Federation (read-only).
 -- from: routers/web/admin/federation_hosts.go:20
 surface FederationAdministration {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
 
     exposes:
         for h in FederationHosts where admin.is_admin:
@@ -1182,11 +1181,9 @@ open question "Remote people are materialised as full accounts/User rows (kind a
 -- REQUEST accounts/User.full_name: display name copied from the remote Person.
 -- REQUEST accounts/User.keep_email_private: WebFinger hides mailto: alias and refuses mailto: lookups.
 -- REQUEST accounts/User.email_notifications: materialised remote users have e-mail notifications disabled.
--- REQUEST accounts/UserDeleted(user): trigger emitted when an account is deleted.
 -- REQUEST accounts/User: creation of kind activitypub must accept fediverse handles ("@name@host[:port]") that local name rules would reject, and reserve the name "actor" for the instance actor.
 -- REQUEST repositories/Star.user, repositories/Star.repository: federated Like creates a Star; local Star creation triggers outbound Like.
--- REQUEST repositories/RepositoryDeleted(repository): trigger emitted when a repository is deleted.
 -- REQUEST notifications/Activity.act_user: the user who performed a feed activity.
--- REQUEST notifications/Activity.created: must fire once per action (not per watcher copy) for federation fan-out.
+-- REQUEST notifications/ActivityRecorded(activity): must fire once per action (not per watcher copy) for federation fan-out.
 -- REQUEST access/is_repo_admin(user, repository): repository settings gate.
 -- REQUEST authentication: activitypub routes accept tokens only with read:activitypub / write:activitypub scope; user-id routes honour public-only tokens.

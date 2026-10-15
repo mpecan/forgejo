@@ -84,8 +84,11 @@
 --     IssueLabelsChanged, IssueLabelsCleared, IssueMilestoneChanged,
 --     IssueAssigneeChanged, IssueCommentCreated, IssueCommentEdited,
 --     IssueCommentDeleted
---   - pulls/PullRequestOpened, PullRequestMerged, PullRequestAutoMerged,
---     PullRequestReviewSubmitted, ReviewRequested, ReviewRequestWithdrawn
+--   - pulls/PullRequestOpened(pull_request), PullRequestMerged(pull_request, merger),
+--     PullRequestAutoMerged(pull_request, merger), ReviewSubmitted(review),
+--     ReviewRequested(pull_request, requester, reviewer),
+--     ReviewRequestRemoved(pull_request, doer, reviewer)
+--   - administration/IssueIndexRebuildDue()   -- the cron task (and "run now")
 --
 -- Black-box predicates. Qualified calls into sibling modules cannot yet be
 -- simulated, so the predicates this module needs are named locally, each
@@ -116,6 +119,7 @@ use "./pulls.allium" as pulls
 use "./releases.allium" as releases
 use "./migrations.allium" as migrations
 use "./projects.allium" as projects
+use "./administration.allium" as administration
 
 ------------------------------------------------------------
 -- Value Types
@@ -1131,7 +1135,7 @@ rule CodeIndexerStartupTimesOut {
     requires: service.status = starting
     requires: service.enabled
     ensures: service.status = unavailable
-    ensures: IndexerStartupFailed(service.kind)
+    ensures: IndexerStartupFailed(kind: service.kind)
     @guidance
         -- Forgejo terminates the process here. A rebuild may instead keep
         -- serving with code search unavailable; see open questions.
@@ -1248,7 +1252,7 @@ rule CodeIndexJobRuns {
                     commit_sha: head,
                     indexed_at: now
                 )
-            CodeIndexRefreshed(repository, head)
+            CodeIndexRefreshed(repository, commit_sha: head)
     @guidance
         -- Documents after the job are exactly the files of `head` for which
         -- is_indexable_file(path, size) holds (see invariant
@@ -1291,7 +1295,7 @@ rule LanguageStatsJobRuns {
                 mark.commit_sha = head
             else:
                 LanguageStatsMark.created(repository: repository, commit_sha: head)
-            LanguageStatsComputed(repository, head, language_sizes(repository, head))
+            LanguageStatsComputed(repository, commit_sha: head, sizes: language_sizes(repository, head))
 }
 
 ------------------------------------------------------------
@@ -1313,7 +1317,7 @@ rule IssueIndexerStartupTimesOut {
     when: service: IssueIndexService.started_at + config.indexer_startup_timeout <= now
     requires: service.status = starting
     ensures: service.status = unavailable
-    ensures: IndexerStartupFailed(service.kind)
+    ensures: IndexerStartupFailed(kind: service.kind)
 }
 
 rule IssueIndexerBecomesUnreachable {
@@ -1347,6 +1351,15 @@ rule ScheduledIssueIndexRebuild {
     requires: config.rebuild_issue_indexer_enabled
     requires: service.status = ready
     ensures: IssueIndexRebuildStarted(service)
+}
+
+-- The administration cron task `rebuild_issue_indexer` (timer or "run now")
+-- starts the same full rebuild as the schedule above.
+-- from: services/cron/tasks_extended.go:210
+rule IssueIndexRebuildTaskRuns {
+    when: administration/IssueIndexRebuildDue()
+    requires: issue_index_service().status = ready
+    ensures: IssueIndexRebuildStarted(service: issue_index_service())
 }
 
 -- Newly created repositories (including generated-from-template and forks)
@@ -1446,42 +1459,42 @@ rule CommentCreatedReindexesIssue {
 
 rule CommentEditedReindexesIssue {
     when: issues/IssueCommentEdited(comment, doer, old_content)
-    ensures: IssueReindexRequested(comment.issue)
+    ensures: IssueReindexRequested(issue: comment.issue)
 }
 
 rule CommentDeletedReindexesIssue {
     when: issues/IssueCommentDeleted(comment, doer)
-    ensures: IssueReindexRequested(comment.issue)
+    ensures: IssueReindexRequested(issue: comment.issue)
 }
 
 rule PullRequestOpenedIsIndexed {
-    when: pulls/PullRequestOpened(pull_request, poster)
-    ensures: IssueReindexRequested(pull_request.issue)
+    when: pulls/PullRequestOpened(pull_request)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
 }
 
 rule PullRequestMergedIsReindexed {
-    when: pulls/PullRequestMerged(pull_request, merger, style)
-    ensures: IssueReindexRequested(pull_request.issue)
+    when: pulls/PullRequestMerged(pull_request, merger)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
 }
 
 rule PullRequestAutoMergedIsReindexed {
-    when: pulls/PullRequestAutoMerged(pull_request, merger, style)
-    ensures: IssueReindexRequested(pull_request.issue)
+    when: pulls/PullRequestAutoMerged(pull_request, merger)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
 }
 
 rule ReviewSubmittedReindexesPull {
-    when: pulls/PullRequestReviewSubmitted(pull_request, review)
-    ensures: IssueReindexRequested(pull_request.issue)
+    when: pulls/ReviewSubmitted(review)
+    ensures: IssueReindexRequested(issue: review.pull_request.issue)
 }
 
 rule ReviewRequestedReindexesPull {
     when: pulls/ReviewRequested(pull_request, requester, reviewer)
-    ensures: IssueReindexRequested(pull_request.issue)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
 }
 
-rule ReviewRequestWithdrawnReindexesPull {
-    when: pulls/ReviewRequestWithdrawn(pull_request, actor, reviewer)
-    ensures: IssueReindexRequested(pull_request.issue)
+rule ReviewRequestRemovedReindexesPull {
+    when: pulls/ReviewRequestRemoved(pull_request, doer, reviewer)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
 }
 
 -- from: services/indexer/notify.go:88
@@ -2249,14 +2262,8 @@ invariant RenderedMarkupIsSanitised {
 -- Actor Declarations
 ------------------------------------------------------------
 
--- Any signed-in, activated, login-permitted account.
-actor SignedInUser {
-    identified_by: accounts/User where is_active = true and prohibit_login = false
-}
-
-actor SiteAdmin {
-    identified_by: accounts/User where is_admin = true and is_active = true
-}
+-- Signed-in users and site administrators are the shared actors
+-- access/SignedInUser and access/SiteAdmin.
 
 -- An account that can read a given repository's code.
 actor RepositoryReader {
@@ -2481,7 +2488,7 @@ surface ProfilePage {
 }
 
 surface ComposerAutocomplete {
-    facing writer: SignedInUser
+    facing writer: access/SignedInUser
 
     context candidates: MentionCandidates where viewer = writer
 
@@ -2554,7 +2561,7 @@ surface MiscellaneousApi {
 }
 
 surface ReindexControls {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
 
     context repository: repositories/Repository
 

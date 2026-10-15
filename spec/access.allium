@@ -23,8 +23,13 @@
 --   * The operation -> required-permission table (see "Authorization table").
 --
 -- Includes: AccessMode, OperationClass, GrantBasis, CredentialRestriction,
---   RepoAccess, AccessDecision, AnonymousVisitor, ForgeComponent,
---   AuthorizationPolicy contract.
+--   RepoAccess, AccessDecision, AnonymousVisitor, RequestParty, ForgeComponent,
+--   AuthorizationPolicy contract, and the shared actors Visitor,
+--   SignedInUser, SiteAdmin and RepoAdmin (see "Actor Declarations").
+--
+-- Shared actors: other modules reference access/Visitor, access/SignedInUser,
+-- access/SiteAdmin and access/RepoAdmin (within: repositories/Repository)
+-- rather than declaring their own.
 --
 -- Excludes:
 --   - Token scope categories/levels and how a token is parsed (owned by
@@ -318,6 +323,15 @@ enum GrantBasis {
 -- from: models/perm/access/repo_permission.go:209
 entity AnonymousVisitor {
     channel: web | api | git_http
+}
+
+-- The party behind one request, whoever it is: anonymous (user = null) or
+-- signed in. Identifies the shared Visitor actor.
+external entity RequestParty {
+    channel: web | api | git_http
+    user: accounts/User?
+    -- true exactly when `user` is set
+    is_signed_in: Boolean
 }
 
 -- The reach of a restricted credential (Forgejo's AuthorizationReducer):
@@ -1119,7 +1133,19 @@ invariant RestrictedUsersOnlyThroughExplicitGrants {
 -- Actor Declarations
 ------------------------------------------------------------
 
--- Anyone signed in with a usable account.
+-- SHARED ACTORS. Visitor, SignedInUser, SiteAdmin and RepoAdmin are the
+-- forge-wide actors: every other module faces them as access/Visitor,
+-- access/SignedInUser, access/SiteAdmin and access/RepoAdmin instead of
+-- declaring its own copy (OrgOwner lives in organizations). Facing an actor
+-- documents who stands at a boundary; the permission itself is always a
+-- `requires` on the rule behind it.
+
+-- Anyone reaching the forge, signed in or not: the party behind one request.
+actor Visitor {
+    identified_by: RequestParty where channel != null
+}
+
+-- Anyone signed in with a usable account (active, login not prohibited).
 actor SignedInUser {
     identified_by: accounts/User where is_active = true and prohibit_login = false
 }
@@ -1130,8 +1156,15 @@ actor RestrictedUser {
     identified_by: accounts/User where is_restricted = true and prohibit_login = false
 }
 
-actor SiteAdministrator {
-    identified_by: accounts/User where is_admin = true and prohibit_login = false
+-- A site (instance) administrator with a usable account.
+actor SiteAdmin {
+    identified_by: accounts/User where is_admin = true and is_active = true and prohibit_login = false
+}
+
+-- A user holding admin (or owner) mode on one repository (table D).
+actor RepoAdmin {
+    within: repositories/Repository
+    identified_by: accounts/User where is_repo_admin(this, within)
 }
 
 -- A running Actions task presenting its automatic token.
@@ -1258,7 +1291,7 @@ surface RepositoryUnitAccess {
 -- /collaborators, /teams, /hooks, /keys, /branch_protections,
 -- /tag_protections, /push_mirrors, /topics PUT, /avatar, /transfer,
 -- /convert, /actions/{secrets,variables,runners}, /hooks/git.
-surface RepositoryAdministration {
+surface RepositoryAccessAdministration {
     facing user: SignedInUser
 
     context repository: repositories/Repository
@@ -1434,7 +1467,7 @@ surface AnonymousProfileAccess {
 -- site admin). API: /admin/* (tokenRequiresScopes(admin), reqToken,
 -- reqSiteAdmin); any API request may carry `sudo`.
 surface SiteAdministration {
-    facing admin: SiteAdministrator
+    facing admin: SiteAdmin
 
     provides:
         UserActsAsSiteAdmin(admin, credential)

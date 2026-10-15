@@ -222,11 +222,11 @@ journey ARepositoryAdminFollowsARemoteRepository {
         upstream.host_software = forgejo
 
     1. mallory, who is not an admin of the repository, tries
-        stipulate access/is_repo_admin(mallory, repo) = false
+        stipulate is_repo_admin(mallory, repo) = false
         mallory cannot do RepoAdminSetsFollowingRepos(mallory, repo, {upstream}) on RepositoryFederationSettings
 
     2. alice, a repository admin, sets it
-        stipulate access/is_repo_admin(alice, repo) = true
+        stipulate is_repo_admin(alice, repo) = true
         stipulate following_input_length({upstream}) = 58
         alice does RepoAdminSetsFollowingRepos(alice, repo, {upstream}) on RepositoryFederationSettings
         then RepoAdminSetsFollowingRepos fires

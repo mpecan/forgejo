@@ -139,7 +139,7 @@ journey ACollaboratorGainsWriteWhenTheIndexIsRecalculated {
         then decision.basis = explicit_grant
 
     4. but a write collaborator is not a repository administrator
-        sam cannot do UserAdministersRepository(sam, repo) on RepositoryAdministration
+        sam cannot do UserAdministersRepository(sam, repo) on RepositoryAccessAdministration
 
     ends: Write comes from an explicit grant; administration needs more.
 }
@@ -189,7 +189,7 @@ journey ArchivedRepositoriesAreReadOnly {
         sam cannot do UserContributesToRepository(sam, code) on RepositoryUnitAccess
 
     4. administration (e.g. unarchiving) is still allowed
-        olga does UserAdministersRepository(olga, repo) on RepositoryAdministration
+        olga does UserAdministersRepository(olga, repo) on RepositoryAccessAdministration
             creating decision: AccessDecision
         then AdministerRepositoryAsOwner fires
 
@@ -391,14 +391,14 @@ journey AdminTeamsAdministerButOnlyOwnersDelete {
         ottogrant: RepoAccess { user: otto, repository: orepo, mode: owner }
 
     1. Ada administers the repository
-        ada does UserAdministersRepository(ada, orepo) on RepositoryAdministration
+        ada does UserAdministersRepository(ada, orepo) on RepositoryAccessAdministration
         then AdministerRepositoryByExplicitGrant fires
 
     2. but cannot delete it
-        ada cannot do UserPerformsOwnerAction(ada, orepo) on RepositoryAdministration
+        ada cannot do UserPerformsOwnerAction(ada, orepo) on RepositoryAccessAdministration
 
     3. Otto, in the owner team, can
-        otto does UserPerformsOwnerAction(otto, orepo) on RepositoryAdministration
+        otto does UserPerformsOwnerAction(otto, orepo) on RepositoryAccessAdministration
             creating decision: AccessDecision
         then OwnRepositoryAsOwnerTeamMember fires
 
@@ -411,7 +411,7 @@ journey AFineGrainedTokenNarrowsEvenAnAdministrator {
           private repository nor use administrator powers.
 
     cast:
-        ash:   SiteAdministrator
+        ash:   SiteAdmin
         token: CredentialRestriction
         prepo: repositories/Repository
         pcode: repositories/RepoUnit
