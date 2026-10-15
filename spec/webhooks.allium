@@ -40,6 +40,9 @@
 --   code/PushReceived(push)                               -> push (one per pushed branch or tag)
 --   code/RefCreated(repository, pusher, ref_kind, ref_name, commit_sha)  -> create
 --   code/RefDeleted(repository, pusher, ref_kind, ref_name)              -> delete
+--   repositories/MirrorSyncPushed(repository, ref_name, commits)          -> push (pull-mirror sync, sender: owner)
+--   repositories/MirrorRefCreated(repository, ref_name)                   -> create (pull-mirror sync, sender: owner)
+--   repositories/MirrorRefDeleted(repository, ref_name)                   -> delete (pull-mirror sync, sender: owner)
 --   repositories/RepositoryCreated(repository, doer)      -> repository/created
 --   migrations/RepositoryMigrated(repository)             -> repository/created (sender: the migration's doer)
 --   repositories/RepositoryForked(source, fork, doer)     -> fork (+ repository/created for org forks)
@@ -71,6 +74,9 @@
 -- Black-box predicates (each the local name of another module's contract):
 --   is_repo_admin(user, repository)    = access/is_repo_admin(user, repository)
 --   is_org_owner(organization, user)   = organizations/is_org_owner(organization, user)
+--   is_branch_ref(ref_name), branch_of_ref(ref_name) = code: refs/heads/<name> and its <name>
+--   mirror_pusher(repository)          = repositories/mirror_pusher(repository): the owning user
+--                                        or organisation account mirror updates are attributed to
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -758,8 +764,8 @@ rule QueueDeliveryForMatchedEvent {
 -- Code ------------------------------------------------------------
 
 -- One push event per branch or tag the push created or moved (a deleted
--- ref is announced by RefDeletionRaisesHookEvent instead). Also fired for
--- refs updated by a pull-mirror sync.
+-- ref is announced by RefDeletionRaisesHookEvent instead). Refs updated by
+-- a pull-mirror sync are announced by MirrorSyncRaisesPushHookEvent.
 -- from: services/webhook/notifier.go:603
 rule PushRaisesHookEvent {
     when: code/PushReceived(push)
@@ -810,6 +816,57 @@ rule RefDeletionRaisesHookEvent {
         branch: if ref_kind = branch_ref: ref_name else: null,
         commit_count: null,
         sender: pusher
+    )
+}
+
+-- Pull-mirror syncs raise the same push / create / delete events as user
+-- pushes, attributed to the repository owner (pusher and sender alike).
+-- from: services/webhook/notifier.go:850
+-- from: services/mirror/mirror_pull.go:600
+rule MirrorSyncRaisesPushHookEvent {
+    when: repositories/MirrorSyncPushed(repository, ref_name, commits)
+    ensures: HookEventRaised(
+        kind: push,
+        action: pushed,
+        source_repo: repository,
+        owner_user: null,
+        owner_org: null,
+        branch: if is_branch_ref(ref_name): branch_of_ref(ref_name) else: null,
+        commit_count: commits.count,
+        sender: mirror_pusher(repository)
+    )
+    @guidance
+        -- Payload as for a user push: at most config.payload_commit_limit
+        -- commits, the head commit, and the full total_commits.
+}
+
+-- from: services/webhook/notifier.go:878
+rule MirrorRefCreationRaisesHookEvent {
+    when: repositories/MirrorRefCreated(repository, ref_name)
+    ensures: HookEventRaised(
+        kind: create,
+        action: created,
+        source_repo: repository,
+        owner_user: null,
+        owner_org: null,
+        branch: if is_branch_ref(ref_name): branch_of_ref(ref_name) else: null,
+        commit_count: null,
+        sender: mirror_pusher(repository)
+    )
+}
+
+-- from: services/webhook/notifier.go:882
+rule MirrorRefDeletionRaisesHookEvent {
+    when: repositories/MirrorRefDeleted(repository, ref_name)
+    ensures: HookEventRaised(
+        kind: delete,
+        action: deleted,
+        source_repo: repository,
+        owner_user: null,
+        owner_org: null,
+        branch: if is_branch_ref(ref_name): branch_of_ref(ref_name) else: null,
+        commit_count: null,
+        sender: mirror_pusher(repository)
     )
 }
 
@@ -1227,7 +1284,8 @@ rule WorkflowJobStatusRaisesHookEvent {
 -- from: services/webhook/notifier.go:926
 rule WorkflowRunCompletionRaisesHookEvent {
     when: actions/WorkflowRunCompleted(run, prior_status)
-    requires: run.status in {cancelled, failure, skipped, success}
+    -- actions emits WorkflowRunCompleted only when the run reaches cancelled,
+    -- failure, skipped or success, so no status guard is needed here.
     ensures: HookEventRaised(
         kind: workflow_run_kind(run.status),
         action: status_changed,
@@ -1243,7 +1301,7 @@ rule WorkflowRunCompletionRaisesHookEvent {
 -- from: services/webhook/notifier.go:1023
 rule WorkflowJobCompletionRaisesHookEvent {
     when: actions/WorkflowJobCompleted(job, prior_status)
-    requires: job.status in {cancelled, failure, skipped, success}
+    -- actions emits WorkflowJobCompleted only for final job statuses.
     ensures: HookEventRaised(
         kind: workflow_job_kind(job.status),
         action: status_changed,

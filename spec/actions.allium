@@ -54,6 +54,9 @@
 --   code/PushReceived(push)                     -- push; also refreshes schedules on default branch
 --   code/RefCreated(repository, pusher, ref_kind, ref_name, commit_sha)  -- create
 --   code/RefDeleted(repository, pusher, ref_kind, ref_name)              -- delete
+--   repositories/MirrorSyncPushed(repository, ref_name, commits)          -- push (pull-mirror sync, doer: owner)
+--   repositories/MirrorRefCreated(repository, ref_name)                   -- create (pull-mirror sync, doer: owner)
+--   repositories/MirrorRefDeleted(repository, ref_name)                   -- delete (pull-mirror sync, doer: owner)
 --   code/DefaultBranchChanged(repository, old_name, new_name, by)        -- re-detect schedules
 --   code/BranchRenamed(repository, from_name, to_name, by)               -- re-detect schedules
 --   repositories/RepositoryForked(source, fork, doer)       -- fork (on the source)
@@ -687,7 +690,7 @@ rule PushStartsWorkflows {
         -- Pushes by the Actions bot never start workflows (see
         -- DetectWorkflowRuns) but still refresh schedules, because a
         -- scheduled job may itself push to the default branch.
-        -- Mirror syncs behave like pushes.
+        -- Pull-mirror syncs are handled by MirrorSyncStartsWorkflows.
 }
 
 -- from: services/actions/notifier.go:610
@@ -703,6 +706,32 @@ rule RefDeletionStartsWorkflows {
     when: code/RefDeleted(repository, pusher, ref_kind, ref_name)
     requires: ref_kind in {branch_ref, tag_ref}
     ensures: ForgeEventObserved(repository, doer: pusher, event: delete, activity: null, ref: qualified_ref(ref_kind, ref_name), commit_sha: null, pull_request: null)
+}
+
+-- Pull-mirror syncs start the same push / create / delete workflows as user
+-- pushes, with the repository owner as doer. A synced ref is a full ref name.
+-- mirror_pusher(repository): the owning user or organisation account
+-- (repositories/mirror_pusher); head_commit_sha(commits): the sync's head
+-- commit, pinned so a concurrent push cannot substitute a newer commit;
+-- ref_head_sha(repository, ref_name): the commit the ref now points to.
+-- from: services/actions/notifier.go:645
+-- from: services/mirror/mirror_pull.go:600
+rule MirrorSyncStartsWorkflows {
+    when: repositories/MirrorSyncPushed(repository, ref_name, commits)
+    ensures: ForgeEventObserved(repository: repository, doer: mirror_pusher(repository), event: push, activity: null, ref: ref_name, commit_sha: head_commit_sha(commits), pull_request: null)
+}
+
+-- from: services/actions/notifier.go:681
+rule MirrorRefCreationStartsWorkflows {
+    when: repositories/MirrorRefCreated(repository, ref_name)
+    ensures: ForgeEventObserved(repository: repository, doer: mirror_pusher(repository), event: create, activity: null, ref: ref_name, commit_sha: ref_head_sha(repository, ref_name), pull_request: null)
+}
+
+-- `delete` runs workflows from the default branch.
+-- from: services/actions/notifier.go:686
+rule MirrorRefDeletionStartsWorkflows {
+    when: repositories/MirrorRefDeleted(repository, ref_name)
+    ensures: ForgeEventObserved(repository: repository, doer: mirror_pusher(repository), event: delete, activity: null, ref: ref_name, commit_sha: null, pull_request: null)
 }
 
 -- `fork` fires on the source repository and runs from its default branch.

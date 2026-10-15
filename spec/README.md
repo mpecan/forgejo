@@ -19,7 +19,21 @@ allium-journey walk . journeys/ --text      # walk every journey
 allium-inspect                              # browse it (reads .allium-inspect.toml)
 ```
 
-<!-- STATS -->
+## At a glance
+
+| | |
+|---|---|
+| Modules | 22 `.allium` files, about 39,900 lines |
+| Entities | 196, plus 18 external entities and 54 value types |
+| Rules | 1,170 |
+| Surfaces | 205, for 66 actors |
+| Invariants | 214 |
+| Config parameters | every `app.ini` setting that changes behaviour, with Forgejo's default |
+| Open questions | 202 ([`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md)) |
+| Journeys | 306 in 22 files: **674 of 682 steps hold**; the other 8 are undecided because of walker limitations (see below) |
+| Cross-module reactions | 299; every one matches its emitter's trigger name and argument names |
+| `allium check .` | 0 errors |
+
 
 ## Modules
 
@@ -132,13 +146,24 @@ this), **refused**, **unspecified** (the spec has no such thing yet),
 **unexposed**, and **undecided** (the tool could not tell). The undecided steps
 that remain are listed below with their reasons.
 
-<!-- JOURNEY-RESULTS -->
+### Steps that do not hold, and why
+
+None of these is a gap in the spec. Each is something `allium-journey` (0.1.1)
+cannot decide.
+
+| Journey | Why |
+|---|---|
+| actions: *A Dispatched Workflow Runs To Success* (step 5), *A Running Run Cannot Be Rerun Until It Finishes* (3), *A Silent Task Becomes A Zombie* (3), *A Job Nobody Picks Up Is Abandoned* (2); pulls: *Auto Merge Waits For Required Checks* (3) | During an `after` step the walker treats an entity collection as open-world. `webhooks/FanOutHookEvent` loops `for w in Webhooks where …`, which yields an unknown member even when the journey casts no webhook, so the downstream `QueueDeliveryForMatchedEvent` cannot be decided "while the clock moved". This reproduces in a 20-line spec. The same fan-out holds in non-timed steps. |
+| webhooks: *A Week Later The History Is Cleaned Up* | The same open-world behaviour, applied to the timeout timer of a delivery that the cleanup just removed |
+| federation: *A Repository Admin Follows A Remote Repository* (2) | The walker cannot evaluate `.all(…)` over a collection |
+| releases: *A Maintainer Links An External Asset* (1) | The walker does not bind an `issues/Attachment` created by a releases rule |
+
 
 ## How this was produced
 
 The Allium `distill` process, run as a fan-out:
 
-1. The codebase was mapped into 20 bounded contexts, and
+1. The codebase was mapped into 22 modules, distilled by 20 agents (releases and wiki shared one, as did quota and moderation), and
    [`VOCABULARY.md`](VOCABULARY.md) fixed module ownership and shared names.
 2. One agent per context read that context's models, services and web/API
    routers. It wrote the module and its journeys, and validated both with
