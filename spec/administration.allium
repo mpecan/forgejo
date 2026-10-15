@@ -114,9 +114,9 @@
 --   UserTwoFactorResetByAdmin(admin, user)              -> authentication
 --   UserPasswordSetByAdmin(admin, user, password) / UserPasswordSetByOperator(operator, user, password) -> authentication (hash + store)
 --   UserAvatarChangedByAdmin(admin, user) / UserAvatarRemovedByAdmin(admin, user)
---   RepositoryDeletedByAdmin(admin, repository)         -> repositories cascade
+--   repositories/OwnerDeletesRepository(user, repository)  -> admin deletion handed to repositories (full cascade)
 --   OrganizationCreatedForUserByAdmin(admin, user, name, visibility)  -> organizations (creates it)
---   RepositoryCreatedForUserByAdmin(admin, user, name)  -> repositories
+--   repositories/UserCreatesRepository(user, name, ...)   -> admin creation handed to repositories
 --   SshKeyAddedForUserByAdmin / SshKeyRemovedForUserByAdmin -> keys
 --   AccessTokenRequestedForUser(requester, user, token_name, scopes) -> authentication
 --   TestMailRequested(admin, address)                   -> notifications
@@ -1438,7 +1438,10 @@ rule AdminCreatesOrganizationForUser {
 rule AdminCreatesRepositoryForUser {
     when: AdminCreatesRepositoryForUser(admin, user, name)
     requires: admin.is_admin = true
-    ensures: RepositoryCreatedForUserByAdmin(admin: admin, user: user, name: name)
+    -- repositories owns creation; the new repository uses the instance defaults.
+    ensures: repositories/UserCreatesRepository(user: user, name: name, description: "",
+        is_private: false, is_template: false, auto_init: false,
+        object_format: repositories/config.default_object_format)
 }
 
 -- Add / remove an SSH key on a user's account (API).
@@ -1473,8 +1476,9 @@ rule AdminCreatesAccessTokenForUser {
 rule AdminDeletesRepository {
     when: AdminDeletesRepository(admin, repository)
     requires: admin.is_admin = true
-    ensures: not exists repository
-    ensures: RepositoryDeletedByAdmin(admin: admin, repository: repository)
+    -- repositories owns the deletion and its cascade (RepositoryDeleted reaches
+    -- access, webhooks, packages, actions, ...); a site admin passes its check.
+    ensures: repositories/OwnerDeletesRepository(user: admin, repository: repository)
 }
 
 -- Adopting an unadopted directory, or deleting its files, is repositories'
@@ -2217,7 +2221,7 @@ open question "migrations asks for a repository notice on ImportedContentFlagged
 -- REQUEST accounts: own InactiveAccountCleanupDue(older_than) — delete never-activated accounts older than that and report CronWorkCompleted.
 -- REQUEST authentication: react to UserTwoFactorResetByAdmin (delete TOTP + WebAuthn), AccessTokenRequestedForUser, AuthorizedIntegrationRequested, AuthSourceConfiguredFromCli, ExternalUserSyncDue(update_existing), UserPasswordSetByAdmin / UserPasswordSetByOperator (hash + store).
 -- REQUEST authentication: expose the password policy as password_acceptable(password) (MIN_PASSWORD_LENGTH default 8, PASSWORD_COMPLEXITY, PASSWORD_CHECK_PWN) and password_long_enough(password).
--- REQUEST repositories: react to MirrorUpdateDue, RepositoryHealthCheckDue, RepositoryStatsCheckDue, RepositoryArchiveCleanupDue, AllRepositoryArchivesDeletionDue, RepositoryGarbageCollectionDue, MissingRepositoryReinitDue, MissingRepositoryDeletionDue, GeneratedRepositoryAvatarDeletionDue, RepositoryDeletedByAdmin, RepositoryCreatedForUserByAdmin.
+-- REQUEST repositories: react to MirrorUpdateDue, RepositoryHealthCheckDue, RepositoryStatsCheckDue, RepositoryArchiveCleanupDue, AllRepositoryArchivesDeletionDue, RepositoryGarbageCollectionDue, MissingRepositoryReinitDue, MissingRepositoryDeletionDue, GeneratedRepositoryAvatarDeletionDue. (Done in integration: all nine have reactions; admin repo create/delete are handed to repositories directly.)
 -- REQUEST code: react to DeletedBranchCleanupDue, LfsGarbageCollectionDue, AllRepositoryBranchesResyncRequested.
 -- REQUEST releases: react to AllRepositoryTagsResyncRequested and ReleasesSyncWithTagsRequested.
 -- REQUEST keys: react to AuthorizedKeysRewriteDue, AuthorizedPrincipalsRewriteDue, AuthorizedKeysRegenerationRequested, SshKeyAddedForUserByAdmin, SshKeyRemovedForUserByAdmin.

@@ -249,6 +249,10 @@ entity PullRequest {
     merge_style: MergeStyle when status = merged | manually_merged
     merger: accounts/User when status = merged | manually_merged
     merged_at: Timestamp when status = merged | manually_merged
+    -- true only when a scheduled auto-merge performed the merge; consumers that
+    -- react to both PullRequestMerged and PullRequestAutoMerged use it to avoid
+    -- announcing one merge twice
+    merged_automatically: Boolean when status = merged | manually_merged
 
     transitions status {
         checking -> mergeable
@@ -825,6 +829,7 @@ rule CheckMergeability {
             pr.merged_at = commit_authored_at(pr.base_repository, merge_commit_containing(pr))
             pr.merger = manual_merge_author(pr)
             pr.conflicted_files = {}
+            pr.merged_automatically = false
             PullRequestMerged(pull_request: pr, merger: manual_merge_author(pr))
         else if outcome = already_in_base:
             pr.status = ancestor
@@ -1054,6 +1059,7 @@ rule UserMergesPullRequest {
         pr.check_requested_at = null
         pr.conflicted_files = {}
         not exists pr.auto_merge
+        pr.merged_automatically = false
         PullRequestMerged(pull_request: pr, merger: user)
         if delete_branch_after_merge:
             PullRequestHeadBranchDeletionRequested(pull_request: pr, doer: user)
@@ -1128,6 +1134,7 @@ rule MergePushMarksPullRequestMerged {
         pull.check_requested_at = null
         pull.conflicted_files = {}
         not exists pull.auto_merge
+        pull.merged_automatically = false
         PullRequestMerged(pull_request: pull, merger: pusher)
     @guidance
         -- In a rebuild where UserMergesPullRequest records the merge directly
@@ -1156,6 +1163,7 @@ rule UserMarksPullRequestManuallyMerged {
         pr.merger = user
         pr.check_requested_at = null
         pr.conflicted_files = {}
+        pr.merged_automatically = false
         PullRequestMerged(pull_request: pr, merger: user)
     @guidance
         -- Accepts full or abbreviated ids in any case; an ambiguous or
@@ -1233,6 +1241,7 @@ rule AutoMergeExecutes {
         pr.check_requested_at = null
         pr.conflicted_files = {}
         not exists scheduled
+        pr.merged_automatically = true
         PullRequestAutoMerged(pull_request: pr, merger: scheduled.scheduled_by)
         PullRequestMerged(pull_request: pr, merger: scheduled.scheduled_by)
         if scheduled.delete_branch_after_merge:

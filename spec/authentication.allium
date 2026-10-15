@@ -1234,6 +1234,25 @@ rule ProviderIdentityLinkedToSignedInUser {
 
 -- Unknown identity, nobody signed in, auto-registration on: create the account.
 -- from: routers/web/auth/oauth.go:1104
+-- A person signing in through an OAuth2 source for the first time may be the
+-- original author of migrated content: a remote placeholder account (kind
+-- `remote`) whose remote source matches this OAuth2 source and whose login name
+-- is this external id. accounts promotes that placeholder to a real account.
+-- from: services/remote/promote.go:52
+rule ProviderIdentityClaimsRemotePlaceholder {
+    when: ProviderReturnsIdentity(session, identity)
+    let source = identity.source
+    let placeholder = remote_placeholder_for(source, identity.external_id)
+    requires: source.is_active
+    requires: placeholder != null
+    requires: identity.email != null
+    ensures: accounts/RemoteUserClaimed(user: placeholder, email: identity.email)
+    @guidance
+        -- remote_placeholder_for: the accounts/User of kind remote whose sign-in
+        -- source is a Remote source matching `source` (same provider URL) and whose
+        -- login name equals the external id; null when there is none.
+}
+
 rule ProviderIdentityAutoRegisters {
     when: ProviderReturnsIdentity(session, identity)
 

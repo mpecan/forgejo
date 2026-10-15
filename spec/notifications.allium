@@ -570,6 +570,8 @@ rule InboxOnReadyForReview {
 -- from: services/uinotification/notify.go:124
 rule InboxOnPullRequestMerged {
     when: pulls/PullRequestMerged(pull_request, merger)
+    -- an auto-merge is announced once, by the PullRequestAutoMerged rule
+    requires: not pull_request.merged_automatically
     ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: merger)
 }
 
@@ -926,6 +928,8 @@ rule MailOnReadyForReview {
 -- from: services/mailer/notify.go:132
 rule MailOnPullRequestMerged {
     when: pulls/PullRequestMerged(pull_request, merger)
+    -- an auto-merge is announced once, by the PullRequestAutoMerged rule
+    requires: not pull_request.merged_automatically
     ensures: IssueMailDue(issue: pull_request.issue, doer: merger, category: pull_merge, comment: null, code_comment: null, mentions: {}, force_doer: false)
 }
 
@@ -1502,6 +1506,8 @@ rule RecordIssueReopened {
 -- from: services/feed/action.go:378
 rule RecordPullRequestMerged {
     when: pulls/PullRequestMerged(pull_request, merger)
+    -- an auto-merge is announced once, by the PullRequestAutoMerged rule
+    requires: not pull_request.merged_automatically
     ensures: Activity.created(
         kind: merge_pull_request, actor: merger, repository: pull_request.issue.repository,
         issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: pull_request.issue.title,
@@ -2181,7 +2187,8 @@ open question "Failed mail is dropped without retry. Should a rebuild retry tran
 -- REQUEST issues: IssueOpened is consumed for issues only (requires not is_pull); please confirm pulls never emits issues/IssueOpened for a PR, or the feed/inbox/mail would double up with pulls/PullRequestOpened.
 -- REQUEST issues/pulls: IssueClosed / IssueReopened are consumed for both issues and PRs; pulls/PullRequestClosed / PullRequestReopened are therefore NOT consumed here — integration must ensure a PR close emits issues/IssueClosed (or switch this module to the pulls triggers).
 -- REQUEST pulls: react to notifications/MailReplyReceived with replied_to_code set (reply in that code conversation); expose the mentions of a PR description, a review body and a code comment (issue_mentions / review_mentions / code_comment_mentions).
--- REQUEST pulls: an automatic merge should emit PullRequestAutoMerged INSTEAD of PullRequestMerged for this module (Forgejo calls one notifier or the other); pulls currently emits both, which would record two activities, two inbox updates and two merge mails.
+-- RESOLVED (integration): pulls emits both triggers for an auto-merge and sets
+--   PullRequest.merged_automatically; the plain-merge rules here skip auto-merges.
 -- REQUEST pulls: TeamReviewRequested(pull_request, requester, team) is not consumed; Forgejo notifies nobody per team member — confirm.
 -- REQUEST actions/Job.{status, run.notify_email, run.trigger_user, run.repository} and is_failure(status); this module mails on WorkflowJobCompleted with a failure status.
 -- REQUEST federation: react to notifications/ActivityRecorded(activity) to publish to ActivityPub followers.
