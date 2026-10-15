@@ -81,7 +81,7 @@
 --   UserViewsIssue(viewer, issue)                      -- external stimulus; notifications marks the thread read
 -- Reacts to:
 --   code/PushReceived(push)                            -- keyword references in commit messages
---   pulls/PullRequestMerged(pr, merger, style)         -- merger's stopwatch on the conversation stops
+--   pulls/PullRequestMerged(pull_request, merger)      -- merger's stopwatch on the conversation stops
 --   pulls/IssueClosedByPullRequest(issue, pull_request, doer)    -- apply closing references
 --   pulls/IssueReopenedByPullRequest(issue, pull_request, doer)  -- apply reopening references
 --   repositories/RepositoryDeleted(repository, doer)   -- the tracker goes with the repository
@@ -108,7 +108,7 @@ use "./releases.allium" as releases
 --   can_read_tracker(user, repository) = can read the issues unit or the pull_requests unit
 --   can_manage_tracker(user, repository) = can write the issues unit or the pull_requests unit
 --   is_repo_admin(user, repository)    = access/is_repo_admin(user, repository)
---   is_org_owner(user, organization)   = user is in organization.owners_team
+--   is_org_owner(organization, user)   = user is in organization.owners_team
 --   can_be_assigned(user, repository)  = user is not an organization and has write
 --                                        on any unit, or read on pull_requests
 --   is_blocked(blocker, user)          = an accounts/UserBlock from blocker to user exists
@@ -980,9 +980,9 @@ rule RecordCrossReferences {
 -- it stops like on any close.
 -- from: services/issue/status.go:31
 rule MergerStopwatchStops {
-    when: pulls/PullRequestMerged(pr, merger, style)
+    when: pulls/PullRequestMerged(pull_request, merger)
     ensures:
-        for sw in Stopwatches where user = merger and issue = pr.issue:
+        for sw in Stopwatches where user = merger and issue = pull_request.issue:
             StopwatchFinished(stopwatch: sw)
 }
 
@@ -1189,7 +1189,7 @@ rule TrackerManagerDeletesLabel {
 -- from: models/issues/label.go:207
 rule OrgOwnerCreatesLabel {
     when: OrgOwnerCreatesLabel(user, organization, name, description, color, is_exclusive)
-    requires: is_org_owner(user, organization)
+    requires: is_org_owner(organization, user)
     requires: trim(name) != "" and length(name) <= config.max_label_name_length
     requires: length(description) <= config.max_label_description_length
     requires: is_valid_color(color)
@@ -1201,7 +1201,7 @@ rule OrgOwnerCreatesLabel {
 rule OrgOwnerEditsLabel {
     when: OrgOwnerEditsLabel(user, label, name, description, color, is_exclusive, is_archived)
     requires: label.organization != null
-    requires: is_org_owner(user, label.organization)
+    requires: is_org_owner(label.organization, user)
     requires: trim(name) != "" and length(name) <= config.max_label_name_length
     requires: is_valid_color(color)
     ensures: label.name = name
@@ -1219,7 +1219,7 @@ rule OrgOwnerEditsLabel {
 rule OrgOwnerDeletesLabel {
     when: OrgOwnerDeletesLabel(user, label)
     requires: label.organization != null
-    requires: is_org_owner(user, label.organization)
+    requires: is_org_owner(label.organization, user)
     ensures: LabelRemovedEverywhere(doomed: label)
 }
 
@@ -1250,7 +1250,7 @@ rule TrackerManagerInitialisesLabels {
 -- from: routers/web/org/org_labels.go:1
 rule OrgOwnerInitialisesLabels {
     when: OrgOwnerInitialisesLabels(user, organization, template)
-    requires: is_org_owner(user, organization)
+    requires: is_org_owner(organization, user)
     ensures:
         for spec in template.labels:
             Label.created(organization: organization, name: spec.name, description: spec.description ?? "",
@@ -1857,19 +1857,7 @@ actor TrackerManager {
     identified_by: accounts/User where can_manage_tracker(this, within)
 }
 
-actor RepoAdmin {
-    within: repositories/Repository
-    identified_by: accounts/User where is_repo_admin(this, within)
-}
-
-actor OrgOwner {
-    within: organizations/Organization
-    identified_by: accounts/User where is_org_owner(this, within)
-}
-
-actor SiteAdmin {
-    identified_by: accounts/User where is_admin = true
-}
+-- Shared actors: access/RepoAdmin, organizations/OrgOwner, access/SiteAdmin.
 
 ------------------------------------------------------------
 -- Surfaces
@@ -2182,7 +2170,7 @@ surface IssueAdministration {
 }
 
 surface PinOrdering {
-    facing admin: RepoAdmin
+    facing admin: access/RepoAdmin
     context repository: repositories/Repository
 
     let pins = IssuePins where repository = repository
@@ -2249,7 +2237,7 @@ surface TrackerSettings {
 }
 
 surface OrganizationLabels {
-    facing owner: OrgOwner
+    facing owner: organizations/OrgOwner
     context organization: organizations/Organization
 
     let labels = Labels where organization = organization
@@ -2299,7 +2287,7 @@ surface MyTimeTracking {
 }
 
 surface SiteTimeAdministration {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
 
     exposes:
         for t in TrackedTimes:
@@ -2346,7 +2334,7 @@ open question "Issue `priority` exists in storage but nothing sets or shows it; 
 -- REQUEST repositories/RepositoryDeleted(repository): trigger this module reacts to
 -- REQUEST repositories/Watch.watches_issues: per-repository custom watch selection (issues / PRs) used for implicit issue subscription
 -- REQUEST code/PushReceived(push) with push.repository, push.pusher, push.branch and push.commits (sha, message, timestamp)
--- REQUEST pulls/PullRequestMerged(pr, merger, style) with pr.issue
+-- REQUEST pulls/PullRequestMerged(pull_request, merger) with pull_request.issue
 -- REQUEST pulls/MergeClosesReferencedIssues guidance: Forgejo does NOT ignore open dependencies when a merge closes a referenced issue — the close fails and the error is swallowed (services/pull/merge.go:303), so the issue stays open; issues/ApplyResolvedReference models that
 -- REQUEST pulls: issues_closed_by(pr) / issues_reopened_by(pr) should be the latest closes/reopens Comment (ref_issue = pr.issue, ref_action) per target issue, from issues' cross-reference entries
 -- REQUEST pulls: PR conversations are created as issues/Issue (is_pull = true) and must set index: next_issue_index(repository), content_version: 0, labels/assignees/mentioned_users/read_by, created_at/updated_at; pulls' Comment.created calls should also set content_version / created_at / updated_at

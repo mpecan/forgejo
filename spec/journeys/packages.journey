@@ -196,7 +196,7 @@ journey AdaLinksAPackageToHerRepository {
     1. she links it
         stipulate can_write_packages(ada, reg) = true
         stipulate same_owner(reg, repo) = true
-        stipulate access/can_write(ada, repo, packages) = true
+        stipulate can_write_repo_packages(ada, repo) = true
         ada does UserLinksPackage(ada, pkg, repo) on PackageVersionSettings
         then UserLinksPackageToRepository fires
         then pkg.linked_repository = repo

@@ -16,7 +16,7 @@ world {
         addr:    RemoteAddress
         creds:   SourceCredentials
         req:     MigrationRequest
-        who:     ExternalIdentity
+        who:     ImportedIdentity
         item:    ImportedIssue
         sel:     RestoreSelection
         orphan:  ImportedComment

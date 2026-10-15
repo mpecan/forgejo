@@ -197,7 +197,7 @@ config {
 rule UserCreatesRepositoryProject {
     when: UserCreatesRepositoryProject(user, repo, title, description, template, card_type)
     requires: not config.repository_projects_globally_disabled
-    requires: access/can_write(user, repo, projects)
+    requires: can_write_projects(user, repo)
     requires: not repo.is_archived
     requires: length(title) >= 1 and length(title) <= config.max_project_title_length
     ensures:
@@ -248,7 +248,7 @@ rule UserCreatesUserProject {
 -- from: routers/web/org/projects.go:177
 rule UserCreatesOrgProject {
     when: UserCreatesOrgProject(user, org, title, description, template, card_type)
-    requires: organizations/can_write_unit(user, org, projects)
+    requires: can_write_org_projects(user, org)
     requires: length(title) >= 1 and length(title) <= config.max_project_title_length
     ensures:
         let project = Project.created(
@@ -357,8 +357,8 @@ rule UserDeletesProject {
 -- Deleting a repository deletes its boards with their columns and cards.
 -- from: services/repository/delete.go:275
 rule RepositoryDeletionRemovesProjects {
-    when: repositories/RepositoryDeleted(deleted)
-    for project in Projects where owner_kind = repository and owner_repository = deleted:
+    when: repositories/RepositoryDeleted(repository, _)
+    for project in Projects where owner_repository = repository:
         ensures:
             for card in project.cards:
                 not exists card
@@ -371,7 +371,7 @@ rule RepositoryDeletionRemovesProjects {
 -- Deleting an issue removes its card.
 -- from: services/issue/issue.go:280
 rule IssueDeletionRemovesCard {
-    when: issues/IssueDeleted(issue)
+    when: issues/IssueDeleted(issue, _)
     ensures:
         for card in ProjectCards where issue = issue:
             not exists card
@@ -573,6 +573,11 @@ rule IssueCreatedOnProject {
 -- Permission helpers (black boxes defined here in prose)
 ------------------------------------------------------------
 
+-- can_write_projects(user, repository)  = access/can_write(user, repository, projects)
+-- can_write_org_projects(user, org)     = organizations/can_write_unit(user, org, projects)
+-- (local names because qualified calls cannot be evaluated by the journey walker)
+--
+
 -- may_manage(user, project):
 --   repository board:   not config.repository_projects_globally_disabled
 --                       and access/can_write(user, project.owner_repository, projects)
@@ -659,11 +664,9 @@ invariant CardIssueInScope {
 -- Actor Declarations
 ------------------------------------------------------------
 
--- Anyone signed in. Anonymous visitors get the read-only parts of the
--- board surfaces when may_view allows (see @guarantee AnonymousReadOnly).
-actor SignedInUser {
-    identified_by: accounts/User where is_active = true
-}
+-- Surfaces face access/SignedInUser (anyone signed in). Anonymous visitors get
+-- the read-only parts of the board surfaces when may_view allows (see
+-- @guarantee AnonymousReadOnly).
 
 ------------------------------------------------------------
 -- Surfaces
@@ -671,7 +674,7 @@ actor SignedInUser {
 
 -- The board list of a repository (Projects tab).
 surface RepositoryProjectList {
-    facing viewer: SignedInUser
+    facing viewer: access/SignedInUser
     context repo: repositories/Repository
 
     let boards = Projects where owner_kind = repository and owner_repository = repo
@@ -686,7 +689,7 @@ surface RepositoryProjectList {
 
     provides:
         UserCreatesRepositoryProject(viewer, repo, title, description, template, card_type)
-            when access/can_write(viewer, repo, projects) and not repo.is_archived
+            when can_write_projects(viewer, repo) and not repo.is_archived
 
     @guarantee ReadersOnly
         -- The tab exists only when the projects unit is enabled for the
@@ -703,7 +706,7 @@ surface RepositoryProjectList {
 
 -- The board list on a user profile.
 surface UserProjectList {
-    facing viewer: SignedInUser
+    facing viewer: access/SignedInUser
     context owner: accounts/User
 
     let boards = Projects where owner_kind = individual and owner_user = owner
@@ -730,7 +733,7 @@ surface UserProjectList {
 
 -- The board list of an organization.
 surface OrgProjectList {
-    facing viewer: SignedInUser
+    facing viewer: access/SignedInUser
     context org: organizations/Organization
 
     let boards = Projects where owner_kind = organization and owner_org = org
@@ -744,7 +747,7 @@ surface OrgProjectList {
 
     provides:
         UserCreatesOrgProject(viewer, org, title, description, template, card_type)
-            when organizations/can_write_unit(viewer, org, projects)
+            when can_write_org_projects(viewer, org)
 
     @guarantee TeamUnitAccess
         -- Members see and manage boards per their teams' access to the
@@ -757,7 +760,7 @@ surface OrgProjectList {
 
 -- A single board with its columns and cards, and every management action.
 surface ProjectBoard {
-    facing viewer: SignedInUser
+    facing viewer: access/SignedInUser
     context project: Project
 
     exposes:
@@ -826,7 +829,7 @@ surface ProjectBoard {
 
 -- The project picker on an issue or pull request.
 surface IssueProjectPicker {
-    facing viewer: SignedInUser
+    facing viewer: access/SignedInUser
     context issue: issues/Issue
 
     let candidates = Projects where accepts_issue(issue)
@@ -877,13 +880,13 @@ open question "Moving cards via drag-and-drop on a repository board requires eac
 -- Requests to other modules
 ------------------------------------------------------------
 
--- REQUEST repositories/RepositoryDeleted(repository): trigger emitted when a repository is deleted, so boards can be removed.
+-- REQUEST repositories/RepositoryDeleted(repository, doer): trigger emitted when a repository is deleted, so boards can be removed.
 -- REQUEST repositories/config.disabled_repo_units: the instance-wide disabled units list; this module mirrors "repo.projects" as config.repository_projects_globally_disabled.
--- REQUEST issues/IssueDeleted(issue): trigger emitted when an issue/PR is deleted, so its card is removed.
+-- REQUEST issues/IssueDeleted(issue, doer): trigger emitted when an issue/PR is deleted, so its card is removed.
 -- REQUEST issues/IssueCreatedWithProject(issue, poster, project): emitted by issue/PR creation when the form named a board (after the permission checks in may_assign_to pass).
 -- REQUEST issues/Comment kind `project` with old_project/new_project: recorded in reaction to IssueProjectChanged; a deleted board renders as a placeholder title.
 -- REQUEST issues filter "project = X / no project" reading ProjectCard: owned by issues/discovery.
 -- REQUEST organizations/can_read_unit(user, org, unit) and organizations/can_write_unit(user, org, unit): org-level unit access (max over the user's teams; read for non-members of public, or limited-and-signed-in, orgs).
--- REQUEST access/can_write(user, repository, projects) must be false for archived repositories or callers must check is_archived (this spec checks it explicitly).
+-- REQUEST can_write_projects(user, repository) must be false for archived repositories or callers must check is_archived (this spec checks it explicitly).
 -- REQUEST accounts/User deletion and organizations/Organization deletion triggers: to delete owner boards (see open question).
 -- REQUEST repositories/RepositoryTransferred(repository, old_owner): to drop cards from the old owner's boards (see open question).

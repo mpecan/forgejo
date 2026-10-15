@@ -171,6 +171,46 @@ journey ReviewThenMerge {
           conversation in reaction to PullRequestMerged.
 }
 
+-- A pull request whose description says "Fixes #2" closes that issue when it
+-- is merged; issues applies the close for the merger.
+journey MergingClosesTheIssuesItFixes {
+    goal: Ada's pull request fixes a bug reported as an issue. Bob merges it and
+          the bug is closed by bob, through the closing keyword.
+
+    cast:
+        bug: issues/Issue
+    given:
+        bug.repository = repo
+        bug.poster = carol
+        bug.title = "Widgets crash"
+        bug.is_pull = false
+        bug.status = open
+        bug.is_locked = false
+
+    1. bob merges it and the referenced issue closes
+        stipulate can_write_code(bob, repo) = true
+        stipulate protection_for(repo, "main") = null
+        stipulate merge_style_allowed(repo, merge) = true
+        stipulate has_wip_prefix("Add widgets") = false
+        stipulate merge_signing_satisfied(pr, bob, merge) = true
+        stipulate has_open_blocking_dependencies(conv) = false
+        stipulate branch_exists(repo, "feature") = true
+        stipulate within_quota(repo) = true
+        stipulate compose_merge_message(pr, merge, "", "") = "Merge pull request 'Add widgets' (#1) from feature into main"
+        stipulate merge_result_commit(pr, merge, "Merge pull request 'Add widgets' (#1) from feature into main") = "abc1"
+        stipulate issues_closed_by(pr) = {bug}
+        stipulate issues_reopened_by(pr) = {}
+        stipulate dependencies_enabled(repo) = false
+        bob does UserMergesPullRequest(bob, pr, merge, "", "", null, false, false) on PullRequestMergeBox
+        then pr.status = merged
+        then MergeResolvesReferencedIssues fires
+        then MergeClosesReferencedIssue fires
+        then ApplyResolvedReference fires
+        then bug.status = closed
+
+    ends: The pull request is merged and the bug it fixes is closed.
+}
+
 -- The poster may not approve their own work.
 journey PosterCannotApproveTheirOwnPullRequest {
     goal: Ada tries to approve her own pull request; the review is refused,

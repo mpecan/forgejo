@@ -337,7 +337,7 @@ journey AReaderProposesAChangeWithAGit {
         stipulate commit_body(repo, "ddd444") = ""
         bob does PusherProposesRefUpdate(bob, push, for_review, "main/fix-typo", null, "ddd444") on GitTransport
         then AcceptReviewRefPush fires
-        then AgitPushOpensPullRequest fires
+        then AgitPushRequestsPullRequest fires
         then main.head_commit_sha = "aaa111"
 
     ends: main is untouched; a pull request from bob/fix-typo is on its way.
@@ -357,13 +357,13 @@ journey CiReportsABuild {
         stipulate commit_exists(repo, "abc123") = true
         stipulate full_sha(repo, "abc123") = "abc123"
         stipulate trim("ci/build") = "ci/build"
-        ci does CommitStatusReported(ci, repo, "abc123", pending, "ci/build", "https://ci.example/1", "running") on CommitStatusApi
+        ci does ReporterPostsCommitStatus(ci, repo, "abc123", pending, "ci/build", "https://ci.example/1", "running") on CommitStatusApi
             creating first: CommitStatus
         then first.state = pending
         then CommitStatusIsReported fires
 
     2. and passes
-        ci does CommitStatusReported(ci, repo, "abc123", success, "ci/build", "https://ci.example/1", "passed") on CommitStatusApi
+        ci does ReporterPostsCommitStatus(ci, repo, "abc123", success, "ci/build", "https://ci.example/1", "passed") on CommitStatusApi
             creating second: CommitStatus
         then second.state = success
         then second.status_context = "ci/build"
@@ -371,7 +371,7 @@ journey CiReportsABuild {
     3. bob reads it but cannot write one
         bob sees second.state on CommitStatusView in second
         stipulate can_write_code(bob, repo) = false
-        bob cannot do CommitStatusReported(bob, repo, "abc123", failure, "ci/build", null, null) on CommitStatusApi
+        bob cannot do ReporterPostsCommitStatus(bob, repo, "abc123", failure, "ci/build", null, null) on CommitStatusApi
 
     ends: The commit carries a pending and a success status for ci/build; success wins.
 }

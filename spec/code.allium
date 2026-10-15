@@ -58,6 +58,7 @@
 --   CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
 --                                                      -- issues (close/reference keywords), pulls (re-test PRs whose head/base is this branch),
 --                                                      -- notifications (feed), webhooks, actions; repositories (auto-watch, size, updated time)
+--                                                      -- (repositories also emits it for branches a pull-mirror sync moved)
 --   RefCreated(repository, pusher, ref_kind, ref_name, commit_sha) -- webhooks (create), actions (create): any branch or tag appearing
 --   RefDeleted(repository, pusher, ref_kind, ref_name)             -- webhooks (delete), actions (delete): any branch or tag disappearing
 --   BranchCreated(branch, by)                          -- notifications; finer-grained than RefCreated
@@ -68,6 +69,8 @@
 --   TagUpdated(tag, by)                                -- releases (refresh tag-only release)
 --   TagDeleted(repository, tag_name, by)               -- releases (drop tag-only release), webhooks, actions
 --   CommitStatusCreated(status)                        -- pulls (auto-merge on success), webhooks (status), notifications
+--   CommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
+--                                                      -- also emitted by actions for job results (code records it)
 --   AgitPullRequestRequested(repository, pusher, base_branch, head_branch, head_sha, title, description)
 --                                                      -- pulls creates the AGit pull request
 --   AgitPullRequestHeadPushed(pull, pusher, old_sha, new_sha) -- pulls updates head, re-tests, adds push comment
@@ -77,9 +80,12 @@
 --   LfsObjectStored(object, by)                        -- quota (usage accounting)
 --
 -- Reacts to:
---   (none required) — every state change here starts from a git client, a person, an
---   external status reporter or the schedule. `actions` reports job results by firing
---   CommitStatusReported; `pulls` performs merges by sending a Push whose merging_pull is set.
+--   CommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
+--                                                      -- from actions (job results) and the status API
+--   administration/DeletedBranchCleanupDue(older_than) -- purge expired deleted-branch records
+--   administration/LfsGarbageCollectionDue(older_than, last_updated_more_than_ago,
+--       number_to_check_per_repo, proportion_to_check_per_repo) -- collect orphaned LFS objects
+--   `pulls` performs merges by sending a Push whose merging_pull is set.
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -88,6 +94,7 @@ use "./repositories.allium" as repositories
 use "./keys.allium" as keys
 use "./pulls.allium" as pulls
 use "./quota.allium" as quota
+use "./administration.allium" as administration
 
 -- Permission functions (black boxes from access/AuthorizationPolicy, VOCABULARY.md):
 --   can_read_code(user, repository)   = access/can_read(user, repository, code)
@@ -860,7 +867,7 @@ rule TagDeletedByPush {
 -- AGit: a refs/for/* push opens a pull request, or updates the open one for the same
 -- topic. The head branch is namespaced by the pusher: `<username>/<topic>`.
 -- from: services/agit/agit.go:112
-rule AgitPushOpensPullRequest {
+rule AgitPushRequestsPullRequest {
     when: RefUpdateAccepted(update)
     requires: update.ref_kind = for_review
     let repository = update.push.repository
@@ -887,7 +894,7 @@ rule AgitPushOpensPullRequest {
 
 -- AGit: updating an existing AGit pull request (by topic, or by refs/pull/<n>/head).
 -- from: services/agit/agit.go:233
-rule AgitPushUpdatesPullRequest {
+rule AgitPushUpdatesPullRequestHead {
     when: RefUpdateAccepted(update)
     requires: update.ref_kind = for_review or update.ref_kind = pull_head
     let repository = update.push.repository
@@ -1337,12 +1344,23 @@ rule UserRemovesCommitNote {
 -- Rules: commit statuses
 ------------------------------------------------------------
 
--- A CI system (or person) reports a status for a commit. Actions reports job results
--- through the same trigger.
+-- A CI system (or person) posts a status for a commit through the API. It needs code
+-- write; the status is then recorded like any other reported status.
+-- from: routers/api/v1/repo/status.go:52
+rule ReporterPostsCommitStatus {
+    when: ReporterPostsCommitStatus(reporter, repository, commit_sha, state, context, target_url, description)
+    requires: can_write_code(reporter, repository)
+    requires: commit_exists(repository, commit_sha)
+    ensures: CommitStatusReported(repository: repository, commit_sha: commit_sha, context: context, state: state,
+        target_url: target_url, description: description, creator: reporter)
+}
+
+-- Recording a reported status: from the API (above) or from Actions, which reports job
+-- results as the Actions bot for the job's own repository (no permission check: actions
+-- is part of the forge and already decided the job may report).
 -- from: services/repository/commitstatus/commitstatus.go:72
 rule CommitStatusIsReported {
-    when: CommitStatusReported(reporter, repository, commit_sha, state, context, target_url, description)
-    requires: can_write_code(reporter, repository)
+    when: CommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
     requires: commit_exists(repository, commit_sha)
     let previous = CommitStatuses where repository = repository and commit_sha = full_sha(repository, commit_sha)
     ensures:
@@ -1354,7 +1372,7 @@ rule CommitStatusIsReported {
             status_context: trim(context),
             target_url: target_url,
             description: description,
-            creator: reporter,
+            creator: creator,
             created_at: now
         )
         CommitStatusCreated(status: status)
@@ -1476,6 +1494,23 @@ rule DeletedBranchRecordExpires {
     when: branch: Branch.deleted_at + config.deleted_branches_retention <= now
     requires: config.deleted_branches_cleanup_enabled
     requires: branch.status = deleted
+    ensures: DeletedBranchRecordPurgeDue(branch: branch)
+}
+
+-- The same cleanup started by administration (cron dispatch or "run now"), with the
+-- configured retention as older_than.
+-- from: services/cron/tasks_basic.go:118
+rule AdministrationCleansDeletedBranches {
+    when: administration/DeletedBranchCleanupDue(older_than)
+    ensures:
+        for branch in Branches where status = deleted and deleted_at + older_than <= now:
+            DeletedBranchRecordPurgeDue(branch: branch)
+}
+
+-- from: models/git/branch.go:276
+rule PurgeDeletedBranchRecord {
+    when: DeletedBranchRecordPurgeDue(branch)
+    requires: branch.status = deleted
     ensures: not exists branch
 }
 
@@ -1488,11 +1523,33 @@ rule OrphanedLfsObjectCollected {
     requires: config.lfs_start_server
     requires: object.last_checked_at + config.lfs_gc_recheck_after <= now
     requires: not lfs_pointer_reachable(object.repository, object.oid)
-    ensures: not exists object
+    ensures: OrphanedLfsObjectRemovalDue(object: object)
     @guidance
         -- A referenced object instead gets last_checked_at = now. Content is deleted from
         -- the store when no other repository references the oid. The per-run budget is
         -- config.lfs_gc_number_to_check_per_repo / lfs_gc_proportion_to_check_per_repo.
+}
+
+-- The same collection started by administration (cron dispatch or "run now"): objects
+-- older than older_than and not checked within last_updated_more_than_ago, up to the
+-- per-repository budget (number_to_check_per_repo, proportion_to_check_per_repo).
+-- from: services/cron/tasks_extended.go:178
+rule AdministrationCollectsOrphanedLfsObjects {
+    when: administration/LfsGarbageCollectionDue(older_than, last_updated_more_than_ago, number_to_check_per_repo, proportion_to_check_per_repo)
+    requires: config.lfs_start_server
+    ensures:
+        for object in LfsObjects where created_at + older_than <= now and last_checked_at + last_updated_more_than_ago <= now:
+            if not lfs_pointer_reachable(object.repository, object.oid):
+                OrphanedLfsObjectRemovalDue(object: object)
+    @guidance
+        -- The budget only limits how many objects one run inspects; the next run
+        -- continues. Referenced objects get last_checked_at = now.
+}
+
+-- from: services/repository/lfs.go:54
+rule RemoveOrphanedLfsObject {
+    when: OrphanedLfsObjectRemovalDue(object)
+    ensures: not exists object
 }
 
 ------------------------------------------------------------
@@ -1568,11 +1625,7 @@ actor CodeWriter {
     identified_by: accounts/User where can_write_code(this, within)
 }
 
--- Repository admin or owner (including org owners and site admins).
-actor RepoAdmin {
-    within: repositories/Repository
-    identified_by: accounts/User where is_repo_admin(this, within)
-}
+-- Repository admins: access/RepoAdmin. Site administrators: access/SiteAdmin.
 
 -- A git client authenticated as a user (password/token over HTTP, key over SSH).
 actor GitClient {
@@ -1583,11 +1636,6 @@ actor GitClient {
 actor StatusReporter {
     within: repositories/Repository
     identified_by: accounts/User where can_write_code(this, within)
-}
-
--- Site administrator (sees scheduled maintenance).
-actor SiteAdmin {
-    identified_by: accounts/User where is_admin
 }
 
 ------------------------------------------------------------
@@ -1882,7 +1930,7 @@ surface CodeWriting {
 
 -- Repository settings for branches, tags and LFS.
 surface CodeSettings {
-    facing admin: RepoAdmin
+    facing admin: access/RepoAdmin
     context repo: repositories/Repository
 
     exposes:
@@ -1976,7 +2024,7 @@ surface CommitStatusApi {
         repo.default_branch
 
     provides:
-        CommitStatusReported(reporter, repo, commit_sha, state, context, target_url, description)
+        ReporterPostsCommitStatus(reporter, repo, commit_sha, state, context, target_url, description)
 
     @guidance
         -- API: POST /repos/{o}/{r}/statuses/{sha}.
@@ -1984,7 +2032,7 @@ surface CommitStatusApi {
 
 -- Scheduled maintenance visible to site administrators.
 surface CodeMaintenance {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
 
     exposes:
         config.deleted_branches_cleanup_enabled

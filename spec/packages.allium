@@ -47,17 +47,19 @@
 -- Emits:
 --   - PackageVersionCreated(version, publisher)        -- a new version became visible
 --                                                  -- (incl. every container manifest push)
---   - PackageVersionDeleted(version, actor) -- a visible version was removed by a person
+--   - PackageVersionDeleted(version, doer)  -- a visible version was removed by a person
 --   (webhooks, actions `on: package`, notifications react to these)
 -- Reacts to:
 --   - repositories/RepositoryDeleted(repository, doer) -- unlink all packages linked to it
 --   - accounts/UserPurged(user)                    -- remove everything in the user's registry
+--   - administration/PackageCleanupDue(older_than) -- run the cleanup task now
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
 use "./repositories.allium" as repositories
 use "./access.allium" as access
 use "./authentication.allium" as authentication
+use "./administration.allium" as administration
 use "./quota.allium" as quota
 
 ------------------------------------------------------------
@@ -485,6 +487,11 @@ default KindPolicy vagrant_policy = { kind: vagrant, display_name: "Vagrant", ve
 --   can_read_packages is true for mode >= read; can_write_packages for
 --   mode >= write.
 --
+-- can_write_repo_packages(user, repository) = access/can_write(user, repository, packages)
+-- can_read_repo_code(user, repository)      = access/can_read(user, repository, code)
+-- is_org_owner(organization, user)          = organizations/is_org_owner(organization, user)
+--   (local names because qualified calls cannot be evaluated by the journey walker)
+--
 -- can_manage_registry(user, registry): the user is the registry's owning
 --   user, or an owner of the owning organisation (organizations/
 --   is_org_owner). Gates the owner package settings (cleanup rules, Cargo
@@ -579,8 +586,8 @@ rule PublishFirstVersionOfNewPackage {
             is_yanked: false,
             dist_tags: initial_dist_tags(kind, sha256)
         )
-        FileStored(new_version, file_name, composite_key, is_lead, size, sha256)
-        PackageVersionCreated(new_version, publisher)
+        FileStored(version: new_version, file_name, composite_key, is_lead, size, sha256)
+        PackageVersionCreated(version: new_version, publisher)
         RegistryContentChanged(registry, kind, package)
     @guidance
         -- Package names are compared case-insensitively (stored as given)
@@ -639,8 +646,8 @@ rule PublishNewVersionOfExistingPackage {
             is_yanked: false,
             dist_tags: initial_dist_tags(kind, sha256)
         )
-        FileStored(new_version, file_name, composite_key, is_lead, size, sha256)
-        PackageVersionCreated(new_version, publisher)
+        FileStored(version: new_version, file_name, composite_key, is_lead, size, sha256)
+        PackageVersionCreated(version: new_version, publisher)
         RegistryContentChanged(registry, kind, package)
     @guidance
         -- npm: dist-tags supplied with the publish are moved onto the new
@@ -669,7 +676,7 @@ rule AddFileToExistingVersion {
     requires: publisher.is_admin or policy.size_limit < 0 or size <= policy.size_limit
     requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + size <= config.limit_total_owner_size
     ensures:
-        FileStored(target, file_name, composite_key, is_lead, size, sha256)
+        FileStored(version: target, file_name, composite_key, is_lead, size, sha256)
         RegistryContentChanged(registry, kind, package)
     @guidance
         -- Maven checksum uploads (.md5/.sha1/.sha256/.sha512) are not stored:
@@ -699,7 +706,7 @@ rule ReplaceFileInExistingVersion {
     requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + size <= config.limit_total_owner_size
     ensures: not exists old_file
     ensures:
-        FileStored(target, file_name, composite_key, is_lead, size, sha256)
+        FileStored(version: target, file_name, composite_key, is_lead, size, sha256)
         RegistryContentChanged(registry, kind, package)
     @guidance
         -- When the new content equals the old (same blob) nothing changes.
@@ -861,7 +868,7 @@ rule CargoYanksVersion {
     requires: can_write_packages(publisher, registry)
     requires: version.is_yanked = false
     ensures: version.is_yanked = true
-    ensures: CargoIndexEntryStale(registry, version.package)
+    ensures: CargoIndexEntryStale(registry, package: version.package)
 }
 
 -- from: routers/api/packages/cargo/cargo.go:264
@@ -874,7 +881,7 @@ rule CargoUnyanksVersion {
     requires: quota_allows_package_upload(registry)
     requires: version.is_yanked = true
     ensures: version.is_yanked = false
-    ensures: CargoIndexEntryStale(registry, version.package)
+    ensures: CargoIndexEntryStale(registry, package: version.package)
 }
 
 -- Point an npm dist-tag at a version; the tag leaves whichever version of the
@@ -1018,10 +1025,10 @@ rule ContainerPushesManifestForNewImage {
     ensures:
         let package = Package.created(registry: registry, kind: container, name: image, semver_compatible: false, is_internal: false, linked_repository: null, properties: {}, autolink_pending: true)
         let new_version = PackageVersion.created(package: package, creator: publisher, version: reference, created_at: now, is_internal: false, metadata: extracted_image_metadata(sha256), properties: extracted_image_properties(sha256), download_count: 0, last_downloaded_at: null, is_tagged: is_tag, is_yanked: false, dist_tags: {})
-        FileStored(new_version, manifest_file_name(sha256), null, true, size, sha256)
-        ContainerManifestLayersAttached(new_version, registry, image)
+        FileStored(version: new_version, file_name: manifest_file_name(sha256), composite_key: null, is_lead: true, size, sha256)
+        ContainerManifestLayersAttached(version: new_version, registry, image)
         ContainerImageCreated(package, publisher)
-        PackageVersionCreated(new_version, publisher)
+        PackageVersionCreated(version: new_version, publisher)
     @guidance
         -- Schema version must be 2; media type is taken from the request or
         -- the manifest; image index entries must themselves be image
@@ -1046,9 +1053,9 @@ rule ContainerPushesNewReference {
     requires: publisher.is_admin or config.limit_total_owner_count < 0 or registry.visible_version_count < config.limit_total_owner_count
     ensures:
         let new_version = PackageVersion.created(package: package, creator: publisher, version: reference, created_at: now, is_internal: false, metadata: extracted_image_metadata(sha256), properties: extracted_image_properties(sha256), download_count: 0, last_downloaded_at: null, is_tagged: is_tag, is_yanked: false, dist_tags: {})
-        FileStored(new_version, manifest_file_name(sha256), null, true, size, sha256)
-        ContainerManifestLayersAttached(new_version, registry, image)
-        PackageVersionCreated(new_version, publisher)
+        FileStored(version: new_version, file_name: manifest_file_name(sha256), composite_key: null, is_lead: true, size, sha256)
+        ContainerManifestLayersAttached(version: new_version, registry, image)
+        PackageVersionCreated(version: new_version, publisher)
     ensures:
         if package.autolink_pending:
             ContainerImageCreated(package, publisher)
@@ -1071,9 +1078,9 @@ rule ContainerRepointsReference {
     ensures: not exists previous
     ensures:
         let new_version = PackageVersion.created(package: package, creator: publisher, version: reference, created_at: now, is_internal: false, metadata: extracted_image_metadata(sha256), properties: extracted_image_properties(sha256), download_count: carried_downloads, last_downloaded_at: carried_last_download, is_tagged: is_tag, is_yanked: false, dist_tags: {})
-        FileStored(new_version, manifest_file_name(sha256), null, true, size, sha256)
-        ContainerManifestLayersAttached(new_version, registry, image)
-        PackageVersionCreated(new_version, publisher)
+        FileStored(version: new_version, file_name: manifest_file_name(sha256), composite_key: null, is_lead: true, size, sha256)
+        ContainerManifestLayersAttached(version: new_version, registry, image)
+        PackageVersionCreated(version: new_version, publisher)
     @guidance
         -- The superseded manifest's own digest version (if any) is left in
         -- place; it becomes dangling and is purged by the expired-data
@@ -1103,7 +1110,7 @@ rule AutolinkContainerImage {
     requires: package.autolink_pending
     ensures: package.autolink_pending = false
     ensures:
-        if candidate != null and package.linked_repository = null and same_owner(package.registry, candidate) and access/can_write(publisher, candidate, packages):
+        if candidate != null and package.linked_repository = null and same_owner(package.registry, candidate) and can_write_repo_packages(publisher, candidate):
             package.linked_repository = candidate
     @guidance
         -- The source URL must start with this instance's URL and have the
@@ -1121,7 +1128,7 @@ rule ContainerDeletesManifest {
     requires: package.kind = container
     requires: can_write_packages(publisher, package.registry)
     ensures: not exists version
-    ensures: PackageVersionDeleted(version, publisher)
+    ensures: PackageVersionDeleted(version, doer: publisher)
 }
 
 -- `docker login` exchange: issue a bearer token for the authenticated user,
@@ -1177,7 +1184,7 @@ rule UserDeletesPackageVersion {
         for f in version.files:
             not exists f
     ensures: not exists version
-    ensures: PackageVersionDeleted(version, actor)
+    ensures: PackageVersionDeleted(version, doer: actor)
     ensures: RegistryContentChanged(registry, kind, package)
     @guidance
         -- RubyGems "yank" and the generic/npm "delete version" endpoints are
@@ -1196,8 +1203,8 @@ rule UserDeletesWholePackage {
     ensures:
         for v in package.visible_versions:
             not exists v
-            PackageVersionDeleted(v, actor)
-    ensures: RegistryContentChanged(package.registry, package.kind, package)
+            PackageVersionDeleted(version: v, doer: actor)
+    ensures: RegistryContentChanged(registry: package.registry, kind: package.kind, package)
 }
 
 -- Delete a single file; when it was the last file of its version the version
@@ -1217,8 +1224,8 @@ rule UserDeletesPackageFile {
     ensures:
         if was_last_file:
             not exists version
-            PackageVersionDeleted(version, actor)
-    ensures: RegistryContentChanged(registry, package.kind, package)
+            PackageVersionDeleted(version, doer: actor)
+    ensures: RegistryContentChanged(registry, kind: package.kind, package)
 }
 
 ------------------------------------------------------------
@@ -1232,7 +1239,7 @@ rule UserLinksPackageToRepository {
     requires: can_write_packages(actor, package.registry)
     requires: same_owner(package.registry, repository)
     requires: package.linked_repository = null
-    requires: access/can_write(actor, repository, packages)
+    requires: can_write_repo_packages(actor, repository)
     ensures: package.linked_repository = repository
 }
 
@@ -1244,8 +1251,8 @@ rule UserUnlinksPackageFromRepository {
     requires: config.packages_enabled
     requires: can_write_packages(actor, registry)
     requires: repository != null
-    requires: access/can_write(actor, repository, packages)
-    requires: actor.is_admin or registry.owner_user = actor or (registry.owner_is_org and organizations/is_org_owner(registry.owner_org, actor))
+    requires: can_write_repo_packages(actor, repository)
+    requires: actor.is_admin or registry.owner_user = actor or (registry.owner_is_org and is_org_owner(registry.owner_org, actor))
     ensures: package.linked_repository = null
 }
 
@@ -1340,15 +1347,32 @@ rule RunScheduledPackageCleanup {
     requires: config.cleanup_enabled
     ensures: schedule.last_run_at = now
     ensures: schedule.next_run_at = now + config.cleanup_interval
-    ensures:
-        for rule in CleanupRules:
-            if rule.enabled:
-                CleanupRuleDue(rule)
-    ensures: ExpiredPackageDataPurgeDue(config.cleanup_older_than)
+    ensures: PackageCleanupRun(older_than: config.cleanup_older_than)
     @guidance
         -- Default schedule "@midnight" and RUN_AT_START = true; modelled as a
         -- fixed interval. Each rule runs in its own transaction and is
         -- retried a few times; a failing rule aborts the task run.
+}
+
+-- The same task started by administration (cron dispatch or "run now" on the
+-- admin dashboard) with its configured age threshold.
+-- from: services/cron/tasks_basic.go:145
+rule AdministrationRunsPackageCleanup {
+    when: administration/PackageCleanupDue(older_than)
+    requires: config.packages_enabled
+    ensures: PackageCleanupRun(older_than: older_than)
+}
+
+-- One cleanup run, however started: apply every enabled cleanup rule, then
+-- purge expired registry data older than the threshold.
+-- from: services/packages/cleanup/cleanup.go:25
+rule RunPackageCleanup {
+    when: PackageCleanupRun(older_than)
+    ensures:
+        for rule in CleanupRules:
+            if rule.enabled:
+                CleanupRuleDue(rule: rule)
+    ensures: ExpiredPackageDataPurgeDue(older_than: older_than)
 }
 
 -- from: services/packages/cleanup/cleanup.go:36
@@ -1360,12 +1384,12 @@ rule ApplyCleanupRule {
             for f in v.files:
                 not exists f
             not exists v
-    ensures: RepositoryIndexStale(rule.registry, rule.kind)
+    ensures: RepositoryIndexStale(registry: rule.registry, kind: rule.kind)
     ensures:
         if rule.kind = cargo:
             for p in rule.registry.packages:
                 if p.kind = cargo:
-                    CargoIndexEntryStale(rule.registry, p)
+                    CargoIndexEntryStale(registry: rule.registry, package: p)
     @guidance
         -- cleanup_targets_of(rule): for each non-internal package of
         -- rule.kind in rule.registry, walk its non-internal versions newest
@@ -1540,9 +1564,7 @@ actor RegistryManager {
     identified_by: accounts/User where can_manage_registry(this, within)
 }
 
-actor PackageSiteAdmin {
-    identified_by: accounts/User where is_admin = true
-}
+-- Site administrators: access/SiteAdmin.
 
 ------------------------------------------------------------
 -- Surfaces
@@ -1705,7 +1727,7 @@ surface PackageBrowsing {
             p.kind
             p.properties
             p.latest_version
-        for p in registry.visible_packages where p.linked_repository != null and can_read_packages(viewer, registry) and access/can_read(viewer, p.linked_repository, code):
+        for p in registry.visible_packages where p.linked_repository != null and can_read_packages(viewer, registry) and can_read_repo_code(viewer, p.linked_repository):
             p.linked_repository
         for v in PackageVersions where v.package.registry = registry and v.is_internal = false and can_read_packages(viewer, registry):
             v.version
@@ -1841,7 +1863,7 @@ surface RepositoryPackages {
     context repository: repositories/Repository
 
     exposes:
-        for p in Packages where p.linked_repository = repository and p.is_internal = false and access/can_read(viewer, repository, code):
+        for p in Packages where p.linked_repository = repository and p.is_internal = false and can_read_repo_code(viewer, repository):
             p.name
             p.kind
             p.latest_version
@@ -1854,7 +1876,7 @@ surface RepositoryPackages {
 
 -- Site administration of the registry.
 surface SiteAdminPackages {
-    facing admin: PackageSiteAdmin
+    facing admin: access/SiteAdmin
 
     exposes:
         for v in PackageVersions:
@@ -1908,8 +1930,8 @@ open question "Owner deletion: users/orgs are refused deletion while they own pa
 -- REQUEST organizations/TeamUnitAccess for unit `packages`: needed to derive can_read/can_write_packages for org registries (max of team authorize level and team packages-unit access).
 -- REQUEST repositories/RepositoryDeleted(repository, doer): already emitted; packages unlinks linked packages.
 -- REQUEST repositories/Repository: creating the `_cargo-index` repository on behalf of the owner (OwnerInitializesCargoIndex).
--- REQUEST access/can_write(user, repository, packages) and access/can_read(user, repository, code): used for linking and for showing linked repositories.
+-- REQUEST can_write_repo_packages(user, repository) and can_read_repo_code(user, repository): used for linking and for showing linked repositories.
 -- REQUEST access/config.require_signin_view: imported as config.require_signin_view (used by can_read_packages and the container token exchange).
 -- REQUEST authentication/TokenScope: read:package / write:package and public-only flag consumed by can_read/can_write_packages.
 -- REQUEST quota/quota_allows(owner, size_assets_packages_all) (QuotaGate gate_package_upload, charged: package_owner): quota_allows_package_upload(registry) is exactly this, evaluated for the registry owner (not the uploader) before every write that stores data; quota/QuotaUsage.packages should sum packages/PackageFile sizes per owner (blob shared by two files counts twice, as LIMIT_TOTAL_OWNER_SIZE does).
--- REQUEST webhooks, actions: already react to PackageVersionCreated(version, doer) / PackageVersionDeleted(version, doer) (names aligned with their requests).
+-- REQUEST webhooks, actions: react to PackageVersionCreated(version, publisher) / PackageVersionDeleted(version, doer) with exactly these parameter names.

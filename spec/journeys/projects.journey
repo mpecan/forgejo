@@ -21,7 +21,7 @@ journey WriterStartsAKanbanBoard {
           the basic kanban template and the board arrives with its columns.
 
     1. ada creates a board from the basic kanban template
-        stipulate access/can_write(ada, repo, projects) = true
+        stipulate can_write_projects(ada, repo) = true
         stipulate length("Roadmap") = 7
         ada does UserCreatesRepositoryProject(ada, repo, "Roadmap", "Q3 work", basic_kanban, text_only) on RepositoryProjectList
             creating board: Project
@@ -44,7 +44,7 @@ journey ReaderCannotCreateABoard {
           unit; the create action is refused.
 
     1. bob tries to create a board
-        stipulate access/can_write(bob, repo, projects) = false
+        stipulate can_write_projects(bob, repo) = false
         stipulate length("Mine") = 4
         bob cannot do UserCreatesRepositoryProject(bob, repo, "Mine", "", none, text_only) on RepositoryProjectList
 
@@ -59,7 +59,7 @@ journey ArchivedRepositoryRefusesNewBoards {
         repo.is_archived = true
 
     1. ada tries to create a board in the archived repository
-        stipulate access/can_write(ada, repo, projects) = true
+        stipulate can_write_projects(ada, repo) = true
         stipulate length("Late") = 4
         ada cannot do UserCreatesRepositoryProject(ada, repo, "Late", "", none, text_only) on RepositoryProjectList
 
@@ -79,12 +79,12 @@ journey PersonalAndOrganizationBoards {
         then mine.owner_user = ada
 
     2. bob is refused an organization board
-        stipulate organizations/can_write_unit(bob, org, projects) = false
+        stipulate can_write_org_projects(bob, org) = false
         stipulate length("Ops") = 3
         bob cannot do UserCreatesOrgProject(bob, org, "Ops", "", bug_triage, text_only) on OrgProjectList
 
     3. ada, an org owner, creates one
-        stipulate organizations/can_write_unit(ada, org, projects) = true
+        stipulate can_write_org_projects(ada, org) = true
         ada does UserCreatesOrgProject(ada, org, "Ops", "", bug_triage, images_and_text) on OrgProjectList
             creating ops: Project
         then ops.owner_kind = organization

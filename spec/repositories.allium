@@ -67,7 +67,10 @@
 --   RepoUnitEnabled(repository, kind) / RepoUnitDisabled(repository, kind)
 --                                                           -- actions (schedules on/off when the actions unit toggles)
 --   RepositoryViewed(viewer, repository)                    -- notifications (transfer-offer threads marked read); provided as UserViewsRepository
---   MirrorSyncPushed(repository, ref_name, commits)         -- notifications feed (mirror_sync_push), webhooks/actions via code
+--   MirrorSyncPushed(repository, ref_name, commits)         -- notifications feed (mirror_sync_push)
+--   code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
+--                                                           -- for each branch a pull-mirror sync moved (issues, pulls,
+--                                                              webhooks, actions see mirror updates like pushes)
 --   MirrorRefCreated(repository, ref_name) / MirrorRefDeleted(repository, ref_name)
 --                                                           -- notifications feed (mirror_sync_create / mirror_sync_delete)
 --   RepositoryDeleted(repository, doer)                     -- every module holding repository-scoped data purges it: issues, pulls (close PRs from its branches first),
@@ -95,8 +98,11 @@
 -- Reacts to:
 --   code/PushReceived(push)          -- push mirrors with sync-on-commit, auto-watch on changes, size refresh
 --   migrations/* via ImportReservesRepository / ImportReservesOrgRepository / ImportCompleted / RepositoryDeletionRequested (see REQUEST)
---   administration cron scheduler via RepositoryHealthCheckDue / GitGarbageCollectionDue /
---     MissingRepositoriesCleanupDue / MissingRepositoriesReinitDue / RepositoryArchivesPurgeDue (at)
+--   administration/MirrorUpdateDue(pull_limit, push_limit), RepositoryHealthCheckDue(timeout, args),
+--     RepositoryStatsCheckDue() (no-op), RepositoryArchiveCleanupDue(older_than),
+--     AllRepositoryArchivesDeletionDue(), RepositoryGarbageCollectionDue(timeout, args),
+--     MissingRepositoryReinitDue(), MissingRepositoryDeletionDue(),
+--     GeneratedRepositoryAvatarDeletionDue() (no-op) -- the cron tasks, also run on demand
 --   discovery stats indexer via LanguageStatsComputed
 --
 -- Black-box predicates. Qualified calls into sibling modules cannot yet be simulated, so the
@@ -108,8 +114,8 @@
 --   is_repo_owner(user, repository)       -- access: access mode `owner` (the owning user, an owner of the
 --                                            owning organisation, or a site admin)
 --   can_create_in_org(user, org)          -- organizations: org owner, or member of a team allowed to create repositories
---   is_org_owner(user, org)               -- organizations: member of the owners team
---   is_org_member(user, org)              -- organizations
+--   is_org_owner(org, user)               -- organizations: member of the owners team
+--   is_org_member(org, user)              -- organizations
 --   is_blocked(blocker, blocked)          -- accounts/UserBlock
 --   within_repo_quota(owner)              -- quota: owner's repository-size quota not exceeded
 --   within_creation_limit(owner)          -- accounts: owner's repository count below its effective limit
@@ -130,6 +136,10 @@
 --   resolve_commit(repository, ref)       -- code: the commit a branch/tag/sha names, or null
 --   in_fork_network_of(owner, source)     -- owner owns `source` or any repository `source` was (transitively) forked from
 --   storage_missing(repository)           -- the git storage for the repository no longer exists
+--   is_branch_ref(ref_name), branch_of_ref(ref_name) -- code: refs/heads/<name> and its <name>
+--   mirror_pusher(repository)             -- the account mirror updates are attributed to: the owning
+--                                            user, or the owning organisation's account
+--   is_force_update(repository, old, new) -- code: old is not an ancestor of new (pruned history)
 --   is_valid_avatar_image(image)          -- decodable image within the avatar size limits
 
 use "./accounts.allium" as accounts
@@ -138,6 +148,8 @@ use "./access.allium" as access
 use "./code.allium" as code
 use "./pulls.allium" as pulls
 use "./releases.allium" as releases
+use "./keys.allium" as keys
+use "./administration.allium" as administration
 
 ------------------------------------------------------------
 -- External Entities
@@ -205,7 +217,6 @@ enum ObjectFormat { sha1 | sha256 }
 
 -- How commit signatures are trusted when shown (keys.allium evaluates; the choice is a repo setting).
 -- from: models/repo/repo.go:84
-enum TrustModel { default | committer | collaborator | collaborator_committer }
 
 -- from: services/repository/archiver/archiver.go:70
 enum ArchiveFormat { zip | tar_gz | bundle }
@@ -254,7 +265,7 @@ entity Repository {
     default_branch: String
     wiki_branch: String
     object_format: ObjectFormat
-    trust_model: TrustModel
+    trust_model: keys/TrustModel
 
     -- Presentation
     avatar: String?                     -- custom avatar image; null = instance fallback
@@ -541,7 +552,7 @@ config {
     enable_flags: Boolean = false                        -- ENABLE_FLAGS
     settable_flags: Set<String> = {}                     -- SETTABLE_FLAGS
     preferred_licenses: Set<String> = { "Apache-2.0", "MIT" }   -- listed first on the create form
-    default_trust_model: TrustModel = collaborator       -- [repository.signing] DEFAULT_TRUST_MODEL
+    default_trust_model: keys/TrustModel = collaborator       -- [repository.signing] DEFAULT_TRUST_MODEL
     initial_commit_signing: Set<String> = { "always" }   -- [repository.signing] INITIAL_COMMIT (evaluated by keys)
     -- [repository.pull-request]
     default_merge_style: pulls/MergeStyle = merge        -- DEFAULT_MERGE_STYLE
@@ -583,12 +594,7 @@ config {
     git_gc_schedule: Duration = 72.hours                 -- cron.git_gc_repos @every 72h
     -- Whether each maintenance task is enabled (cron.<task> ENABLED).
     update_mirrors_enabled: Boolean = true
-    repo_health_check_enabled: Boolean = true
     archive_cleanup_enabled: Boolean = true
-    git_gc_enabled: Boolean = false
-    delete_missing_repos_enabled: Boolean = false        -- @every 72h
-    reinit_missing_repos_enabled: Boolean = false        -- @every 72h
-    delete_repo_archives_enabled: Boolean = false        -- @annually
 }
 
 ------------------------------------------------------------
@@ -627,7 +633,7 @@ rule UserCreatesRepository {
             default_branch: config.default_branch,
             wiki_branch: config.default_branch,
             object_format: object_format,
-            trust_model: default,
+            trust_model: instance_default,
             avatar: null,
             git_size: 0,
             lfs_size: 0,
@@ -684,7 +690,7 @@ rule UserCreatesOrgRepository {
             default_branch: config.default_branch,
             wiki_branch: config.default_branch,
             object_format: object_format,
-            trust_model: default,
+            trust_model: instance_default,
             avatar: null,
             git_size: 0,
             lfs_size: 0,
@@ -760,7 +766,7 @@ rule GitClientPushCreatesUserRepository {
             is_template: false, generated_from: null, is_empty: true, is_fsck_enabled: true,
             close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
             default_branch: config.default_branch, wiki_branch: config.default_branch,
-            object_format: config.default_object_format, trust_model: default, avatar: null,
+            object_format: config.default_object_format, trust_model: instance_default, avatar: null,
             git_size: 0, lfs_size: 0, status: ready, created_at: now, updated_at: now
         )
         RepositoryProvisioned(repository: repo, doer: user, unit_kinds: config.default_repo_units)
@@ -784,7 +790,7 @@ rule GitClientPushCreatesOrgRepository {
             is_template: false, generated_from: null, is_empty: true, is_fsck_enabled: true,
             close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
             default_branch: config.default_branch, wiki_branch: config.default_branch,
-            object_format: config.default_object_format, trust_model: default, avatar: null,
+            object_format: config.default_object_format, trust_model: instance_default, avatar: null,
             git_size: 0, lfs_size: 0, status: ready, created_at: now, updated_at: now
         )
         RepositoryProvisioned(repository: repo, doer: user, unit_kinds: config.default_repo_units)
@@ -905,7 +911,7 @@ rule UserForksRepository {
             is_template: false, generated_from: null, is_empty: source.is_empty, is_fsck_enabled: true,
             close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
             default_branch: single_branch ?? source.default_branch, wiki_branch: config.default_branch,
-            object_format: source.object_format, trust_model: default, avatar: null,
+            object_format: source.object_format, trust_model: instance_default, avatar: null,
             git_size: source.git_size, lfs_size: source.lfs_size, status: ready, created_at: now, updated_at: now
         )
         RepositoryProvisioned(repository: fork, doer: user, unit_kinds: config.default_fork_repo_units)
@@ -940,7 +946,7 @@ rule UserForksRepositoryIntoOrg {
             is_template: false, generated_from: null, is_empty: source.is_empty, is_fsck_enabled: true,
             close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
             default_branch: single_branch ?? source.default_branch, wiki_branch: config.default_branch,
-            object_format: source.object_format, trust_model: default, avatar: null,
+            object_format: source.object_format, trust_model: instance_default, avatar: null,
             git_size: source.git_size, lfs_size: source.lfs_size, status: ready, created_at: now, updated_at: now
         )
         RepositoryProvisioned(repository: fork, doer: user, unit_kinds: config.default_fork_repo_units)
@@ -1089,16 +1095,8 @@ rule AdminSetsCloseIssuesViaAnyBranch {
     ensures: repository.close_issues_via_commit_in_any_branch = enabled
 }
 
--- Choosing the default branch (the branch must exist unless the repository is empty).
--- from: routers/api/v1/repo/repo.go:800
-rule AdminSetsDefaultBranch {
-    when: AdminSetsDefaultBranch(user, repository, branch)
-    requires: is_repo_admin(user, repository)
-    requires: not repository.is_archived
-    requires: repository.is_empty or exists code/Branch{repository: repository, name: branch}
-    ensures: repository.default_branch = branch
-    ensures: DefaultBranchChanged(repository: repository, doer: user, branch: branch)
-}
+-- Choosing the default branch is code's: code/AdminChangesDefaultBranch, which emits
+-- code/DefaultBranchChanged(repository, old_name, new_name, by).
 
 -- Site-admin only: include or exclude the repository from the scheduled git health check.
 -- from: routers/web/repo/setting/setting.go:771
@@ -1279,7 +1277,7 @@ rule OwnerUnarchivesRepository {
 -- from: services/repository/delete.go:52
 rule OwnerDeletesRepository {
     when: OwnerDeletesRepository(user, repository)
-    requires: user.is_admin or repository.owner_user = user or (repository.owner_org != null and is_org_owner(user, repository.owner_org))
+    requires: user.is_admin or repository.owner_user = user or (repository.owner_org != null and is_org_owner(repository.owner_org, user))
     ensures:
         for f in repository.forks:
             f.is_fork = false
@@ -1353,7 +1351,7 @@ rule OwnerTransfersRepositoryToOrg {
     requires: is_repo_owner(user, repository)
     requires: repository.status = ready
     requires: org != repository.owner_org
-    requires: user.is_admin or org.visibility != private or is_org_member(user, org)
+    requires: user.is_admin or org.visibility != private or is_org_member(org, user)
     requires: teams.all(t => t.organization = org)
     requires: repository_name_free(org, repository.name)
     requires: within_repo_quota(org)
@@ -1459,7 +1457,7 @@ rule OwnershipMovesToOrg {
     ensures: not exists RepoTransfer{repository: repository}
     ensures:
         for c in repository.collaborations:
-            if is_org_member(c.user, org):
+            if is_org_member(org, c.user):
                 not exists c
     ensures: not exists RepoRedirect{owner_org: org, name: repository.name}
     ensures: RepoRedirect.created(owner_user: old_user, owner_org: old_org, name: repository.name, repository: repository)
@@ -1489,7 +1487,7 @@ rule AdminAddsCollaborator {
     requires: not exists Collaboration{repository: repository, user: collaborator}
     requires: not is_blocked(repository.owner, collaborator)
     requires: not is_blocked(collaborator, repository.owner)
-    requires: repository.owner_org = null or not is_org_owner(collaborator, repository.owner_org)
+    requires: repository.owner_org = null or not is_org_owner(repository.owner_org, collaborator)
     ensures: Collaboration.created(repository: repository, user: collaborator, access_mode: write, created_at: now)
     ensures: CollaboratorAdded(repository: repository, user: collaborator, doer: user)
     @guidance
@@ -1712,7 +1710,7 @@ rule UserAdoptsRepository {
             is_template: false, generated_from: null, is_empty: storage_is_empty(unadopted), is_fsck_enabled: true,
             close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
             default_branch: storage_head_branch(unadopted) ?? config.default_branch, wiki_branch: config.default_branch,
-            object_format: storage_object_format(unadopted), trust_model: default, avatar: null,
+            object_format: storage_object_format(unadopted), trust_model: instance_default, avatar: null,
             git_size: 0, lfs_size: 0, status: ready, created_at: now, updated_at: now
         )
         not exists unadopted
@@ -1753,7 +1751,7 @@ rule ImportReservesRepository {
         is_template: false, generated_from: null, is_empty: true, is_fsck_enabled: not as_mirror,
         close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
         default_branch: config.default_branch, wiki_branch: config.default_branch,
-        object_format: config.default_object_format, trust_model: default, avatar: null,
+        object_format: config.default_object_format, trust_model: instance_default, avatar: null,
         git_size: 0, lfs_size: 0, status: being_migrated, created_at: now, updated_at: now
     )
     ensures: ImportedRepositoryReserved(user: user, owner_user: owner, owner_org: null, name: name, as_mirror: as_mirror)
@@ -1776,7 +1774,7 @@ rule ImportReservesOrgRepository {
         is_template: false, generated_from: null, is_empty: true, is_fsck_enabled: not as_mirror,
         close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
         default_branch: config.default_branch, wiki_branch: config.default_branch,
-        object_format: config.default_object_format, trust_model: default, avatar: null,
+        object_format: config.default_object_format, trust_model: instance_default, avatar: null,
         git_size: 0, lfs_size: 0, status: being_migrated, created_at: now, updated_at: now
     )
     ensures: ImportedRepositoryReserved(user: user, owner_user: null, owner_org: org, name: name, as_mirror: as_mirror)
@@ -1910,12 +1908,18 @@ rule PullMirrorSyncSucceeds {
 }
 
 -- While fetching, the worker reports each ref that changed. Updated branches are announced
--- like pushes by the repository owner and wake push mirrors that sync on commit.
+-- like pushes by the repository owner (code/CommitsPushed, so issues, pulls, webhooks and
+-- actions see them) and wake push mirrors that sync on commit.
 -- from: services/mirror/mirror_pull.go:595
 rule PullMirrorRefUpdated {
-    when: PullMirrorRefUpdated(worker, mirror, ref_name, commits)
+    when: PullMirrorRefUpdated(worker, mirror, ref_name, old_sha, new_sha, commits)
     requires: mirror.sync_state = queued
     ensures: MirrorSyncPushed(repository: mirror.repository, ref_name: ref_name, commits: commits)
+    ensures:
+        if is_branch_ref(ref_name):
+            code/CommitsPushed(repository: mirror.repository, branch_name: branch_of_ref(ref_name),
+                pusher: mirror_pusher(mirror.repository), old_sha: old_sha, new_sha: new_sha,
+                is_force: is_force_update(mirror.repository, old_sha, new_sha))
     ensures:
         for pm in mirror.repository.push_mirrors:
             if pm.sync_on_commit and pm.sync_state = idle:
@@ -2044,6 +2048,28 @@ rule ScheduledPushMirrorSync {
     ensures: PushMirrorSyncDue(push_mirror: push_mirror)
 }
 
+-- The update_mirrors task started by administration (cron or "run now"): queue every due
+-- pull mirror and push mirror exactly as the two scheduled rules above do.
+-- from: services/mirror/mirror.go:37
+rule AdministrationUpdatesMirrors {
+    when: administration/MirrorUpdateDue(pull_limit, push_limit)
+    requires: config.mirror_enabled
+    ensures:
+        for mirror in Mirrors where sync_state = idle and interval > 0.seconds and next_sync_at <= now:
+            if within_repo_quota(mirror.repository.owner):
+                mirror.sync_state = queued
+                MirrorSyncDue(mirror: mirror)
+    ensures:
+        for pm in PushMirrors where sync_state = idle and interval > 0.seconds and next_sync_at <= now:
+            if not pm.repository.is_archived:
+                pm.sync_state = queued
+                PushMirrorSyncDue(push_mirror: pm)
+    @guidance
+        -- At most pull_limit pull mirrors and push_limit push mirrors are queued per run
+        -- (least recently synced first); the rest wait for the next run. A negative limit
+        -- means no limit.
+}
+
 -- The worker pushed (branches/tags matching the filter, or everything with prune semantics,
 -- LFS objects when enabled, and the wiki if it exists).
 -- from: services/mirror/mirror_push.go:138
@@ -2141,11 +2167,20 @@ rule ExpiredArchiveRemoved {
     ensures: not exists archive
 }
 
+-- The archive_cleanup task started by administration (cron or "run now"): the same removal
+-- as ExpiredArchiveRemoved, with the task's own threshold.
+-- from: services/repository/archiver/archiver.go:339
+rule AdministrationCleansUpArchives {
+    when: administration/RepositoryArchiveCleanupDue(older_than)
+    ensures:
+        for a in RepoArchives where state = ready and created_at + older_than <= now:
+            not exists a
+}
+
 -- Admin-triggered purge of all generated archives (delete_repo_archives, disabled by default).
 -- from: services/repository/archiver/archiver.go:370
 rule PurgeAllArchives {
-    when: RepositoryArchivesPurgeDue(at)
-    requires: config.delete_repo_archives_enabled
+    when: administration/AllRepositoryArchivesDeletionDue()
     ensures:
         for a in RepoArchives:
             not exists a
@@ -2158,32 +2193,33 @@ rule PurgeAllArchives {
 -- git fsck on every repository with health checks enabled (repo_health_check, daily).
 -- from: services/repository/check.go:24
 rule ScheduledHealthCheck {
-    when: RepositoryHealthCheckDue(at)
-    requires: config.repo_health_check_enabled
+    when: administration/RepositoryHealthCheckDue(timeout, args)
     for repository in Repositories where is_fsck_enabled = true:
         ensures:
             if not passes_fsck(repository):
                 RepositoryHealthCheckFailed(repository: repository, reason: fsck_report(repository))
+    @guidance
+        -- `git fsck` runs with the task's args and is bounded by its timeout.
 }
 
 -- git gc on every repository, then refresh its size (git_gc_repos, every 72h, off by default).
 -- from: services/repository/check.go:61
 rule ScheduledGarbageCollection {
-    when: GitGarbageCollectionDue(at)
-    requires: config.git_gc_enabled
+    when: administration/RepositoryGarbageCollectionDue(timeout, args)
     for repository in Repositories:
         ensures:
             if gc_succeeds(repository):
                 repository.git_size = measured_git_size(repository)
             else:
                 RepositoryGarbageCollectionFailed(repository: repository, reason: gc_report(repository))
+    @guidance
+        -- `git gc` runs with the task's args and is bounded by its timeout.
 }
 
 -- Records whose storage vanished are deleted (delete_missing_repos, off by default).
 -- from: services/repository/check.go:148
 rule DeleteRepositoriesMissingFromStorage {
-    when: MissingRepositoriesCleanupDue(at)
-    requires: config.delete_missing_repos_enabled
+    when: administration/MissingRepositoryDeletionDue()
     for repository in Repositories where storage_missing(repository):
         ensures: RepositoryDeletionRequested(repository: repository)
 }
@@ -2221,10 +2257,28 @@ rule SystemDeletesRepository {
 -- Records whose storage vanished get a fresh empty git repository (reinit_missing_repos, off by default).
 -- from: services/repository/check.go:176
 rule ReinitialiseRepositoriesMissingFromStorage {
-    when: MissingRepositoriesReinitDue(at)
-    requires: config.reinit_missing_repos_enabled
+    when: administration/MissingRepositoryReinitDue()
     for repository in Repositories where storage_missing(repository):
         ensures: RepositoryStorageRecreated(repository: repository)
+}
+
+-- check_repo_stats: repository counters (stars, watches, forks, issues, ...) are derived
+-- values here, so the repair task has nothing to correct.
+-- from: services/cron/tasks_basic.go:98
+rule AdministrationChecksRepositoryStats {
+    when: administration/RepositoryStatsCheckDue()
+    ensures: RepositoryStatsChecked()
+    @guidance
+        -- Implementation workaround for denormalised counters; a rebuild that derives
+        -- counts has no work to do.
+}
+
+-- delete_generated_repository_avatars: repositories never get generated avatars here (the
+-- fallback image is a rendering concern), so there is nothing to delete.
+-- from: services/cron/tasks_extended.go:107
+rule AdministrationDeletesGeneratedAvatars {
+    when: administration/GeneratedRepositoryAvatarDeletionDue()
+    ensures: GeneratedRepositoryAvatarsChecked()
 }
 
 ------------------------------------------------------------
@@ -2323,33 +2377,17 @@ invariant PushMirrorSshExcludesCredentials {
 -- Actor Declarations
 ------------------------------------------------------------
 
--- Anyone signed in and allowed to log in. (Anonymous visitors are access.allium's; every
--- read surface below is also offered to them when access allows reading.)
-actor SignedInUser {
-    identified_by: accounts/User where is_active = true and prohibit_login = false
-}
-
--- Someone with admin access to this repository (collaborator with admin, admin team, org owner,
--- owning user, site admin).
-actor RepoAdministrator {
-    within: Repository
-    identified_by: accounts/User where is_repo_admin(this, within)
-}
+-- Shared actors: access/SignedInUser (anyone signed in and allowed to log in; anonymous
+-- visitors are access/Visitor, and every read surface below is also offered to them when
+-- access allows reading), access/RepoAdmin (admin access to the repository: collaborator
+-- with admin, admin team, org owner, owning user, site admin), access/SiteAdmin, and
+-- code/GitClient (an authenticated git client pushing over HTTP or SSH).
 
 -- Someone with owner-level access to this repository (owning user, owner of the owning
 -- organisation, site admin) — needed for the danger zone.
 actor RepoOwner {
     within: Repository
     identified_by: accounts/User where is_repo_owner(this, within)
-}
-
-actor SiteAdmin {
-    identified_by: accounts/User where is_admin = true
-}
-
--- An authenticated git client pushing over HTTP or SSH.
-actor GitClient {
-    identified_by: accounts/User where is_active = true and prohibit_login = false
 }
 
 -- The instance's own background workers.
@@ -2365,7 +2403,7 @@ actor Worker {
 -- Web: GET/POST /repo/create. API: POST /user/repos, POST /orgs/{org}/repos,
 -- POST /repos/{template_owner}/{template}/generate.
 surface RepositoryCreation {
-    facing creator: SignedInUser
+    facing creator: access/SignedInUser
 
     let templates = Repositories where is_template = true
 
@@ -2395,7 +2433,7 @@ surface RepositoryCreation {
 -- The repository as any reader sees it (home page header, API GET /repos/{o}/{r},
 -- /repos/{o}/{r}/languages, /stargazers, /subscribers, /forks, /topics).
 surface RepositoryOverview {
-    facing viewer: SignedInUser
+    facing viewer: access/SignedInUser
     context repository: Repository
 
     exposes:
@@ -2476,7 +2514,7 @@ surface RepositoryOverview {
 
 -- A user's own stars and watches (API /user/starred, /user/subscriptions, /users/{u}/starred).
 surface MyStarsAndWatches {
-    facing viewer: SignedInUser
+    facing viewer: access/SignedInUser
     context star: Star where user = viewer
 
     exposes:
@@ -2491,7 +2529,7 @@ surface MyStarsAndWatches {
 -- collaboration, avatar, mirror sections), API PATCH /repos/{o}/{r}, /collaborators,
 -- /topics, /avatar, /push_mirrors, /push_mirrors-sync.
 surface RepositorySettings {
-    facing admin: RepoAdministrator
+    facing admin: access/RepoAdmin
     context repository: Repository
 
     exposes:
@@ -2542,8 +2580,6 @@ surface RepositorySettings {
             when not repository.is_fork
         AdminSetsTrustModel(admin, repository, trust_model)
         AdminSetsCloseIssuesViaAnyBranch(admin, repository, enabled)
-        AdminSetsDefaultBranch(admin, repository, branch)
-            when not repository.is_archived
         AdminEnablesUnit(admin, repository, kind)
         AdminDisablesUnit(admin, repository, unit)
         AdminConfiguresIssueTracker(admin, unit, settings)
@@ -2626,7 +2662,7 @@ surface RepositoryDangerZone {
 -- Offers of repositories transferred to the viewer personally.
 -- Web: /{o}/{r}/action/accept_transfer, reject_transfer; API POST .../transfer/accept, /reject.
 surface IncomingTransfer {
-    facing recipient: SignedInUser
+    facing recipient: access/SignedInUser
     context transfer: RepoTransfer where recipient_user = recipient
 
     exposes:
@@ -2641,7 +2677,7 @@ surface IncomingTransfer {
 
 -- Offers of repositories transferred to an organisation the viewer may create repositories in.
 surface IncomingOrgTransfer {
-    facing member: SignedInUser
+    facing member: access/SignedInUser
     context transfer: RepoTransfer where recipient_org != null and can_create_in_org(member, recipient_org)
 
     exposes:
@@ -2658,7 +2694,7 @@ surface IncomingOrgTransfer {
 
 -- Who has explicit access (API GET /repos/{o}/{r}/collaborators[/{user}], readers).
 surface CollaboratorList {
-    facing reader: SignedInUser
+    facing reader: access/SignedInUser
     context collaboration: Collaboration where can_see_repository(reader, repository)
 
     exposes:
@@ -2669,7 +2705,7 @@ surface CollaboratorList {
 -- Site administration of repositories: /admin/repos, /admin/repos/unadopted,
 -- /{o}/{r}/flags, API /admin/unadopted, /repos/{o}/{r}/flags.
 surface RepositoryAdministration {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
 
     let unadopted = UnadoptedRepositories
 
@@ -2689,7 +2725,7 @@ surface RepositoryAdministration {
 
 -- A user's own unadopted repositories (web /user/settings/repos).
 surface MyUnadoptedRepositories {
-    facing viewer: SignedInUser
+    facing viewer: access/SignedInUser
     context unadopted: UnadoptedRepository where owner_name = viewer.name
 
     exposes:
@@ -2704,7 +2740,7 @@ surface MyUnadoptedRepositories {
 
 -- Push to create (git over HTTP / SSH to a repository path that does not exist).
 surface GitPushToCreate {
-    facing client: GitClient
+    facing client: code/GitClient
 
     provides:
         GitClientPushesToMissingUserRepository(client, owner, name)
@@ -2719,7 +2755,7 @@ surface RepositoryWorkers {
 
     provides:
         PullMirrorFetchSucceeded(worker, mirror, received_any)
-        PullMirrorRefUpdated(worker, mirror, ref_name, commits)
+        PullMirrorRefUpdated(worker, mirror, ref_name, old_sha, new_sha, commits)
         PullMirrorRefCreated(worker, mirror, ref_name)
         PullMirrorRefDeleted(worker, mirror, ref_name)
         PullMirrorFetchFailed(worker, mirror, reason)
@@ -2744,12 +2780,13 @@ surface MaintenanceScheduler {
     exposes:
         worker.queue
 
-    provides:
-        RepositoryHealthCheckDue(at)
-        GitGarbageCollectionDue(at)
-        MissingRepositoriesCleanupDue(at)
-        MissingRepositoriesReinitDue(at)
-        RepositoryArchivesPurgeDue(at)
+    @guidance
+        -- The tasks themselves arrive as administration/*Due triggers (MirrorUpdateDue,
+        -- RepositoryHealthCheckDue, RepositoryStatsCheckDue, RepositoryArchiveCleanupDue,
+        -- AllRepositoryArchivesDeletionDue, RepositoryGarbageCollectionDue,
+        -- MissingRepositoryReinitDue, MissingRepositoryDeletionDue,
+        -- GeneratedRepositoryAvatarDeletionDue); administration owns schedules,
+        -- enablement and "run now".
 }
 
 -- Other modules' pipelines reporting into this one: the importer (migrations), the git storage
@@ -2808,15 +2845,15 @@ open question "Org 'can create repositories' members get transfers completed ins
 -- REQUEST access: expose can_see_repository / can_read_code / can_write_code / is_repo_admin / is_repo_owner as callable predicates; owner-level access = owning user, org owners, site admins
 -- REQUEST access: an anonymous actor so RepositoryOverview can face anonymous visitors on public repositories
 -- REQUEST code/PushReceived(push) with push.repository and push.pusher
--- REQUEST code/Branch lookup by {repository, name} for AdminSetsDefaultBranch; code reacts to DefaultBranchChanged (sets HEAD), ForkBranchFastForwarded, RepositoryGeneratedFromTemplate (git content, git hooks, protected branches)
+-- REQUEST code: owns changing the default branch (AdminChangesDefaultBranch, DefaultBranchChanged); reacts to ForkBranchFastForwarded, RepositoryGeneratedFromTemplate (git content, git hooks, protected branches)
 -- REQUEST code: report RepositoryStorageUnreadable / RepositoryStorageRestored / RepositoryStorageRecreated around git storage, and fork_branch_can_fast_forward(repository, branch)
 -- REQUEST pulls/MergeStyle (incl. manually_merged, fast_forward_only) and pulls/UpdateStyle = merge | rebase
 -- REQUEST releases/Release.repository and a way to find the release of a tag, so ReaderDownloadsArchive can count release archive downloads
 -- REQUEST issues: react to LabelTemplateApplied(repository, template_name) and RepositoryGeneratedFromTemplate(labels) to create labels; CollaboratorRemoved unassigns
 -- REQUEST migrations: emit ImportReservesRepository(user, owner, name, description, is_private, as_mirror, original_url) / ImportReservesOrgRepository(user, org, ...) instead of creating repositories/Repository directly (this module owns the record and its provisioning: units, auto-watch, creator admin); emit ImportCompleted(repository, remote_address, has_credentials, interval, lfs_enabled, lfs_endpoint?); a failed import stays being_migrated; discarding it emits RepositoryDeletionRequested(repository); expose is_allowed_remote(address, user)
 -- NOTE for integration: webhooks listens for repositories/RepositoryMigrated(repository, doer) but migrations emits its own RepositoryMigrated; one of them should own it (this module would need the doer in ImportCompleted)
--- NOTE for integration: siblings call some of this module's triggers with other shapes — RepositoryDeleted(repository) (here: repository, doer), RepositoryForked(fork, source, doer) (here: source, fork, doer), DefaultBranchChanged(repository) (here: repository, doer, branch), RepositoryGeneratedFromTemplate(repository, template, include_webhooks) (here: template, repository, doer, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches), RepositoryTransferred(repository, old_owner)
--- REQUEST administration/CronTask: schedule this module's tasks (update_mirrors, repo_health_check, archive_cleanup, git_gc_repos, delete_missing_repos, reinit_missing_repos, delete_repo_archives) and emit RepositoryHealthCheckDue / GitGarbageCollectionDue / MissingRepositoriesCleanupDue / MissingRepositoriesReinitDue / RepositoryArchivesPurgeDue (at) on the cron.* schedules; create SystemNotice on PullMirrorSyncFailed / RepositoryHealthCheckFailed / RepositoryGarbageCollectionFailed
+-- NOTE for integration: siblings call some of this module's triggers with other shapes — RepositoryDeleted(repository) (here: repository, doer), RepositoryForked(fork, source, doer) (here: source, fork, doer), RepositoryGeneratedFromTemplate(repository, template, include_webhooks) (here: template, repository, doer, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches), RepositoryTransferred(repository, old_owner)
+-- REQUEST administration/CronTask: schedule this module's tasks and emit their *Due triggers with named arguments (see Reacts to); create SystemNotice on PullMirrorSyncFailed / RepositoryHealthCheckFailed / RepositoryGarbageCollectionFailed
 -- REQUEST quota: within_repo_quota(owner) for the repository-size subject
 -- REQUEST discovery: emit LanguageStatsComputed(repository, commit_sha, sizes) from the stats indexer
 -- REQUEST keys: initial-commit signing policy (config.initial_commit_signing) and TrustModel semantics

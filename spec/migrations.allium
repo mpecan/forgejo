@@ -7,7 +7,7 @@
 -- as an addon on top of the new system. This file specifies (a) what the
 -- import addon does, and (b) the extension points the core must offer so an
 -- addon can do it — declared below as `contract`s (ImportSink,
--- ExternalIdentityResolver, OutboundFetchPolicy, BackgroundJobQueue) and
+-- ImportedIdentityResolver, OutboundFetchPolicy, BackgroundJobQueue) and
 -- consumed on the CoreHostBoundary surface. Anything the core does on its own
 -- (repository lifecycle, issue model, pull-mirror syncing) is owned by the
 -- core modules and only referenced here.
@@ -56,7 +56,7 @@
 --       webhooks (repository created), activity feed, notifications; the
 --       doer is migrations/Migration{repository}.doer
 --   - MigrationFailed(migration)                 -- progress page, notifications
---   - administration/SystemFailureReported(repository, description) -- on a
+--   - administration/SystemFailureReported(kind, description) -- kind: repository; on a
 --       failed import and on dropped unsafe source data (SystemNotice)
 --   - MigratedContentDiscarded(repository)       -- core wipes partially
 --       imported content before a retry
@@ -82,7 +82,7 @@
 --   may_import_local_paths(user)           -- accounts: per-user "may import local paths" right
 --   linked_account_for(kind, external_id)  -- authentication: owner of an ExternalLogin with that provider/id
 --   is_allowed_remote(url, user)           -- this module's OutboundFetchPolicy, exported for mirrors
---   resolve_author(migration, identity)    -- ExternalIdentityResolver.resolve / resolve_same_instance
+--   resolve_author(migration, identity)    -- ImportedIdentityResolver.resolve / resolve_same_instance
 --   first_present(a, b, c)                 -- the first non-absent timestamp, else now
 --   - (job queue) MigrationDequeued(migration) via CoreHostBoundary
 
@@ -179,7 +179,7 @@ value RestoreSelection {
 
 -- The identity of a person on the source forge, as carried by imported data.
 -- from: models/user/external_login_user.go (ExternalUserMigrated)
-value ExternalIdentity {
+value ImportedIdentity {
     external_id: String
     name: String
     email: String?
@@ -218,7 +218,7 @@ value ImportedLabel {
 
 -- from: modules/migration/reaction.go:7
 value ImportedReaction {
-    author: ExternalIdentity
+    author: ImportedIdentity
     content: String
 }
 
@@ -238,7 +238,7 @@ value ImportedRelease {
     body: String
     is_draft: Boolean
     is_prerelease: Boolean
-    publisher: ExternalIdentity
+    publisher: ImportedIdentity
     created_at: Timestamp?
     published_at: Timestamp?
     assets: List<ImportedReleaseAsset>
@@ -247,7 +247,7 @@ value ImportedRelease {
 -- from: modules/migration/issue.go:9
 value ImportedIssue {
     number: Integer
-    author: ExternalIdentity
+    author: ImportedIdentity
     title: String
     content: String
     ref: String?
@@ -274,7 +274,7 @@ value PullRequestEndpoint {
 -- from: modules/migration/pullrequest.go:16
 value ImportedPullRequest {
     number: Integer
-    author: ExternalIdentity
+    author: ImportedIdentity
     title: String
     content: String
     milestone_title: String?
@@ -301,7 +301,7 @@ value ImportedComment {
     issue_number: Integer
     source_index: Integer
     kind: String
-    author: ExternalIdentity
+    author: ImportedIdentity
     content: String
     created_at: Timestamp?
     updated_at: Timestamp?
@@ -311,7 +311,7 @@ value ImportedComment {
 
 -- from: modules/migration/review.go:55
 value ImportedReviewComment {
-    author: ExternalIdentity?
+    author: ImportedIdentity?
     content: String
     tree_path: String
     diff_hunk: String?
@@ -325,7 +325,7 @@ value ImportedReviewComment {
 -- from: modules/migration/review.go:37
 value ImportedReview {
     issue_number: Integer
-    reviewer: ExternalIdentity
+    reviewer: ImportedIdentity
     official: Boolean
     commit_sha: String?
     content: String
@@ -404,7 +404,7 @@ contract ImportSink {
     @invariant PreservesOriginalAuthorship
         -- Every imported issue, pull request, comment, review, review
         -- comment, release and reaction is attributed either to a resolved
-        -- local account (ExternalIdentityResolver) or to the ghost
+        -- local account (ImportedIdentityResolver) or to the ghost
         -- placeholder user while carrying the original author's name and
         -- external id, so it can be re-attributed later.
 
@@ -433,9 +433,9 @@ contract ImportSink {
 
 -- Resolves a source identity to a local account.
 -- from: services/migrations/gitea_uploader.go:1065
-contract ExternalIdentityResolver {
-    resolve: (source_kind: SourceKind, identity: ExternalIdentity) -> accounts/User
-    resolve_same_instance: (identity: ExternalIdentity) -> accounts/User
+contract ImportedIdentityResolver {
+    resolve: (source_kind: SourceKind, identity: ImportedIdentity) -> accounts/User
+    resolve_same_instance: (identity: ImportedIdentity) -> accounts/User
 
     @invariant ResolutionOrder
         -- When the source is this same instance (original URL starts with
@@ -1790,9 +1790,7 @@ invariant AuthorshipPointsAtItsContent {
 -- Actor Declarations
 ------------------------------------------------------------
 
-actor SignedInUser {
-    identified_by: accounts/User where is_active = true and prohibit_login = false
-}
+-- Anyone signed in: access/SignedInUser.
 
 actor MigrationRepoAdmin {
     within: Migration
@@ -1827,7 +1825,7 @@ actor InstanceOperator {
 
 -- The "New migration" page and POST /repos/migrate.
 surface MigrationForm {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
 
     exposes:
         for p in SourceProfiles:
@@ -1972,7 +1970,7 @@ surface CoreHostBoundary {
 
     contracts:
         demands ImportSink
-        demands ExternalIdentityResolver
+        demands ImportedIdentityResolver
         demands OutboundFetchPolicy
         demands BackgroundJobQueue
 

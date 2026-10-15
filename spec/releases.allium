@@ -751,9 +751,7 @@ actor TagSource {
     identified_by: accounts/User where can_write_code(this, within)
 }
 
-actor ReleaseSyncAdmin {
-    identified_by: accounts/User where is_admin = true
-}
+-- Site administrators: access/SiteAdmin.
 
 ------------------------------------------------------------
 -- Surfaces
@@ -899,7 +897,7 @@ surface TagReconciliation {
 }
 
 surface ReleaseSyncAdministration {
-    facing admin: ReleaseSyncAdmin
+    facing admin: access/SiteAdmin
 
     provides:
         AdminResynchronisesAllTags(admin)

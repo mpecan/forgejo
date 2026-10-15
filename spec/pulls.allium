@@ -73,6 +73,8 @@
 --   ReviewDismissed(review, dismisser, message)
 --   PullRequestHeadBranchDeleted(pull_request, doer)
 --   SuggestionsApplied(pull_request, doer, conversations)
+--   IssueClosedByPullRequest(issue, pull_request, doer)   -- per issue the merged PR closes by keyword
+--   IssueReopenedByPullRequest(issue, pull_request, doer) -- per issue the merged PR reopens by keyword
 --
 -- Reacts to:
 --   code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
@@ -153,6 +155,9 @@ use "./issues.allium" as issues
 --   count_suggestions(body): number of ```suggestion blocks
 --   code_owner_users(rules, pr), code_owner_teams(rules, pr)
 --   compose_merge_message(pr, style, title, message), default_merge_message(pr, style)
+--   issues_closed_by(pr) / issues_reopened_by(pr) -> Set<issues/Issue>: the issues whose
+--       latest keyword reference from this PR (issues/Comment with ref_issue = pr.issue
+--       and ref_action closes / reopens) is a close / reopen; one entry per issue
 --   agit_head_branch / rename_agit_head_branch: "<lowercase user name>/<topic>"
 -- Elsewhere:
 --   has_open_blocking_dependencies(issue): issues dependencies enabled and an open blocker exists
@@ -1094,6 +1099,20 @@ rule UserMergesPullRequest {
         -- default_merge_message_all_authors).
 }
 
+-- Whatever way a pull request got merged, each issue it references with a
+-- closing or reopening keyword (title, description or its comments) is closed
+-- or reopened by the merger; issues applies the change (and leaves an issue
+-- with open blockers open).
+-- from: services/pull/merge.go:288
+rule MergeResolvesReferencedIssues {
+    when: PullRequestMerged(pull_request, merger)
+    ensures:
+        for target in issues_closed_by(pull_request):
+            IssueClosedByPullRequest(issue: target, pull_request: pull_request, doer: merger)
+        for target in issues_reopened_by(pull_request):
+            IssueReopenedByPullRequest(issue: target, pull_request: pull_request, doer: merger)
+}
+
 -- The merge push reached the base branch (code's post-receive). Marks the PR
 -- merged when the merge rule has not already done so.
 -- from: routers/private/hook_post_receive.go:355
@@ -1840,11 +1859,6 @@ actor PullRequestRepoAdmin {
     identified_by: accounts/User where is_repo_admin(this, within.base_repository)
 }
 
--- An instance (site) administrator.
-actor SiteAdministrator {
-    identified_by: accounts/User where is_admin = true
-}
-
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
@@ -2066,7 +2080,7 @@ surface ReviewModeration {
 
 -- Instance administrators.
 surface SiteAdminReviewControls {
-    facing admin: SiteAdministrator
+    facing admin: access/SiteAdmin
     context review: Review
 
     exposes:
