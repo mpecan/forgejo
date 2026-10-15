@@ -1,0 +1,1916 @@
+-- allium: 3
+-- organizations.allium — organizations, their teams, team membership, invitations and team repository access.
+--
+-- Scope: Everything that makes an organization a shared owner of repositories:
+--   the organization's lifecycle and settings, its membership (always mediated
+--   by teams), the Owners team and its invariants, teams with their access
+--   level and per-unit grants, team invitations, the set of repositories each
+--   team covers, membership visibility, org-level blocking and the org profile.
+--
+-- Includes:
+--   - Organization create (who may, instance switches), profile settings,
+--     rename, visibility (public/limited/private), avatar, delete (refused
+--     while it still owns repositories or packages), purge on behalf of the
+--     system (owner account deletion, moderation).
+--   - OrgMembership (public/concealed), leaving, removal by owners.
+--   - Team create/edit/delete, access mode (read/write/admin/owner), per-unit
+--     access, includes-all-repositories, can-create-org-repo.
+--   - The Owners team: exists from creation, cannot be deleted or renamed,
+--     always owner access over all repositories, never empties.
+--   - TeamMembership add/remove/join/leave, provenance (creator, co-opted by a
+--     person, synchronised from an authentication source).
+--   - TeamInvite by account or by e-mail address, expiry, accept/decline/revoke,
+--     ADD_MEMBERS_BY_INVITATIONS consent flow.
+--   - TeamRepository add/remove/add-all/remove-all, including from the
+--     repository side by repository admins when the org allows it.
+--   - Who can see the organization, its members and its teams.
+--   - Organization profile from the `.profile` repository.
+--
+-- Excludes:
+--   - Org-level labels (owned by issues.allium).
+--   - Org webhooks (webhooks.allium), org actions secrets/variables/runners
+--     (actions.allium), org packages and cleanup rules (packages.allium), org
+--     projects (projects.allium), org OAuth2 applications (authentication.allium),
+--     org quota (quota.allium).
+--   - The derived repository permission a team grants: computed by
+--     access.allium from Team, TeamUnitAccess and TeamRepository declared here.
+--   - Org dashboards, org activity feeds (notifications.allium); explore page and
+--     org search (discovery.allium).
+--   - "Ghost team" placeholder and the doctor repair of inconsistent Owners-team
+--     units: legacy data-repair, not behaviour a rebuild needs.
+--   - Membership reason "unknown": exists only for rows created before
+--     provenance was tracked (legacy).
+--   - The deprecated API `units` list (replaced by a per-unit map): Gitea
+--     API compatibility only.
+--   - Denormalised counters (num_members, num_teams, num_repos): derived here as
+--     `.count` of relationships.
+--   - Org-level user blocking (OrganizationBlocksUser / OrganizationUnblocksUser,
+--     the OrganizationBlockList surface): owned by accounts.allium, which
+--     owns UserBlock with an organization blocker; it uses is_org_owner from
+--     here. Note: a block does not end an existing org membership.
+--   - Team-scoped review requests are removed with a team: pulls.allium reacts
+--     to TeamDeleted.
+--
+-- Emits (domain triggers other modules react to):
+--   OrganizationCreated(organization, creator)
+--   OrganizationRenamed(organization, old_name, new_name)
+--   OrganizationVisibilityChanged(organization)
+--   OrganizationProfileUpdated(organization)
+--   OrganizationAvatarChanged(organization)
+--   OrganizationDeleted(organization)
+--   OrganizationPurgeStarted(organization)
+--   OrgMemberAdded(organization, user)
+--   OrgMemberRemoved(organization, user)
+--   OrgMembershipVisibilityChanged(membership)
+--   TeamCreated(team, actor)
+--   TeamUpdated(team, actor)
+--   TeamAccessChanged(team)
+--   TeamDeleted(team)
+--   TeamMemberAdded(team, user)
+--   TeamMemberRemoved(team, user)
+--   TeamInviteCreated(invite, inviter)   -- notifications mails the invitee
+--   TeamInviteDeclined(invite)
+--   TeamRepositoryAdded(team, repository)
+--   TeamRepositoryRemoved(team, repository)
+--
+-- Reacts to:
+--   repositories/Repository.created  -- add new org repo to includes-all teams
+--   OrgRepositoryArrived(repository) / OrgRepositoryDeparted(repository, organization)
+--       (see REQUESTs: emitted by repositories on transfer/delete)
+--   authentication/ExternalGroupsAsserted(user, source, groups)  -- group-to-team sync
+--   authentication/AuthSourceDeleted(source)                      -- forget provenance
+--   accounts/UserPurgeStarted(user)  -- leave every org; purge orgs where last owner
+--   moderation/ModeratorDeletesOrganization(admin, organization)  -- purge the org
+
+use "./accounts.allium" as accounts
+use "./access.allium" as access
+use "./repositories.allium" as repositories
+use "./authentication.allium" as authentication
+use "./moderation.allium" as moderation
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A request with no signed-in identity. access.allium owns the canonical
+-- anonymous actor; this stands in for it until the integration pass.
+external entity Visitor {
+    is_signed_in: Boolean
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- How a person came to be on a team.
+-- from: models/organization/team_user.go:20
+enum MembershipReason {
+    org_creator | added_by_user | added_by_auth_source
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- An account that owns repositories on behalf of a group of people. Shares the
+-- owner namespace with accounts/User (one name cannot be both).
+-- from: models/organization/org.go:84
+entity Organization {
+    name: String                              -- unique across users and orgs, max 40, renamable
+    full_name: String?                        -- max 100
+    description: String?                      -- max 255, rendered as markdown on the profile
+    website: String?                          -- max 255, must be a valid site URL
+    location: String?                         -- max 50
+    email: String?                            -- public contact address, max 255
+    visibility: accounts/Visibility
+    repo_admin_change_team_access: Boolean    -- repo admins may add/remove teams on their repo
+    max_repo_creation: Integer?               -- null: instance default limit applies (site admin only)
+    has_custom_avatar: Boolean
+    created_at: Timestamp
+
+    -- Relationships
+    teams: Team with organization = this
+    memberships: OrgMembership with organization = this
+    invites: TeamInvite with organization = this
+
+    -- Projections
+    members: memberships -> user
+    public_members: memberships where is_public = true -> user
+    owners_team: Team with organization = this and is_owners_team = true
+    owners: owners_team.members
+
+    -- Derived
+    is_public: visibility = public
+    member_count: memberships.count
+    team_count: teams.count
+    owner_count: owners.count
+
+    has_member(u): u in members
+    has_owner(u): u in owners
+    -- Owner, or member of any team with admin access.
+    has_admin(u): teams.any(t => t.is_admin_team and u in t.members)
+    -- May create repositories owned by the org.
+    lets_create_repo(u): u.is_admin or teams.any(t => (t.can_create_org_repo or t.access_mode = owner) and u in t.members)
+    -- Sees every team (not only the ones they are on).
+    sees_all_teams(u): u.is_admin or u in owners
+        or teams.any(t => t.includes_all_repositories and t.access_mode in {admin, owner} and u in t.members)
+    -- Which signed-in people can see that the organization exists at all.
+    -- from: models/organization/org.go:526
+    is_visible_to(u): u.is_admin or u in members
+        or (not u.is_restricted and visibility in {public, limited})
+    -- Signed-in people for whom concealed memberships are listed too.
+    sees_concealed_members(u): u.is_admin or u in members
+}
+
+-- The fact that a person belongs to an organization. Exists exactly while the
+-- person is on at least one of the organization's teams.
+-- from: models/organization/org_user.go:21
+entity OrgMembership {
+    organization: Organization
+    user: accounts/User
+    is_public: Boolean                        -- shown on the org and the user's profile to everyone
+    joined_at: Timestamp
+
+    team_memberships: TeamMembership with organization = organization and user = user
+}
+
+-- A named group within an organization granting its members one access level
+-- over a set of the organization's repositories.
+-- from: models/organization/team.go:66
+entity Team {
+    organization: Organization
+    name: String                              -- AlphaDashDot, max 255, unique per org ignoring case, not "new"
+    description: String?                      -- max 255
+    access_mode: access/AccessMode            -- read | write (summary of unit grants) | admin | owner
+    includes_all_repositories: Boolean        -- covers every current and future org repository
+    can_create_org_repo: Boolean
+    is_owners_team: Boolean
+
+    -- Relationships
+    memberships: TeamMembership with team = this
+    unit_accesses: TeamUnitAccess with team = this
+    repository_links: TeamRepository with team = this
+    invites: TeamInvite with team = this
+
+    -- Projections
+    members: memberships -> user
+    repositories: repository_links -> repository
+    pending_invites: invites where status = pending
+    expired_invites: invites where status = expired
+
+    -- Derived
+    member_count: memberships.count
+    repository_count: repository_links.count
+    is_admin_team: access_mode in {admin, owner}
+    has_member(u): u in members
+    covers(r): r in repositories
+    -- Who may open the team page and list its members and repositories.
+    -- from: services/context/org.go:245
+    can_be_viewed_by(u): u in members or organization.sees_all_teams(u)
+}
+
+-- One person's place on one team.
+-- from: models/organization/team_user.go:36
+entity TeamMembership {
+    team: Team
+    organization: Organization                -- always team.organization
+    user: accounts/User
+    reason: MembershipReason
+    added_by: accounts/User?                  -- set when reason = added_by_user
+    auth_source: authentication/AuthSource?   -- set when reason = added_by_auth_source
+    added_at: Timestamp
+}
+
+-- The access a team grants to one repository unit. Admin and owner teams carry
+-- their own mode on every unit, except external wiki/tracker which are read.
+-- Read/write teams grant at most write per unit.
+-- from: models/organization/team_unit.go:15
+entity TeamUnitAccess {
+    team: Team
+    unit: repositories/UnitKind
+    access_mode: access/AccessMode
+}
+
+-- A repository a team covers. The repository is always owned by the team's org.
+-- from: models/organization/team_repo.go:17
+entity TeamRepository {
+    team: Team
+    repository: repositories/Repository
+}
+
+-- A pending offer to join a team, addressed either to an existing account or to
+-- an e-mail address. Accepting it is the invitee's consent to join the org.
+-- from: models/organization/team_invite.go:97
+entity TeamInvite {
+    team: Team
+    organization: Organization                -- always team.organization
+    inviter: accounts/User
+    email: String
+    invited_user: accounts/User?              -- null: invitation by e-mail address only
+    token: String                             -- unguessable secret carried by the invite link
+    created_at: Timestamp
+    expires_at: Timestamp?                    -- null: never expires (expiry disabled)
+    status: pending | expired
+
+    transitions status {
+        pending -> expired
+        terminal: expired
+    }
+
+    is_addressed_to(u): invited_user = null or invited_user = u
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [admin] DISABLE_REGULAR_ORG_CREATION: only site admins may create orgs.
+    disable_regular_org_creation: Boolean = false
+    -- [service] DEFAULT_ORG_VISIBILITY: preselected visibility on the create form.
+    default_org_visibility: accounts/Visibility = public
+    -- [service] DEFAULT_ORG_MEMBER_VISIBLE: new memberships start public.
+    default_org_member_visible: Boolean = false
+    -- [service] ADD_MEMBERS_BY_INVITATIONS: adding someone who is not yet an org
+    -- member sends an invitation instead of adding them directly.
+    add_members_by_invitations: Boolean = false
+    -- [service] TEAM_INVITATION_EXPIRY_DAYS: zero disables expiry.
+    team_invitation_expiry: Duration = 14.days
+    -- Organization name length limit (shared with user names).
+    max_org_name_length: Integer = 40
+    max_full_name_length: Integer = 100
+    max_description_length: Integer = 255
+    max_website_length: Integer = 255
+    max_location_length: Integer = 50
+    max_team_name_length: Integer = 255
+    max_team_description_length: Integer = 255
+}
+
+------------------------------------------------------------
+-- Rules: creating an organization
+------------------------------------------------------------
+
+-- A signed-in person founds an organization and becomes its first owner.
+-- from: models/organization/org.go:268
+rule UserCreatesOrganization {
+    when: UserCreatesOrganization(creator, name, visibility, repo_admin_change_team_access)
+
+    requires: creator.is_admin
+        or (creator.allow_create_organization and not config.disable_regular_org_creation)
+    requires: is_usable_owner_name(name)
+    requires: length(name) <= config.max_org_name_length
+    requires: owner_name_available(name)
+
+    ensures:
+        let org = Organization.created(
+            name: name,
+            visibility: visibility,
+            repo_admin_change_team_access: repo_admin_change_team_access,
+            has_custom_avatar: false,
+            created_at: now
+        )
+        let owners = Team.created(
+            organization: org,
+            name: "Owners",
+            access_mode: owner,
+            includes_all_repositories: true,
+            can_create_org_repo: true,
+            is_owners_team: true
+        )
+        for g in owner_unit_grants():
+            TeamUnitAccess.created(team: owners, unit: g.unit, access_mode: g.access_mode)
+        OrgMembership.created(
+            organization: org,
+            user: creator,
+            is_public: config.default_org_member_visible,
+            joined_at: now
+        )
+        TeamMembership.created(
+            team: owners,
+            organization: org,
+            user: creator,
+            reason: org_creator,
+            added_at: now
+        )
+        OrganizationCreated(organization: org, creator: creator)
+
+    @guidance
+        -- Web: GET/POST /org/create. API: POST /orgs.
+        -- The name check covers reserved names and patterns and the
+        -- character set accepted for user names; a name held by any
+        -- user or organization is taken. A stale rename redirect for the
+        -- name is dropped (accounts reacts to OrganizationCreated).
+        -- A generated identicon is the initial avatar.
+}
+
+-- A site admin founds an organization on behalf of an existing person, who
+-- becomes its first owner.
+-- from: routers/api/v1/admin/org.go:24
+rule AdminCreatesOrganizationForUser {
+    when: AdminCreatesOrganizationForUser(admin, owner, name, visibility)
+
+    requires: admin.is_admin
+    requires: owner.kind in {individual, bot}
+    requires: owner.is_admin
+        or (owner.allow_create_organization and not config.disable_regular_org_creation)
+    requires: is_usable_owner_name(name)
+    requires: length(name) <= config.max_org_name_length
+    requires: owner_name_available(name)
+
+    ensures:
+        let org = Organization.created(
+            name: name,
+            visibility: visibility,
+            repo_admin_change_team_access: false,
+            has_custom_avatar: false,
+            created_at: now
+        )
+        let owners = Team.created(
+            organization: org,
+            name: "Owners",
+            access_mode: owner,
+            includes_all_repositories: true,
+            can_create_org_repo: true,
+            is_owners_team: true
+        )
+        for g in owner_unit_grants():
+            TeamUnitAccess.created(team: owners, unit: g.unit, access_mode: g.access_mode)
+        OrgMembership.created(
+            organization: org,
+            user: owner,
+            is_public: config.default_org_member_visible,
+            joined_at: now
+        )
+        TeamMembership.created(
+            team: owners,
+            organization: org,
+            user: owner,
+            reason: org_creator,
+            added_at: now
+        )
+        OrganizationCreated(organization: org, creator: owner)
+
+    @guidance
+        -- API: POST /admin/users/{username}/orgs.
+}
+
+------------------------------------------------------------
+-- Rules: organization settings
+------------------------------------------------------------
+
+-- from: routers/web/org/setting.go:120
+rule OwnerUpdatesOrganizationProfile {
+    when: OwnerUpdatesOrganizationProfile(actor, org, full_name, description, website, location, email)
+
+    requires: is_org_owner(org, actor) or actor.is_admin
+    requires: full_name = null or length(full_name) <= config.max_full_name_length
+    requires: description = null or length(description) <= config.max_description_length
+    requires: website = null or (is_valid_site_url(website) and length(website) <= config.max_website_length)
+    requires: location = null or length(location) <= config.max_location_length
+    requires: email = null or is_valid_email(email)
+
+    ensures: org.full_name = full_name
+    ensures: org.description = description
+    ensures: org.website = website
+    ensures: org.location = location
+    ensures: org.email = email
+    ensures: OrganizationProfileUpdated(organization: org)
+
+    @guidance
+        -- Web: POST /org/{org}/settings. API: PATCH /orgs/{org} (each field
+        -- optional; an empty e-mail clears it).
+}
+
+-- from: routers/web/org/setting.go:135
+rule OwnerChangesOrganizationVisibility {
+    when: OwnerChangesOrganizationVisibility(actor, org, visibility)
+
+    requires: is_org_owner(org, actor) or actor.is_admin
+    requires: visibility != org.visibility
+
+    ensures: org.visibility = visibility
+    ensures: OrganizationVisibilityChanged(organization: org)
+
+    @guidance
+        -- Part of the settings form / PATCH /orgs/{org}. Unlike user
+        -- accounts, organizations are not restricted by the instance's
+        -- allowed-user-visibility list. Search indexes of the org's
+        -- repositories are refreshed (discovery reacts).
+}
+
+-- Whether repository admins may grant or withdraw team access on their repo.
+-- from: routers/web/org/setting.go:128
+rule OwnerSetsRepoAdminTeamAccess {
+    when: OwnerSetsRepoAdminTeamAccess(actor, org, allowed)
+
+    requires: is_org_owner(org, actor) or actor.is_admin
+
+    ensures: org.repo_admin_change_team_access = allowed
+}
+
+-- from: routers/web/org/setting.go:130
+rule AdminSetsOrganizationRepoLimit {
+    when: AdminSetsOrganizationRepoLimit(admin, org, limit)
+
+    requires: admin.is_admin
+
+    ensures: org.max_repo_creation = limit
+
+    @guidance
+        -- null restores the instance default (repositories' MAX_CREATION_LIMIT).
+}
+
+-- from: services/user/user.go:69
+rule OwnerRenamesOrganization {
+    when: OwnerRenamesOrganization(actor, org, new_name)
+
+    requires: is_org_owner(org, actor) or actor.is_admin
+    requires: new_name != org.name
+    requires: is_usable_owner_name(new_name)
+    requires: length(new_name) <= config.max_org_name_length
+    requires: owner_name_available(new_name) or lower(new_name) = lower(org.name)
+    requires: owner_name_claimable(new_name, org) or actor.is_admin
+
+    let old_name = org.name
+
+    ensures: org.name = new_name
+    ensures: OrganizationRenamed(organization: org, old_name: old_name, new_name: new_name)
+
+    @guidance
+        -- Web: name field of POST /org/{org}/settings. API: POST
+        -- /orgs/{org}/rename. Organizations can always be renamed (no
+        -- local-account restriction). The name cooldown (accounts'
+        -- USERNAME_COOLDOWN_PERIOD) applies unless a site admin renames.
+        -- A pure change of letter case is always allowed. accounts records a
+        -- redirect from the old name; repositories update owner names.
+}
+
+-- from: routers/web/org/setting.go:162
+rule OwnerUploadsOrganizationAvatar {
+    when: OwnerUploadsOrganizationAvatar(actor, org, image)
+
+    requires: is_org_owner(org, actor) or actor.is_admin
+    requires: is_acceptable_avatar(image)
+
+    ensures: org.has_custom_avatar = true
+    ensures: OrganizationAvatarChanged(organization: org)
+
+    @guidance
+        -- Web: POST /org/{org}/settings/avatar. API: POST /orgs/{org}/avatar
+        -- (base64 image). Size and dimension limits are accounts' avatar
+        -- settings ([avatar] MAX_FILE_SIZE, MAX_WIDTH, MAX_HEIGHT).
+}
+
+-- from: routers/web/org/setting.go:174
+rule OwnerDeletesOrganizationAvatar {
+    when: OwnerDeletesOrganizationAvatar(actor, org)
+
+    requires: is_org_owner(org, actor) or actor.is_admin
+
+    ensures: org.has_custom_avatar = false
+    ensures: OrganizationAvatarChanged(organization: org)
+
+    @guidance
+        -- Web: POST /org/{org}/settings/avatar/delete. API: DELETE /orgs/{org}/avatar.
+        -- Falls back to a generated identicon.
+}
+
+------------------------------------------------------------
+-- Rules: deleting an organization
+------------------------------------------------------------
+
+-- An owner deletes an empty organization. Refused while it owns repositories
+-- or packages: those must be deleted or transferred first.
+-- from: services/org/org.go:22
+rule OwnerDeletesOrganization {
+    when: OwnerDeletesOrganization(actor, org, confirmation_name)
+
+    requires: is_org_owner(org, actor) or actor.is_admin
+    requires: confirmation_name = org.name
+    requires: owned_repository_count(org) = 0
+    requires: owned_package_count(org) = 0
+
+    ensures:
+        for i in org.invites:
+            not exists i
+        for t in org.teams:
+            for tm in t.memberships:
+                not exists tm
+            for tu in t.unit_accesses:
+                not exists tu
+            for tr in t.repository_links:
+                not exists tr
+            not exists t
+        for m in org.memberships:
+            not exists m
+        not exists org
+        OrganizationDeleted(organization: org)
+
+    @guidance
+        -- Web: POST /org/{org}/settings/delete (must type the org name).
+        -- API: DELETE /orgs/{org}. Reactors to OrganizationDeleted remove the
+        -- org's actions secrets, runners and registration tokens (actions),
+        -- its follows, blocks and uploaded avatar (accounts), its webhooks,
+        -- labels and projects. The name becomes free immediately.
+}
+
+-- The system deletes an organization together with everything it owns: when
+-- its last owner's account is purged, or by moderation.
+-- from: services/org/org.go:23
+rule SystemPurgesOrganization {
+    when: OrganizationPurgeRequested(org)
+
+    ensures:
+        for i in org.invites:
+            not exists i
+        for t in org.teams:
+            for tm in t.memberships:
+                not exists tm
+            for tu in t.unit_accesses:
+                not exists tu
+            for tr in t.repository_links:
+                not exists tr
+            not exists t
+        for m in org.memberships:
+            not exists m
+        not exists org
+        OrganizationPurgeStarted(organization: org)
+        OrganizationDeleted(organization: org)
+
+    @guidance
+        -- repositories and packages react to OrganizationPurgeStarted by
+        -- deleting every repository and package the org owns before the org
+        -- record goes. Triggered by accounts (purging a user who is last
+        -- owner) and moderation (admin acting on an abuse report).
+}
+
+-- A site admin deletes an organization in response to an abuse report.
+-- from: routers/web/admin/reports.go:329
+rule ModeratorPurgesOrganization {
+    when: moderation/ModeratorDeletesOrganization(admin, organization)
+
+    ensures: OrganizationPurgeRequested(organization)
+}
+
+------------------------------------------------------------
+-- Rules: organization membership
+------------------------------------------------------------
+
+-- A member shows or hides their own membership; owners may change it for any
+-- member.
+-- from: routers/web/org/members.go:93
+rule MemberChangesMembershipVisibility {
+    when: MemberChangesMembershipVisibility(actor, membership, is_public)
+
+    requires: actor = membership.user
+        or is_org_owner(membership.organization, actor)
+        or actor.is_admin
+    requires: membership.is_public != is_public
+
+    ensures: membership.is_public = is_public
+    ensures: OrgMembershipVisibilityChanged(membership: membership)
+
+    @guidance
+        -- Web: POST /org/{org}/members/action/{public|private}?uid=
+        -- (self or owner). API: PUT/DELETE /orgs/{org}/public_members/{username}
+        -- (self only — see open question).
+}
+
+-- A member leaves the organization, which takes them off every team.
+-- from: models/org.go:18
+rule MemberLeavesOrganization {
+    when: MemberLeavesOrganization(user, org)
+
+    let membership = OrgMembership{organization: org, user: user}
+
+    requires: exists membership
+    requires: not is_org_owner(org, user) or owner_count(org) > 1
+
+    ensures:
+        for tm in membership.team_memberships:
+            not exists tm
+            TeamMemberRemoved(team: tm.team, user: user)
+        not exists membership
+        OrgMemberRemoved(organization: org, user: user)
+
+    @guidance
+        -- Web: POST /org/{org}/members/action/leave, also offered from
+        -- /user/settings/organization. The last owner cannot leave.
+}
+
+-- An owner removes a person from the organization (every team).
+-- from: routers/web/org/members.go:106
+rule OwnerRemovesOrgMember {
+    when: OwnerRemovesOrgMember(actor, org, user)
+
+    let membership = OrgMembership{organization: org, user: user}
+
+    requires: is_org_owner(org, actor) or actor.is_admin
+    requires: exists membership
+    requires: not is_org_owner(org, user) or owner_count(org) > 1
+
+    ensures:
+        for tm in membership.team_memberships:
+            not exists tm
+            TeamMemberRemoved(team: tm.team, user: user)
+        not exists membership
+        OrgMemberRemoved(organization: org, user: user)
+
+    @guidance
+        -- Web: POST /org/{org}/members/action/remove?uid=.
+        -- API: DELETE /orgs/{org}/members/{username}.
+}
+
+-- An owner brings an existing person into the organization by putting them on
+-- one or more teams. Under ADD_MEMBERS_BY_INVITATIONS each team gets an
+-- invitation instead (see OwnerAddsTeamMember).
+-- from: routers/web/org/members.go:113
+rule OwnerAddsMemberToOrganization {
+    when: OwnerAddsMemberToOrganization(actor, org, user, teams)
+
+    requires: is_org_owner(org, actor) or actor.is_admin
+    requires: user.kind in {individual, bot, remote}
+    requires: not is_org_member(org, user)
+    requires: not config.add_members_by_invitations
+        or not has_pending_org_invite(org, user)
+    requires: teams.count > 0
+    requires: teams.all(t => t.organization = org)
+
+    ensures:
+        for t in teams:
+            OwnerAddsTeamMember(actor, t, user)
+
+    @guidance
+        -- Web: POST /org/{org}/members/action/add with uname and team_<id>
+        -- checkboxes. Organizations cannot be members.
+}
+
+-- A person whose account is being purged is taken out of every organization;
+-- organizations where they are the last owner are purged with them. (A
+-- non-purge account deletion is refused by accounts while the person still
+-- belongs to any organization.)
+-- from: services/user/user.go:244
+rule RemoveDeletedUserFromOrganizations {
+    when: accounts/UserPurgeStarted(user)
+
+    ensures:
+        for m in OrgMemberships where user = user:
+            if is_org_owner(m.organization, user) and owner_count(m.organization) = 1:
+                OrganizationPurgeRequested(m.organization)
+            else:
+                for tm in m.team_memberships:
+                    not exists tm
+                    TeamMemberRemoved(team: tm.team, user: user)
+                not exists m
+                OrgMemberRemoved(organization: m.organization, user: user)
+}
+
+-- Losing the last team means losing the organization.
+-- from: models/org_team.go:519
+rule DropOrgMembershipWithoutTeams {
+    when: TeamMemberRemoved(team, user)
+
+    let membership = OrgMembership{organization: team.organization, user: user}
+
+    requires: exists membership
+    requires: not is_on_any_team(team.organization, user)
+
+    ensures: not exists membership
+    ensures: OrgMemberRemoved(organization: team.organization, user: user)
+
+    @guidance
+        -- Removing someone from their last team (or deleting their last
+        -- team) ends their organization membership. access, repositories
+        -- and issues react to OrgMemberRemoved / TeamMemberRemoved by
+        -- dropping watches, issue subscriptions and assignments on
+        -- repositories the person can no longer read.
+}
+
+------------------------------------------------------------
+-- Rules: teams
+------------------------------------------------------------
+
+-- from: models/org_team.go:177
+rule OwnerCreatesTeam {
+    when: OwnerCreatesTeam(actor, org, name, description, access_mode, grants, includes_all_repositories, can_create_org_repo)
+
+    requires: is_org_owner(org, actor) or actor.is_admin
+    requires: is_alpha_dash_dot(name)
+    requires: length(name) <= config.max_team_name_length
+    requires: lower(name) != "new"
+    requires: not team_name_taken(org, name)
+    requires: description = null or length(description) <= config.max_team_description_length
+    requires: access_mode in {read, write, admin}
+    requires: access_mode = admin or grants_some_unit(grants)
+
+    let effective_mode = team_mode_for(access_mode, grants)
+
+    ensures:
+        let team = Team.created(
+            organization: org,
+            name: name,
+            description: description,
+            access_mode: effective_mode,
+            includes_all_repositories: includes_all_repositories,
+            can_create_org_repo: can_create_org_repo,
+            is_owners_team: false
+        )
+        for g in normalised_unit_grants(access_mode, grants):
+            TeamUnitAccess.created(team: team, unit: g.unit, access_mode: g.access_mode)
+        if includes_all_repositories:
+            for r in org_repositories(org):
+                TeamRepository.created(team: team, repository: r)
+        TeamCreated(team: team, actor: actor)
+
+    @guidance
+        -- Web: GET/POST /org/{org}/teams/new. API: POST /orgs/{org}/teams
+        -- (units_map: unit key -> none|read|write|admin).
+        -- Normalisation: an admin team gets admin on every unit and read on
+        -- external wiki/tracker; a read/write team keeps its per-unit
+        -- choices clamped to write, external units to read, and its
+        -- summary access_mode is the lowest non-none unit grant.
+}
+
+-- Editing any team except Owners.
+-- from: routers/web/org/teams.go:530
+rule OwnerEditsTeam {
+    when: OwnerEditsTeam(actor, team, name, description, access_mode, grants, includes_all_repositories, can_create_org_repo)
+
+    requires: is_org_owner(team.organization, actor) or actor.is_admin
+    requires: not team.is_owners_team
+    requires: is_alpha_dash_dot(name)
+    requires: length(name) <= config.max_team_name_length
+    requires: lower(name) != "new"
+    requires: not team_name_taken_by_other(team, name)
+    requires: description = null or length(description) <= config.max_team_description_length
+    requires: access_mode in {read, write, admin}
+    requires: access_mode = admin or grants_some_unit(grants)
+
+    let effective_mode = team_mode_for(access_mode, grants)
+    let was_includes_all = team.includes_all_repositories
+
+    ensures: team.name = name
+    ensures: team.description = description
+    ensures: team.access_mode = effective_mode
+    ensures: team.includes_all_repositories = includes_all_repositories
+    ensures: team.can_create_org_repo = can_create_org_repo
+    ensures:
+        for old in team.unit_accesses:
+            not exists old
+        for g in normalised_unit_grants(access_mode, grants):
+            TeamUnitAccess.created(team: team, unit: g.unit, access_mode: g.access_mode)
+    ensures:
+        if includes_all_repositories and not was_includes_all:
+            for r in org_repositories(team.organization):
+                if not team_covers(team, r):
+                    TeamRepository.created(team: team, repository: r)
+    ensures: TeamUpdated(team: team, actor: actor)
+    ensures: TeamAccessChanged(team: team)
+
+    @guidance
+        -- Web: GET/POST /org/{org}/teams/{team}/edit. API: PATCH
+        -- /teams/{id} (all fields optional). Any edit of mode, unit grants or
+        -- includes-all is an access change for access.allium. Switching
+        -- includes-all off keeps the repositories already linked.
+}
+
+-- The Owners team keeps its name, owner access, all repositories and the
+-- right to create repositories; only its description can change.
+-- from: routers/web/org/teams.go:567
+rule OwnerEditsOwnersTeamDescription {
+    when: OwnerEditsOwnersTeamDescription(actor, team, description)
+
+    requires: is_org_owner(team.organization, actor) or actor.is_admin
+    requires: team.is_owners_team
+    requires: description = null or length(description) <= config.max_team_description_length
+
+    ensures: team.description = description
+    ensures: TeamUpdated(team: team, actor: actor)
+}
+
+-- from: models/org_team.go:323
+rule OwnerDeletesTeam {
+    when: OwnerDeletesTeam(actor, team)
+
+    requires: is_org_owner(team.organization, actor) or actor.is_admin
+    requires: not team.is_owners_team
+
+    ensures:
+        for i in team.invites:
+            not exists i
+        for tu in team.unit_accesses:
+            not exists tu
+        for tr in team.repository_links:
+            not exists tr
+        for tm in team.memberships:
+            not exists tm
+            TeamMemberRemoved(team: team, user: tm.user)
+        not exists team
+        TeamDeleted(team: team)
+
+    @guidance
+        -- Web: POST /org/{org}/teams/{team}/delete. API: DELETE /teams/{id}.
+        -- code removes the team from branch-protection allow lists and
+        -- pulls drops review requests addressed to it (both react to
+        -- TeamDeleted). Members left without any team leave the org.
+}
+
+------------------------------------------------------------
+-- Rules: team membership
+------------------------------------------------------------
+
+-- An owner puts a person on a team. With ADD_MEMBERS_BY_INVITATIONS and a
+-- person who is not yet an org member (and is not the owner themself), an
+-- invitation is sent instead so the person consents to joining.
+-- from: services/org/team_invite.go:34
+rule OwnerAddsTeamMember {
+    when: OwnerAddsTeamMember(actor, team, user)
+
+    requires: is_org_owner(team.organization, actor) or actor.is_admin
+    requires: user.kind in {individual, bot, remote}
+    requires: not is_team_member(team, user)
+    requires: not has_pending_team_invite(team, user)
+
+    let org = team.organization
+    let needs_consent = config.add_members_by_invitations and actor != user and not is_org_member(org, user)
+
+    ensures:
+        if needs_consent:
+            let invite = TeamInvite.created(
+                team: team,
+                organization: org,
+                inviter: actor,
+                email: user.primary_email,
+                invited_user: user,
+                token: new_invite_token(),
+                created_at: now,
+                expires_at: if config.team_invitation_expiry > 0.days: now + config.team_invitation_expiry else: null,
+                status: pending
+            )
+            TeamInviteCreated(invite: invite, inviter: actor)
+        else:
+            if not is_org_member(org, user):
+                OrgMembership.created(
+                    organization: org,
+                    user: user,
+                    is_public: config.default_org_member_visible,
+                    joined_at: now
+                )
+                OrgMemberAdded(organization: org, user: user)
+            TeamMembership.created(
+                team: team,
+                organization: org,
+                user: user,
+                reason: added_by_user,
+                added_by: actor,
+                added_at: now
+            )
+            TeamMemberAdded(team: team, user: user)
+
+    @guidance
+        -- Web: POST /org/{org}/teams/{team}/action/add (uname). API: PUT
+        -- /teams/{id}/members/{username}. An expired invitation for the same
+        -- person is replaced. repositories reacts to TeamMemberAdded by
+        -- auto-watching the team's repositories when AUTO_WATCH_NEW_REPOS.
+}
+
+-- An owner invites an e-mail address that has no account (yet).
+-- from: models/organization/team_invite.go:112
+rule OwnerInvitesEmailToTeam {
+    when: OwnerInvitesEmailToTeam(actor, team, email)
+
+    requires: is_org_owner(team.organization, actor) or actor.is_admin
+    requires: mail_service_enabled()
+    requires: is_valid_email(email)
+    requires: not has_pending_team_invite_for_email(team, email)
+    requires: not has_member_with_email(team, email)
+
+    ensures:
+        let invite = TeamInvite.created(
+            team: team,
+            organization: team.organization,
+            inviter: actor,
+            email: email,
+            invited_user: null,
+            token: new_invite_token(),
+            created_at: now,
+            expires_at: if config.team_invitation_expiry > 0.days: now + config.team_invitation_expiry else: null,
+            status: pending
+        )
+        TeamInviteCreated(invite: invite, inviter: actor)
+
+    @guidance
+        -- Web: the same "add" box on the team page, when the text is an
+        -- e-mail address and no account has that name.
+}
+
+-- An owner places themself on a team.
+-- from: routers/web/org/teams.go:81
+rule OwnerJoinsTeam {
+    when: OwnerJoinsTeam(actor, team)
+
+    requires: is_org_owner(team.organization, actor) or actor.is_admin
+    requires: not is_team_member(team, actor)
+
+    let org = team.organization
+
+    ensures:
+        if not is_org_member(org, actor):
+            OrgMembership.created(
+                organization: org,
+                user: actor,
+                is_public: config.default_org_member_visible,
+                joined_at: now
+            )
+            OrgMemberAdded(organization: org, user: actor)
+        TeamMembership.created(
+            team: team,
+            organization: org,
+            user: actor,
+            reason: added_by_user,
+            added_by: actor,
+            added_at: now
+        )
+        TeamMemberAdded(team: team, user: actor)
+
+    @guidance
+        -- Web: POST /org/{org}/teams/{team}/action/join.
+}
+
+-- A member takes themself off a team.
+-- from: routers/web/org/teams.go:87
+rule MemberLeavesTeam {
+    when: MemberLeavesTeam(user, team)
+
+    let tm = TeamMembership{team: team, user: user}
+
+    requires: exists tm
+    requires: not team.is_owners_team or team.member_count > 1
+
+    ensures: not exists tm
+    ensures: TeamMemberRemoved(team: team, user: user)
+
+    @guidance
+        -- Web: POST /org/{org}/teams/{team}/action/leave.
+}
+
+-- from: models/org_team.go:462
+rule OwnerRemovesTeamMember {
+    when: OwnerRemovesTeamMember(actor, team, user)
+
+    let tm = TeamMembership{team: team, user: user}
+
+    requires: is_org_owner(team.organization, actor) or actor.is_admin
+    requires: exists tm
+    requires: not team.is_owners_team or team.member_count > 1
+
+    ensures: not exists tm
+    ensures: TeamMemberRemoved(team: team, user: user)
+
+    @guidance
+        -- Web: POST /org/{org}/teams/{team}/action/remove?uid=.
+        -- API: DELETE /teams/{id}/members/{username}.
+}
+
+-- At sign-in (and on the scheduled LDAP sync) an authentication source asserts
+-- the person's external groups; its group-to-team map (static
+-- {group: {org: [team]}} or dynamic patterns capturing {org} and {team})
+-- says which teams that means.
+-- from: services/auth/source/source_group_sync.go:29
+rule SyncTeamsFromExternalGroups {
+    when: authentication/ExternalGroupsAsserted(user, source, groups)
+
+    ensures:
+        for team in teams_mapped_from(source, groups):
+            if not is_team_member(team, user):
+                AuthSourceSyncAddsTeamMember(source, user, team)
+        for team in teams_unmapped_from(source, user, groups):
+            AuthSourceSyncRemovesTeamMember(source, user, team)
+
+    @guidance
+        -- teams_unmapped_from is empty unless the source removes memberships
+        -- for groups the person no longer has (group_team_map_removal).
+        -- Teams or organizations named in the map that do not exist are
+        -- skipped.
+}
+
+-- When an authentication source is deleted, memberships it created stay but
+-- lose their provenance.
+-- from: models/organization/team_user.go:48
+rule ForgetDeletedAuthSourceProvenance {
+    when: authentication/AuthSourceDeleted(source)
+
+    ensures:
+        for tm in TeamMemberships where auth_source = source:
+            tm.auth_source = null
+}
+
+-- An authentication source (LDAP group, OAuth2 group claim) maps a group the
+-- person belongs to onto a team.
+-- from: services/auth/source/source_group_sync.go:332
+rule AuthSourceSyncAddsTeamMember {
+    when: AuthSourceSyncAddsTeamMember(source, user, team)
+
+    requires: not is_team_member(team, user)
+
+    let org = team.organization
+
+    ensures:
+        if not is_org_member(org, user):
+            OrgMembership.created(
+                organization: org,
+                user: user,
+                is_public: config.default_org_member_visible,
+                joined_at: now
+            )
+            OrgMemberAdded(organization: org, user: user)
+        TeamMembership.created(
+            team: team,
+            organization: org,
+            user: user,
+            reason: added_by_auth_source,
+            auth_source: source,
+            added_at: now
+        )
+        TeamMemberAdded(team: team, user: user)
+
+    @guidance
+        -- No invitation: the identity provider's group membership is the consent.
+}
+
+-- from: services/auth/source/source_group_sync.go:231
+rule AuthSourceSyncRemovesTeamMember {
+    when: AuthSourceSyncRemovesTeamMember(source, user, team)
+
+    let tm = TeamMembership{team: team, user: user}
+
+    requires: exists tm
+    requires: not team.is_owners_team or team.member_count > 1
+
+    ensures: not exists tm
+    ensures: TeamMemberRemoved(team: team, user: user)
+
+    @guidance
+        -- Only when the source is configured to remove memberships for groups
+        -- the person has left. The last owner is skipped, not an error.
+}
+
+------------------------------------------------------------
+-- Rules: team invitations
+------------------------------------------------------------
+
+-- from: services/org/team_invite.go:50
+rule InviteeAcceptsTeamInvite {
+    when: InviteeAcceptsTeamInvite(user, invite, hide_membership)
+
+    requires: invite.status = pending
+    requires: (invite.invited_user = null or invite.invited_user = user)
+    requires: not is_team_member(invite.team, user)
+
+    let team = invite.team
+    let org = invite.organization
+    let membership = OrgMembership{organization: org, user: user}
+
+    ensures:
+        if exists membership:
+            membership.is_public = not hide_membership
+        else:
+            OrgMembership.created(
+                organization: org,
+                user: user,
+                is_public: not hide_membership,
+                joined_at: now
+            )
+            OrgMemberAdded(organization: org, user: user)
+        TeamMembership.created(
+            team: team,
+            organization: org,
+            user: user,
+            reason: added_by_user,
+            added_by: invite.inviter,
+            added_at: now
+        )
+        TeamMemberAdded(team: team, user: user)
+        not exists invite
+
+    @guidance
+        -- Web: GET/POST /org/invite/{token} (anyone signed in holding the link
+        -- of an e-mail invitation; only the named person for an account
+        -- invitation). API: POST /user/team_invitations/{id}/accept
+        -- (hide_membership). After accepting, the next pending invitation
+        -- into the same org, if any, is shown.
+}
+
+-- from: services/org/team_invite.go:76
+rule InviteeDeclinesTeamInvite {
+    when: InviteeDeclinesTeamInvite(user, invite)
+
+    requires: invite.status = pending
+    requires: (invite.invited_user = null or invite.invited_user = user)
+
+    ensures: not exists invite
+    ensures: TeamInviteDeclined(invite: invite)
+
+    @guidance
+        -- Web: POST /org/invite/{token}/decline.
+        -- API: POST /user/team_invitations/{id}/decline.
+}
+
+-- from: models/organization/team_invite.go:247
+rule OwnerRevokesTeamInvite {
+    when: OwnerRevokesTeamInvite(actor, invite)
+
+    requires: is_org_owner(invite.organization, actor) or actor.is_admin
+
+    ensures: not exists invite
+
+    @guidance
+        -- Web: POST /org/{org}/teams/{team}/action/remove_invite?iid=.
+        -- API: DELETE /teams/{id}/invitations/{inviteid}. Works on pending
+        -- and expired invitations alike.
+}
+
+-- An invitation stops being usable once its expiry passes. It stays listed
+-- (as expired) until revoked or replaced by a new invitation.
+-- from: models/organization/team_invite.go:405
+rule TeamInviteExpires {
+    when: invite: TeamInvite.expires_at <= now
+
+    requires: invite.status = pending
+
+    ensures: invite.status = expired
+}
+
+------------------------------------------------------------
+-- Rules: team repositories
+------------------------------------------------------------
+
+-- from: services/org/repo.go:16
+rule OwnerAddsRepositoryToTeam {
+    when: OwnerAddsRepositoryToTeam(actor, team, repository)
+
+    requires: is_org_owner(team.organization, actor) or actor.is_admin
+    requires: repository.owner_org = team.organization
+    requires: not team_covers(team, repository)
+
+    ensures: TeamRepository.created(team: team, repository: repository)
+    ensures: TeamRepositoryAdded(team: team, repository: repository)
+
+    @guidance
+        -- Web: POST /org/{org}/teams/{team}/action/repo/add (repo_name).
+        -- API: PUT /teams/{id}/repos/{org}/{repo} (owner of the org, or
+        -- admin of the repository — see RepoAdminAddsTeamToRepository).
+}
+
+-- from: routers/web/repo/setting/collaboration.go:152
+rule RepoAdminAddsTeamToRepository {
+    when: RepoAdminAddsTeamToRepository(actor, repository, team)
+
+    requires: access/is_repo_admin(actor, repository) or actor.is_admin
+    requires: repository.owner_org = team.organization
+    requires: team.organization.repo_admin_change_team_access
+        or is_org_owner(team.organization, actor) or actor.is_admin
+    requires: not team_covers(team, repository)
+
+    ensures: TeamRepository.created(team: team, repository: repository)
+    ensures: TeamRepositoryAdded(team: team, repository: repository)
+
+    @guidance
+        -- Web: POST /{owner}/{repo}/settings/collaboration/team.
+        -- API: PUT /repos/{owner}/{repo}/teams/{team}.
+}
+
+-- Removing a repository from a team that includes all repositories is a no-op.
+-- from: services/repository/delete.go:477
+rule OwnerRemovesRepositoryFromTeam {
+    when: OwnerRemovesRepositoryFromTeam(actor, team, repository)
+
+    let link = TeamRepository{team: team, repository: repository}
+
+    requires: is_org_owner(team.organization, actor) or actor.is_admin
+    requires: exists link
+    requires: not team.includes_all_repositories
+
+    ensures: not exists link
+    ensures: TeamRepositoryRemoved(team: team, repository: repository)
+
+    @guidance
+        -- Web: POST /org/{org}/teams/{team}/action/repo/remove (repoid).
+        -- API: DELETE /teams/{id}/repos/{org}/{repo}. Members who lose read
+        -- access stop watching the repository and its issues (repositories
+        -- and issues react to TeamRepositoryRemoved).
+}
+
+-- from: routers/web/repo/setting/collaboration.go:198
+rule RepoAdminRemovesTeamFromRepository {
+    when: RepoAdminRemovesTeamFromRepository(actor, repository, team)
+
+    let link = TeamRepository{team: team, repository: repository}
+
+    requires: access/is_repo_admin(actor, repository) or actor.is_admin
+    requires: team.organization.repo_admin_change_team_access
+        or is_org_owner(team.organization, actor) or actor.is_admin
+    requires: exists link
+    requires: not team.includes_all_repositories
+
+    ensures: not exists link
+    ensures: TeamRepositoryRemoved(team: team, repository: repository)
+
+    @guidance
+        -- Web: POST /{owner}/{repo}/settings/collaboration/team/delete.
+        -- API: DELETE /repos/{owner}/{repo}/teams/{team}.
+}
+
+-- from: models/org_team.go:63
+rule OwnerAddsAllRepositoriesToTeam {
+    when: OwnerAddsAllRepositoriesToTeam(actor, team)
+
+    requires: is_org_owner(team.organization, actor) or actor.is_admin
+
+    ensures:
+        for r in org_repositories(team.organization):
+            if not team_covers(team, r):
+                TeamRepository.created(team: team, repository: r)
+                TeamRepositoryAdded(team: team, repository: r)
+
+    @guidance
+        -- Web: POST /org/{org}/teams/{team}/action/repo/addall. A one-off
+        -- copy; future repositories are only added when includes-all is on.
+}
+
+-- from: models/org_team.go:79
+rule OwnerRemovesAllRepositoriesFromTeam {
+    when: OwnerRemovesAllRepositoriesFromTeam(actor, team)
+
+    requires: is_org_owner(team.organization, actor) or actor.is_admin
+    requires: not team.includes_all_repositories
+
+    ensures:
+        for tr in team.repository_links:
+            not exists tr
+            TeamRepositoryRemoved(team: team, repository: tr.repository)
+
+    @guidance
+        -- Web: POST /org/{org}/teams/{team}/action/repo/removeall.
+}
+
+-- A new repository in the org joins every includes-all team.
+-- from: modules/repository/create.go:126
+rule IncludeNewRepositoryInAllRepoTeams {
+    when: repository: repositories/Repository.created
+
+    requires: repository.owner_org != null
+
+    ensures:
+        for t in repository.owner_org.teams where includes_all_repositories = true:
+            TeamRepository.created(team: t, repository: repository)
+            TeamRepositoryAdded(team: t, repository: repository)
+
+    @guidance
+        -- repositories also makes the creator a repository admin
+        -- collaborator when no team already gives them admin.
+}
+
+-- A repository transferred into the org joins every includes-all team.
+-- from: services/repository/transfer.go:186
+rule IncludeTransferredRepositoryInAllRepoTeams {
+    when: OrgRepositoryArrived(repository)
+
+    requires: repository.owner_org != null
+
+    ensures:
+        for t in repository.owner_org.teams where includes_all_repositories = true:
+            if not team_covers(t, repository):
+                TeamRepository.created(team: t, repository: repository)
+                TeamRepositoryAdded(team: t, repository: repository)
+}
+
+-- A repository that leaves the org (transfer out, deletion) leaves every team.
+-- from: models/organization/org.go:612
+rule DropTeamLinksOfDepartedRepository {
+    when: OrgRepositoryDeparted(repository, org)
+
+    ensures:
+        for t in org.teams:
+            for tr in t.repository_links where repository = repository:
+                not exists tr
+                TeamRepositoryRemoved(team: t, repository: repository)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Every organization has exactly one Owners team.
+invariant OneOwnersTeamPerOrganization {
+    for org in Organizations:
+        (org.teams where is_owners_team = true).count = 1
+}
+
+-- The Owners team is never empty: an organization always has an owner.
+invariant OrganizationAlwaysHasAnOwner {
+    for org in Organizations:
+        org.owner_count >= 1
+}
+
+-- The Owners team has owner access over every repository and may create repos.
+invariant OwnersTeamShape {
+    for t in Teams where is_owners_team = true:
+        t.access_mode = owner and t.includes_all_repositories and t.can_create_org_repo
+}
+
+-- Only the Owners team carries owner access.
+invariant OnlyOwnersTeamHasOwnerMode {
+    for t in Teams:
+        t.access_mode = owner implies t.is_owners_team
+}
+
+-- A team never grants "none" overall.
+invariant TeamGrantsSomething {
+    for t in Teams:
+        t.access_mode != none
+}
+
+-- Team names are unique within an organization, ignoring case.
+invariant TeamNamesUniquePerOrganization {
+    for t in Teams:
+        t.organization.teams.all(o => o = t or lower(o.name) != lower(t.name))
+}
+
+-- A person is an org member exactly when they are on at least one of its teams.
+invariant MembershipIsTeamMembership {
+    for m in OrgMemberships:
+        m.team_memberships.count >= 1
+}
+
+invariant TeamMembersAreOrgMembers {
+    for tm in TeamMemberships:
+        exists OrgMembership{organization: tm.team.organization, user: tm.user}
+}
+
+invariant TeamMembershipOrganizationMatches {
+    for tm in TeamMemberships:
+        tm.organization = tm.team.organization
+}
+
+-- Only people (not organizations) are members; organizations are separate entities.
+invariant MembersArePeople {
+    for m in OrgMemberships:
+        m.user.kind in {individual, bot, remote}
+}
+
+-- A team only covers repositories its organization owns.
+invariant TeamRepositoriesBelongToOrganization {
+    for tr in TeamRepositories:
+        tr.repository.owner_org = tr.team.organization
+}
+
+-- An includes-all team covers every repository of its organization.
+invariant IncludesAllMeansAll {
+    for t in Teams where includes_all_repositories = true:
+        org_repositories(t.organization).all(r => r in t.repositories)
+}
+
+-- External wiki and tracker units can at most be read.
+invariant ExternalUnitsReadOnly {
+    for tu in TeamUnitAccesses:
+        tu.unit in {external_wiki, external_tracker} implies tu.access_mode in {none, read}
+}
+
+-- Read/write teams grant at most write on any unit.
+invariant NonAdminTeamsCapUnitsAtWrite {
+    for tu in TeamUnitAccesses:
+        tu.team.access_mode in {read, write} implies tu.access_mode in {none, read, write}
+}
+
+-- At most one pending invitation per team and address.
+invariant OnePendingInvitePerAddress {
+    for i in TeamInvites where status = pending:
+        i.team.pending_invites.all(o => o = i or o.email != i.email)
+}
+
+invariant InviteOrganizationMatches {
+    for i in TeamInvites:
+        i.organization = i.team.organization
+}
+
+-- Account invitations carry the invited person's address.
+invariant AccountInviteAddressed {
+    for i in TeamInvites:
+        i.invited_user != null implies i.email != ""
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor SignedInUser {
+    identified_by: accounts/User where prohibit_login = false
+}
+
+actor SiteAdmin {
+    identified_by: accounts/User where is_admin = true
+}
+
+-- A member of the Owners team (site admins act as owners everywhere).
+actor OrgOwner {
+    within: Organization
+    identified_by: accounts/User where is_org_owner(within, this) or is_admin = true
+}
+
+-- Anybody on at least one of the organization's teams.
+actor OrgMember {
+    within: Organization
+    identified_by: accounts/User where is_org_member(within, this) or is_admin = true
+}
+
+-- Somebody allowed to open a given team's page.
+actor TeamViewer {
+    within: Team
+    identified_by: accounts/User where can_view_team(within, this) or is_admin = true
+}
+
+-- An admin of a repository owned by an organization.
+actor OrgRepoAdmin {
+    within: repositories/Repository
+    identified_by: accounts/User where access/is_repo_admin(this, within) or is_admin = true
+}
+
+actor AnonymousVisitor {
+    identified_by: Visitor where is_signed_in = false
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- Founding an organization.
+surface OrganizationCreation {
+    facing user: SignedInUser
+
+    exposes:
+        config.default_org_visibility
+        user.allow_create_organization
+        config.disable_regular_org_creation
+
+    provides:
+        UserCreatesOrganization(user, name, visibility, repo_admin_change_team_access)
+            when user.is_admin or (user.allow_create_organization and not config.disable_regular_org_creation)
+
+    @guidance
+        -- Web: GET/POST /org/create. API: POST /orgs. The "New organization"
+        -- entry is hidden when the person may not create one.
+}
+
+-- The org profile as an anonymous visitor sees it: public orgs only, public
+-- members only, no teams.
+surface AnonymousOrganizationProfile {
+    facing visitor: AnonymousVisitor
+
+    context org: Organization where visibility = public
+
+    exposes:
+        org.name
+        org.full_name
+        org.description
+        org.website
+        org.location
+        org.visibility
+        for m in org.memberships where is_public:
+            m.user.name
+
+    @guidance
+        -- Web: GET /{org} (home, repositories, .profile README), GET
+        -- /org/{org}/members. API: GET /orgs/{org} (e-mail withheld from
+        -- anonymous callers), GET /orgs/{org}/public_members,
+        -- GET /orgs/{org}/public_members/{username}. Limited and private orgs
+        -- are not found for anonymous visitors.
+        -- Profile README: if the org owns a non-fork, public, non-empty
+        -- repository named ".profile" that the viewer can read, its README
+        -- from the default branch is rendered on the home page, and its
+        -- FUNDING file (if any) is shown.
+}
+
+-- The org profile as any signed-in person who may see the org sees it.
+surface OrganizationProfile {
+    facing viewer: SignedInUser
+
+    context org: Organization
+
+    exposes:
+        org.name
+        org.full_name
+        org.description
+        org.website
+        org.location
+        org.email
+        org.visibility
+        org.member_count when sees_concealed_members(org, viewer)
+        for m in org.memberships where is_public or sees_concealed_members(org, viewer):
+            m.user.name
+        is_org_owner(org, viewer)
+        is_org_member(org, viewer)
+        can_create_repository_in(viewer, org)
+
+    provides:
+        MemberLeavesOrganization(viewer, org)
+            when is_org_member(org, viewer) and (not is_org_owner(org, viewer) or owner_count(org) > 1)
+
+    related:
+        OrganizationMembersArea(org) when is_org_member(org, viewer)
+        OrganizationSettings(org) when is_org_owner(org, viewer)
+
+    @guarantee HiddenFromStrangers
+        -- A private organization, or any organization when the viewer is a
+        -- restricted user, is not found unless the viewer is a member or a
+        -- site admin (is_visible_to). Limited organizations are visible to
+        -- every signed-in non-restricted person.
+
+    @guarantee ConcealedMembersStayConcealed
+        -- People who are neither members nor site admins only ever see
+        -- public memberships, in lists, counts and membership checks.
+
+    @guidance
+        -- Web: GET /{org}, GET /org/{org}/members. API: GET /orgs/{org},
+        -- GET /orgs (all visible orgs), GET /users/{username}/orgs (public
+        -- memberships unless self/admin), GET /user/orgs,
+        -- GET /users/{username}/orgs/{org}/permissions (is_owner, is_admin,
+        -- can_write, can_read, can_create_repository),
+        -- GET /orgs/{org}/members, GET /orgs/{org}/members/{username}
+        -- (non-members are redirected to the public_members check).
+        -- The members/teams tabs show when the viewer is a member or the
+        -- org has public members.
+}
+
+-- What members (not only owners) can see and do.
+surface OrganizationMembersArea {
+    facing member: OrgMember
+
+    context org: Organization
+
+    exposes:
+        for m in org.memberships:
+            m.user.name
+            m.is_public
+            is_org_owner(org, m.user)
+        for t in org.teams:
+            t.name
+            t.description
+            t.access_mode
+            t.member_count
+            t.repository_count
+            is_team_member(t, member)
+        for i in org.invites:
+            i.team.name when i.invited_user = member
+
+    provides:
+        MemberChangesMembershipVisibility(member, membership, is_public)
+            when membership.organization = org and (membership.user = member or is_org_owner(org, member))
+        MemberLeavesOrganization(member, org)
+            when not is_org_owner(org, member) or owner_count(org) > 1
+
+    related:
+        TeamPage(t) when can_view_team(t, member)
+
+    @guidance
+        -- Web: GET /org/{org}/teams, GET /org/{org}/members (all members with
+        -- their 2FA status, owner badge and public/private flag).
+        -- API: GET /orgs/{org}/teams, GET /orgs/{org}/teams/search
+        -- (non-admins search only their own teams), PUT/DELETE
+        -- /orgs/{org}/public_members/{username}.
+}
+
+-- A single team's page.
+surface TeamPage {
+    facing viewer: TeamViewer
+
+    context team: Team
+
+    exposes:
+        team.name
+        team.description
+        team.access_mode
+        team.includes_all_repositories
+        team.can_create_org_repo
+        for u in team.unit_accesses:
+            u.unit
+            u.access_mode
+        for m in team.memberships:
+            m.user.name
+            m.reason
+            m.added_by
+            m.added_at
+        for r in team.repositories:
+            r.name
+        for i in team.pending_invites:
+            i.email when is_org_owner(team.organization, viewer)
+        for i in team.expired_invites:
+            i.email when is_org_owner(team.organization, viewer)
+
+    provides:
+        MemberLeavesTeam(viewer, team)
+            when is_team_member(team, viewer) and (not team.is_owners_team or team.member_count > 1)
+        OwnerJoinsTeam(viewer, team)
+            when is_org_owner(team.organization, viewer) and not is_team_member(team, viewer)
+
+    @guidance
+        -- Web: GET /org/{org}/teams/{team}, GET /org/{org}/teams/{team}/repositories.
+        -- API: GET /teams/{id}, GET /teams/{id}/members[/{username}],
+        -- GET /teams/{id}/repos[/{org}/{repo}], GET /teams/{id}/invitations,
+        -- GET /user/teams. Repositories listed are further limited by the
+        -- caller's token scope. A member of the org who is not on the team
+        -- (and does not see all teams) is refused; anyone else is not told
+        -- the team exists.
+}
+
+-- Everything only owners (and site admins) do.
+surface OrganizationSettings {
+    facing owner: OrgOwner
+
+    context org: Organization
+
+    exposes:
+        org.name
+        org.full_name
+        org.description
+        org.website
+        org.location
+        org.email
+        org.visibility
+        org.repo_admin_change_team_access
+        org.max_repo_creation
+        org.has_custom_avatar
+        for t in org.teams:
+            t.name
+        for i in org.invites:
+            i.email
+            i.status
+            i.expires_at
+
+    provides:
+        OwnerUpdatesOrganizationProfile(owner, org, full_name, description, website, location, email)
+        OwnerChangesOrganizationVisibility(owner, org, visibility)
+        OwnerSetsRepoAdminTeamAccess(owner, org, allowed)
+        OwnerRenamesOrganization(owner, org, new_name)
+        OwnerUploadsOrganizationAvatar(owner, org, image)
+        OwnerDeletesOrganizationAvatar(owner, org)
+            when org.has_custom_avatar
+        OwnerDeletesOrganization(owner, org, confirmation_name)
+        OwnerCreatesTeam(owner, org, name, description, access_mode, grants, includes_all_repositories, can_create_org_repo)
+        OwnerEditsTeam(owner, team, name, description, access_mode, grants, includes_all_repositories, can_create_org_repo)
+            when team.organization = org and not team.is_owners_team
+        OwnerEditsOwnersTeamDescription(owner, team, description)
+            when team.organization = org and team.is_owners_team
+        OwnerDeletesTeam(owner, team)
+            when team.organization = org and not team.is_owners_team
+        OwnerAddsMemberToOrganization(owner, org, user, teams)
+        OwnerRemovesOrgMember(owner, org, user)
+        OwnerAddsTeamMember(owner, team, user)
+            when team.organization = org
+        OwnerInvitesEmailToTeam(owner, team, email)
+            when team.organization = org and mail_service_enabled()
+        OwnerRemovesTeamMember(owner, team, user)
+            when team.organization = org
+        OwnerRevokesTeamInvite(owner, invite)
+            when invite.organization = org
+        OwnerAddsRepositoryToTeam(owner, team, repository)
+            when team.organization = org
+        OwnerRemovesRepositoryFromTeam(owner, team, repository)
+            when team.organization = org and not team.includes_all_repositories
+        OwnerAddsAllRepositoriesToTeam(owner, team)
+            when team.organization = org
+        OwnerRemovesAllRepositoriesFromTeam(owner, team)
+            when team.organization = org and not team.includes_all_repositories
+
+    @guarantee LastOwnerStays
+        -- No operation leaves the Owners team empty: removing, leaving or
+        -- syncing away the only owner is refused.
+
+    @guarantee OwnersTeamIsPermanent
+        -- The Owners team cannot be deleted, renamed, narrowed below owner
+        -- access, or detached from any repository.
+
+    @guarantee DeleteNeedsEmptyOrganization
+        -- An organization that still owns repositories or packages cannot be
+        -- deleted by its owners.
+
+    @guidance
+        -- Web: /org/{org}/settings (options, avatar, delete,
+        -- blocked_users), /org/{org}/teams/new, /org/{org}/teams/{team}/edit,
+        -- /org/{org}/teams/{team}/delete, /org/{org}/members/action/{add,remove},
+        -- /org/{org}/teams/{team}/action/{add,remove,remove_invite,join},
+        -- /org/{org}/teams/{team}/action/repo/{add,remove,addall,removeall}.
+        -- API: PATCH/DELETE /orgs/{org}, POST /orgs/{org}/rename,
+        -- POST/DELETE /orgs/{org}/avatar, DELETE /orgs/{org}/members/{username},
+        -- POST /orgs/{org}/teams, PATCH/DELETE /teams/{id},
+        -- PUT/DELETE /teams/{id}/members/{username},
+        -- GET/DELETE /teams/{id}/invitations/{inviteid},
+        -- PUT/DELETE /teams/{id}/repos/{org}/{repo},
+        -- Settings sub-pages for blocked users (accounts), webhooks, labels,
+        -- actions, packages, OAuth2 applications and storage overview belong
+        -- to their own modules.
+        -- A non-owner member gets "forbidden"; a non-member gets "not found".
+}
+
+-- Accepting or declining an invitation.
+surface TeamInvitation {
+    facing invitee: SignedInUser
+
+    context invite: TeamInvite where status = pending
+
+    exposes:
+        invite.team.name
+        invite.organization.name
+        invite.inviter.name
+        invite.email
+        invite.expires_at
+
+    provides:
+        InviteeAcceptsTeamInvite(invitee, invite, hide_membership)
+            when (invite.invited_user = null or invite.invited_user = invitee)
+        InviteeDeclinesTeamInvite(invitee, invite)
+            when (invite.invited_user = null or invite.invited_user = invitee)
+
+    timeout:
+        TeamInviteExpires
+
+    @guarantee InviteIsPersonal
+        -- An invitation addressed to an account can only be seen, accepted
+        -- or declined by that account; everyone else is told it does not
+        -- exist. An expired invitation is not found.
+
+    @guidance
+        -- Web: GET/POST /org/invite/{token}, POST /org/invite/{token}/decline;
+        -- the org home page shows a banner for pending invitations into that
+        -- org. API: GET /user/team_invitations, GET
+        -- /user/team_invitations/{id}, POST .../accept, POST .../decline.
+}
+
+-- Team access managed from the repository side.
+surface RepositoryTeamAccess {
+    facing admin: OrgRepoAdmin
+
+    context repository: repositories/Repository where owner_org != null
+
+    exposes:
+        repository.owner_org.repo_admin_change_team_access
+        for t in repository.owner_org.teams:
+            t.name when team_covers(t, repository)
+            t.access_mode when team_covers(t, repository)
+
+    provides:
+        RepoAdminAddsTeamToRepository(admin, repository, team)
+            when repository.owner_org.repo_admin_change_team_access or is_org_owner(repository.owner_org, admin)
+        RepoAdminRemovesTeamFromRepository(admin, repository, team)
+            when repository.owner_org.repo_admin_change_team_access or is_org_owner(repository.owner_org, admin)
+
+    @guidance
+        -- Web: /{owner}/{repo}/settings/collaboration (team section).
+        -- API: GET/PUT/DELETE /repos/{owner}/{repo}/teams[/{team}].
+}
+
+-- Site administration of organizations.
+surface OrganizationAdministration {
+    facing admin: SiteAdmin
+
+    context org: Organization
+
+    exposes:
+        org.name
+        org.visibility
+        org.member_count
+        org.team_count
+        org.max_repo_creation
+
+    provides:
+        AdminCreatesOrganizationForUser(admin, owner, name, visibility)
+        AdminSetsOrganizationRepoLimit(admin, org, limit)
+
+    @guidance
+        -- Web: GET /admin/orgs (list all, including private). API: GET
+        -- /admin/orgs, POST /admin/users/{username}/orgs. Site admins also
+        -- pass every owner check on OrganizationSettings.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred Organization.unit_permission    -- see: access.allium (org-level read of projects/packages/code from team units or visibility)
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Forgejo's API lets an owner rename the Owners team (PATCH /teams/{id} with a name), which breaks owner detection by name; the web UI does not. This spec forbids it — confirm."
+open question "Forgejo does not refuse deleting the Owners team in the backend (only the UI hides the button). This spec refuses it — confirm."
+open question "Membership visibility: the web lets owners publicize/conceal other members, the API only lets members change their own. Which should a rebuild keep? (Spec: self or owner.)"
+open question "A read/write team's summary access_mode is the lowest non-none unit grant (team_mode_for). Is a summary needed at all, or should read/write teams be defined purely by their unit grants?"
+open question "AdminCreatesOrganizationForUser checks the target owner's permission to create organizations rather than the admin's. Intended?"
+open question "Team-repository add via API requires repository admin (reqAdmin) plus team membership, while the web requires org ownership. Spec treats the API path as the repo-side RepoAdminAddsTeamToRepository (honouring repo_admin_change_team_access). Confirm."
+open question "Should a user block at org level prevent the blocked user from being added to or invited into the org's teams? Forgejo does not check."
+open question "Expired invitations are never cleaned up automatically; they stay listed until revoked or replaced. Should a rebuild purge them after some time?"
+
+-- Black-box functions used above (implementation-defined, pure).
+-- Membership predicates offered to other modules; each equals the derived
+-- value named on the right:
+--   is_org_owner(org, user)            -- org.has_owner(user)
+--   is_org_member(org, user)           -- org.has_member(user)
+--   is_team_member(team, user)         -- team.has_member(user)
+--   team_covers(team, repository)      -- team.covers(repository)
+--   can_view_team(team, user)          -- team.can_be_viewed_by(user)
+--   can_create_repository_in(user, org)-- org.lets_create_repo(user)
+--   sees_concealed_members(org, user)  -- org.sees_concealed_members(user)
+--   organization_visible_to(org, user) -- org.is_visible_to(user); anonymous: org.is_public
+--                                      -- (same as access/can_see_organization(viewer, org))
+--   owner_count(org)                   -- org.owner_count
+--   is_on_any_team(org, user)          -- some TeamMembership{organization: org, user: user} exists
+--   belongs_to_organizations(user)     -- some OrgMembership{user: user} exists
+--   shares_organization(a, b)          -- a and b are members of a common org, or one is that org
+--   can_read_unit(user, org, unit) / can_write_unit(user, org, unit)
+--                                      -- org-level unit access: the highest grant for `unit`
+--                                      -- across the user's teams in org; with no team, read
+--                                      -- when org is public, or limited and the user is signed in
+--                                      -- (same as access/organization_unit_mode)
+-- Other black boxes:
+--   team_name_taken(org, name)         -- some team of org has this name, ignoring case
+--   team_name_taken_by_other(team, name)
+--   grants_some_unit(grants)           -- at least one grant above none
+--   has_pending_team_invite(team, user), has_pending_team_invite_for_email(team, email),
+--   has_pending_org_invite(org, user), has_member_with_email(team, email)
+--   is_usable_owner_name(name)       -- accounts' user-name rules: charset, reserved names and patterns
+--   owner_name_available(name)       -- no user or organization holds this name (ignoring case)
+--   owner_name_claimable(name, org)  -- not within accounts' USERNAME_COOLDOWN_PERIOD of another owner's release
+--   owned_repository_count(org)      -- repositories with owner_org = org
+--   owned_package_count(org)         -- packages owned by org
+--   org_repositories(org)            -- repositories with owner_org = org
+--   owner_unit_grants()              -- every UnitKind at owner, external wiki/tracker at read
+--   normalised_unit_grants(mode, grants), team_mode_for(mode, grants)  -- see OwnerCreatesTeam guidance;
+--                                      -- `grants` is a set of {unit: repositories/UnitKind,
+--                                      -- access_mode: access/AccessMode} pairs (API units_map)
+--   new_invite_token()               -- unguessable, unique
+--   mail_service_enabled()           -- [mailer] ENABLED (notifications' outbound mail is configured)
+--   is_alpha_dash_dot(s), is_valid_email(s), is_valid_site_url(s), is_acceptable_avatar(img), lower(s), length(s)
+
+------------------------------------------------------------
+-- Requests to other modules
+------------------------------------------------------------
+
+-- REQUEST accounts/User.allow_create_organization: per-user permission to create orgs (default from [service] DEFAULT_ALLOW_CREATE_ORGANIZATION = true).
+-- REQUEST accounts: react to OrganizationRenamed(organization, old_name, new_name) with RenameNamespace semantics (UserRedirect with organization set, MAX_USER_REDIRECTS); react to OrganizationCreated by dropping any redirect holding the new name; follows and blocks of an org removed on OrganizationDeleted.
+-- REQUEST accounts: OrganizationBlocksUser should also require that the blocked user is not the acting owner (Forgejo refuses blocking yourself).
+-- REQUEST accounts: owner-name namespace — a name may be held by a User or an Organization, never both (is_usable_owner_name, owner_name_available, owner_name_claimable as black boxes over accounts' rules).
+-- REQUEST access/is_repo_admin(user, repository): black box used by OrgRepoAdmin.
+-- REQUEST access: derive repository permission for org repositories from TeamRepository + TeamUnitAccess + Team.access_mode (owner/admin teams: all units), and org-level unit read (projects/packages/code) from team units or org visibility; provide the anonymous actor to replace local Visitor.
+-- REQUEST repositories: emit OrgRepositoryArrived(repository) after a transfer into an org, and OrgRepositoryDeparted(repository, organization) when an org repository is transferred out or deleted.
+-- REQUEST repositories: when an org repository is created and no team gives its creator admin, add the creator as an admin Collaboration; check can_create_repository_in(user, org) and Organization.max_repo_creation for creation, forks, transfers and push-to-create.
+-- REQUEST repositories: react to TeamMemberAdded / TeamRepositoryAdded with auto-watch when AUTO_WATCH_NEW_REPOS; react to TeamMemberRemoved / OrgMemberRemoved / TeamRepositoryRemoved by unwatching repositories the user can no longer read; react to OrganizationPurgeStarted by deleting all org repositories.
+-- REQUEST issues: react to TeamMemberRemoved / OrgMemberRemoved / TeamRepositoryRemoved by removing IssueWatch and assignments the user can no longer hold.
+-- REQUEST packages: react to OrganizationPurgeStarted by deleting all org packages; expose owned package count.
+-- REQUEST actions: react to OrganizationDeleted by deleting org secrets, variables, runners and runner registration tokens.
+-- REQUEST code: react to TeamDeleted by removing the team from ProtectedBranch / ProtectedTag allow lists.
+-- REQUEST pulls: react to TeamDeleted by removing team ReviewRequests.
+-- REQUEST notifications: react to TeamInviteCreated by mailing invite.email with the invite link (inviter, org, team).
+-- REQUEST authentication: is_org_owner takes (org, user) here — authentication.allium uses is_org_owner(user, org); align on (org, user). Black boxes teams_mapped_from(source, groups) / teams_unmapped_from(source, user, groups) read the source's group_team_map, dynamic maps and group_team_map_removal.
+-- REQUEST moderation: ReportableContentChanging is not raised from here yet; the integration pass should decide how org profile edits (OrganizationProfileUpdated, OrganizationRenamed, OrganizationAvatarChanged) feed moderation's shadow copies.
+-- REQUEST quota: is_org_owner takes (org, user) here — quota.allium names it is_org_owner(user, org); align on (org, user).
