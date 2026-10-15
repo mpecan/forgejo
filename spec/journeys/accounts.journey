@@ -1,0 +1,383 @@
+-- Journeys through accounts.allium: a person's identity on the instance —
+-- their name, their profile, their addresses, who they follow and block, and
+-- how the account ends.
+
+world {
+    cast:
+        ada:   User
+        bob:   User
+        root:  User
+    given:
+        ada.name = "ada"
+        ada.kind = individual
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.is_admin = false
+        ada.is_restricted = false
+        ada.login_source = null
+        ada.visibility = public
+        ada.primary_email = "ada@example.org"
+        bob.name = "bob"
+        bob.kind = individual
+        bob.is_active = true
+        bob.prohibit_login = false
+        bob.is_admin = false
+        bob.is_restricted = false
+        bob.login_source = null
+        bob.visibility = public
+        root.name = "root"
+        root.kind = individual
+        root.is_active = true
+        root.prohibit_login = false
+        root.is_admin = true
+        root.is_restricted = false
+}
+
+-- The happy path of a rename: the new name takes effect and the old one
+-- becomes a redirect pointing at her.
+journey AdaRenamesHerself {
+    goal: Ada wants a fuller handle. She changes her name in her profile
+          settings; links to her old name keep working.
+
+    1. she renames herself
+        stipulate is_usable_username("ada-lovelace") = true
+        stipulate name_taken("ada-lovelace") = false
+        stipulate same_name("ada-lovelace", "ada") = false
+        stipulate same_name("ada", "ada") = true
+        stipulate same_name("ada", "ada-lovelace") = false
+        ada does UserRenamesSelf(ada, "ada-lovelace") on OwnProfileSettings
+            creating redirect: UserRedirect
+        then UserRenamesSelf fires
+        then RenameNamespace fires
+        then ada.name = "ada-lovelace"
+
+    2. her old name now points at her
+        then redirect.old_name = "ada"
+        then redirect.user = ada
+
+    ends: Ada is "ada-lovelace"; "ada" redirects to her.
+}
+
+-- The cooldown keeps an old name for its former owner for a while.
+journey OldNameIsReservedDuringCooldown {
+    goal: Bob wants the name Ada just gave up. While the cooldown runs he
+          cannot have it; once it has passed he can.
+
+    cast:
+        old: UserRedirect
+
+    given:
+        old.old_name = "ada"
+        old.user = ada
+        old.organization = null
+        old.created_at = 0.days
+
+    1. bob tries to claim "ada" straight away
+        stipulate is_usable_username("ada") = true
+        stipulate name_taken("ada") = false
+        stipulate same_name("ada", "bob") = false
+        stipulate same_name("ada", "ada") = true
+        stipulate old.in_cooldown = true
+        bob cannot do UserRenamesSelf(bob, "ada") on OwnProfileSettings
+
+    2. a month passes and the name is free
+        after 31.days
+        stipulate old.in_cooldown = false
+        bob does UserRenamesSelf(bob, "ada") on OwnProfileSettings
+        then bob.name = "ada"
+
+    ends: The old name was protected for its owner, then released.
+}
+
+-- Following, and what a block does to it.
+journey BobFollowsAdaThenGetsBlocked {
+    goal: Bob follows Ada. Ada blocks him: the follow disappears, and he
+          cannot follow her again while the block stands.
+
+    1. bob follows ada
+        bob does UserFollowsUser(bob, ada) on UserProfile
+            creating follow: Follow
+        then UserFollowsUser fires
+        then follow.follower = bob
+        then follow.followee = ada
+
+    2. ada blocks bob
+        ada does UserBlocksUser(ada, bob) on UserProfile
+            creating block: UserBlock
+        then UserBlocksUser fires
+        then block.blocked = bob
+        then follow does not exist
+
+    3. bob cannot follow her again
+        bob cannot do UserFollowsUser(bob, ada) on UserProfile
+
+    4. ada lifts the block
+        ada does UserUnblocksUser(ada, bob) on OwnBlockList
+        then block does not exist
+
+    ends: The block severed the follow and stopped a new one until lifted.
+}
+
+-- Adding a second address and making it primary (instance default: no
+-- confirmation required, so a new address is active at once).
+journey AdaMovesToANewAddress {
+    goal: Ada changes jobs. She adds her new address and makes it her
+          primary address; the old one stays as a secondary address.
+
+    cast:
+        old: EmailAddress
+
+    given:
+        old.user = ada
+        old.address = "ada@example.org"
+        old.is_primary = true
+        old.is_activated = true
+
+    1. she adds the new address
+        stipulate is_valid_email("ada@new.example") = true
+        stipulate email_domain_allowed("ada@new.example") = true
+        stipulate length("ada@new.example") = 15
+        stipulate activation_mail_recently_sent(ada) = false
+        ada does UserAddsEmail(ada, "ada@new.example") on OwnAccountSettings
+            creating fresh: EmailAddress
+        then fresh.is_activated = true
+        then fresh.is_primary = false
+
+    2. she makes it primary
+        ada does UserMakesEmailPrimary(ada, fresh) on OwnAccountSettings
+        then fresh.is_primary = true
+        then old.is_primary = false
+        then ada.primary_email = "ada@new.example"
+        ada sees ada.primary_email on OwnAccountSettings
+
+    ends: Her new address is primary; the old one stays as a secondary address.
+}
+
+-- An unconfirmed address is confirmed through the activation link, and only
+-- then may become primary.
+journey AdaConfirmsAnAddress {
+    goal: Ada has an unconfirmed secondary address. She cannot make it
+          primary yet; she asks for the activation mail again, follows the
+          link, and then she can.
+
+    cast:
+        pending: EmailAddress
+
+    given:
+        pending.user = ada
+        pending.address = "ada@lab.example"
+        pending.is_primary = false
+        pending.is_activated = false
+
+    1. it cannot be primary while unconfirmed
+        ada cannot do UserMakesEmailPrimary(ada, pending) on OwnAccountSettings
+
+    2. she asks for the activation mail again
+        stipulate activation_mail_recently_sent(ada) = false
+        ada does UserResendsEmailActivation(ada, pending) on OwnAccountSettings
+        then UserResendsEmailActivation fires
+
+    3. she follows the link
+        stipulate activated_elsewhere(pending) = false
+        ada does UserConfirmsEmailAddress(ada, pending) on AccountActivation
+        then pending.is_activated = true
+
+    4. now it can be primary
+        ada does UserMakesEmailPrimary(ada, pending) on OwnAccountSettings
+        then pending.is_primary = true
+
+    ends: Only confirmed addresses become primary.
+}
+
+-- The primary address is not removable.
+journey PrimaryAddressCannotBeRemoved {
+    goal: Ada tries to delete her only (primary) address and is refused.
+
+    cast:
+        mine: EmailAddress
+
+    given:
+        mine.user = ada
+        mine.address = "ada@example.org"
+        mine.is_primary = true
+        mine.is_activated = true
+
+    1. she tries to delete it
+        ada cannot do UserDeletesEmail(ada, mine) on OwnAccountSettings
+
+    ends: The account keeps a primary address.
+}
+
+-- Someone else's address is not hers to remove either.
+journey CannotRemoveSomeoneElsesAddress {
+    goal: Bob tries to delete one of Ada's secondary addresses.
+
+    cast:
+        hers: EmailAddress
+
+    given:
+        hers.user = ada
+        hers.address = "ada@work.example"
+        hers.is_primary = false
+        hers.is_activated = true
+
+    1. bob tries to delete it
+        bob cannot do UserDeletesEmail(bob, hers) on OwnAccountSettings
+
+    ends: Ada's address is untouched.
+}
+
+-- A private profile is only visible to people the owner follows, people
+-- sharing an organization, and admins.
+journey CarolKeepsHerProfilePrivate {
+    goal: Carol's profile is private. Bob, a stranger, cannot see it; Ada,
+          whom Carol follows, can.
+
+    cast:
+        carol: User
+        tie:   Follow
+
+    given:
+        carol.name = "carol"
+        carol.kind = individual
+        carol.is_active = true
+        carol.prohibit_login = false
+        carol.is_admin = false
+        carol.visibility = private
+        carol.location = "Ljubljana"
+        tie.follower = carol
+        tie.followee = ada
+
+    1. bob, a stranger, cannot see her location
+        stipulate shares_organization(carol, bob) = false
+        bob cannot see carol.location on UserProfile in carol
+
+    2. ada, whom carol follows, can
+        ada sees carol.location on UserProfile in carol
+
+    3. the site admin can too
+        root sees carol.location on UserProfile in carol
+
+    ends: Private means visible to a chosen circle, not to everyone signed in.
+}
+
+-- Site admins cannot delete their own account from settings.
+journey AdminCannotDeleteThemselves {
+    goal: The site admin tries to delete their own account from the
+          account settings page and is refused.
+
+    1. root tries to delete their own account
+        stipulate owns_packages(root) = false
+        stipulate owns_repositories(root) = false
+        stipulate belongs_to_organizations(root) = false
+        root cannot do UserDeletesOwnAccount(root) on OwnAccountSettings
+
+    ends: An admin account has to be demoted (or removed by another admin) first.
+}
+
+-- An account that still owns repositories cannot be deleted without purge.
+journey AdaCannotLeaveWhileOwningRepositories {
+    goal: Ada tries to delete her account while she still owns a repository;
+          she is refused until she transfers or deletes it.
+
+    1. she tries to delete her account
+        stipulate owns_packages(ada) = false
+        stipulate owns_repositories(ada) = true
+        stipulate belongs_to_organizations(ada) = false
+        ada cannot do UserDeletesOwnAccount(ada) on OwnAccountSettings
+
+    ends: Nothing is orphaned by a self-deletion.
+}
+
+-- With nothing left to own, she can go.
+journey AdaDeletesHerAccount {
+    goal: Ada owns nothing and belongs to no organization; she deletes her
+          account and it is gone, together with her addresses and follows.
+
+    cast:
+        mine: EmailAddress
+        tie:  Follow
+
+    given:
+        mine.user = ada
+        mine.address = "ada@example.org"
+        mine.is_primary = true
+        mine.is_activated = true
+        tie.follower = bob
+        tie.followee = ada
+
+    1. she deletes her account
+        stipulate owns_repositories(ada) = false
+        stipulate belongs_to_organizations(ada) = false
+        stipulate owns_packages(ada) = false
+        stipulate deletion_disabled_for(ada) = false
+        ada does UserDeletesOwnAccount(ada) on OwnAccountSettings
+        then DeleteUserAccount fires
+        then ada does not exist
+        then mine does not exist
+        then tie does not exist
+
+    ends: Her identity, addresses and follows are gone; her content (owned
+          by other modules) is handed to the ghost user.
+}
+
+-- Avatars: upload, then go back to the email-based service.
+journey AdaChangesHerAvatar {
+    goal: Ada uploads a picture, then decides to use Gravatar after all.
+
+    1. she uploads a PNG
+        stipulate image_format("portrait") = "png"
+        stipulate byte_size("portrait") = 50000
+        stipulate image_width("portrait") = 512
+        stipulate image_height("portrait") = 512
+        ada does UserUploadsAvatar(ada, "portrait") on OwnProfileSettings
+        then UserUploadsAvatar fires
+        then ada.use_custom_avatar = true
+
+    2. she switches to her email-based avatar
+        stipulate is_valid_email("ada@example.org") = true
+        stipulate email_domain_allowed("ada@example.org") = true
+        ada does UserChoosesEmailAvatar(ada, "ada@example.org") on OwnProfileSettings
+        then ada.use_custom_avatar = false
+        then ada.avatar_email = "ada@example.org"
+
+    ends: Her avatar follows her choice.
+}
+
+-- An oversized upload is refused.
+journey OversizedAvatarIsRefused {
+    goal: Bob tries to upload a 5 MB photo as his avatar.
+
+    1. he uploads it
+        stipulate image_format("holiday") = "jpeg"
+        stipulate byte_size("holiday") = 5000000
+        stipulate image_width("holiday") = 3000
+        stipulate image_height("holiday") = 2000
+        bob cannot do UserUploadsAvatar(bob, "holiday") on OwnProfileSettings
+
+    ends: The avatar stays as it was.
+}
+
+-- Organizations block users too; only their owners may do it.
+journey AnOrganizationBlocksATroll {
+    goal: Ada owns an organization and blocks Bob on its behalf; Bob, who
+          is not an owner, cannot block anyone on its behalf.
+
+    cast:
+        org: organizations/Organization
+
+    1. bob, not an owner, cannot block on the organization's behalf
+        stipulate is_org_owner(org, bob) = false
+        stipulate organization_has_blocked(org, ada) = false
+        bob cannot do OrganizationBlocksUser(bob, org, ada) on OrganizationBlockList
+
+    2. ada, an owner, blocks bob
+        stipulate is_org_owner(org, ada) = true
+        stipulate organization_has_blocked(org, bob) = false
+        ada does OrganizationBlocksUser(ada, org, bob) on OrganizationBlockList
+            creating block: UserBlock
+        then block.blocked = bob
+        then block.blocker_organization = org
+
+    ends: The organization's block stands; repositories it owns now refuse Bob.
+}

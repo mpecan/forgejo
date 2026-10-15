@@ -1,0 +1,1467 @@
+-- allium: 3
+-- accounts.allium — user accounts as identities: who a user is, how others see them, and how the account changes over its life.
+--
+-- Scope: the User identity (individual people, bots, remote/F3 placeholders,
+-- ActivityPub mirrors, and the built-in system identities), its public profile,
+-- its account status flags, its personal preferences, its email addresses, its
+-- name (with renames, redirects and the reclaim cooldown), the social graph
+-- (follow / block), account deletion and purge, and the profile README.
+--
+-- Includes:
+--   - User (kinds, profile, status flags, preferences, avatar), Visibility
+--   - EmailAddress (primary / secondary, activation, admin forced changes)
+--   - UserRedirect (old names after a rename), username rules, reserved names,
+--     USERNAME_PREFIX, USERNAME_COOLDOWN_PERIOD, MAX_USER_REDIRECTS
+--   - Follow (user -> user or user -> organization)
+--   - UserBlock (user or organization blocks a user) and the block enforcement
+--     contract the other modules must honour
+--   - UserSetting (per-user key/value preferences that change behaviour)
+--   - Badge / UserBadge (profile badges)
+--   - Account deletion (self / admin), purge, inactive-account cleanup cron
+--   - Profile visibility (public / limited / private), keep-email-private,
+--     keep-pronouns-private, keep-activity-private
+--   - Profile README (`.profile` repository) and funding display rules
+--   - Remote (F3) placeholder users being promoted to real accounts
+--
+-- Excludes:
+--   - Registration forms, sign-in, passwords, 2FA, WebAuthn, OpenID URIs,
+--     access tokens, OAuth2 apps, account activation mail / token checking,
+--     password reset: owned by authentication (it emits the triggers this
+--     module reacts to, see "Reacts to").
+--   - SSH / GPG keys and their deletion on account removal: owned by keys.
+--   - Organizations, teams, org membership, org renames: owned by organizations
+--     (org renames create UserRedirect rows through RenameNamespace below).
+--   - Quota: owned by quota.
+--   - Activity feed, heatmap, RSS/Atom feeds, in-app notifications, mail
+--     delivery: owned by notifications; this module only emits triggers and
+--     exposes keep_activity_private / email_notifications.
+--   - The explore/users search page and user search API: owned by discovery.
+--   - Admin user management entry points (create user, edit status flags and
+--     profile, set password / login source, set primary email, (de)activate
+--     or delete addresses, rename, delete / purge, avatar, user list and
+--     search, SystemNotice on cleanup failures) and the delete_inactive_accounts
+--     cron task: owned by administration. This module reacts to its triggers
+--     with the account-side consequences (redirects, purge cascade, cleanup).
+--   - Service-message "confirm" timestamps (User.Confirms): owned by
+--     administration (Announcement).
+--   - FederatedUser / ActivityPub actor data, keys, inbox paths and remote
+--     follows (FederatedUserFollower): owned by federation.
+--   - "Wrong user type" doctor fix (CountWrongUserType/FixWrongUserType):
+--     data-repair accident of the legacy schema, not behaviour.
+--   - LastRepoVisibility (form convenience), Rands/Salt rotation (security
+--     implementation detail), LowerName columns (case-insensitivity is stated
+--     as an invariant instead).
+--   - The X-Gitea-Warning header on admin email-domain conflicts: Gitea API
+--     compatibility only; the behaviour (admin bypasses domain lists) is kept.
+--   - Reserved user/organization placeholder rows (UserTypeUserReserved /
+--     UserTypeOrganizationReserved): no code path creates them; parked as an
+--     open question.
+--
+-- Emits:
+--   UserAccountCreated(user)                       -- any new account
+--   UserSignedUp(user)                             -- self-registration only (admin notify mail)
+--   UserProfileUpdated(user)                       -- profile fields changed
+--   UserRenamed(user, old_name, new_name)          -- repositories update owner names,
+--                                                  -- packages update container image names,
+--                                                  -- code moves AGit refs
+--   UserVisibilityChanged(user, old_visibility, new_visibility)
+--   UserAvatarChanged(user)
+--   UserEmailAdded(user, address)                  -- notifications sends activation mail
+--                                                  -- when confirmation is required
+--   EmailActivationRequested(user, address)        -- resend; notifications sends mail
+--   EmailAddressActivated(user, address)
+--   PrimaryEmailChanged(user, old_address, new_address) -- notifications mails the old address
+--   UserFollowed(follower, followee)
+--   UserUnfollowed(follower, followee)
+--   OrganizationFollowed(follower, organization)
+--   UserBlocked(blocker, blocked)                  -- repositories: unwatch blocker's repos,
+--                                                  -- drop collaboration, cancel transfers;
+--                                                  -- actions: revoke trust
+--   OrganizationBlockedUser(organization, blocked) -- same consequences for org-owned repos
+--   UserUnblocked(blocker, blocked)
+--   AccountStatusChanged(user)                     -- admin flags changed
+--   UserPurged(user)                               -- purge began; repositories delete owned repos,
+--                                                  -- organizations remove memberships and
+--                                                  -- delete orgs where user is last owner,
+--                                                  -- packages delete owned packages,
+--                                                  -- federation deletes FederatedUser,
+--                                                  -- authentication ends sessions
+--   UserAccountDeleted(user, purge, delete_contributions)
+--                                                  -- every module removes or ghosts the user's
+--                                                  -- rows (see DeleteUserAccount guidance)
+--
+-- Reacts to:
+--   authentication/SelfRegistrationAccepted(name, email, password_set)
+--   authentication/ExternalAccountAutoRegistered(name, email, full_name)
+--   authentication/RemoteUserClaimed(user, email)  -- OAuth2 login matched an F3 placeholder
+--   authentication/EmailConfirmationLinkFollowed(user, address)
+--   federation/RemoteActorDiscovered(name, full_name, email)
+--   administration/UserRenamedByAdmin(admin, user, old_name, new_name)
+--   administration/UserDeletedByAdmin(admin, user, purge)
+--   administration/UserAvatarChangedByAdmin(admin, user)
+--   administration/UserAvatarRemovedByAdmin(admin, user)
+--   administration/InactiveAccountCleanupDue(older_than)
+--   (named locally below as triggers with the same parameters; the integration
+--   pass should bind them to the owning modules' emissions)
+
+use "./authentication.allium" as authentication
+use "./organizations.allium" as organizations
+use "./administration.allium" as administration
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Who can see a user (and, for organizations, the organization).
+-- from: modules/structs/visible_type.go:12
+enum Visibility { public | limited | private }
+
+-- from: models/user/user.go:50
+enum UserKind {
+    individual      -- a person with a login
+    | bot           -- automation account; behaves like an individual, labelled as a bot
+    | remote        -- placeholder created by an F3 import for a person on another forge;
+                    -- cannot log in until claimed through a matching OAuth2 login
+    | activitypub   -- local mirror of a fediverse actor; never logs in
+}
+
+-- Built-in identities that are never stored and can never be registered.
+-- from: models/user/user_system.go:20
+enum SystemIdentity {
+    ghost             -- stands in for a deleted account on everything it left behind
+    | actions         -- "forgejo-actions": the doer of automated workflow changes
+    | federation_actor -- "actor": the instance's own ActivityPub actor
+}
+
+-- from: models/user/user.go:75
+enum EmailNotificationPreference {
+    enabled           -- every notification mail except ones caused by the user
+    | on_mention      -- only when mentioned
+    | disabled
+    | and_your_own    -- every notification mail including ones caused by the user
+}
+
+-- from: modules/setting/admin.go:31
+enum UserFeature { deletion | manage_ssh_keys | manage_gpg_keys | manage_password }
+
+-- How a user's avatar is resolved.
+-- from: models/user/avatar.go:62
+enum AvatarSource {
+    uploaded          -- a custom image the user uploaded
+    | generated       -- an identicon generated from the email (or name) seed
+    | email_service   -- Gravatar / Libravatar, keyed on avatar_email
+}
+
+enum DiffViewStyle { unified | split }
+
+-- from: routers/web/repo/middlewares.go:83
+enum DiffWhitespaceBehaviour { show_all | ignore_all | ignore_change | ignore_eol }
+
+-- Comment-type groups a user can hide from issue/PR timelines.
+-- from: services/forms/user_form_hidden_comments.go:17
+enum TimelineEventGroup {
+    reference | label | milestone | assignee | title | branch | time_tracking
+    | deadline | dependency | lock | review_request | pull_request_push
+    | project | issue_ref
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- An identity on the instance. Organizations are organizations/Organization,
+-- but users and organizations share one namespace of names.
+-- from: models/user/user.go:86
+entity User {
+    -- Identity
+    name: String                         -- unique (case-insensitive) handle, renamable
+    kind: UserKind
+    created_at: Timestamp
+    last_login_at: Timestamp?
+    login_source: authentication/AuthSource?   -- null for local accounts
+
+    -- Profile
+    full_name: String                    -- max 100
+    description: String                  -- "bio", Markdown, max 255
+    website: String                      -- max 255, must use an allowed URL scheme
+    location: String                     -- max 50
+    pronouns: String                     -- max 50
+    keep_pronouns_private: Boolean       -- hide pronouns from anonymous visitors
+    keep_email_private: Boolean          -- show the no-reply address instead of the primary
+    keep_activity_private: Boolean       -- hide activity feed and heatmap from others
+    visibility: Visibility
+
+    -- Avatar
+    use_custom_avatar: Boolean
+    custom_avatar: String?               -- stored image when uploaded or generated
+    avatar_email: String                 -- address used for Gravatar/Libravatar lookups
+
+    -- Contact
+    primary_email: String
+    email_notifications: EmailNotificationPreference
+
+    -- Account status
+    is_active: Boolean                   -- primary email confirmed / account activated
+    is_admin: Boolean
+    is_restricted: Boolean               -- only sees what it is explicitly given
+    prohibit_login: Boolean              -- cannot sign in (git/SSH may still be allowed)
+
+    -- Per-user capability overrides (admin managed)
+    allow_git_hook: Boolean
+    allow_import_local: Boolean
+    allow_create_organization: Boolean
+    max_repo_creation: Integer?          -- null means use the instance default
+
+    -- Preferences
+    language: String?                    -- null means use the browser / instance default
+    theme: String
+    diff_view_style: DiffViewStyle
+    enable_repo_unit_hints: Boolean
+
+    -- Relationships
+    email_addresses: EmailAddress with user = this
+    redirects: UserRedirect with user = this
+    follows_given: Follow with follower = this
+    follows_received: Follow with followee = this
+    blocks_given: UserBlock with blocker = this
+    blocks_received: UserBlock with blocked = this
+    settings: UserSetting with user = this
+    badges: UserBadge with user = this
+
+    -- Projections
+    followers: follows_received -> follower
+    following_users: follows_given where followee != null -> followee
+    activated_emails: email_addresses where is_activated = true
+    primary_address: email_addresses where is_primary = true
+
+    -- Derived
+    num_followers: follows_received.count
+    num_following: follows_given.count
+    is_local: login_source = null
+    is_system: false                     -- stored users are never system identities
+    no_reply_email: name + "@" + config.no_reply_address
+    public_email: if keep_email_private: no_reply_email else: primary_email
+    display_name: if full_name != "": full_name else: name
+    can_sign_in: is_active and not prohibit_login
+    can_receive_mail: is_active and not prohibit_login and kind = individual
+    avatar_source:
+        if use_custom_avatar: uploaded
+        else: if config.disable_gravatar: generated
+        else: email_service
+    effective_repo_limit:
+        if max_repo_creation != null: max_repo_creation
+        else: config.max_repo_creation_default
+    can_create_organization: is_admin or (allow_create_organization and not config.disable_regular_org_creation)
+    can_edit_git_hooks: not config.disable_git_hooks and (is_admin or allow_git_hook)
+    can_import_local: config.import_local_paths and (is_admin or allow_import_local)
+    pronouns_for(signed_in): if keep_pronouns_private and not signed_in: "" else: pronouns
+    activity_readable_by(viewer): not keep_activity_private or viewer.is_admin or viewer = this
+    has_feature_disabled(f):
+        f in config.user_disabled_features
+        or (not is_local and f in config.external_user_disabled_features)
+
+    -- Who may see this profile (and therefore resolve its name, its followers
+    -- lists and its redirects). Admins and the user always can. Public: everyone.
+    -- Limited: any signed-in, non-restricted user. Private: signed-in,
+    -- non-restricted users this user follows, or who share an organization.
+    -- from: models/user/user.go:1402
+    visible_to(viewer):
+        viewer.is_admin
+        or viewer = this
+        or visibility = public
+        or (visibility = limited and not viewer.is_restricted)
+        or (visibility = private and not viewer.is_restricted
+            and (exists Follow{follower: this, followee: viewer} or shares_organization(this, viewer)))
+}
+
+-- One address of a user. Every address is unique across the instance
+-- (case-insensitive); exactly one per user is primary.
+-- from: models/user/email_address.go:79
+entity EmailAddress {
+    user: User
+    address: String                      -- max 254
+    is_activated: Boolean
+    is_primary: Boolean
+
+    can_be_primary: is_activated
+}
+
+-- An old name of a user (or organization) that still resolves to it.
+-- from: models/user/redirect.go:52
+entity UserRedirect {
+    old_name: String
+    user: User?                          -- set when the namespace owner is a user
+    organization: organizations/Organization?   -- set when it is an organization
+    created_at: Timestamp
+
+    cooldown_ends_at: created_at + config.username_cooldown_period
+    in_cooldown: config.username_cooldown_period > 0.days and cooldown_ends_at > now
+}
+
+-- A user following another user or an organization.
+-- from: models/user/follow.go:15
+entity Follow {
+    follower: User
+    followee: User?
+    followee_organization: organizations/Organization?
+    created_at: Timestamp
+}
+
+-- A block. The blocker is a user or an organization; the blocked party is
+-- always a user.
+-- from: models/user/block.go:18
+entity UserBlock {
+    blocker: User?
+    blocker_organization: organizations/Organization?
+    blocked: User
+    created_at: Timestamp
+}
+
+-- Per-user preference with behaviour elsewhere in the system.
+-- from: models/user/setting.go:20
+entity UserSetting {
+    user: User
+    key: hidden_timeline_events | diff_whitespace_behaviour | show_outdated_review_comments
+    value: String
+}
+
+-- A badge an instance can award; shown on profiles.
+-- from: models/user/badge.go:12
+entity Badge {
+    description: String
+    image_url: String
+}
+
+-- from: models/user/badge.go:18
+entity UserBadge {
+    badge: Badge
+    user: User
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [service]
+    default_keep_email_private: Boolean = false              -- DEFAULT_KEEP_EMAIL_PRIVATE
+    default_allow_create_organization: Boolean = true        -- DEFAULT_ALLOW_CREATE_ORGANIZATION
+    default_user_is_restricted: Boolean = false              -- DEFAULT_USER_IS_RESTRICTED
+    default_user_visibility: Visibility = public             -- DEFAULT_USER_VISIBILITY (first allowed mode)
+    allowed_user_visibility_modes: Set<Visibility> = { public, limited, private }  -- ALLOWED_USER_VISIBILITY_MODES
+    allow_dots_in_usernames: Boolean = true                  -- ALLOW_DOTS_IN_USERNAMES
+    username_prefix: String = ""                             -- USERNAME_PREFIX, applied on self-registration
+    username_cooldown_period: Duration = 0.days              -- USERNAME_COOLDOWN_PERIOD (days); 0 disables
+    max_user_redirects: Integer = 0                          -- MAX_USER_REDIRECTS; defaults to 5 when a cooldown is set; 0 = unlimited
+    no_reply_address: String = "noreply.localhost"           -- NO_REPLY_ADDRESS, default "noreply." + DOMAIN
+    user_location_map_url: String = "https://www.openstreetmap.org/search?query="  -- USER_LOCATION_MAP_URL
+    valid_site_url_schemes: Set<String> = { "http", "https" }  -- VALID_SITE_URL_SCHEMES (website field)
+    user_delete_with_comments_max_time: Duration = 0.days    -- USER_DELETE_WITH_COMMENTS_MAX_TIME; 0 disables
+    require_email_confirmation: Boolean = false              -- REGISTER_EMAIL_CONFIRM (shared with authentication)
+    require_manual_confirmation: Boolean = false             -- REGISTER_MANUAL_CONFIRM (shared with authentication)
+    email_domain_allowlist: Set<String> = {}                 -- EMAIL_DOMAIN_ALLOWLIST (globs)
+    email_domain_blocklist: Set<String> = {}                 -- EMAIL_DOMAIN_BLOCKLIST (globs)
+    email_domain_block_disposable: Boolean = false           -- EMAIL_DOMAIN_BLOCK_DISPOSABLE
+    activation_link_lifetime: Duration = 180.minutes         -- ACTIVE_CODE_LIVE_MINUTES
+    activation_resend_cooldown: Duration = 3.minutes         -- hard-coded mail resend limit
+
+    -- [admin]
+    disable_regular_org_creation: Boolean = false            -- DISABLE_REGULAR_ORG_CREATION
+    default_email_notifications: EmailNotificationPreference = enabled  -- DEFAULT_EMAIL_NOTIFICATIONS
+    user_disabled_features: Set<UserFeature> = {}            -- USER_DISABLED_FEATURES
+    external_user_disabled_features: Set<UserFeature> = {}   -- EXTERNAL_USER_DISABLE_FEATURES
+
+    -- [picture]
+    avatar_max_width: Integer = 4096                         -- AVATAR_MAX_WIDTH (pixels)
+    avatar_max_height: Integer = 4096                        -- AVATAR_MAX_HEIGHT (pixels)
+    avatar_max_file_size: Integer = 1048576                  -- AVATAR_MAX_FILE_SIZE (bytes)
+    avatar_max_origin_size: Integer = 262144                 -- AVATAR_MAX_ORIGIN_SIZE: smaller uploads are stored unprocessed
+    avatar_rendered_size_factor: Integer = 2                 -- AVATAR_RENDERED_SIZE_FACTOR
+    gravatar_source: String = "https://secure.gravatar.com/avatar/"  -- GRAVATAR_SOURCE ("gravatar" | "libravatar" | URL)
+    disable_gravatar: Boolean = false                        -- DISABLE_GRAVATAR (true in OFFLINE_MODE); runtime-editable
+    enable_federated_avatar: Boolean = false                 -- ENABLE_FEDERATED_AVATAR (Libravatar DNS lookup); runtime-editable
+
+    -- [ui]
+    show_user_email: Boolean = true                          -- SHOW_USER_EMAIL
+    default_show_full_name: Boolean = false                  -- DEFAULT_SHOW_FULL_NAME
+    default_theme: String = "forgejo-auto"                   -- DEFAULT_THEME
+    themes: Set<String> = { "forgejo-auto", "forgejo-light", "forgejo-dark", "gitea-auto", "gitea-light", "gitea-dark", "forgejo-auto-deuteranopia-protanopia", "forgejo-light-deuteranopia-protanopia", "forgejo-dark-deuteranopia-protanopia", "forgejo-auto-tritanopia", "forgejo-light-tritanopia", "forgejo-dark-tritanopia" }  -- THEMES
+    languages: Set<String> = { "en-US" }                     -- [i18n] LANGS (abbreviated)
+
+    -- Capability defaults that live in other sections but are evaluated on User
+    max_repo_creation_default: Integer = -1                  -- [repository] MAX_CREATION_LIMIT; -1 = unlimited
+    disable_git_hooks: Boolean = true                        -- [security] DISABLE_GIT_HOOKS
+    import_local_paths: Boolean = false                      -- [security] IMPORT_LOCAL_PATHS
+    packages_enabled: Boolean = true                         -- [packages] ENABLED
+    federation_enabled: Boolean = false                      -- [federation] ENABLED
+
+    -- [cron.delete_inactive_accounts] ENABLED / SCHEDULE / OLDER_THAN belong to
+    -- administration's CronTask, which passes OLDER_THAN (default
+    -- ACTIVE_CODE_LIVE_MINUTES) in InactiveAccountCleanupDue.
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+------------------------------------------------------------
+-- Names
+------------------------------------------------------------
+
+-- A name is usable when it matches the username pattern and is not reserved.
+-- Pattern: starts with a letter or digit; then letters, digits, '-', '_' and
+-- (when allowed) '.'; no two consecutive '-', '_', '.' and no trailing one;
+-- max 40 characters. Reserved: ".", "..", "-", ".well-known", "api",
+-- "metrics", "v2", "assets", "attachments", "avatar", "avatars",
+-- "repo-avatars", "captcha", "login", "org", "repo", "user", "admin",
+-- "explore", "issues", "pulls", "milestones", "notifications",
+-- "report_abuse", "favicon.ico", "manifest.json", "robots.txt",
+-- "sitemap.xml", "ssh_info", "swagger.v1.json", "ghost", "gitea-actions",
+-- "forgejo-actions", "actor"; reserved patterns "*.keys", "*.gpg", "*.rss",
+-- "*.atom", "*.png". All comparisons are case-insensitive. Lookups by
+-- name or address (UserRedirect{old_name}, EmailAddress{address}) are
+-- case-insensitive too.
+-- ActivityPub mirrors instead use the handle form "@user@host[:port]".
+-- from: models/user/user.go:621
+
+-- Self-registration (also used by external-login auto-registration).
+-- from: models/user/user.go:681
+rule CreateAccountBySelfRegistration {
+    when: AccountRegistrationAccepted(name, email, full_name)
+    let final_name = if config.username_prefix != "" and not starts_with(name, config.username_prefix): config.username_prefix + name else: name
+    requires: is_usable_username(final_name)
+    requires: not name_taken(final_name)
+    let claimed = UserRedirect{old_name: final_name}
+    requires: not exists claimed or not claimed.in_cooldown
+    requires: is_valid_email(email) and email_domain_allowed(email)
+    requires: not exists EmailAddress{address: email}
+    ensures:
+        let user = User.created(
+            name: final_name,
+            kind: individual,
+            created_at: now,
+            full_name: full_name,
+            description: "", website: "", location: "", pronouns: "",
+            keep_pronouns_private: false,
+            keep_email_private: config.default_keep_email_private,
+            keep_activity_private: false,
+            visibility: config.default_user_visibility,
+            use_custom_avatar: false,
+            avatar_email: email,
+            primary_email: email,
+            email_notifications: config.default_email_notifications,
+            is_active: not config.require_email_confirmation and not config.require_manual_confirmation,
+            is_admin: false,
+            is_restricted: config.default_user_is_restricted,
+            prohibit_login: false,
+            allow_git_hook: false,
+            allow_import_local: false,
+            allow_create_organization: config.default_allow_create_organization and not config.disable_regular_org_creation,
+            theme: config.default_theme,
+            diff_view_style: unified,
+            enable_repo_unit_hints: true
+        )
+        EmailAddress.created(user: user, address: email, is_activated: user.is_active, is_primary: true)
+        for r in UserRedirects where same_name(old_name, final_name):
+            not exists r
+        UserAccountCreated(user: user)
+        UserSignedUp(user: user)
+}
+
+-- A fediverse actor seen for the first time gets a local mirror account.
+-- from: services/federation/federation_service.go:232
+rule CreateActivityPubMirror {
+    when: RemoteActorDiscovered(handle, full_name, email)
+    requires: config.federation_enabled
+    requires: is_valid_activitypub_handle(handle)
+    requires: not name_taken(handle)
+    ensures:
+        let user = User.created(
+            name: handle,
+            kind: activitypub,
+            created_at: now,
+            full_name: full_name,
+            description: "", website: "", location: "", pronouns: "",
+            keep_pronouns_private: false,
+            keep_email_private: true,
+            keep_activity_private: false,
+            visibility: config.default_user_visibility,
+            use_custom_avatar: false,
+            avatar_email: email,
+            primary_email: email,
+            email_notifications: disabled,
+            is_active: false,
+            is_admin: false,
+            is_restricted: false,
+            prohibit_login: true,
+            allow_git_hook: false,
+            allow_import_local: false,
+            allow_create_organization: false,
+            theme: config.default_theme,
+            diff_view_style: unified,
+            enable_repo_unit_hints: true
+        )
+        EmailAddress.created(user: user, address: email, is_activated: false, is_primary: true)
+        UserAccountCreated(user: user)
+}
+
+-- An F3 placeholder is promoted to a real account when its person signs in
+-- through the OAuth2 source that matches the placeholder's remote source.
+-- from: services/remote/promote.go:52
+rule PromoteRemoteUser {
+    when: RemoteUserClaimed(user, email)
+    requires: user.kind = remote
+    requires: user.primary_email = ""
+    requires: not exists EmailAddress{address: email}
+    ensures: user.kind = individual
+    ensures: user.primary_email = email
+    ensures: user.prohibit_login = false
+    ensures: EmailAddress.created(user: user, address: email, is_activated: true, is_primary: true)
+    ensures: AccountStatusChanged(user: user)
+}
+
+------------------------------------------------------------
+-- Renaming
+------------------------------------------------------------
+
+-- A user renames themselves. Only local accounts, or accounts whose OAuth2
+-- source allows username changes, may do so. A case-only change keeps
+-- everything else as is. Otherwise the old name becomes a redirect, only
+-- the newest MAX_USER_REDIRECTS redirects are kept, and a name whose
+-- redirect is still cooling down can only be reclaimed by its former owner
+-- (or, for an organization's old name, by that organization's owners).
+-- Web: POST /user/settings (name field). There is no self-rename API.
+-- from: services/user/user.go:69
+rule UserRenamesSelf {
+    when: UserRenamesSelf(user, new_name)
+    requires: new_name != user.name
+    requires: user.login_source = null or user.login_source.allows_username_change
+    requires: is_usable_username(new_name)
+    requires: same_name(new_name, user.name) or not name_taken(new_name)
+    let claimed = UserRedirect{old_name: new_name}
+    requires: not exists claimed
+        or not claimed.in_cooldown
+        or claimed.user = user
+        or (claimed.organization != null and is_org_owner(claimed.organization, user))
+    ensures: RenameNamespace(user: user, old_name: user.name, new_name: new_name)
+}
+
+-- A site admin renamed a user (administration owns the entry point; it skips
+-- the login-source and cooldown checks). The old name is kept as a redirect
+-- exactly as for a self rename.
+-- API: POST /admin/users/{username}/rename. Web: /-/admin/users/{id}/edit.
+-- from: services/user/user.go:48
+rule AdminRenameKeepsRedirect {
+    when: administration/UserRenamedByAdmin(admin, user, old_name, new_name)
+    ensures: RenameNamespace(user: user, old_name: old_name, new_name: new_name)
+}
+
+-- The common half of a rename.
+-- from: services/user/user.go:107
+rule RenameNamespace {
+    when: RenameNamespace(user, old_name, new_name)
+    let case_only = same_name(old_name, new_name)
+    ensures: user.name = new_name
+    ensures:
+        if not case_only:
+            for r in UserRedirects where same_name(old_name, old_name) or same_name(old_name, new_name):
+                not exists r
+            UserRedirect.created(old_name: old_name, user: user, created_at: now)
+    ensures: UserRenamed(user: user, old_name: old_name, new_name: new_name)
+    @guidance
+        -- When MAX_USER_REDIRECTS > 0, delete this user's oldest redirects
+        -- beyond that count (see LimitUserRedirects).
+        -- Consumers of UserRenamed: repositories (owner name on every owned
+        -- repository and on-disk location), packages (container image names),
+        -- code (AGit refs that embed the user name).
+}
+
+-- Keep only the newest MAX_USER_REDIRECTS redirects per user.
+-- from: models/user/redirect.go:97
+rule LimitUserRedirects {
+    when: redirect: UserRedirect.created
+    requires: config.max_user_redirects > 0
+    requires: redirect.user != null
+    requires: redirect.user.redirects.count > config.max_user_redirects
+    ensures:
+        for r in oldest_redirects(redirect.user, redirect.user.redirects.count - config.max_user_redirects):
+            not exists r
+}
+
+------------------------------------------------------------
+-- Profile, preferences, avatar
+------------------------------------------------------------
+
+-- Web: POST /user/settings. API: PATCH /user/settings (subset: full_name,
+-- description, pronouns, website, location, hide_email, hide_pronouns,
+-- hide_activity).
+-- from: routers/web/user/setting/profile.go:72
+rule UserUpdatesProfile {
+    when: UserUpdatesProfile(user, full_name, description, website, location, pronouns, keep_email_private, keep_pronouns_private, keep_activity_private)
+    requires: length(full_name) <= 100
+    requires: length(description) <= 255
+    requires: length(website) <= 255
+    requires: website = "" or url_scheme(website) in config.valid_site_url_schemes
+    requires: length(location) <= 50
+    requires: length(pronouns) <= 50
+    ensures: user.full_name = full_name
+    ensures: user.description = description
+    ensures: user.website = website
+    ensures: user.location = location
+    ensures: user.pronouns = pronouns
+    ensures: user.keep_email_private = keep_email_private
+    ensures: user.keep_pronouns_private = keep_pronouns_private
+    ensures: user.keep_activity_private = keep_activity_private
+    ensures: UserProfileUpdated(user: user)
+}
+
+-- Visibility is changed from the same profile form; only modes the
+-- instance allows are accepted.
+-- from: services/user/update.go:131
+rule UserChangesVisibility {
+    when: UserChangesVisibility(user, visibility)
+    requires: visibility in config.allowed_user_visibility_modes
+    requires: visibility != user.visibility
+    ensures: user.visibility = visibility
+    ensures: UserVisibilityChanged(user: user, old_visibility: user.visibility, new_visibility: visibility)
+}
+
+-- Web: POST /user/settings/appearance/theme. API: PATCH /user/settings (theme).
+-- from: routers/web/user/setting/profile.go:351
+rule UserChangesTheme {
+    when: UserChangesTheme(user, theme)
+    requires: theme in config.themes
+    ensures: user.theme = theme
+}
+
+-- Web: POST /user/settings/appearance/language. API: PATCH /user/settings (language).
+-- An empty language means "follow the browser".
+-- from: routers/web/user/setting/profile.go:378
+rule UserChangesLanguage {
+    when: UserChangesLanguage(user, language)
+    requires: language = null or language in config.languages
+    ensures: user.language = language
+}
+
+-- Web: POST /user/settings/appearance/hints. API: PATCH /user/settings.
+-- from: routers/web/user/setting/profile.go:408
+rule UserTogglesRepoUnitHints {
+    when: UserTogglesRepoUnitHints(user, enabled)
+    ensures: user.enable_repo_unit_hints = enabled
+}
+
+-- Remembered whenever the user switches the diff view; also API PATCH /user/settings.
+-- from: routers/web/repo/middlewares.go:39
+rule UserChangesDiffViewStyle {
+    when: UserChangesDiffViewStyle(user, style)
+    ensures: user.diff_view_style = style
+}
+
+-- Web: POST /user/settings/appearance/hidden_comments.
+-- from: routers/web/user/setting/profile.go:426
+rule UserHidesTimelineEvents {
+    when: UserHidesTimelineEvents(user, groups)
+    let existing = UserSetting{user: user, key: hidden_timeline_events}
+    ensures:
+        if exists existing:
+            existing.value = encode_groups(groups)
+        else:
+            UserSetting.created(user: user, key: hidden_timeline_events, value: encode_groups(groups))
+}
+
+-- Remembered whenever the user picks a whitespace mode on a diff.
+-- from: routers/web/repo/middlewares.go:83
+rule UserChangesDiffWhitespace {
+    when: UserChangesDiffWhitespace(user, behaviour)
+    let existing = UserSetting{user: user, key: diff_whitespace_behaviour}
+    ensures:
+        if exists existing:
+            existing.value = encode_whitespace(behaviour)
+        else:
+            UserSetting.created(user: user, key: diff_whitespace_behaviour, value: encode_whitespace(behaviour))
+}
+
+-- Remembered whenever the user toggles outdated review comments on a PR.
+-- from: routers/web/repo/middlewares.go:109
+rule UserTogglesOutdatedComments {
+    when: UserTogglesOutdatedComments(user, show)
+    let existing = UserSetting{user: user, key: show_outdated_review_comments}
+    ensures:
+        if exists existing:
+            existing.value = encode_boolean(show)
+        else:
+            UserSetting.created(user: user, key: show_outdated_review_comments, value: encode_boolean(show))
+}
+
+-- Web: POST /user/settings/account/email with _method=NOTIFICATION.
+-- from: routers/web/user/setting/account.go:186
+rule UserChangesEmailNotifications {
+    when: UserChangesEmailNotifications(user, preference)
+    ensures: user.email_notifications = preference
+}
+
+-- Upload a custom avatar. Only PNG, JPEG, GIF and WebP; never SVG; at most
+-- AVATAR_MAX_FILE_SIZE bytes and AVATAR_MAX_WIDTH x AVATAR_MAX_HEIGHT pixels.
+-- Images at or above AVATAR_MAX_ORIGIN_SIZE are centre-cropped to a square
+-- and scaled; the smaller of original and processed is kept.
+-- Web: POST /user/settings/avatar (source=local). API: POST /user/avatar (base64).
+-- from: services/user/avatar.go:20
+rule UserUploadsAvatar {
+    when: UserUploadsAvatar(user, image)
+    requires: image_format(image) in { "png", "jpeg", "gif", "webp" }
+    requires: byte_size(image) <= config.avatar_max_file_size
+    requires: image_width(image) <= config.avatar_max_width
+    requires: image_height(image) <= config.avatar_max_height
+    ensures: user.use_custom_avatar = true
+    ensures: user.custom_avatar = store_avatar(user, image)
+    ensures: UserAvatarChanged(user: user)
+}
+
+-- Choose the email-keyed avatar service (Gravatar / Libravatar) and the
+-- address it is keyed on. The address must pass the email-domain lists.
+-- Web: POST /user/settings/avatar (source=bymail).
+-- from: routers/web/user/setting/profile.go:126
+rule UserChoosesEmailAvatar {
+    when: UserChoosesEmailAvatar(user, avatar_email)
+    requires: is_valid_email(avatar_email) and email_domain_allowed(avatar_email)
+    ensures: user.use_custom_avatar = false
+    ensures: user.avatar_email = avatar_email
+    ensures: UserAvatarChanged(user: user)
+}
+
+-- Switching to "custom" without an upload generates an identicon.
+-- from: routers/web/user/setting/profile.go:146
+rule UserSwitchesToGeneratedAvatar {
+    when: UserSwitchesToGeneratedAvatar(user)
+    requires: user.custom_avatar = null
+    ensures: user.use_custom_avatar = true
+    ensures: user.custom_avatar = generate_identicon(user)
+    ensures: UserAvatarChanged(user: user)
+}
+
+-- Web: POST /user/settings/avatar/delete. API: DELETE /user/avatar.
+-- from: services/user/avatar.go:53
+rule UserDeletesAvatar {
+    when: UserDeletesAvatar(user)
+    ensures: user.use_custom_avatar = false
+    ensures: user.custom_avatar = null
+    ensures: UserAvatarChanged(user: user)
+}
+
+-- An admin uploaded or removed a user's avatar (administration owns the
+-- entry points; the same image limits apply).
+-- from: routers/web/admin/users.go:542
+rule AdminAvatarChangeApplies {
+    when: administration/UserAvatarChangedByAdmin(admin, user)
+    ensures: user.use_custom_avatar = true
+    ensures: UserAvatarChanged(user: user)
+}
+
+-- from: routers/web/admin/users.go:559
+rule AdminAvatarRemovalApplies {
+    when: administration/UserAvatarRemovedByAdmin(admin, user)
+    ensures: user.use_custom_avatar = false
+    ensures: user.custom_avatar = null
+    ensures: UserAvatarChanged(user: user)
+}
+
+------------------------------------------------------------
+-- Email addresses
+------------------------------------------------------------
+
+-- Add one or more secondary addresses. With confirmation required they start
+-- unactivated and an activation mail is sent; adding is blocked while an
+-- activation mail sent in the last few minutes is pending.
+-- Web: POST /user/settings/account/email. API: POST /user/emails (list).
+-- from: services/user/email.go:120
+rule UserAddsEmail {
+    when: UserAddsEmail(user, address)
+    requires: length(address) <= 254
+    requires: is_valid_email(address) and email_domain_allowed(address)
+    requires: not exists EmailAddress{address: address}
+    ensures:
+        let added = EmailAddress.created(user: user, address: address, is_activated: not config.require_email_confirmation, is_primary: false)
+        UserEmailAdded(user: user, address: added)
+        if config.require_email_confirmation:
+            EmailActivationRequested(user: user, address: added)
+}
+
+-- Resend an activation mail for an unactivated address (rate limited).
+-- Web: POST /user/settings/account/email with _method=SENDACTIVATION.
+-- from: routers/web/user/setting/account.go:131
+rule UserResendsEmailActivation {
+    when: UserResendsEmailActivation(user, address)
+    requires: address.user = user
+    requires: not address.is_activated
+    requires: not activation_mail_recently_sent(user)
+    ensures: EmailActivationRequested(user: user, address: address)
+}
+
+-- The user followed a valid activation link (token checked by
+-- authentication). Activating the primary address also activates the account.
+-- An address already active on another account cannot be activated.
+-- Web: /user/activate_email, /user/activate.
+-- from: models/user/email_address.go:367
+rule UserConfirmsEmailAddress {
+    when: UserConfirmsEmailAddress(user, address)
+    requires: address.user = user
+    requires: not address.is_activated
+    requires: not activated_elsewhere(address)
+    ensures: address.is_activated = true
+    ensures:
+        if address.is_primary:
+            user.is_active = true
+    ensures: EmailAddressActivated(user: user, address: address)
+}
+
+-- Make an activated secondary address the primary; the old primary stays as
+-- a secondary address and is told about the change.
+-- Web: POST /user/settings/account/email with _method=PRIMARY.
+-- from: services/user/email.go:217
+rule UserMakesEmailPrimary {
+    when: UserMakesEmailPrimary(user, address)
+    requires: address.user = user
+    requires: address.is_activated
+    requires: not address.is_primary
+    let old_primary = user.primary_email
+    ensures:
+        for e in user.email_addresses where is_primary:
+            e.is_primary = false
+    ensures: address.is_primary = true
+    ensures: user.primary_email = address.address
+    ensures: PrimaryEmailChanged(user: user, old_address: old_primary, new_address: address.address)
+}
+
+-- An unactivated account may replace its (unconfirmed) primary address,
+-- e.g. after a typo during registration; a fresh activation mail follows.
+-- Web: POST /user/activate (change_email).
+-- from: services/user/email.go:168
+rule UserReplacesInactivePrimaryEmail {
+    when: UserReplacesInactivePrimaryEmail(user, new_address)
+    requires: not user.is_active
+    requires: is_valid_email(new_address) and email_domain_allowed(new_address)
+    requires: not exists EmailAddress{address: new_address}
+    ensures:
+        for e in user.email_addresses where is_primary:
+            not exists e
+        let added = EmailAddress.created(user: user, address: new_address, is_activated: not config.require_email_confirmation, is_primary: true)
+        user.primary_email = new_address
+        EmailActivationRequested(user: user, address: added)
+}
+
+-- Remove secondary addresses; the primary can never be removed.
+-- Web: POST /user/settings/account/email/delete. API: DELETE /user/emails.
+-- from: services/user/email.go:194
+rule UserDeletesEmail {
+    when: UserDeletesEmail(user, address)
+    requires: address.user = user
+    requires: not address.is_primary
+    ensures: not exists address
+}
+
+------------------------------------------------------------
+-- Following
+------------------------------------------------------------
+
+-- Web: POST /{username} action=follow. API: PUT /user/following/{username}.
+-- Following an organization uses the same endpoint on the org's name.
+-- from: models/user/follow.go:31
+rule UserFollowsUser {
+    when: UserFollowsUser(follower, followee)
+    requires: follower != followee
+    requires: not exists Follow{follower: follower, followee: followee}
+    requires: not exists UserBlock{blocker: follower, blocked: followee}
+    requires: not exists UserBlock{blocker: followee, blocked: follower}
+    requires: followee.visible_to(follower)
+    ensures: Follow.created(follower: follower, followee: followee, created_at: now)
+    ensures: UserFollowed(follower: follower, followee: followee)
+}
+
+-- from: routers/web/user/profile.go:426
+rule UserFollowsOrganization {
+    when: UserFollowsOrganization(follower, organization)
+    requires: not exists Follow{follower: follower, followee_organization: organization}
+    requires: not organization_has_blocked(organization, follower)
+    ensures: Follow.created(follower: follower, followee_organization: organization, created_at: now)
+    ensures: OrganizationFollowed(follower: follower, organization: organization)
+}
+
+-- Web: POST /{username} action=unfollow. API: DELETE /user/following/{username}.
+-- from: models/user/follow.go:60
+rule UserUnfollowsUser {
+    when: UserUnfollowsUser(follower, followee)
+    let follow = Follow{follower: follower, followee: followee}
+    requires: exists follow
+    ensures: not exists follow
+    ensures: UserUnfollowed(follower: follower, followee: followee)
+}
+
+-- from: models/user/follow.go:60
+rule UserUnfollowsOrganization {
+    when: UserUnfollowsOrganization(follower, organization)
+    let follow = Follow{follower: follower, followee_organization: organization}
+    requires: exists follow
+    ensures: not exists follow
+}
+
+------------------------------------------------------------
+-- Blocking
+------------------------------------------------------------
+
+-- A user blocks another user. Both follow relationships are dropped at once;
+-- the remaining consequences (unwatch the blocker's repositories, drop the
+-- blocked user's collaboration on them, cancel pending transfers between the
+-- two, revoke Actions trust on the blocker's repositories) happen in the
+-- modules that own those things, reacting to UserBlocked.
+-- Organizations cannot be blocked through this rule.
+-- Web: POST /{username} action=block. API: PUT /user/block/{username}.
+-- from: services/user/block.go:21
+rule UserBlocksUser {
+    when: UserBlocksUser(blocker, blocked)
+    requires: blocker != blocked
+    requires: not exists UserBlock{blocker: blocker, blocked: blocked}
+    ensures: UserBlock.created(blocker: blocker, blocked: blocked, created_at: now)
+    ensures: not exists Follow{follower: blocker, followee: blocked}
+    ensures: not exists Follow{follower: blocked, followee: blocker}
+    ensures: UserBlocked(blocker: blocker, blocked: blocked)
+}
+
+-- Web: POST /{username} action=unblock, POST /user/settings/blocked_users/unblock.
+-- API: PUT /user/unblock/{username}.
+-- from: models/user/block.go:47
+rule UserUnblocksUser {
+    when: UserUnblocksUser(blocker, blocked)
+    let block = UserBlock{blocker: blocker, blocked: blocked}
+    requires: exists block
+    ensures: not exists block
+    ensures: UserUnblocked(blocker: blocker, blocked: blocked)
+}
+
+-- An organization owner blocks a user on behalf of the organization.
+-- Web: POST /org/{org}/settings/blocked_users/block. API: PUT /orgs/{org}/block/{username}.
+-- from: routers/web/org/setting/blocked_users.go:62
+rule OrganizationBlocksUser {
+    when: OrganizationBlocksUser(owner, organization, blocked)
+    requires: is_org_owner(organization, owner) or owner.is_admin
+    requires: not organization_has_blocked(organization, blocked)
+    ensures: UserBlock.created(blocker_organization: organization, blocked: blocked, created_at: now)
+    ensures: not exists Follow{follower: blocked, followee_organization: organization}
+    ensures: OrganizationBlockedUser(organization: organization, blocked: blocked)
+}
+
+-- Web: POST /org/{org}/settings/blocked_users/unblock. API: PUT /orgs/{org}/unblock/{username}.
+-- from: routers/web/org/setting/blocked_users.go:80
+rule OrganizationUnblocksUser {
+    when: OrganizationUnblocksUser(owner, organization, blocked)
+    let block = UserBlock{blocker_organization: organization, blocked: blocked}
+    requires: is_org_owner(organization, owner) or owner.is_admin
+    requires: exists block
+    ensures: not exists block
+}
+
+------------------------------------------------------------
+-- Deletion
+------------------------------------------------------------
+
+-- A user deletes their own account after re-entering their password
+-- (checked by authentication). Admins cannot delete themselves; the
+-- "deletion" feature can be disabled per instance (or for external users);
+-- the account must own no repositories or packages and belong to no
+-- organization.
+-- Web: POST /user/settings/account/delete. No API.
+-- from: routers/web/user/setting/account.go:240
+rule UserDeletesOwnAccount {
+    when: UserDeletesOwnAccount(user)
+    requires: not deletion_disabled_for(user)   -- = user.has_feature_disabled(deletion)
+    requires: not user.is_admin
+    requires: not owns_repositories(user)
+    requires: not belongs_to_organizations(user)
+    requires: not owns_packages(user)
+    ensures: DeleteUserAccount(user: user, purge: false)
+}
+
+-- A site admin deleted an account (administration owns the entry point and
+-- its preconditions: not self, not the last admin, purge or owns nothing).
+-- With purge the account is disabled at once, then everything it owns is
+-- removed by the owning modules, then the account itself.
+-- API: DELETE /admin/users/{username}?purge=. Web: POST /-/admin/users/{id}/delete.
+-- from: services/user/user.go:183
+rule AdminDeletionCascades {
+    when: administration/UserDeletedByAdmin(admin, user, purge)
+    ensures:
+        if purge:
+            user.is_active = false
+            user.is_restricted = true
+            user.is_admin = false
+            user.prohibit_login = true
+            user.max_repo_creation = 0
+            UserPurged(user: user)
+        DeleteUserAccount(user: user, purge: purge)
+}
+
+-- The removal itself. Things this module owns go here; everything else
+-- reacts to UserAccountDeleted.
+-- from: services/user/delete.go:36
+rule DeleteUserAccount {
+    when: DeleteUserAccount(user, purge)
+    let young = config.user_delete_with_comments_max_time > 0.days
+                and user.created_at + config.user_delete_with_comments_max_time > now
+    ensures:
+        for e in user.email_addresses: not exists e
+        for f in user.follows_given: not exists f
+        for f in user.follows_received: not exists f
+        for b in user.blocks_given: not exists b
+        for b in user.blocks_received: not exists b
+        for s in user.settings: not exists s
+        for ub in user.badges: not exists ub
+        for r in user.redirects: not exists r
+        UserAccountDeleted(user: user, purge: purge, delete_contributions: purge or young)
+        not exists user
+    @guidance
+        -- Consumers of UserAccountDeleted, all keyed on the user:
+        --   repositories: stars, watches (and their counters), collaborations,
+        --     derived access rows.
+        --   issues: reactions, stopwatches, assignments, issue-user state;
+        --     tracked time is kept but detached; if delete_contributions,
+        --     the user's plain comments and reactions are deleted, and if
+        --     purge, every issue/PR they opened is deleted; otherwise
+        --     their content stays and shows as the ghost user.
+        --   pulls: auto-merge requests, review state.
+        --   code: the user disappears from branch-protection allow-lists.
+        --   keys: SSH keys (authorized_keys rewritten), GPG keys and imports.
+        --   authentication: access tokens and their repo scopes, OAuth2
+        --     grants/apps, external logins, OpenID URIs, authorization
+        --     tokens, authorized integrations.
+        --   organizations: team memberships, team invites sent or received;
+        --     the "added by" provenance on team memberships is cleared.
+        --   actions: user-owned runners and runner tokens, action-user trust.
+        --   notifications: the user's activity rows.
+        --   moderation: a shadow copy is kept if the user was reported.
+        -- On-disk repository root and stored avatar are removed last;
+        -- failures there become a system notice (administration).
+}
+
+-- Unactivated individual accounts older than OLDER_THAN are removed when
+-- administration's delete_inactive_accounts cron task runs (disabled by
+-- default, @annually when enabled, runnable on demand). Accounts that own
+-- something, belong to an organization, or are the last admin are skipped.
+-- from: services/user/user.go:363
+rule DeleteInactiveAccounts {
+    when: administration/InactiveAccountCleanupDue(older_than)
+    for user in Users where is_active = false and kind = individual:
+        requires: user.created_at + older_than <= now
+        requires: not owns_repositories(user)
+        requires: not belongs_to_organizations(user)
+        requires: not owns_packages(user)
+        requires: not (user.is_admin and admin_count() <= 1)
+        ensures: DeleteUserAccount(user: user, purge: false)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Names are unique case-insensitively across users and organizations.
+-- from: models/user/user.go:86 (UNIQUE lower_name)
+invariant UniqueUserNames {
+    for a in Users:
+        for b in Users:
+            a = b or not same_name(a.name, b.name)
+}
+
+-- Addresses are unique case-insensitively across the instance.
+-- from: models/user/email_address.go:82
+invariant UniqueEmailAddresses {
+    for a in EmailAddresses:
+        for b in EmailAddresses:
+            a = b or not same_address(a.address, b.address)
+}
+
+-- Every account that has addresses has exactly one primary, and it matches
+-- User.primary_email.
+invariant SinglePrimaryEmail {
+    for u in Users:
+        u.email_addresses.count = 0
+        or (u.primary_address.count = 1
+            and u.primary_address.all(e => e.address = u.primary_email))
+}
+
+-- An unactivated primary address means an unactivated account.
+invariant ActiveAccountHasActivatedPrimary {
+    for e in EmailAddresses:
+        not e.is_primary or e.is_activated or not e.user.is_active or not config.require_email_confirmation
+}
+
+-- There is always at least one site admin once the instance is installed.
+invariant AtLeastOneAdmin {
+    Users.any(u => u.is_admin)
+}
+
+-- No one follows or blocks themselves.
+invariant NoSelfFollow {
+    for f in Follows:
+        f.followee != f.follower
+}
+
+invariant NoSelfBlock {
+    for b in UserBlocks:
+        b.blocker != b.blocked
+}
+
+-- A block and a follow never coexist between the same two users.
+invariant BlockSeversFollow {
+    for b in UserBlocks:
+        b.blocker = null
+        or not Follows.any(f =>
+            (f.follower = b.blocker and f.followee = b.blocked)
+            or (f.follower = b.blocked and f.followee = b.blocker))
+}
+
+-- Exactly one followee kind and one blocker kind.
+invariant FollowHasOneTarget {
+    for f in Follows:
+        (f.followee != null) != (f.followee_organization != null)
+}
+
+invariant BlockHasOneBlocker {
+    for b in UserBlocks:
+        (b.blocker != null) != (b.blocker_organization != null)
+}
+
+invariant RedirectHasOneTarget {
+    for r in UserRedirects:
+        (r.user != null) != (r.organization != null)
+}
+
+-- An old name never shadows a live name.
+invariant RedirectNeverShadowsLiveName {
+    for r in UserRedirects:
+        not Users.any(u => same_name(u.name, r.old_name))
+}
+
+-- User visibility is always one of the instance's allowed modes at the
+-- time it was set (organizations are exempt; see organizations).
+invariant VisibilityAllowed {
+    for u in Users:
+        u.visibility in config.allowed_user_visibility_modes
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Anyone signed in to a usable account.
+actor SignedInUser {
+    identified_by: User where is_active = true and prohibit_login = false
+}
+
+-- A signed-in account whose primary email is not yet confirmed: it may only
+-- manage its account (activation / change address), nothing else.
+actor UnactivatedUser {
+    identified_by: User where is_active = false and prohibit_login = false
+}
+
+actor OrganizationOwner {
+    within: organizations/Organization
+    identified_by: User where is_org_owner(within, this)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The account holder's own settings: profile, appearance, avatar.
+surface OwnProfileSettings {
+    facing user: SignedInUser
+
+    exposes:
+        user.name
+        user.full_name
+        user.description
+        user.website
+        user.location
+        user.pronouns
+        user.visibility
+        user.keep_email_private
+        user.keep_pronouns_private
+        user.keep_activity_private
+        user.avatar_source
+        user.avatar_email
+        user.theme
+        user.language
+        user.diff_view_style
+        user.enable_repo_unit_hints
+        user.is_local
+        config.allowed_user_visibility_modes
+        config.username_cooldown_period
+        config.themes
+
+    provides:
+        UserRenamesSelf(user, new_name)
+            when user.is_local or user.login_source.allows_username_change
+        UserUpdatesProfile(user, full_name, description, website, location, pronouns, keep_email_private, keep_pronouns_private, keep_activity_private)
+        UserChangesVisibility(user, visibility)
+        UserChangesTheme(user, theme)
+        UserChangesLanguage(user, language)
+        UserTogglesRepoUnitHints(user, enabled)
+        UserChangesDiffViewStyle(user, style)
+        UserHidesTimelineEvents(user, groups)
+        UserChangesDiffWhitespace(user, behaviour)
+        UserTogglesOutdatedComments(user, show)
+        UserUploadsAvatar(user, image)
+        UserChoosesEmailAvatar(user, avatar_email)
+            when not config.disable_gravatar
+        UserSwitchesToGeneratedAvatar(user)
+        UserDeletesAvatar(user)
+
+    @guarantee RenameWarnsAboutCooldown
+        -- When a cooldown is configured, the rename form says how long the
+        -- old name stays reserved for the user before others may claim it.
+
+    @guidance
+        -- Web: GET/POST /user/settings, POST /user/settings/avatar,
+        -- POST /user/settings/avatar/delete, GET /user/settings/appearance,
+        -- POST /user/settings/appearance/{theme,language,hints,hidden_comments}.
+        -- API: GET/PATCH /user/settings, POST/DELETE /user/avatar,
+        -- GET /user (the caller's own full record).
+}
+
+-- The account holder's addresses, notification mail preference and the
+-- delete-account form.
+surface OwnAccountSettings {
+    facing user: SignedInUser
+
+    exposes:
+        user.primary_email
+        user.email_notifications
+        for e in user.email_addresses:
+            e.address
+            e.is_activated
+            e.is_primary
+            e.can_be_primary
+        user.has_feature_disabled(deletion)
+        config.user_delete_with_comments_max_time
+
+    provides:
+        UserAddsEmail(user, address)
+            when not config.require_email_confirmation or not activation_mail_recently_sent(user)
+        UserResendsEmailActivation(user, address)
+        UserMakesEmailPrimary(user, address)
+        UserDeletesEmail(user, address)
+        UserChangesEmailNotifications(user, preference)
+        UserDeletesOwnAccount(user)
+            when not deletion_disabled_for(user) and not user.is_admin
+
+    @guarantee DeletionWarnsAboutContributions
+        -- When USER_DELETE_WITH_COMMENTS_MAX_TIME is set and the account is
+        -- younger than it, the form warns that comments will be deleted too.
+
+    @guidance
+        -- Web: GET /user/settings/account, POST /user/settings/account/email
+        -- (_method = PRIMARY | SENDACTIVATION | NOTIFICATION | add),
+        -- POST /user/settings/account/email/delete, POST /user/settings/account/delete.
+        -- API: GET/POST/DELETE /user/emails.
+        -- Password change on the same page belongs to authentication.
+}
+
+-- What an unactivated account can do.
+surface AccountActivation {
+    facing user: UnactivatedUser
+
+    exposes:
+        user.primary_email
+
+    provides:
+        UserConfirmsEmailAddress(user, address)
+        UserReplacesInactivePrimaryEmail(user, new_address)
+        UserResendsEmailActivation(user, address)
+
+    @guidance
+        -- Web: GET/POST /user/activate, /user/activate_email.
+}
+
+-- A signed-in user looking at someone's profile.
+surface UserProfile {
+    facing viewer: SignedInUser
+    context profile: User where visible_to(viewer)
+
+    exposes:
+        profile.name
+        profile.full_name
+        profile.display_name
+        profile.description
+        profile.website
+        profile.location
+        profile.pronouns
+        profile.visibility
+        profile.created_at
+        profile.kind
+        profile.num_followers
+        profile.num_following
+        profile.public_email
+            when config.show_user_email and not profile.keep_email_private
+        for f in profile.follows_received:
+            f.follower.name
+                when f.follower.visible_to(viewer)
+        for ub in profile.badges:
+            ub.badge.description
+            ub.badge.image_url
+
+    provides:
+        UserFollowsUser(viewer, profile)
+            when viewer != profile
+        UserUnfollowsUser(viewer, profile)
+        UserBlocksUser(viewer, profile)
+            when viewer != profile
+        UserUnblocksUser(viewer, profile)
+
+    @guarantee InvisibleProfilesDoNotExist
+        -- A profile the viewer may not see answers exactly like a name that
+        -- does not exist, including through its old names (redirects) and
+        -- the .keys / .gpg / .rss / .atom / .png sub-routes.
+
+    @guarantee ActivityRespectsPrivacy
+        -- The activity tab, heatmap and feeds show nothing to others when
+        -- keep_activity_private is set (admins and the user still see them).
+
+    @guarantee ProfileReadme
+        -- If the user owns a repository named ".profile" that is public, not
+        -- a fork, not empty and readable by the viewer, its default branch
+        -- README is rendered as the default "overview" tab, and its
+        -- FUNDING file adds funding links; otherwise the repositories tab is
+        -- the default.
+
+    @guarantee OldNamesRedirect
+        -- A request for an old name of a visible user redirects to the
+        -- current name, keeping the rest of the path and the query.
+
+    @guidance
+        -- Web: GET /{username} (tabs: overview, repositories, stars,
+        -- watching, followers, following, activity, projects, packages,
+        -- feed), GET /{username}.{keys,gpg,rss,atom,png},
+        -- POST /{username} (action = follow | unfollow | block | unblock).
+        -- API: GET /users/{username}, /users/{username}/followers,
+        -- /users/{username}/following[/{target}], GET/PUT/DELETE
+        -- /user/following/{username}, GET /user/followers,
+        -- PUT /user/block/{username}, PUT /user/unblock/{username}.
+        -- Location links to USER_LOCATION_MAP_URL + location.
+        -- Followers / following lists only include users visible to the viewer.
+        -- Organizations the user belongs to are listed: public ones to
+        -- everybody, limited ones to signed-in viewers, private ones only to
+        -- the user and admins.
+}
+
+-- An organization page's follow button.
+surface OrganizationFollowButton {
+    facing viewer: SignedInUser
+    context organization: organizations/Organization
+
+    provides:
+        UserFollowsOrganization(viewer, organization)
+        UserUnfollowsOrganization(viewer, organization)
+}
+
+-- The user's own block list.
+surface OwnBlockList {
+    facing user: SignedInUser
+
+    exposes:
+        for b in user.blocks_given:
+            b.blocked.name
+            b.created_at
+
+    provides:
+        UserUnblocksUser(user, blocked)
+
+    @guidance
+        -- Web: GET /user/settings/blocked_users, POST .../unblock.
+        -- API: GET /user/list_blocked.
+}
+
+-- An organization's block list, managed by its owners.
+surface OrganizationBlockList {
+    facing owner: OrganizationOwner
+    context organization: organizations/Organization
+
+    provides:
+        OrganizationBlocksUser(owner, organization, blocked)
+        OrganizationUnblocksUser(owner, organization, blocked)
+
+    @guidance
+        -- Web: /org/{org}/settings/blocked_users. API: GET /orgs/{org}/list_blocked,
+        -- PUT /orgs/{org}/block/{username}, PUT /orgs/{org}/unblock/{username}.
+}
+
+-- The block contract other modules must enforce. Stated here because the
+-- block is defined here; each module states its own rule-level check.
+surface BlockEnforcement {
+    facing actor: SignedInUser
+    context block: UserBlock where blocked = actor
+
+    exposes:
+        block.created_at
+
+    @guarantee BlockedCannotFollow
+        -- Neither side of a user-to-user block can follow the other.
+    @guarantee BlockedCannotOpenIssuesOrPulls
+        -- A user blocked by a repository's owner (user or organization)
+        -- cannot open issues or pull requests in that repository.
+    @guarantee BlockedCannotInteractWithIssue
+        -- A user blocked by the repository owner or by an issue's poster
+        -- cannot comment on, react to, retitle, close or reopen that issue
+        -- or pull request; reacting to a comment is also refused when the
+        -- comment's poster blocked them.
+    @guarantee BlockedCannotCollaborate
+        -- A user cannot be added as a collaborator to a repository whose
+        -- owner blocked them, or whose owner they blocked.
+    @guarantee BlockedCannotTransferTo
+        -- A repository cannot be transferred to an owner who blocked the doer.
+    @guarantee BlockIsSilent
+        -- The blocked user is not told they were blocked; the refused
+        -- action simply reports that the user blocked them.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred User.avatar_url              -- see: notifications / UI; resolution order in AvatarSource
+deferred is_usable_username           -- see: header comment "Names"
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Follow visibility: Forgejo lets anyone follow a user they cannot see (no visibility check on follow). The spec requires visibility to avoid leaking private accounts; confirm."
+open question "Reserved user/organization placeholder kinds (UserTypeUserReserved/OrganizationReserved) exist in the schema with no creation path; should the rebuild offer admin-reserved names (anti re-registration) as a feature?"
+open question "Admins are not immune to being blocked (TODO in services/user/block.go). Should a block prevent a site admin's actions?"
+open question "Blocking does not remove the blocked user from repositories the blocker owns through an organization, nor org membership; should it?"
+open question "Self-deletion is refused for site admins entirely (not only the last admin). Keep, or allow when other admins remain?"
+open question "Making an address primary via the web does not re-check activation server-side (only the UI hides the button). The spec requires activation; confirm."
+open question "Badges have a schema and display but no management UI or API; should the rebuild offer admin badge management?"
+open question "Inactive-account cleanup runs only on its cron schedule (default yearly, disabled). Should eligibility be continuous instead?"
+open question "Purge disables the account outside the deletion transaction so a failure can leave a disabled, half-purged account; should purge be resumable?"
+
+------------------------------------------------------------
+-- Requests to other modules
+------------------------------------------------------------
+-- REQUEST authentication/AuthSource.allows_username_change: OAuth2 sources may allow users to rename themselves (UserRenamesSelf).
+-- REQUEST authentication: emit AccountRegistrationAccepted(name, email, full_name) after sign-up / auto-registration checks pass; emit UserConfirmsEmailAddress(user, address) after a valid activation link; emit RemoteUserClaimed(user, email) when an OAuth2 login matches an F3 placeholder; react to UserPurged by ending all sessions.
+-- REQUEST authentication: the password re-entry for UserDeletesOwnAccount and the "manage_password" feature flag (UserFeature) are yours.
+-- REQUEST organizations: provide is_org_owner(organization, user) and shares_organization(a, b) (both users are members of a common organization, or one is the organization); react to UserPurged by removing memberships and deleting organizations where the user is the last owner; org renames should go through RenameNamespace semantics (UserRedirect with organization set); names are unique across users and organizations.
+-- REQUEST organizations/Organization.follows: Follow.followee_organization relationship for follower counts on org pages.
+-- REQUEST repositories: provide owns_repositories(user) (any repository with owner_user = user); used by deletion preconditions.
+-- REQUEST organizations: provide belongs_to_organizations(user) (any OrgMembership of the user); used by deletion preconditions.
+-- REQUEST repositories: react to UserRenamed (owner names and storage), UserBlocked / OrganizationBlockedUser (unwatch blocker-owned repos, drop collaboration, cancel pending transfers, refuse collaborator add and transfer to a blocker), UserPurged (delete owned repos), UserAccountDeleted (stars, watches, collaborations).
+-- REQUEST issues: enforce BlockEnforcement on issue creation (repo owner blocked poster), comment, reaction (also comment poster), title change, status change (repo owner or issue poster blocked doer); react to UserAccountDeleted(delete_contributions, purge).
+-- REQUEST pulls: refuse PR creation when the base repository owner blocked the poster; react to UserAccountDeleted (auto-merges, review state).
+-- REQUEST packages: provide owns_packages(user); react to UserPurged (delete all owned packages) and UserRenamed (container image names).
+-- REQUEST actions: react to UserBlocked (revoke trust of the blocked user on the blocker's repositories) and UserAccountDeleted (runners, tokens, trust).
+-- REQUEST keys: react to UserAccountDeleted (SSH, GPG keys and imports; rewrite authorized keys / principals).
+-- REQUEST administration: admin user management entry points stay yours; this module reacts to UserRenamedByAdmin (redirect), UserDeletedByAdmin (purge disable + cascade), UserAvatarChangedByAdmin / UserAvatarRemovedByAdmin, InactiveAccountCleanupDue(older_than).
+-- REQUEST administration: AdminSetsUserPrimaryEmail must keep EmailAddress rows consistent (promote an existing address of the same user or create one, mark it primary and activated, keep the old primary as a secondary address, skip email-domain lists) and emit accounts' PrimaryEmailChanged; AdminCreatesUser must create the primary EmailAddress (activated), delete any UserRedirect for the name, and apply the same creation defaults as CreateAccountBySelfRegistration minus prefix/cooldown/domain checks.
+-- REQUEST administration: AdminSetsUserAdmin / AdminDeletesUser must refuse removing the last admin (invariant AtLeastOneAdmin).
+-- REQUEST notifications: send activation mail on EmailActivationRequested, primary-change mail to the old address on PrimaryEmailChanged; honour User.email_notifications and User.can_receive_mail; honour activity_readable_by for feeds and heatmap.
+-- REQUEST federation: emit RemoteActorDiscovered(handle, full_name, email); react to UserPurged (delete FederatedUser).
+-- REQUEST access: anonymous visitors see only public profiles; restricted users see only public profiles (plus their own and admins' rules); expose an anonymous actor this module's profile surface can face.
+-- REQUEST moderation: keep a shadow copy of a reported user's profile fields before UserProfileUpdated / PrimaryEmailChanged / deletion.
