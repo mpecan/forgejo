@@ -107,6 +107,8 @@ the Forgejo code it was distilled from.
 
 ## Conventions forced by the tooling
 
+The `allium-journey` limitations behind these are filed as [#6–#13](https://github.com/mpecan/allium-inspect/issues?q=is%3Aissue+6..13) on allium-inspect.
+
 These shape how the spec is written. They are not domain decisions.
 
 - **Permission checks are local predicates.** A rule says
@@ -153,10 +155,10 @@ cannot decide.
 
 | Journey | Why |
 |---|---|
-| actions: *A Dispatched Workflow Runs To Success* (step 5), *A Running Run Cannot Be Rerun Until It Finishes* (3), *A Silent Task Becomes A Zombie* (3), *A Job Nobody Picks Up Is Abandoned* (2); pulls: *Auto Merge Waits For Required Checks* (3) | During an `after` step the walker treats an entity collection as open-world. `webhooks/FanOutHookEvent` loops `for w in Webhooks where …`, which yields an unknown member even when the journey casts no webhook, so the downstream `QueueDeliveryForMatchedEvent` cannot be decided "while the clock moved". This reproduces in a 20-line spec. The same fan-out holds in non-timed steps. |
-| webhooks: *A Week Later The History Is Cleaned Up* | The same open-world behaviour, applied to the timeout timer of a delivery that the cleanup just removed |
-| federation: *A Repository Admin Follows A Remote Repository* (2) | The walker cannot evaluate `.all(…)` over a collection |
-| releases: *A Maintainer Links An External Asset* (1) | The walker does not bind an `issues/Attachment` created by a releases rule |
+| actions: *A Dispatched Workflow Runs To Success* (step 5), *A Running Run Cannot Be Rerun Until It Finishes* (3), *A Silent Task Becomes A Zombie* (3), *A Job Nobody Picks Up Is Abandoned* (2); pulls: *Auto Merge Waits For Required Checks* (3) | During an `after` step the walker treats an entity collection as open-world. `webhooks/FanOutHookEvent` loops `for w in Webhooks where …`, which yields an unknown member even when the journey casts no webhook, so the downstream `QueueDeliveryForMatchedEvent` cannot be decided "while the clock moved". This reproduces in a 20-line spec. The same fan-out holds in non-timed steps. ([#6](https://github.com/mpecan/allium-inspect/issues/6)) |
+| webhooks: *A Week Later The History Is Cleaned Up* | The same open-world behaviour, applied to the timeout timer of a delivery that the cleanup just removed ([#6](https://github.com/mpecan/allium-inspect/issues/6)) |
+| federation: *A Repository Admin Follows A Remote Repository* (2) | The walker cannot evaluate `.all(…)` over a collection ([#7](https://github.com/mpecan/allium-inspect/issues/7)) |
+| releases: *A Maintainer Links An External Asset* (1) | The walker does not bind an `issues/Attachment` created by a releases rule ([#9](https://github.com/mpecan/allium-inspect/issues/9)) |
 
 
 ## How this was produced
