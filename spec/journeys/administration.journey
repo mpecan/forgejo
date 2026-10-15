@@ -1,0 +1,446 @@
+-- Journeys through site administration and the instance lifecycle.
+--
+-- Most of these need a signed-in site administrator (`root`) and an ordinary
+-- account (`ada`). accounts/User is owned by accounts.allium.
+
+world {
+    cast:
+        site: Instance
+        root: accounts/User
+        ada:  accounts/User
+        proc: ServerProcess
+    given:
+        site.install_status = installed
+        site.app_name = "Forgejo"
+        site.version = "12.0.0"
+        site.database_reachable = true
+        site.cache_reachable = true
+        root.name = "root"
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+        ada.name = "ada"
+        ada.is_admin = false
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.is_restricted = false
+        proc.is_running = true
+}
+
+-- The very first visit: nobody has an account yet.
+journey FirstRunInstallCreatesTheAdministrator {
+    goal: Mira has just started a fresh Forgejo. The install wizard is the only
+          page there is. She fills it in with an administrator account; the
+          instance is installed, she is signed in as that administrator, and the
+          wizard is gone for good.
+
+    world: none
+
+    cast:
+        mira:     Visitor
+        site:     Instance
+        settings: InstallSettings
+
+    given:
+        mira.is_signed_in = false
+        site.install_status = awaiting_install
+        settings.app_name = "Forge of Mira"
+        settings.root_url = "https://forge.example/"
+        settings.git_available = true
+        settings.database_reachable = true
+        settings.database_previously_used = false
+        settings.reinstall_confirmed = false
+        settings.paths_writable = true
+        settings.run_user_matches = true
+        settings.ssh_port = 0
+        settings.smtp_address = null
+        settings.disable_registration = true
+        settings.disable_gravatar = true
+        settings.enable_federated_avatar = false
+        settings.password_hash_algorithm = null
+        settings.admin_name = "mira"
+        settings.admin_email = "mira@forge.example"
+        settings.admin_password = "correct horse battery"
+        settings.admin_password_confirm = "correct horse battery"
+
+    1. she submits the wizard
+        stipulate is_usable_username("mira") = true
+        stipulate password_long_enough("correct horse battery") = true
+        mira does VisitorSubmitsInstallation(mira, site, settings) on InstallWizard
+        then VisitorInstallsInstance fires
+        then InstallerCreatesFirstAdmin fires
+        then site.install_status = installed
+        then site.app_name = "Forge of Mira"
+
+    2. the wizard is gone
+        mira cannot do VisitorSubmitsInstallation(mira, site, settings) on InstallWizard
+
+    ends: The instance is installed, registration is closed, and Mira is its
+          administrator.
+}
+
+-- Closing registration without creating an administrator would lock everybody out.
+journey InstallRefusesToLockEveryoneOut {
+    goal: Mira ticks "disable self-registration" but leaves the administrator
+          section empty. The wizard refuses rather than produce an instance
+          nobody can ever sign in to.
+
+    world: none
+
+    cast:
+        mira:     Visitor
+        site:     Instance
+        settings: InstallSettings
+
+    given:
+        mira.is_signed_in = false
+        site.install_status = awaiting_install
+        settings.git_available = true
+        settings.database_reachable = true
+        settings.database_previously_used = false
+        settings.paths_writable = true
+        settings.run_user_matches = true
+        settings.ssh_port = 0
+        settings.smtp_address = null
+        settings.password_hash_algorithm = null
+        settings.disable_registration = true
+        settings.admin_name = null
+
+    1. she submits
+        mira cannot do VisitorSubmitsInstallation(mira, site, settings) on InstallWizard
+        then site.install_status = awaiting_install
+
+    ends: Nothing was written; the wizard is still there.
+}
+
+-- Running a maintenance task by hand, and what a failure leaves behind.
+journey AdministratorRunsADisabledTaskByHand {
+    goal: Root wants to purge never-activated accounts now. The task is
+          disabled on the schedule, but the dashboard still offers it. It runs,
+          the accounts module reports a failure, and the failure is waiting in
+          the system notices.
+
+    given:
+        sweep: CronTask { name: delete_inactive_accounts, owner: accounts, requires_feature: always, enabled: false, run_at_start: false, schedule: "@annually", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+
+    1. root runs it from the dashboard
+        root does AdminRunsCronTask(root, sweep) on AdminDashboard
+        then AdminRunsCronTask fires
+        then StartCronTaskRun fires
+        then DispatchDeleteInactiveAccounts fires
+        then sweep.run_state = running
+        then sweep.exec_times = 1
+
+    2. a second click while it runs does not start it twice
+        root does AdminRunsCronTask(root, sweep) on CronTaskMonitor
+        then StartCronTaskRun does not fire
+        then sweep.exec_times = 1
+
+    3. the accounts module reports it failed
+        proc does CronWorkCompleted(sweep, failed, "database is locked") on BackgroundWorkReporting
+            creating notice: SystemNotice
+        then FinishCronTaskRun fires
+        then sweep.run_state = idle
+        then sweep.last_outcome = failed
+        then notice.kind = task
+
+    4. root reads the notice and the task's last outcome
+        root sees notice.description on SystemNoticeLog in notice
+        root sees sweep.last_message on CronTaskMonitor in sweep
+
+    ends: The failure is recorded on the task and in the notice log.
+}
+
+-- Only administrators run maintenance.
+journey AnOrdinaryUserCannotRunMaintenance {
+    goal: Ada finds the cron endpoint in the API docs and tries it. She is not
+          an administrator, so nothing runs.
+
+    given:
+        gc: CronTask { name: git_gc_repos, owner: repositories, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 72h", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+
+    1. ada tries to run garbage collection
+        ada cannot do AdminRunsCronTask(ada, gc) on CronTaskMonitor
+        then gc.exec_times = 0
+
+    2. nor may she empty the notice log
+        ada cannot do AdminEmptiesNotices(ada) on SystemNoticeLog
+
+    ends: The task never started.
+}
+
+-- The scheduler at work.
+journey TheMirrorTaskRunsOnItsSchedule {
+    goal: The instance starts. update_mirrors is enabled every ten minutes and
+          not run at start; ten minutes later it falls due, starts, and asks
+          the repositories module to sync up to fifty pull and fifty push
+          mirrors.
+
+    given:
+        mirrors: CronTask { name: update_mirrors, owner: repositories, requires_feature: mirrors, enabled: true, run_at_start: false, schedule: "@every 10m", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+
+    1. the instance starts and schedules it
+        stipulate time_until_next("@every 10m") = 10.minutes
+        proc does InstanceStarted(site) on BackgroundWorkReporting
+        then ScheduleTasksAtStart fires
+        then StartCronTaskRun does not fire
+        then mirrors.run_state = idle
+
+    2. ten minutes pass
+        after 10.minutes
+        then CronTaskFallsDue fires
+        then StartCronTaskRun fires
+        then DispatchUpdateMirrors fires
+        then mirrors.run_state = running
+        then mirrors.exec_times = 1
+
+    3. the sync finishes cleanly; nothing is noticed
+        proc does CronWorkCompleted(mirrors, finished, null) on BackgroundWorkReporting
+        then FinishCronTaskRun fires
+        then mirrors.last_outcome = finished
+        root sees mirrors.last_outcome on CronTaskMonitor in mirrors
+
+    ends: The task is idle again with one run recorded and no notice.
+}
+
+-- Old notices age out once the cleanup task is enabled.
+journey OldNoticesAgeOut {
+    goal: An operator enabled delete_old_system_notices. A notice recorded
+          over a year ago is removed on its weekly run.
+
+    given:
+        tidy: CronTask { name: delete_old_system_notices, owner: administration, requires_feature: always, enabled: true, run_at_start: false, schedule: "@every 168h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+
+    1. a background failure is reported
+        proc does SystemFailureReported(repository, "Failed to remove /data/repos/x.git") on BackgroundWorkReporting
+            creating old: SystemNotice
+        then RecordSystemNotice fires
+        then old.kind = repository
+
+    2. a year and a bit later root runs the cleanup
+        after 400.days
+        root does AdminRunsCronTask(root, tidy) on CronTaskMonitor
+        then DispatchDeleteOldSystemNotices fires
+        then DeleteOldSystemNotices fires
+        then old does not exist
+
+    ends: Only the last year of notices is kept.
+}
+
+-- The last administrator is protected.
+journey TheLastAdministratorCannotBeDemoted {
+    goal: Root is the only administrator. Root cannot strip their own admin
+          flag or delete themselves; promoting Ada is fine.
+
+    1. root tries to step down
+        stipulate has_other_admin(root) = false
+        root cannot do AdminSetsUserAdmin(root, root, false) on AdminUserAccount
+        then root.is_admin = true
+
+    2. root cannot delete their own account
+        root cannot do AdminDeletesUser(root, root, false) on AdminUserAccount
+
+    3. root promotes ada
+        root does AdminSetsUserAdmin(root, ada, true) on AdminUserAccount
+        then ada.is_admin = true
+
+    ends: There is always at least one administrator.
+}
+
+-- With a second administrator, stepping down is allowed.
+journey AnAdministratorStepsDownWhenAnotherRemains {
+    goal: Ada is already an administrator too, so Root may give up the role.
+
+    given:
+        ada.is_admin = true
+
+    1. root steps down
+        stipulate has_other_admin(root) = true
+        root does AdminSetsUserAdmin(root, root, false) on AdminUserAccount
+        then root.is_admin = false
+
+    ends: Ada remains the administrator.
+}
+
+-- Editing an account's limits and access.
+journey AdministratorRestrictsAnAccount {
+    goal: Ada's account is being used to spam repositories. Root restricts it,
+          blocks its sign-in and stops it creating repositories. Root cannot
+          block their own sign-in by accident.
+
+    1. root restricts ada and caps her repositories
+        root does AdminSetsUserRestricted(root, ada, true) on AdminUserAccount
+        then ada.is_restricted = true
+        root does AdminSetsMaxRepoCreation(root, ada, 0) on AdminUserAccount
+        then ada.max_repo_creation = 0
+
+    2. root blocks her sign-in
+        root does AdminSetsProhibitLogin(root, ada, true) on AdminUserAccount
+        then ada.prohibit_login = true
+        root sees ada.prohibit_login on AdminUserAccount in ada
+
+    3. ticking the box on root's own account changes nothing
+        root does AdminSetsProhibitLogin(root, root, true) on AdminUserAccount
+        then root.prohibit_login = false
+
+    ends: Ada can no longer sign in or create repositories; Root still can.
+}
+
+-- Deleting an account, and purging one.
+journey AnAccountThatOwnsThingsMustBePurged {
+    goal: Root deletes Ada's account. Ada still owns repositories, so a plain
+          delete is refused; a purge removes the account with everything it owns.
+
+    1. a plain delete is refused
+        stipulate owns_content(ada) = true
+        root cannot do AdminDeletesUser(root, ada, false) on AdminUserAccount
+
+    2. a purge goes through
+        root does AdminDeletesUser(root, ada, true) on AdminUserAccount
+        then AdminDeletesUser fires
+        then ada does not exist
+
+    ends: The account and everything it owned are gone.
+}
+
+-- Accounts created by an administrator.
+journey AdministratorCreatesAnAccountThatMustChangeItsPassword {
+    goal: Root creates an account for a new colleague with a temporary
+          password and ticks "must change password".
+
+    1. root creates the account
+        stipulate is_usable_username("bea") = true
+        stipulate username_taken("bea") = false
+        stipulate is_valid_email("bea@forge.example") = true
+        stipulate email_in_use("bea@forge.example") = false
+        stipulate password_acceptable("Temp-Passw0rd-1") = true
+        root does AdminCreatesUser(root, "bea", "bea@forge.example", "Temp-Passw0rd-1", null, null, public, true, false, true) on AdminUserDirectory
+        then AdminCreatesUser fires
+
+    2. ada cannot create accounts
+        ada cannot do AdminCreatesUser(ada, "eve", "eve@forge.example", "Temp-Passw0rd-1", null, null, public, false, false, false) on AdminUserDirectory
+
+    ends: Bea's account is active and will force a password change at first sign-in.
+}
+
+-- The site-wide announcement.
+journey AnAnnouncementIsShownUntilAcknowledged {
+    goal: Root announces a maintenance window. Ada sees it as a modal until she
+          dismisses it; re-publishing the text shows it to her again.
+
+    1. root publishes
+        stipulate truncate_bytes("Maintenance", 255) = "Maintenance"
+        root does AdminPublishesAnnouncement(root, modal, "Maintenance", "Down **Sunday 02:00 UTC**.") on AnnouncementAdministration
+            creating notice_board: Announcement
+        then AdminPublishesAnnouncement fires
+        then notice_board.title = "Maintenance"
+        root sees notice_board.title on AnnouncementAdministration in notice_board
+
+    2. ada dismisses it
+        ada does UserAcknowledgesAnnouncement(ada, notice_board) on AnnouncementBanner
+            creating ack: AnnouncementAcknowledgement
+        then ack.user = ada
+
+    3. an empty title is refused
+        root cannot do AdminPublishesAnnouncement(root, modal, "", "text") on AnnouncementAdministration
+
+    4. root withdraws it
+        root does AdminWithdrawsAnnouncement(root, notice_board) on AnnouncementAdministration
+        then notice_board does not exist
+
+    ends: The announcement came and went; Ada's acknowledgement is remembered.
+}
+
+-- Runtime settings and the read-only configuration.
+journey AdministratorTurnsOffGravatarWithoutARestart {
+    goal: Root disables Gravatar from the settings page; it takes effect
+          without editing app.ini. In the configuration view the database
+          password is masked.
+
+    given:
+        dbpass: ConfigEntry { section: "database", key: "PASSWD", value: "hunter2", is_secret: true }
+
+    1. root flips the switch
+        stipulate normalise_setting(disable_gravatar, "on") = "true"
+        root does AdminChangesSetting(root, disable_gravatar, "on") on RuntimeSettings
+            creating gravatar: SystemSetting
+        then AdminChangesSetting fires
+        then gravatar.value = "true"
+
+    2. the configuration shows the secret masked, never in clear
+        stipulate masked("hunter2") = "******"
+        root sees dbpass.displayed_value on InstanceConfiguration in dbpass
+        root cannot see dbpass.value on InstanceConfiguration in dbpass
+
+    3. ada cannot change settings
+        ada cannot do AdminChangesSetting(ada, disable_gravatar, "off") on RuntimeSettings
+
+    ends: Gravatar is off instance-wide; secrets stay hidden.
+}
+
+-- Adopting a repository directory that has no record.
+journey AdministratorAdoptsAStrayRepository {
+    goal: A repository directory was copied into ada's folder by hand. Root
+          finds it among the unadopted repositories and adopts it; it becomes a
+          private repository of ada's.
+
+    given:
+        stray: UnadoptedRepository { owner: ada, name: "old-notes" }
+
+    1. root sees it listed
+        root sees stray.name on UnadoptedRepositories in stray
+
+    2. root adopts it
+        stipulate repository_exists(ada, "old-notes") = false
+        root does AdminAdoptsRepository(root, stray) on UnadoptedRepositories
+        then AdminAdoptsRepository fires
+        then stray does not exist
+
+    ends: ada owns a private repository "old-notes".
+}
+
+-- The health endpoint.
+journey AProbeChecksTheInstanceHealth {
+    goal: A load balancer polls the health endpoint. While database and cache
+          answer it reports pass.
+
+    cast:
+        lb: Visitor
+
+    given:
+        lb.is_signed_in = false
+
+    1. the probe reads the status and each component
+        lb sees site.health_status on HealthEndpoint in site
+        lb sees site.database_reachable on HealthEndpoint in site
+        lb sees site.cache_reachable on HealthEndpoint in site
+
+    ends: The instance is reported healthy.
+}
+
+-- The CLI.
+journey AnOperatorBootstrapsFromTheShell {
+    goal: An operator with shell access creates the first administrator from
+          the command line, then mails everyone about the new instance.
+
+    cast:
+        ops: Operator
+
+    given:
+        ops.has_host_access = true
+
+    1. the operator creates an admin
+        stipulate is_usable_username("admin") = true
+        stipulate username_taken("admin") = false
+        stipulate email_in_use("admin@forge.example") = false
+        ops does OperatorCreatesUser(ops, site, "admin", "admin@forge.example", "Sup3r-Secret!", true, false, null, null, null) on OperatorConsole
+        then OperatorCreatesUser fires
+
+    2. and mails every active user
+        stipulate mail_enabled() = true
+        stipulate active_accounts_with_email() = {root, ada}
+        ops does OperatorMailsAllUsers(ops, site, "Welcome", "We are live.") on OperatorConsole
+        then OperatorMailsAllUsers fires
+
+    ends: The instance has an administrator and its users were told.
+}
