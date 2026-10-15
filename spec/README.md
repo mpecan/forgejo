@@ -107,7 +107,7 @@ the Forgejo code it was distilled from.
 
 ## Conventions forced by the tooling
 
-The `allium-journey` limitations behind these are filed as [#6–#13](https://github.com/mpecan/allium-inspect/issues?q=is%3Aissue+6..13) on allium-inspect.
+The `allium-journey` limitations behind these are filed on allium-inspect as [#6](https://github.com/mpecan/allium-inspect/issues/6)–[#13](https://github.com/mpecan/allium-inspect/issues/13).
 
 These shape how the spec is written. They are not domain decisions.
 
