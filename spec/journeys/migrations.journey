@@ -1,0 +1,591 @@
+-- Journeys through the repository import addon (migrations.allium).
+--
+-- The world: Alice and Bob are ordinary signed-in users, a GitHub adapter
+-- process is running, and the core is hosting the addon. Set-valued facts
+-- (what a source supports, what was asked for) are stated with `stipulate`
+-- in each journey's first step, and so are the answers of black-box policy
+-- predicates owned elsewhere (name availability, allowed hosts).
+
+world {
+    cast:
+        alice:   accounts/User
+        bob:     accounts/User
+        gh:      SourceProfile
+        adapter: SourceAdapterProcess
+        core:    CoreRuntime
+        addr:    RemoteAddress
+        creds:   SourceCredentials
+        req:     MigrationRequest
+        who:     ExternalIdentity
+        item:    ImportedIssue
+        sel:     RestoreSelection
+        orphan:  ImportedComment
+    given:
+        alice.is_active = true
+        alice.prohibit_login = false
+        alice.is_admin = false
+        bob.is_active = true
+        bob.prohibit_login = false
+        bob.is_admin = false
+        gh.kind = github
+        gh.imports_topics = true
+        adapter.source_kind = github
+        adapter.active = true
+        core.addon_installed = true
+        addr.url = "https://github.com/acme/widget"
+        addr.scheme = https
+        addr.host = "github.com"
+        addr.embeds_credentials = false
+        creds.kind = token
+        creds.token = "ghp_secret"
+        req.source = gh
+        req.address = addr
+        req.credentials = creds
+        req.repo_name = "widget"
+        req.description = "Widgets"
+        req.private = false
+        req.mirror = false
+        req.mirror_interval = 8.hours
+        req.wiki = true
+        req.lfs = false
+        req.lfs_endpoint = null
+        who.external_id = "4242"
+        who.name = "carol-gh"
+        item.number = 7
+        item.author = who
+        item.title = "It breaks"
+        item.content = "Steps..."
+        item.is_closed = false
+        item.is_locked = false
+        item.closed_at = null
+        item.created_at = null
+        item.updated_at = null
+        item.ref = null
+        item.milestone_title = null
+        sel.validate = true
+        orphan.issue_number = 9
+        orphan.author = who
+        orphan.kind = "comment"
+        orphan.content = "me too"
+}
+
+-- The main path: a full import from GitHub, from the form to a ready
+-- repository.
+journey AliceImportsARepositoryFromGitHub {
+    goal: Alice moves her project off GitHub. She fills in the address and a
+          token, picks issues, labels and milestones, and gets back a ready
+          repository whose history arrived intact.
+
+    1. she submits the migration form
+        stipulate gh.supports = {milestones, labels, release_items, release_assets, issue_items, comments, pull_requests, reviews, reactions}
+        stipulate req.wanted = {issue_items, comments, reactions, labels, milestones}
+        stipulate is_valid_repo_name("widget") = true
+        stipulate length("widget") = 6
+        stipulate length("Widgets") = 7
+        stipulate repository_name_free(alice, "widget") = true
+        stipulate within_creation_limit(alice) = true
+        stipulate quota_allows_new_repository(alice) = true
+        stipulate is_allowed_remote("https://github.com/acme/widget", alice) = true
+        stipulate sanitized_url(addr) = "https://github.com/acme/widget"
+        alice does UserRequestsMigration(alice, alice, req) on MigrationForm
+            creating m: Migration
+        then UserRequestsMigration fires
+        then m.status = queued
+        then m.lfs = false
+        then m.original_url = "https://github.com/acme/widget"
+
+    2. the job queue hands it to a worker
+        core does MigrationDequeued(m) on CoreHostBoundary
+        then StartMigration fires
+        then m.status = running
+        then m.stage = git
+
+    3. the adapter reports it has reached the issues
+        adapter does ImportStageReached(m, issue_items) on SourceAdapterBoundary
+        then ImportAdvancesStage fires
+        then m.stage = issue_items
+
+    4. the adapter finishes and the repository is ready
+        adapter does SourceImportFinished(m) on SourceAdapterBoundary
+        then CompleteMigration fires
+        then m.status = finished
+
+    ends: The repository is ready and the migration has let go of the
+          address and token it no longer needs.
+}
+
+-- Content selection is clipped to what the source can supply.
+journey AGogsImportSkipsWhatGogsCannotGive {
+    goal: Bob imports from a Gogs server and ticks pull requests too. Gogs
+          has no pull request API, so the import simply does not include them
+          — it does not fail.
+
+    cast:
+        gogs: SourceProfile
+    given:
+        gogs.kind = gogs
+        req.source = gogs
+
+    1. he submits the form
+        stipulate gogs.supports = {milestones, labels, issue_items, comments}
+        stipulate req.wanted = {issue_items, comments, pull_requests}
+        stipulate is_valid_repo_name("widget") = true
+        stipulate length("widget") = 6
+        stipulate length("Widgets") = 7
+        stipulate repository_name_free(bob, "widget") = true
+        stipulate within_creation_limit(bob) = true
+        stipulate quota_allows_new_repository(bob) = true
+        stipulate is_allowed_remote("https://github.com/acme/widget", bob) = true
+        bob does UserRequestsMigration(bob, bob, req) on MigrationForm
+            creating m: Migration
+        then m.status = queued
+        then m.content_scope = {issue_items, comments}
+
+    ends: The migration will import issues and comments, and nothing it
+          cannot get.
+}
+
+-- Importing as a pull mirror.
+journey AliceMirrorsARepository {
+    goal: Alice wants a read-only copy that keeps itself up to date. She
+          ticks "mirror", leaves the issue tracker alone, and when the import
+          finishes the repository has a pull mirror on the interval she chose.
+
+    given:
+        req.mirror = true
+        req.mirror_interval = 1.hour
+
+    1. she asks for a mirror
+        stipulate gh.supports = {milestones, labels, issue_items, comments}
+        stipulate req.wanted = {}
+        stipulate is_valid_repo_name("widget") = true
+        stipulate length("widget") = 6
+        stipulate length("Widgets") = 7
+        stipulate repository_name_free(alice, "widget") = true
+        stipulate within_creation_limit(alice) = true
+        stipulate quota_allows_new_repository(alice) = true
+        stipulate is_allowed_remote("https://github.com/acme/widget", alice) = true
+        alice does UserRequestsMigration(alice, alice, req) on MigrationForm
+            creating m: Migration
+        then m.mirror = true
+        then m.mirror_interval = 1.hour
+
+    2. it runs and completes
+        core does MigrationDequeued(m) on CoreHostBoundary
+        adapter does ImportStageReached(m, topics) on SourceAdapterBoundary
+        adapter does SourceImportFinished(m) on SourceAdapterBoundary
+        then CompleteMigration fires
+        then m.status = finished
+        then m.mirror_interval = 1.hour
+
+    ends: The repository exists as a pull mirror; syncing from now on is the
+          repositories module's business.
+}
+
+-- Refusals at the form.
+journey AMirrorCarriesNoIssueTracker {
+    goal: Alice ticks "mirror" and also asks for issues. A mirror is a
+          git-level copy, so the request is refused rather than half-honoured.
+
+    given:
+        req.mirror = true
+
+    1. she asks for a mirror with issues
+        stipulate gh.supports = {milestones, labels, issue_items, comments}
+        stipulate req.wanted = {issue_items, comments}
+        stipulate is_valid_repo_name("widget") = true
+        stipulate repository_name_free(alice, "widget") = true
+        stipulate is_allowed_remote("https://github.com/acme/widget", alice) = true
+        alice cannot do UserRequestsMigration(alice, alice, req) on MigrationForm
+
+    ends: Nothing was created.
+}
+
+journey BobCannotImportIntoAliceNamespace {
+    goal: Bob, who is not an administrator, tries to create the import under
+          Alice's name. Only Alice (or a site admin) may do that.
+
+    1. he tries
+        stipulate gh.supports = {milestones, labels, issue_items, comments}
+        stipulate req.wanted = {issue_items, comments}
+        stipulate is_valid_repo_name("widget") = true
+        stipulate repository_name_free(alice, "widget") = true
+        stipulate is_allowed_remote("https://github.com/acme/widget", bob) = true
+        bob cannot do UserRequestsMigration(bob, alice, req) on MigrationForm
+
+    ends: Alice's namespace is untouched.
+}
+
+journey CredentialsInTheAddressAreRefused {
+    goal: Alice pastes an address with a password embedded in it. The form
+          refuses it — credentials go in their own fields, so they never end
+          up stored as the repository's original URL.
+
+    given:
+        addr.url = "https://alice:hunter2@github.com/acme/widget"
+        addr.embeds_credentials = true
+
+    1. she submits it
+        stipulate gh.supports = {milestones, labels, issue_items, comments}
+        stipulate req.wanted = {issue_items, comments}
+        stipulate is_valid_repo_name("widget") = true
+        stipulate repository_name_free(alice, "widget") = true
+        stipulate is_allowed_remote("https://alice:hunter2@github.com/acme/widget", alice) = true
+        alice cannot do UserRequestsMigration(alice, alice, req) on MigrationForm
+
+    ends: Nothing was created.
+}
+
+journey AServerPathIsNotForEveryone {
+    goal: Bob points the import at a directory on the server. Importing from
+          local paths is off unless the administrator enables it, and then
+          only for admins and users granted the right.
+
+    given:
+        addr.url = "/srv/git/secret.git"
+        addr.scheme = local_path
+
+    1. he submits it
+        stipulate gh.supports = {milestones, labels, issue_items, comments}
+        stipulate req.wanted = {issue_items, comments}
+        stipulate may_import_local_paths(bob) = false
+        stipulate is_valid_repo_name("widget") = true
+        stipulate repository_name_free(bob, "widget") = true
+        bob cannot do UserRequestsMigration(bob, bob, req) on MigrationForm
+
+    ends: The server's filesystem stays private.
+}
+
+journey ABlockedHostIsRefused {
+    goal: The instance blocks imports from an internal host. Alice's request
+          for it is refused at the form.
+
+    given:
+        addr.url = "https://git.internal/acme/widget"
+        addr.host = "git.internal"
+
+    1. she submits it
+        stipulate gh.supports = {milestones, labels, issue_items, comments}
+        stipulate req.wanted = {issue_items, comments}
+        stipulate is_valid_repo_name("widget") = true
+        stipulate repository_name_free(alice, "widget") = true
+        stipulate is_allowed_remote("https://git.internal/acme/widget", alice) = false
+        alice cannot do UserRequestsMigration(alice, alice, req) on MigrationForm
+
+    ends: No request reached the internal host.
+}
+
+-- Cancel, then retry.
+journey AliceCancelsAndRetries {
+    goal: Alice's import is taking forever; she cancels it, sees why it
+          stopped, and later tries again with the same repository name.
+
+    cast:
+        repo: repositories/Repository
+        m:    Migration
+    given:
+        repo.status = being_migrated
+        m.repository = repo
+        m.doer = alice
+        m.source = gh
+        m.status = running
+        m.source_address = addr
+        m.credentials = creds
+        m.items_processed = 40
+
+    1. she cancels
+        stipulate is_repo_admin(alice, repo) = true
+        alice does RepoAdminCancelsMigration(alice, m) on MigrationAdministration
+        then RepoAdminCancelsMigration fires
+        then m.status = failed
+        then m.failure_reason = canceled
+
+    2. she sees the reason
+        alice sees m.message on MigrationAdministration in m
+
+    3. she retries
+        stipulate quota_allows_retry(repo) = true
+        alice does RepoAdminRetriesMigration(alice, m) on MigrationAdministration
+        then RepoAdminRetriesMigration fires
+        then m.status = queued
+        then m.items_processed = 0
+        then repo.status = being_migrated
+
+    ends: The migration is queued again against the same repository, with
+          the half-imported content wiped.
+}
+
+journey OnlyRepositoryAdminsControlAMigration {
+    goal: Bob can read the repository being imported, but he is not one of
+          its admins. He cannot cancel Alice's import.
+
+    cast:
+        repo: repositories/Repository
+        m:    Migration
+    given:
+        repo.status = being_migrated
+        m.repository = repo
+        m.doer = alice
+        m.status = running
+        m.source_address = addr
+        m.credentials = creds
+
+    1. he tries to cancel it
+        stipulate is_repo_admin(bob, repo) = false
+        bob cannot do RepoAdminCancelsMigration(bob, m) on MigrationAdministration
+
+    ends: The import carries on.
+}
+
+journey AFailedImportCanBeThrownAway {
+    goal: The import failed because the token was wrong. Alice reads why,
+          and rather than retrying she deletes the half-made repository.
+
+    cast:
+        repo: repositories/Repository
+        m:    Migration
+    given:
+        repo.status = being_migrated
+        m.repository = repo
+        m.doer = alice
+        m.source = gh
+        m.status = running
+        m.source_address = addr
+        m.credentials = creds
+        m.original_url = "https://github.com/acme/widget"
+
+    1. the adapter reports a failure
+        stipulate strip_credentials("Authentication failed") = "Authentication failed"
+        adapter does SourceImportFailed(m, authentication_failed, "Authentication failed") on SourceAdapterBoundary
+        then FailMigration fires
+        then m.status = failed
+        then m.failure_reason = authentication_failed
+        then m.message = "Authentication failed"
+        then repo.status = being_migrated
+
+    2. she discards it
+        stipulate is_repo_admin(alice, repo) = true
+        alice does RepoAdminDiscardsFailedMigration(alice, m) on MigrationAdministration
+        then RepoAdminDiscardsFailedMigration fires
+        then m does not exist
+        then repo does not exist
+
+    ends: Nothing is left of the attempt, and the name is free again.
+}
+
+-- Visibility of the task status.
+journey OnlyTheRequesterSeesTheTaskMessage {
+    goal: Alice polls her migration's status and sees the progress message.
+          Bob, who did not start it, does not get that view.
+
+    cast:
+        repo: repositories/Repository
+        m:    Migration
+    given:
+        repo.status = being_migrated
+        m.repository = repo
+        m.doer = alice
+        m.status = running
+        m.source_address = addr
+        m.credentials = creds
+        m.message = "migrating issues"
+
+    1. alice polls
+        alice sees m.message on MigrationTaskStatus in m
+
+    2. bob does not get the requester's view
+        bob cannot see m.message on MigrationTaskStatus in m
+
+    ends: The requester sees her task; others do not.
+}
+
+-- Imported content keeps its authorship.
+journey ImportedIssuesKeepTheirAuthor {
+    goal: Carol wrote an issue on GitHub but has no account here. The issue
+          arrives under the ghost placeholder, with her GitHub identity
+          recorded so it can be handed to her later.
+
+    cast:
+        ghost:   accounts/User
+        repo:    repositories/Repository
+        m:       Migration
+    given:
+        repo.status = being_migrated
+        m.repository = repo
+        m.doer = alice
+        m.source = gh
+        m.status = running
+        m.source_address = addr
+        m.credentials = creds
+
+    1. the adapter yields her issue
+        stipulate m.content_scope = {issue_items, comments}
+        stipulate m.imported_numbers = {}
+        stipulate item.reactions = []
+        stipulate item.label_names = {}
+        stipulate resolve_author(m, who) = null
+        stipulate ghost_user() = ghost
+        stipulate truncate("It breaks", 255) = "It breaks"
+        adapter does SourceYieldsIssue(m, item) on SourceAdapterBoundary
+            creating authorship: ExternalAuthorship
+        then ImportIssue fires
+        then authorship.external_name = "carol-gh"
+        then authorship.status = unlinked
+        then m.imported_numbers = {7}
+
+    ends: The issue keeps its number and is recorded as Carol's, waiting
+          for her to link a GitHub login.
+}
+
+journey ACommentForAMissingIssueStopsTheImport {
+    goal: The adapter hands over a comment for issue 9, which was never
+          imported. The import stops rather than attach it somewhere wrong.
+
+    cast:
+        repo:    repositories/Repository
+        m:       Migration
+    given:
+        repo.status = being_migrated
+        m.repository = repo
+        m.doer = alice
+        m.source = gh
+        m.status = running
+        m.source_address = addr
+        m.credentials = creds
+
+    1. the orphan comment arrives
+        stipulate m.content_scope = {issue_items, comments}
+        stipulate m.imported_numbers = {7}
+        adapter does SourceYieldsComment(m, orphan) on SourceAdapterBoundary
+        then RefuseOrphanComment fires
+        then m.status = failed
+        then m.failure_reason = invalid_source_data
+
+    ends: The migration failed with a reason an admin can act on.
+}
+
+-- A clone that hangs is abandoned.
+journey AHangingCloneTimesOut {
+    goal: The source accepts the connection and then never sends the
+          repository. Ten minutes later the migration gives up on its own.
+
+    cast:
+        repo: repositories/Repository
+        m:    Migration
+    given:
+        repo.status = being_migrated
+        m.repository = repo
+        m.doer = alice
+        m.source = gh
+        m.status = queued
+        m.source_address = addr
+        m.credentials = creds
+        m.items_processed = 0
+
+    1. a worker starts it
+        core does MigrationDequeued(m) on CoreHostBoundary
+        then StartMigration fires
+        then m.stage = git
+
+    2. nothing arrives for eleven minutes
+        after 11.minutes
+        then GitCloneTimesOut fires
+        then m.status = failed
+        then m.failure_reason = remote_error
+
+    3. alice sees it failed
+        stipulate can_read_code(alice, repo) = true
+        alice sees m.status on MigrationProgressPage in m
+
+    ends: The repository waits, failed, for an admin to retry or discard it.
+}
+
+-- Dump and restore.
+journey AnOperatorRestoresAnArchive {
+    goal: The operator exported a repository with `dump-repo` on another
+          machine and restores it here under Alice's name; once it finishes,
+          imported comments by someone who already has a linked GitLab login
+          are handed to him.
+
+    cast:
+        op:      OperatorShell
+        archive: DumpArchive
+        dave:    accounts/User
+        admin:   accounts/User
+        lab:     SourceProfile
+    given:
+        op.has_server_access = true
+        archive.directory = "/data/acme/widget"
+        archive.status = writing
+        archive.source_kind = gitlab
+        archive.original_url = "https://gitlab.com/acme/widget"
+        archive.includes_wiki = true
+        lab.kind = gitlab
+
+    1. the dump finishes writing
+        stipulate archive.contents = {issue_items, comments, labels}
+        adapter does ArchiveWriteCompleted(archive) on SourceAdapterBoundary
+        then ArchiveWriteCompletes fires
+        then archive.status = complete
+
+    2. the operator restores it
+        stipulate sel.units = {}
+        stipulate repository_name_free(alice, "widget") = true
+        stipulate first_site_admin() = admin
+        stipulate profile_for(gitlab) = lab
+        op does OperatorRestoresRepository(op, archive, alice, "widget", sel) on RepositoryArchiveConsole
+            creating m: Migration
+        then OperatorRestoresRepository fires
+        then m.from_archive = true
+        then m.status = queued
+        then m.validate_archive = true
+        then m.content_scope = {issue_items, comments, labels}
+
+    ends: The archive is queued for import like any other migration.
+}
+
+journey ARestoreHandsCommentsToLinkedAccounts {
+    goal: A restored GitLab archive finishes importing. Dave's comments came
+          in under the ghost placeholder, but Dave has a linked GitLab login,
+          so the restore hands them straight to him.
+
+    cast:
+        dave: accounts/User
+        repo: repositories/Repository
+        m:    Migration
+        ext:  ExternalAuthorship
+    given:
+        repo.status = being_migrated
+        m.repository = repo
+        m.doer = alice
+        m.source = gh
+        m.from_archive = true
+        m.mirror = false
+        m.lfs = false
+        m.lfs_endpoint = null
+        m.mirror_interval = 8.hours
+        m.status = running
+        m.stage = finalizing
+        m.source_address = addr
+        m.credentials = creds
+        ext.repository = repo
+        ext.source_kind = gitlab
+        ext.external_id = "77"
+        ext.external_name = "dave-gl"
+        ext.content = on_comment
+        ext.comment = null
+        ext.status = unlinked
+
+    1. the archive import finishes
+        stipulate linked_account_for(gitlab, "77") = dave
+        stipulate sanitized_url(addr) = "https://github.com/acme/widget"
+        stipulate url_of(null) = null
+        adapter does SourceImportFinished(m) on SourceAdapterBoundary
+        then CompleteMigration fires
+        then RelinkPass fires
+        then ClaimAuthorship fires
+        then ext.status = linked
+        then ext.linked_user = dave
+
+    ends: Dave owns his old comments without having done anything.
+}
