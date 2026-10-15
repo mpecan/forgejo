@@ -1,0 +1,1481 @@
+-- allium: 3
+-- webhooks.allium — outbound HTTP notifications of repository, owner and instance events to external services
+--
+-- Scope: Webhooks at four levels (repository, owner = user or organization,
+--   instance-wide "system" hooks, and admin "default" hooks that are copied into
+--   every new repository); the target kinds and their per-kind settings; event
+--   selection, branch filtering, secrets/HMAC signatures and Authorization
+--   headers; turning domain events from other modules into deliveries; the
+--   delivery pipeline (queue, single attempt, timeout, SSRF host allow-list,
+--   proxy, TLS); delivery history, manual redelivery and test deliveries; the
+--   nightly cleanup of delivery history; who may manage which webhooks.
+-- Includes: Webhook, HookDelivery, HookEventKind, HookEventChoice, HookKind,
+--   WebhookConfig, HookTargetSettings, HookRequest, HookResponse.
+-- Excludes:
+--   - Server-side git hooks (pre-receive/update/post-receive scripts edited in
+--     repo settings "Git hooks"): owned by code.allium.
+--   - The exact JSON/form payload schemas per event and the per-kind message
+--     formatting (Slack/Discord/MS Teams/... text, colours, links): treated as a
+--     black box render_request(); payload schema belongs to the API contract,
+--     not to behaviour.
+--   - Legacy "payload version 1" deliveries (stored pre-rendered bodies) and the
+--     Gitea short-ref substitution quirk: data-migration concerns only.
+--   - Duplicate compatibility headers X-Gitea-*, X-Gogs-*, X-GitHub-*: only the
+--     canonical X-Forgejo-* and the de-facto standard X-Hub-Signature(-256)
+--     headers are specified (see contract SignedDelivery).
+--   - Deprecated action_run_success / action_run_failure events (marked "can be
+--     removed after Forgejo 19"); superseded by workflow_run_* events.
+--   - API "config" map on hook objects (documented as deprecated, kept only for
+--     compatibility).
+--   - Worker-queue sizing (QUEUE_LENGTH) and in-process de-duplication of queue
+--     items: infrastructure.
+--
+-- Emits: (internal only — nothing outside this module reacts to them)
+--   HookEventRaised(kind, action, source_repo?, owner_user?, owner_org?, branch?, commit_count?, sender?)
+--   HookEventMatched(webhook, kind, action, branch?, commit_count?)
+--   HookDeliveryQueued(delivery)
+--   HookDeliveryCompleted(delivery)      -- succeeded, failed or skipped
+--
+-- Reacts to:
+--   code/PushReceived(push)                               -> push
+--   code/RefCreated(repository, ref_name, ref_kind, pusher)  -> create
+--   code/RefDeleted(repository, ref_name, ref_kind, pusher)  -> delete
+--   repositories/RepositoryCreated(repository, doer)      -> repository/created
+--   repositories/RepositoryMigrated(repository, doer)     -> repository/created
+--   repositories/RepositoryForked(fork, source, doer)     -> fork (+ repository/created for org forks)
+--   repositories/RepositoryDeleted(repository, doer)      -> repository/deleted; removes repo webhooks
+--   repositories/Repository.created                       -> copy default webhooks
+--   repositories/RepositoryGeneratedFromTemplate(repository, template, include_webhooks)
+--   issues/IssueOpened(issue)                             -> issues/opened
+--   issues/IssueTitleChanged(issue, doer, old_title)      -> issues|pull_request/edited
+--   issues/IssueContentChanged(issue, doer, old_content)  -> issues|pull_request/edited
+--   issues/IssueClosed(issue, doer), issues/IssueReopened(issue, doer)
+--   issues/IssueAssigneeAdded(issue, doer, assignee), issues/IssueAssigneeRemoved(issue, doer, assignee)
+--   issues/IssueLabelsChanged(issue, doer), issues/IssueLabelsCleared(issue, doer)
+--   issues/IssueMilestoneChanged(issue, doer, old_milestone?)
+--   issues/CommentCreated(comment, doer), issues/CommentEdited(comment, doer, old_content),
+--   issues/CommentDeleted(comment, doer)
+--   pulls/PullRequestOpened(pr), pulls/PullRequestMerged(pr, merger),
+--   pulls/PullRequestTargetBranchChanged(pr, doer, old_branch),
+--   pulls/PullRequestSynchronized(pr, doer), pulls/ReviewSubmitted(review),
+--   pulls/ReviewRequested(pr, doer, reviewer), pulls/ReviewRequestRemoved(pr, doer, reviewer)
+--   wiki/WikiPageCreated(repository, doer, page), wiki/WikiPageEdited(...), wiki/WikiPageDeleted(...)
+--   releases/ReleasePublished(release), releases/ReleaseUpdated(release, doer), releases/ReleaseDeleted(release, doer)
+--   packages/PackageVersionCreated(version, doer), packages/PackageVersionDeleted(version, doer)
+--   actions/WorkflowRunStatusChanged(run, prior_status), actions/WorkflowJobStatusChanged(job, prior_status)
+--   accounts/UserAccountDeleted(user, purge, delete_contributions), organizations/OrganizationDeleted(organization)
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./repositories.allium" as repositories
+use "./access.allium" as access
+use "./code.allium" as code
+use "./issues.allium" as issues
+use "./pulls.allium" as pulls
+use "./wiki.allium" as wiki
+use "./releases.allium" as releases
+use "./packages.allium" as packages
+use "./actions.allium" as actions
+use "./administration.allium" as administration
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The HTTP endpoint on the other side of a delivery. It is not a user of the
+-- forge; it only answers requests.
+-- from: services/webhook/deliver.go:112
+external entity ReceivingService {
+    base_url: String
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value HookHeader {
+    name: String
+    value: String
+}
+
+-- What was sent. Recorded on the delivery for the history view. The
+-- Authorization header value is redacted to "******" (keeping a "Bearer " or
+-- "Basic " prefix) before it is recorded.
+-- from: models/webhook/hooktask.go:30
+value HookRequest {
+    url: String
+    method: HookHttpMethod
+    headers: Set<HookHeader>
+    body: String
+}
+
+-- What came back. On a transport failure (timeout, refused host, TLS error)
+-- status_code is absent and body carries the error text.
+-- from: models/webhook/hooktask.go:38
+value HookResponse {
+    status_code: Integer?
+    headers: Set<HookHeader>
+    body: String
+}
+
+-- Per-kind settings. Only the group belonging to the webhook's kind is set
+-- (see invariant KindSettingsMatchKind).
+-- from: services/webhook/slack.go:32
+value HookTargetSettings {
+    -- slack: channel must match ^#?[a-z0-9_-]{1,80}$
+    slack_channel: String?
+    slack_username: String?
+    slack_icon_url: String?
+    slack_color: String?
+    -- discord: username required, max 80 characters; icon URL max 2048 characters
+    discord_username: String?
+    discord_icon_url: String?
+    -- telegram: target URL is derived from bot token, chat id and optional thread id
+    telegram_bot_token: String?
+    telegram_chat_id: String?
+    telegram_thread_id: String?
+    -- matrix: target URL is derived from homeserver and room; access token becomes
+    -- "Authorization: Bearer <token>"
+    matrix_homeserver_url: String?
+    matrix_room_id: String?
+    matrix_message_type: MatrixMessageType?
+    -- packagist: target URL derived from username + API token; package_url is the payload
+    packagist_username: String?
+    packagist_api_token: String?
+    packagist_package_url: String?
+    -- sourcehut builds: manifest submitted as a GraphQL job; access token becomes
+    -- "Authorization: Bearer <token>"
+    sourcehut_manifest_path: String?
+    sourcehut_visibility: SourcehutVisibility?
+    sourcehut_secrets: Boolean?
+}
+
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- What every receiver of a generic (forgejo/gitea/gogs) delivery can rely on,
+-- and what chat-style kinds (slack, discord, dingtalk, telegram, msteams,
+-- feishu, matrix, wechatwork) also carry. packagist and sourcehut_builds send
+-- only their service-specific request.
+-- from: services/webhook/shared/payloader.go:140
+contract SignedDelivery {
+    deliver: (request: HookRequest) -> HookResponse
+
+    @invariant IdentifyingHeaders
+        -- X-Forgejo-Delivery: the delivery's unique id (stable across the
+        -- delivery, new on redelivery); X-Forgejo-Event: the coarse event name
+        -- (e.g. issue_assign -> "issues", pull_request_sync -> "pull_request",
+        -- pull_request_comment -> "issue_comment", review approved ->
+        -- "pull_request_approved"); X-Forgejo-Event-Type: the precise
+        -- HookEventKind.
+
+    @invariant HmacSignature
+        -- When the webhook has a secret, X-Forgejo-Signature and
+        -- X-Hub-Signature-256 ("sha256=" prefix) carry the hex HMAC-SHA256 of
+        -- the exact request body keyed by the secret; X-Hub-Signature
+        -- ("sha1=" prefix) carries HMAC-SHA1. Without a secret the signature
+        -- headers are empty.
+
+    @invariant AuthorizationHeader
+        -- When an authorization header is configured it is sent verbatim as
+        -- the HTTP Authorization header.
+
+    @invariant SuccessIsTwoHundreds
+        -- Any 2xx status code counts as success; everything else, including
+        -- redirects that are not followed to a 2xx, is a failure.
+}
+
+-- How the body is shaped from the stored event for each kind.
+-- from: services/webhook/default.go:67
+contract HookRequestRendering {
+    render: (webhook: Webhook, delivery: HookDelivery) -> HookRequest
+
+    @invariant GenericBodies
+        -- forgejo/gitea/gogs: the event JSON; content_type json sends it as
+        -- the body, form sends it url-encoded as field "payload"; method GET
+        -- sends it as query parameter "payload" with no body.
+
+    @invariant ChatKinds
+        -- slack, discord, dingtalk, telegram, msteams, feishu, matrix,
+        -- wechatwork: a human-readable message built from the event, JSON
+        -- body. matrix uses PUT to the room send endpoint with a per-delivery
+        -- transaction id; message type m.notice or m.text.
+
+    @invariant ServiceKinds
+        -- packagist: {"repository":{"url": package_url}} for every event.
+        -- sourcehut_builds: reads the manifest at manifest_path from the
+        -- pushed commit (push and create events only) and submits it as a
+        -- GraphQL job with the configured visibility and secrets flag.
+
+    @invariant UnsupportedEvents
+        -- Kinds that cannot express an event (e.g. sourcehut_builds for
+        -- anything but push/create) produce no delivery for it.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- from: modules/webhook/type.go:126
+enum HookKind {
+    forgejo | gitea | gogs | slack | discord | dingtalk | telegram | msteams
+    | feishu | matrix | wechatwork | packagist | sourcehut_builds
+}
+
+-- from: models/webhook/webhook.go:67
+enum HookContentType { json | form }
+
+enum HookHttpMethod { post | get | put }
+
+-- from: modules/webhook/structs.go:47
+enum HookEventMode { push_only | send_everything | choose_events }
+
+-- Where the webhook lives.
+-- from: models/webhook/webhook.go:124
+enum WebhookScope { per_repository | per_owner | system | default }
+
+-- Last delivery outcome shown in lists.
+-- from: modules/webhook/type.go:146
+enum HookLastStatus { none | succeeded | failed }
+
+enum MatrixMessageType { notice | text }
+
+enum SourcehutVisibility { public | unlisted | private }
+
+-- The precise kind of event a delivery carries (X-Forgejo-Event-Type).
+-- from: modules/webhook/type.go:12
+enum HookEventKind {
+    create | delete | fork | push
+    | issues | issue_assign | issue_label | issue_milestone | issue_comment
+    | pull_request | pull_request_assign | pull_request_label | pull_request_milestone
+    | pull_request_comment | pull_request_review_approved | pull_request_review_rejected
+    | pull_request_review_comment | pull_request_sync | pull_request_review_request
+    | wiki | repository | release | package
+    | workflow_run_blocked | workflow_run_cancelled | workflow_run_failure | workflow_run_running
+    | workflow_run_skipped | workflow_run_success | workflow_run_waiting
+    | workflow_job_blocked | workflow_job_cancelled | workflow_job_failure | workflow_job_running
+    | workflow_job_skipped | workflow_job_success | workflow_job_waiting
+}
+
+-- What a manager can tick in "choose events". Identical to HookEventKind except
+-- that the three review outcomes share one choice, pull_request_review.
+-- choice_of(kind) maps a kind to its choice.
+-- from: modules/webhook/structs.go:7
+enum HookEventChoice {
+    create | delete | fork | push
+    | issues | issue_assign | issue_label | issue_milestone | issue_comment
+    | pull_request | pull_request_assign | pull_request_label | pull_request_milestone
+    | pull_request_comment | pull_request_review | pull_request_sync | pull_request_review_request
+    | wiki | repository | release | package
+    | workflow_run_blocked | workflow_run_cancelled | workflow_run_failure | workflow_run_running
+    | workflow_run_skipped | workflow_run_success | workflow_run_waiting
+    | workflow_job_blocked | workflow_job_cancelled | workflow_job_failure | workflow_job_running
+    | workflow_job_skipped | workflow_job_success | workflow_job_waiting
+}
+
+-- The "action" field of the payload: what happened within the event kind.
+-- from: modules/structs/hook.go (HookIssueAction, HookRepoAction, ...)
+enum HookAction {
+    opened | edited | closed | reopened | assigned | unassigned
+    | label_updated | label_cleared | milestoned | demilestoned
+    | synchronized | reviewed | review_requested | review_request_removed
+    | created | deleted | published | updated | pushed | forked
+    | status_changed
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- Everything a manager sets on a webhook: the submitted form (web) or hook
+-- option (API). A webhook holds exactly one; editing replaces it.
+-- from: services/forms/repo_form.go:261
+entity WebhookConfig {
+    kind: HookKind
+    target_url: String
+    http_method: HookHttpMethod
+    content_type: HookContentType
+    secret: String?                        -- HMAC key; only forgejo, gitea, gogs
+    authorization_header: String?          -- sent verbatim as Authorization header
+    event_mode: HookEventMode
+    chosen_events: Set<HookEventChoice>    -- meaningful only with choose_events
+    branch_filter: String?                 -- glob; empty or "*" means all branches
+    settings: HookTargetSettings
+
+    is_generic: kind in {forgejo, gitea, gogs}
+
+    -- Validation shared by every create/edit path (web form and API).
+    -- from: services/webhook/default.go:46
+    is_valid:
+        is_valid_http_url(target_url)
+        and (branch_filter = null or is_valid_glob(branch_filter))
+        and (kind in {forgejo, gitea} implies http_method in {post, get})
+        and (kind = gogs implies http_method = post)
+        and (kind = matrix implies http_method = put)
+        and ((not is_generic and kind != matrix) implies http_method = post)
+        and ((not is_generic) implies (content_type = json and secret = null))
+        and (kind = slack implies (settings.slack_channel != null and is_valid_slack_channel(settings.slack_channel)))
+        and (kind = discord implies (settings.discord_username != null and length(settings.discord_username) <= 80))
+        and (kind = discord implies (settings.discord_icon_url = null or length(settings.discord_icon_url) <= 2048))
+        and (kind = telegram implies (settings.telegram_bot_token != null and settings.telegram_chat_id != null))
+        and (kind = matrix implies (settings.matrix_homeserver_url != null and settings.matrix_room_id != null and authorization_header != null))
+        and (kind = packagist implies (settings.packagist_username != null and settings.packagist_api_token != null and settings.packagist_package_url != null))
+        and (kind = sourcehut_builds implies (settings.sourcehut_manifest_path != null and is_valid_relative_path(settings.sourcehut_manifest_path) and settings.sourcehut_visibility != null and authorization_header != null))
+}
+
+-- from: models/webhook/webhook.go:122
+entity Webhook {
+    scope: WebhookScope
+    repository: repositories/Repository?          -- set iff scope = per_repository
+    owner_user: accounts/User?                     -- scope = per_owner, a personal account
+    owner_org: organizations/Organization?         -- scope = per_owner, an organization
+    config: WebhookConfig
+    is_active: Boolean
+    last_status: HookLastStatus
+    created_at: Timestamp
+    updated_at: Timestamp
+
+    deliveries: HookDelivery with webhook = this
+    finished_deliveries: deliveries where status in {succeeded, failed, skipped}
+
+    is_admin_level: scope in {system, default}
+    -- Default hooks are templates: they never fire themselves.
+    -- from: services/webhook/webhook.go:270
+    can_fire: is_active and scope != default
+    history_over_limit: finished_deliveries.count > config.cleanup_keep_count
+}
+
+-- One attempt to send one event to one webhook ("hook task").
+-- There are no automatic retries: a delivery is attempted exactly once and its
+-- outcome recorded; redelivery creates a new delivery.
+-- from: models/webhook/hooktask.go:45
+entity HookDelivery {
+    webhook: Webhook
+    delivery_id: String              -- unique, sent as X-Forgejo-Delivery
+    event: HookEventKind
+    action: HookAction?
+    payload: String                  -- the event as captured when it happened
+    is_test: Boolean
+    created_at: Timestamp
+    status: queued | sending | succeeded | failed | skipped
+    sent_at: Timestamp?
+    finished_at: Timestamp?
+    request: HookRequest?
+    response: HookResponse?
+
+    transitions status {
+        queued -> sending
+        queued -> skipped
+        queued -> failed
+        sending -> succeeded
+        sending -> failed
+        terminal: succeeded, failed, skipped
+    }
+
+    is_finished: status in {succeeded, failed, skipped}
+    -- from: services/webhook/deliver.go:499
+    is_overdue: if status = sending: sent_at + config.deliver_timeout <= now else: false
+    -- from: models/webhook/hooktask.go:205
+    is_expired: if is_finished: finished_at + config.cleanup_older_than <= now else: false
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [security] DISABLE_WEBHOOKS: hides all webhook management and stops
+    -- creating and sending deliveries.
+    -- from: modules/setting/security.go:508
+    disable_webhooks: Boolean = false
+    -- [webhook] DELIVER_TIMEOUT (seconds)
+    -- from: modules/setting/webhook.go:24
+    deliver_timeout: Duration = 5.seconds
+    -- [webhook] SKIP_TLS_VERIFY
+    skip_tls_verify: Boolean = false
+    -- [webhook] ALLOWED_HOST_LIST: comma list of "loopback", "private",
+    -- "external", "*", CIDRs and host globs. Empty means "external" (only
+    -- public, non-private, non-loopback addresses).
+    -- from: services/webhook/deliver.go:173
+    allowed_host_list: String = "external"
+    -- [webhook] PAGING_NUM: deliveries per history page
+    history_page_size: Integer = 10
+    -- [webhook] PROXY_URL / PROXY_HOSTS: deliveries to hosts matching one of
+    -- the PROXY_HOSTS globs go through PROXY_URL; others use the environment proxy.
+    proxy_url: String = ""
+    proxy_hosts: String = ""
+    -- [webhook] PAYLOAD_COMMIT_LIMIT: commits listed in a push payload (the
+    -- total count is still reported)
+    payload_commit_limit: Integer = 15
+    -- [cron.cleanup_hook_task_table]
+    -- from: services/cron/tasks_basic.go:129
+    cleanup_enabled: Boolean = true
+    cleanup_schedule: String = "@midnight"
+    cleanup_run_at_start: Boolean = false
+    cleanup_type: String = "older_than"         -- "older_than" | "per_webhook"
+    cleanup_older_than: Duration = 7.days
+    cleanup_keep_count: Integer = 10
+}
+
+------------------------------------------------------------
+-- Rules — managing webhooks
+------------------------------------------------------------
+
+-- from: routers/web/repo/setting/webhook.go:199
+rule RepoAdminCreatesWebhook {
+    when: RepoAdminCreatesWebhook(actor, repo, hook_config, is_active)
+    requires: not config.disable_webhooks
+    requires: access/is_repo_admin(actor, repo)
+    requires: hook_config.is_valid
+    ensures: Webhook.created(
+        scope: per_repository,
+        repository: repository,
+        config: hook_config,
+        is_active: is_active,
+        last_status: none,
+        created_at: now,
+        updated_at: now
+    )
+    @guidance
+        -- Web: GET/POST {repo}/settings/hooks/{kind}/new.
+        -- API: POST /repos/{owner}/{repo}/hooks (token, repo admin).
+        -- API defaults: events [] means ["push"]; "issues" selects all issue
+        -- sub-events, "pull_request" all PR sub-events; "issues_only" and
+        -- "pull_request_only" select only the base event; method is always
+        -- POST; event mode is always choose_events.
+}
+
+-- from: routers/api/v1/utils/hook.go:110
+rule OrgOwnerCreatesWebhook {
+    when: OrgOwnerCreatesWebhook(actor, organization, hook_config, is_active)
+    requires: not config.disable_webhooks
+    requires: organization.has_owner(actor) or actor.is_admin
+    requires: hook_config.is_valid
+    ensures: Webhook.created(
+        scope: per_owner,
+        owner_org: organization,
+        config: hook_config,
+        is_active: is_active,
+        last_status: none,
+        created_at: now,
+        updated_at: now
+    )
+    @guidance
+        -- Web: {org}/settings/hooks/{kind}/new. API: POST /orgs/{org}/hooks
+        -- (token, org owner). Fires for events in every repository of the
+        -- organization and for organization-owned packages.
+}
+
+-- from: routers/api/v1/user/hook.go:87
+rule UserCreatesOwnWebhook {
+    when: UserCreatesOwnWebhook(actor, hook_config, is_active)
+    requires: not config.disable_webhooks
+    requires: actor.is_active and not actor.prohibit_login
+    requires: hook_config.is_valid
+    ensures: Webhook.created(
+        scope: per_owner,
+        owner_user: actor,
+        config: hook_config,
+        is_active: is_active,
+        last_status: none,
+        created_at: now,
+        updated_at: now
+    )
+    @guidance
+        -- Web: /user/settings/hooks/{kind}/new. API: POST /user/hooks.
+        -- Fires for events in every repository the user owns and for
+        -- user-owned packages.
+}
+
+-- System hooks fire for every event on the instance.
+-- from: routers/web/repo/setting/webhook.go:103
+rule AdminCreatesSystemWebhook {
+    when: AdminCreatesSystemWebhook(actor, hook_config, is_active)
+    requires: not config.disable_webhooks
+    requires: actor.is_admin
+    requires: hook_config.is_valid
+    ensures: Webhook.created(
+        scope: system,
+        config: hook_config,
+        is_active: is_active,
+        last_status: none,
+        created_at: now,
+        updated_at: now
+    )
+    @guidance
+        -- Web: /admin/system-hooks/{kind}/new. API: POST /admin/hooks with
+        -- config.is_system_webhook = "true".
+}
+
+-- Default hooks never fire; they are copied into each new repository.
+-- from: routers/web/repo/setting/webhook.go:127
+rule AdminCreatesDefaultWebhook {
+    when: AdminCreatesDefaultWebhook(actor, hook_config, is_active)
+    requires: not config.disable_webhooks
+    requires: actor.is_admin
+    requires: hook_config.is_valid
+    ensures: Webhook.created(
+        scope: default,
+        config: hook_config,
+        is_active: is_active,
+        last_status: none,
+        created_at: now,
+        updated_at: now
+    )
+    @guidance
+        -- Web: /admin/default-hooks/{kind}/new. API: POST /admin/hooks
+        -- without is_system_webhook (or "false").
+}
+
+-- Editing replaces the whole configuration. The kind cannot change.
+-- from: routers/web/repo/setting/webhook.go:282
+rule ManagerEditsWebhook {
+    when: ManagerEditsWebhook(actor, webhook, hook_config, is_active)
+    requires: not config.disable_webhooks
+    let may_manage =
+        if webhook.scope = per_repository: access/is_repo_admin(actor, webhook.repository)
+        else: if webhook.scope = per_owner and webhook.owner_user != null: webhook.owner_user = actor
+        else: if webhook.scope = per_owner and webhook.owner_org != null: webhook.owner_org.has_owner(actor) or actor.is_admin
+        else: webhook.is_admin_level and actor.is_admin
+    requires: may_manage
+    requires: hook_config.kind = webhook.config.kind
+    requires: hook_config.is_valid
+    ensures: webhook.config = hook_config
+    ensures: webhook.is_active = is_active
+    ensures: webhook.updated_at = now
+    @guidance
+        -- Web: POST {base}/hooks/{id}. API: PATCH /repos/{o}/{r}/hooks/{id},
+        -- /orgs/{org}/hooks/{id}, /user/hooks/{id}, /admin/hooks/{id}.
+        -- Site admins pass the repository-admin check for every repository
+        -- and may manage any organization's webhooks.
+}
+
+-- Deleting a webhook removes its whole delivery history.
+-- from: models/webhook/webhook.go:580
+rule ManagerDeletesWebhook {
+    when: ManagerDeletesWebhook(actor, webhook)
+    requires: not config.disable_webhooks
+    let may_manage =
+        if webhook.scope = per_repository: access/is_repo_admin(actor, webhook.repository)
+        else: if webhook.scope = per_owner and webhook.owner_user != null: webhook.owner_user = actor
+        else: if webhook.scope = per_owner and webhook.owner_org != null: webhook.owner_org.has_owner(actor) or actor.is_admin
+        else: webhook.is_admin_level and actor.is_admin
+    requires: may_manage
+    ensures:
+        for d in webhook.deliveries:
+            not exists d
+    ensures: not exists webhook
+    @guidance
+        -- Web: POST {base}/hooks/delete (id). API: DELETE .../hooks/{id}.
+}
+
+-- A synthetic push of the default branch head (or a placeholder commit when
+-- the repository is empty) is queued regardless of the webhook's event
+-- selection, branch filter or active flag (an inactive webhook's test is
+-- recorded as skipped). Only repository webhooks can be tested.
+-- from: routers/web/repo/setting/webhook.go:401
+rule RepoAdminTestsWebhook {
+    when: RepoAdminTestsWebhook(actor, webhook)
+    requires: not config.disable_webhooks
+    requires: webhook.scope = per_repository
+    requires: access/is_repo_admin(actor, webhook.repository)
+    ensures:
+        let fresh = HookDelivery.created(
+            webhook: webhook,
+            delivery_id: new_delivery_id(),
+            event: push,
+            action: pushed,
+            payload: synthetic_push_payload(webhook.repository, actor),
+            is_test: true,
+            created_at: now,
+            status: queued
+        )
+        HookDeliveryQueued(delivery: fresh)
+    @guidance
+        -- Web: POST {repo}/settings/hooks/{id}/test.
+        -- API: POST /repos/{o}/{r}/hooks/{id}/tests?ref=... (optional ref
+        -- overrides the default branch; empty repository -> nothing queued).
+}
+
+-- Redeliver an earlier delivery: a fresh delivery (new id) with the same
+-- event and captured payload is queued.
+-- from: models/webhook/hooktask.go:154
+rule ManagerRedeliversDelivery {
+    when: ManagerRedeliversDelivery(actor, delivery)
+    requires: not config.disable_webhooks
+    let may_manage =
+        if delivery.webhook.scope = per_repository: access/is_repo_admin(actor, delivery.webhook.repository)
+        else: if delivery.webhook.scope = per_owner and delivery.webhook.owner_user != null: delivery.webhook.owner_user = actor
+        else: if delivery.webhook.scope = per_owner and delivery.webhook.owner_org != null: delivery.webhook.owner_org.has_owner(actor) or actor.is_admin
+        else: delivery.webhook.is_admin_level and actor.is_admin
+    requires: may_manage
+    ensures:
+        let fresh = HookDelivery.created(
+            webhook: delivery.webhook,
+            delivery_id: new_delivery_id(),
+            event: delivery.event,
+            action: delivery.action,
+            payload: delivery.payload,
+            is_test: delivery.is_test,
+            created_at: now,
+            status: queued
+        )
+        HookDeliveryQueued(delivery: fresh)
+    @guidance
+        -- Web only: POST {base}/hooks/{id}/replay/{delivery_id}. The button
+        -- is disabled while the webhook is inactive.
+}
+
+------------------------------------------------------------
+-- Rules — webhooks following repositories and owners
+------------------------------------------------------------
+
+-- Every new repository (created, forked, migrated, generated, adopted) gets
+-- its own copy of each default webhook.
+-- from: models/webhook/webhook_system.go:71
+rule CopyDefaultWebhooksIntoNewRepository {
+    when: repository: repositories/Repository.created
+    for template in Webhooks where scope = default:
+        ensures: Webhook.created(
+            scope: per_repository,
+            repository: repository,
+            config: template.config,
+            is_active: template.is_active,
+            last_status: none,
+            created_at: now,
+            updated_at: now
+        )
+}
+
+-- "Generate from template" with the webhooks option copies the template
+-- repository's own webhooks.
+-- from: services/repository/hooks.go:49
+rule CopyTemplateRepositoryWebhooks {
+    when: repositories/RepositoryGeneratedFromTemplate(repository, template, include_webhooks)
+    requires: include_webhooks
+    for source in Webhooks where scope = per_repository and repository = template:
+        ensures: Webhook.created(
+            scope: per_repository,
+            repository: repository,
+            config: source.config,
+            is_active: source.is_active,
+            last_status: none,
+            created_at: now,
+            updated_at: now
+        )
+}
+
+-- from: services/repository/delete.go:199
+rule RemoveWebhooksOfDeletedRepository {
+    when: repositories/RepositoryDeleted(deleted_repo, doer)
+    for w in Webhooks where scope = per_repository and repository = deleted_repo:
+        ensures:
+            for d in w.deliveries:
+                not exists d
+        ensures: not exists w
+}
+
+rule RemoveWebhooksOfDeletedUser {
+    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
+    for w in Webhooks where scope = per_owner and owner_user = user:
+        ensures:
+            for d in w.deliveries:
+                not exists d
+        ensures: not exists w
+}
+
+rule RemoveWebhooksOfDeletedOrganization {
+    when: organizations/OrganizationDeleted(organization)
+    for w in Webhooks where scope = per_owner and owner_org = organization:
+        ensures:
+            for d in w.deliveries:
+                not exists d
+        ensures: not exists w
+}
+
+------------------------------------------------------------
+-- Rules — from domain events to deliveries
+------------------------------------------------------------
+
+-- Fan-out: an event concerning a repository reaches the repository's active
+-- webhooks, the active webhooks of the repository's owner (user or org) and
+-- every active system webhook. An event without a repository (an
+-- owner-level package) reaches the owner's and the system webhooks.
+-- from: services/webhook/webhook.go:239
+rule FanOutHookEvent {
+    when: HookEventRaised(kind, action, source_repo?, owner_user?, owner_org?, branch?, commit_count?, sender?)
+    requires: not config.disable_webhooks
+    let o_user = if source_repo != null: source_repo.owner_user else: owner_user
+    let o_org = if source_repo != null: source_repo.owner_org else: owner_org
+    for w in Webhooks where can_fire and (
+            (scope = per_repository and source_repo != null and w.repository = source_repo)
+            or (scope = per_owner and o_user != null and owner_user = o_user)
+            or (scope = per_owner and o_org != null and owner_org = o_org)
+            or scope = system):
+        ensures: HookEventMatched(webhook: w, kind: kind, action: action, branch: branch, commit_count: commit_count)
+}
+
+-- Per-webhook filtering, then a queued delivery.
+-- from: services/webhook/webhook.go:161
+rule QueueDeliveryForMatchedEvent {
+    when: HookEventMatched(webhook, kind, action, branch?, commit_count?)
+    -- event selection
+    requires: webhook.config.event_mode = send_everything
+        or (webhook.config.event_mode = push_only and kind = push)
+        or (webhook.config.event_mode = choose_events and choice_of(kind) in webhook.config.chosen_events)
+    -- chat-style kinds are not told about pushes with no new commits
+    requires: not (kind = push and commit_count = 0 and not webhook.config.is_generic)
+    -- branch filter applies to branch pushes, branch creation and deletion only
+    requires: branch = null
+        or webhook.config.branch_filter = null
+        or webhook.config.branch_filter = "*"
+        or glob_matches(webhook.config.branch_filter, branch)
+    requires: kind_supports(webhook.config.kind, kind)
+    ensures:
+        let fresh = HookDelivery.created(
+            webhook: webhook,
+            delivery_id: new_delivery_id(),
+            event: kind,
+            action: action,
+            payload: capture_payload(kind, action),
+            is_test: false,
+            created_at: now,
+            status: queued
+        )
+        HookDeliveryQueued(delivery: fresh)
+}
+
+-- Code ------------------------------------------------------------
+
+-- Also fired for refs updated by a pull-mirror sync.
+-- from: services/webhook/notifier.go:603
+rule PushRaisesHookEvent {
+    when: code/PushReceived(push)
+    ensures: HookEventRaised(
+        kind: push,
+        action: pushed,
+        source_repo: push.repository,
+        branch: push.branch_name,
+        commit_count: push.commit_count,
+        sender: push.pusher
+    )
+    @guidance
+        -- The payload lists at most config.payload_commit_limit commits plus
+        -- the head commit, and reports the full total_commits.
+}
+
+-- from: services/webhook/notifier.go:770
+rule RefCreationRaisesHookEvent {
+    when: code/RefCreated(repo, ref_name, ref_kind, pusher)
+    ensures: HookEventRaised(
+        kind: create,
+        action: created,
+        source_repo: repo,
+        branch: if ref_kind = branch: ref_name else: null,
+        sender: pusher
+    )
+}
+
+-- from: services/webhook/notifier.go:806
+rule RefDeletionRaisesHookEvent {
+    when: code/RefDeleted(repo, ref_name, ref_kind, pusher)
+    ensures: HookEventRaised(
+        kind: delete,
+        action: deleted,
+        source_repo: repo,
+        branch: if ref_kind = branch: ref_name else: null,
+        sender: pusher
+    )
+}
+
+-- Repositories ----------------------------------------------------
+
+-- from: services/webhook/notifier.go:110
+rule RepositoryCreationRaisesHookEvent {
+    when: repositories/RepositoryCreated(repo, doer)
+    ensures: HookEventRaised(kind: repository, action: created, source_repo: repo, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:133
+rule RepositoryMigrationRaisesHookEvent {
+    when: repositories/RepositoryMigrated(repo, doer)
+    ensures: HookEventRaised(kind: repository, action: created, source_repo: repo, sender: doer)
+}
+
+-- The fork event goes to the source repository's hooks; a fork into an
+-- organization also announces the new repository to the organization.
+-- from: services/webhook/notifier.go:82
+rule ForkRaisesHookEvents {
+    when: repositories/RepositoryForked(fork, source, doer)
+    ensures: HookEventRaised(kind: fork, action: forked, source_repo: source, sender: doer)
+    ensures:
+        if fork.owner_org != null:
+            HookEventRaised(kind: repository, action: created, source_repo: fork, sender: doer)
+}
+
+-- Announced before the repository disappears; its own webhooks go with it,
+-- so only owner and system webhooks are told.
+-- from: services/webhook/notifier.go:122
+rule RepositoryDeletionRaisesHookEvent {
+    when: repositories/RepositoryDeleted(deleted_repo, doer)
+    ensures: HookEventRaised(
+        kind: repository,
+        action: deleted,
+        owner_user: deleted_repo.owner_user,
+        owner_org: deleted_repo.owner_org,
+        sender: doer
+    )
+}
+
+-- Issues and pull-request conversations ---------------------------
+
+-- from: services/webhook/notifier.go:272
+rule IssueOpenedRaisesHookEvent {
+    when: issues/IssueOpened(issue)
+    requires: not issue.is_pull
+    ensures: HookEventRaised(kind: issues, action: opened, source_repo: issue.repository, sender: issue.poster)
+}
+
+-- from: services/webhook/notifier.go:294
+rule PullRequestOpenedRaisesHookEvent {
+    when: pulls/PullRequestOpened(pr)
+    ensures: HookEventRaised(kind: pull_request, action: opened, source_repo: pr.issue.repository, sender: pr.issue.poster)
+}
+
+-- from: services/webhook/notifier.go:190
+rule TitleChangeRaisesHookEvent {
+    when: issues/IssueTitleChanged(issue, doer, old_title)
+    ensures: HookEventRaised(
+        kind: if issue.is_pull: pull_request else: issues,
+        action: edited, source_repo: issue.repository, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:320
+rule ContentChangeRaisesHookEvent {
+    when: issues/IssueContentChanged(issue, doer, old_content)
+    ensures: HookEventRaised(
+        kind: if issue.is_pull: pull_request else: issues,
+        action: edited, source_repo: issue.repository, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:230
+rule CloseRaisesHookEvent {
+    when: issues/IssueClosed(issue, doer)
+    ensures: HookEventRaised(
+        kind: if issue.is_pull: pull_request else: issues,
+        action: closed, source_repo: issue.repository, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:230
+rule ReopenRaisesHookEvent {
+    when: issues/IssueReopened(issue, doer)
+    ensures: HookEventRaised(
+        kind: if issue.is_pull: pull_request else: issues,
+        action: reopened, source_repo: issue.repository, sender: doer)
+}
+
+-- Manual and automatic merges alike; the payload marks the PR merged.
+-- from: services/webhook/notifier.go:636
+rule MergeRaisesHookEvent {
+    when: pulls/PullRequestMerged(pr, merger)
+    ensures: HookEventRaised(kind: pull_request, action: closed, source_repo: pr.issue.repository, sender: merger)
+}
+
+-- from: services/webhook/notifier.go:673
+rule TargetBranchChangeRaisesHookEvent {
+    when: pulls/PullRequestTargetBranchChanged(pr, doer, old_branch)
+    ensures: HookEventRaised(kind: pull_request, action: edited, source_repo: pr.issue.repository, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:145
+rule AssigneeAddedRaisesHookEvent {
+    when: issues/IssueAssigneeAdded(issue, doer, assignee)
+    ensures: HookEventRaised(
+        kind: if issue.is_pull: pull_request_assign else: issue_assign,
+        action: assigned, source_repo: issue.repository, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:145
+rule AssigneeRemovedRaisesHookEvent {
+    when: issues/IssueAssigneeRemoved(issue, doer, assignee)
+    ensures: HookEventRaised(
+        kind: if issue.is_pull: pull_request_assign else: issue_assign,
+        action: unassigned, source_repo: issue.repository, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:515
+rule LabelsChangedRaisesHookEvent {
+    when: issues/IssueLabelsChanged(issue, doer)
+    ensures: HookEventRaised(
+        kind: if issue.is_pull: pull_request_label else: issue_label,
+        action: label_updated, source_repo: issue.repository, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:42
+rule LabelsClearedRaisesHookEvent {
+    when: issues/IssueLabelsCleared(issue, doer)
+    ensures: HookEventRaised(
+        kind: if issue.is_pull: pull_request_label else: issue_label,
+        action: label_cleared, source_repo: issue.repository, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:561
+rule MilestoneChangedRaisesHookEvent {
+    when: issues/IssueMilestoneChanged(issue, doer, old_milestone?)
+    ensures: HookEventRaised(
+        kind: if issue.is_pull: pull_request_milestone else: issue_milestone,
+        action: if issue.milestone != null: milestoned else: demilestoned,
+        source_repo: issue.repository, sender: doer)
+}
+
+-- Only conversation comments (not timeline events) are announced.
+-- from: services/webhook/notifier.go:407
+rule CommentCreatedRaisesHookEvent {
+    when: issues/CommentCreated(comment, doer)
+    requires: comment.kind = comment
+    ensures: HookEventRaised(
+        kind: if comment.issue.is_pull: pull_request_comment else: issue_comment,
+        action: created, source_repo: comment.issue.repository, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:364
+rule CommentEditedRaisesHookEvent {
+    when: issues/CommentEdited(comment, doer, old_content)
+    ensures: HookEventRaised(
+        kind: if comment.issue.is_pull: pull_request_comment else: issue_comment,
+        action: edited, source_repo: comment.issue.repository, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:437
+rule CommentDeletedRaisesHookEvent {
+    when: issues/CommentDeleted(comment, doer)
+    ensures: HookEventRaised(
+        kind: if comment.issue.is_pull: pull_request_comment else: issue_comment,
+        action: deleted, source_repo: comment.issue.repository, sender: doer)
+}
+
+-- Pull requests ---------------------------------------------------
+
+-- Pending reviews and review-request markers are not announced.
+-- from: services/webhook/notifier.go:698
+rule ReviewSubmittedRaisesHookEvent {
+    when: pulls/ReviewSubmitted(review)
+    requires: review.kind in {approve, comment, reject}
+    ensures: HookEventRaised(
+        kind: if review.kind = approve: pull_request_review_approved
+              else: if review.kind = reject: pull_request_review_rejected
+              else: pull_request_review_comment,
+        action: reviewed, source_repo: review.pull_request.issue.repository, sender: review.reviewer)
+}
+
+-- from: services/webhook/notifier.go:742
+rule ReviewRequestedRaisesHookEvent {
+    when: pulls/ReviewRequested(pr, doer, reviewer)
+    ensures: HookEventRaised(kind: pull_request_review_request, action: review_requested, source_repo: pr.issue.repository, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:742
+rule ReviewRequestRemovedRaisesHookEvent {
+    when: pulls/ReviewRequestRemoved(pr, doer, reviewer)
+    ensures: HookEventRaised(kind: pull_request_review_request, action: review_request_removed, source_repo: pr.issue.repository, sender: doer)
+}
+
+-- New commits on the head branch.
+-- from: services/webhook/notifier.go:785
+rule SynchronizeRaisesHookEvent {
+    when: pulls/PullRequestSynchronized(pr, doer)
+    ensures: HookEventRaised(kind: pull_request_sync, action: synchronized, source_repo: pr.issue.repository, sender: doer)
+}
+
+-- Wiki ------------------------------------------------------------
+
+-- from: services/webhook/notifier.go:477
+rule WikiPageCreatedRaisesHookEvent {
+    when: wiki/WikiPageCreated(repo, doer, page)
+    ensures: HookEventRaised(kind: wiki, action: created, source_repo: repo, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:490
+rule WikiPageEditedRaisesHookEvent {
+    when: wiki/WikiPageEdited(repo, doer, page)
+    ensures: HookEventRaised(kind: wiki, action: edited, source_repo: repo, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:503
+rule WikiPageDeletedRaisesHookEvent {
+    when: wiki/WikiPageDeleted(repo, doer, page)
+    ensures: HookEventRaised(kind: wiki, action: deleted, source_repo: repo, sender: doer)
+}
+
+-- Releases --------------------------------------------------------
+
+-- from: services/webhook/notifier.go:838
+rule ReleasePublishedRaisesHookEvent {
+    when: releases/ReleasePublished(release)
+    ensures: HookEventRaised(kind: release, action: published, source_repo: release.repository, sender: release.publisher)
+}
+
+-- from: services/webhook/notifier.go:842
+rule ReleaseUpdatedRaisesHookEvent {
+    when: releases/ReleaseUpdated(release, doer)
+    ensures: HookEventRaised(kind: release, action: updated, source_repo: release.repository, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:846
+rule ReleaseDeletedRaisesHookEvent {
+    when: releases/ReleaseDeleted(release, doer)
+    ensures: HookEventRaised(kind: release, action: deleted, source_repo: release.repository, sender: doer)
+}
+
+-- Packages --------------------------------------------------------
+
+-- A package linked to a repository reaches that repository's hooks too.
+-- from: services/webhook/notifier.go:1095
+rule PackageVersionCreatedRaisesHookEvent {
+    when: packages/PackageVersionCreated(version, doer)
+    ensures: HookEventRaised(
+        kind: package, action: created,
+        source_repo: version.package.repository,
+        owner_user: version.package.owner_user,
+        owner_org: version.package.owner_org,
+        sender: doer)
+}
+
+-- from: services/webhook/notifier.go:890
+rule PackageVersionDeletedRaisesHookEvent {
+    when: packages/PackageVersionDeleted(version, doer)
+    ensures: HookEventRaised(
+        kind: package, action: deleted,
+        source_repo: version.package.repository,
+        owner_user: version.package.owner_user,
+        owner_org: version.package.owner_org,
+        sender: doer)
+}
+
+-- Actions ---------------------------------------------------------
+
+-- A run entering blocked, cancelled, failure, running, skipped, success or
+-- waiting (including a new attempt and completion) is announced as
+-- workflow_run_<status>; other statuses are not announced.
+-- from: services/webhook/notifier.go:926
+rule WorkflowRunStatusRaisesHookEvent {
+    when: actions/WorkflowRunStatusChanged(run, prior_status)
+    requires: run.status in {blocked, cancelled, failure, running, skipped, success, waiting}
+    ensures: HookEventRaised(
+        kind: workflow_run_kind(run.status),
+        action: status_changed,
+        source_repo: run.repository,
+        sender: run.trigger_user)
+}
+
+-- from: services/webhook/notifier.go:1023
+rule WorkflowJobStatusRaisesHookEvent {
+    when: actions/WorkflowJobStatusChanged(job, prior_status)
+    requires: job.status in {blocked, cancelled, failure, running, skipped, success, waiting}
+    ensures: HookEventRaised(
+        kind: workflow_job_kind(job.status),
+        action: status_changed,
+        source_repo: job.run.repository,
+        sender: job.run.trigger_user)
+}
+
+------------------------------------------------------------
+-- Rules — delivering
+------------------------------------------------------------
+
+-- A queued delivery is picked up by the delivery worker. Queued deliveries
+-- survive restarts: on start-up every still-queued delivery is re-queued.
+-- from: services/webhook/deliver.go:330
+rule DispatchQueuedDelivery {
+    when: HookDeliveryQueued(delivery)
+    requires: delivery.status = queued
+    let w = delivery.webhook
+    ensures:
+        if config.disable_webhooks or not w.is_active:
+            delivery.status = skipped
+            delivery.finished_at = now
+            w.last_status = failed
+            HookDeliveryCompleted(delivery: delivery)
+        else:
+            if not host_allowed(config.allowed_host_list, w.config.target_url):
+                delivery.status = failed
+                delivery.request = render_request(w, delivery)
+                delivery.response = denied_response(w.config.target_url)
+                delivery.finished_at = now
+                w.last_status = failed
+                HookDeliveryCompleted(delivery: delivery)
+            else:
+                delivery.status = sending
+                delivery.request = render_request(w, delivery)
+                delivery.sent_at = now
+    @guidance
+        -- Deliveries are processed by a persistent work queue; a delivery is
+        -- claimed atomically so it is sent at most once even if queued twice.
+        -- TLS certificates are verified unless config.skip_tls_verify. The
+        -- allow-list is enforced on the resolved IP at connect time (also
+        -- through redirects and the proxy), not only on the URL host name.
+}
+
+-- from: services/webhook/deliver.go:447
+rule ReceiverAnswers {
+    when: ReceiverResponds(delivery, status_code, headers, body)
+    requires: delivery.status = sending
+    ensures: delivery.response = HookResponse{status_code: status_code, headers: headers, body: body}
+    ensures: delivery.finished_at = now
+    ensures:
+        if status_code >= 200 and status_code < 300:
+            delivery.status = succeeded
+            delivery.webhook.last_status = succeeded
+        else:
+            delivery.status = failed
+            delivery.webhook.last_status = failed
+    ensures: HookDeliveryCompleted(delivery: delivery)
+}
+
+-- Connection refused, DNS failure, TLS failure, a host refused by the
+-- allow-list after resolution, or an unreadable response body.
+-- from: services/webhook/deliver.go:440
+rule DeliveryTransportFails {
+    when: DeliveryTransportFailed(delivery, reason)
+    requires: delivery.status = sending
+    ensures: delivery.status = failed
+    ensures: delivery.response = HookResponse{status_code: null, headers: {}, body: reason}
+    ensures: delivery.finished_at = now
+    ensures: delivery.webhook.last_status = failed
+    ensures: HookDeliveryCompleted(delivery: delivery)
+}
+
+-- from: services/webhook/deliver.go:499
+rule DeliveryTimesOut {
+    when: delivery: HookDelivery.is_overdue
+    requires: delivery.status = sending
+    ensures: delivery.status = failed
+    ensures: delivery.response = HookResponse{status_code: null, headers: {}, body: "timeout"}
+    ensures: delivery.finished_at = now
+    ensures: delivery.webhook.last_status = failed
+    ensures: HookDeliveryCompleted(delivery: delivery)
+}
+
+------------------------------------------------------------
+-- Rules — history cleanup (cron task cleanup_hook_task_table)
+------------------------------------------------------------
+
+-- Runs on config.cleanup_schedule (default nightly); expressed here as the
+-- condition it enforces.
+-- from: models/webhook/hooktask.go:202
+rule CleanupDeliveriesOlderThan {
+    when: delivery: HookDelivery.is_expired
+    requires: config.cleanup_enabled
+    requires: config.cleanup_type = "older_than"
+    ensures: not exists delivery
+}
+
+-- from: models/webhook/hooktask.go:236
+rule CleanupDeliveriesBeyondKeepCount {
+    when: webhook: Webhook.history_over_limit
+    requires: config.cleanup_enabled
+    requires: config.cleanup_type = "per_webhook"
+    let excess = oldest_beyond(webhook.finished_deliveries, config.cleanup_keep_count)
+    ensures:
+        for d in excess:
+            not exists d
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- from: models/webhook/webhook.go:124
+invariant WebhookHasExactlyOneHome {
+    for w in Webhooks:
+        (w.scope = per_repository implies (w.repository != null and w.owner_user = null and w.owner_org = null))
+        and (w.scope = per_owner implies (w.repository = null and ((w.owner_user != null) != (w.owner_org != null))))
+        and (w.is_admin_level implies (w.repository = null and w.owner_user = null and w.owner_org = null))
+}
+
+invariant StoredConfigIsValid {
+    for w in Webhooks:
+        w.config.is_valid
+}
+
+invariant DeliveryIdsAreUnique {
+    for a in HookDeliveries:
+        for b in HookDeliveries:
+            a != b implies a.delivery_id != b.delivery_id
+}
+
+-- Default webhooks are templates and never accumulate deliveries.
+invariant DefaultWebhooksHaveNoDeliveries {
+    for w in Webhooks:
+        w.scope = default implies w.deliveries.count = 0
+}
+
+invariant ChosenEventsOnlyWhenChoosing {
+    for w in Webhooks:
+        w.config.event_mode != choose_events implies w.config.chosen_events.count = 0
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor RepoAdmin {
+    within: repositories/Repository
+    identified_by: accounts/User where access/is_repo_admin(this, within)
+}
+
+actor OrgOwner {
+    within: organizations/Organization
+    identified_by: accounts/User where within.has_owner(this) or is_admin = true
+}
+
+actor SignedInUser {
+    identified_by: accounts/User where is_active = true and prohibit_login = false
+}
+
+actor SiteAdmin {
+    identified_by: accounts/User where is_admin = true
+}
+
+actor HookReceiver {
+    identified_by: ReceivingService where base_url != ""
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- Repository settings → Webhooks (web) and /repos/{owner}/{repo}/hooks (API).
+-- from: routers/web/web.go:1329
+surface RepoWebhookSettings {
+    facing admin: RepoAdmin
+    context repo: repositories/Repository
+
+    let hooks = Webhooks where scope = per_repository and repository = repo
+
+    exposes:
+        for w in hooks:
+            w.config.kind
+            w.config.target_url
+            w.config.http_method
+            w.config.content_type
+            w.config.authorization_header
+            w.config.event_mode
+            w.config.chosen_events
+            w.config.branch_filter
+            w.config.settings
+            w.is_active
+            w.last_status
+            w.created_at
+            w.updated_at
+        for d in HookDeliveries where webhook.repository = repo:
+            d.delivery_id
+            d.event
+            d.status
+            d.is_test
+            d.request
+            d.response
+            d.finished_at
+
+    provides:
+        RepoAdminCreatesWebhook(admin, repo, hook_config, is_active) when not config.disable_webhooks
+        ManagerEditsWebhook(admin, webhook, hook_config, is_active) when not config.disable_webhooks
+        ManagerDeletesWebhook(admin, webhook) when not config.disable_webhooks
+        RepoAdminTestsWebhook(admin, webhook) when not config.disable_webhooks
+        ManagerRedeliversDelivery(admin, delivery) when not config.disable_webhooks
+
+    @guarantee SecretIsWriteOnly
+        -- The HMAC secret is never shown back, in the web UI or the API.
+
+    @guarantee HistoryIsPaged
+        -- Deliveries are listed newest first, config.history_page_size per page.
+
+    @guidance
+        -- Web: GET {repo}/settings/hooks; GET/POST {repo}/settings/hooks/{kind}/new;
+        -- GET/POST {repo}/settings/hooks/{id}; POST .../{id}/test;
+        -- POST .../{id}/replay/{delivery_id}; POST {repo}/settings/hooks/delete.
+        -- API: GET/POST /repos/{o}/{r}/hooks; GET/PATCH/DELETE /repos/{o}/{r}/hooks/{id};
+        -- POST /repos/{o}/{r}/hooks/{id}/tests. All need a token and repo admin.
+}
+
+-- Organization settings → Webhooks and /orgs/{org}/hooks.
+-- from: routers/web/web.go:1151
+surface OrgWebhookSettings {
+    facing owner: OrgOwner
+    context organization: organizations/Organization
+
+    let hooks = Webhooks where scope = per_owner and owner_org = organization
+
+    exposes:
+        for w in hooks:
+            w.config.kind
+            w.config.target_url
+            w.config.authorization_header
+            w.config.event_mode
+            w.config.chosen_events
+            w.config.branch_filter
+            w.config.settings
+            w.is_active
+            w.last_status
+        for d in HookDeliveries where webhook.owner_org = organization:
+            d.delivery_id
+            d.event
+            d.status
+            d.request
+            d.response
+
+    provides:
+        OrgOwnerCreatesWebhook(owner, organization, hook_config, is_active) when not config.disable_webhooks
+        ManagerEditsWebhook(owner, webhook, hook_config, is_active) when not config.disable_webhooks
+        ManagerDeletesWebhook(owner, webhook) when not config.disable_webhooks
+        ManagerRedeliversDelivery(owner, delivery) when not config.disable_webhooks
+
+    @guidance
+        -- Web: {org}/settings/hooks[...] (no test button). API: GET/POST
+        -- /orgs/{org}/hooks, GET/PATCH/DELETE /orgs/{org}/hooks/{id}.
+}
+
+-- User settings → Webhooks and /user/hooks.
+-- from: routers/web/web.go:867
+surface UserWebhookSettings {
+    facing user: SignedInUser
+
+    let hooks = Webhooks where scope = per_owner and owner_user = user
+
+    exposes:
+        for w in hooks:
+            w.config.kind
+            w.config.target_url
+            w.config.authorization_header
+            w.config.event_mode
+            w.config.chosen_events
+            w.config.branch_filter
+            w.config.settings
+            w.is_active
+            w.last_status
+        for d in HookDeliveries where webhook.owner_user = user:
+            d.delivery_id
+            d.event
+            d.status
+            d.request
+            d.response
+
+    provides:
+        UserCreatesOwnWebhook(user, hook_config, is_active) when not config.disable_webhooks
+        ManagerEditsWebhook(user, webhook, hook_config, is_active) when not config.disable_webhooks
+        ManagerDeletesWebhook(user, webhook) when not config.disable_webhooks
+        ManagerRedeliversDelivery(user, delivery) when not config.disable_webhooks
+
+    @guidance
+        -- Web: /user/settings/hooks[...]. API: GET/POST /user/hooks,
+        -- GET/PATCH/DELETE /user/hooks/{id}.
+}
+
+-- Site administration → Webhooks (system and default) and /admin/hooks.
+-- from: routers/web/admin/hooks.go:22
+surface AdminWebhookSettings {
+    facing admin: SiteAdmin
+
+    let hooks = Webhooks where is_admin_level
+
+    exposes:
+        for w in hooks:
+            w.scope
+            w.config.kind
+            w.config.target_url
+            w.config.authorization_header
+            w.config.event_mode
+            w.config.chosen_events
+            w.config.branch_filter
+            w.config.settings
+            w.is_active
+            w.last_status
+        for d in HookDeliveries where webhook.scope = system:
+            d.delivery_id
+            d.event
+            d.status
+            d.request
+            d.response
+
+    provides:
+        AdminCreatesSystemWebhook(admin, hook_config, is_active) when not config.disable_webhooks
+        AdminCreatesDefaultWebhook(admin, hook_config, is_active) when not config.disable_webhooks
+        ManagerEditsWebhook(admin, webhook, hook_config, is_active) when not config.disable_webhooks
+        ManagerDeletesWebhook(admin, webhook) when not config.disable_webhooks
+        ManagerRedeliversDelivery(admin, delivery) when not config.disable_webhooks
+
+    @guidance
+        -- Web: GET /admin/hooks (both lists); /admin/{system-hooks|default-hooks}/{kind}/new;
+        -- GET/POST /admin/hooks/{id}; POST /admin/hooks/{id}/replay/{uuid};
+        -- POST /admin/hooks/delete. API: GET/POST /admin/hooks (list shows
+        -- system hooks only), GET/PATCH/DELETE /admin/hooks/{id}.
+}
+
+-- The external endpoint receiving a delivery.
+-- from: services/webhook/deliver.go:440
+surface HookReceiverEndpoint {
+    facing receiver: HookReceiver
+    context delivery: HookDelivery where status = sending
+
+    exposes:
+        delivery.request
+
+    provides:
+        ReceiverResponds(delivery, status_code, headers, body) when receiver.base_url != ""
+        DeliveryTransportFailed(delivery, reason)
+
+    contracts:
+        fulfils SignedDelivery
+        fulfils HookRequestRendering
+
+    @guarantee AtMostOnce
+        -- Each delivery is sent at most once; there are no automatic retries.
+
+    @guarantee BoundedWait
+        -- The receiver has config.deliver_timeout to answer.
+
+    timeout:
+        DeliveryTimesOut
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred HookRequestRendering.render    -- see: services/webhook/ per-kind message formatting: services/webhook/{slack,discord,dingtalk,telegram,msteams,feishu,matrix,wechatwork,packagist}.go, sourcehut/builds.go
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Inactive or globally-disabled deliveries: Forgejo marks them delivered, not succeeded, and sets the webhook's last status to failed. Should a skipped delivery leave last_status untouched instead?"
+open question "Kinds that cannot render an event (e.g. sourcehut_builds for issues): Forgejo still creates the delivery and it stays undelivered forever (re-queued at every start). The spec drops such events at queue time (kind_supports) — confirm, or record them as failed?"
+open question "Review comments: Forgejo's event checker gates pull_request_review_comment on the pull_request_comment choice while the matching helper uses pull_request_review. The spec uses pull_request_review for all three review outcomes — confirm."
+open question "API edit (PATCH .../hooks/{id}) resets event mode to choose_events and leaves package, workflow_run_* and workflow_job_* selections untouched; the API create path also ignores http_method. Should API create/edit accept the full WebhookConfig like the web form?"
+open question "Copying default webhooks into a new repository and copying template webhooks drop the Authorization header in Forgejo. The spec copies the whole config, including it — confirm."
+open question "Owner deletion: Forgejo leaves a deleted user's or organization's webhooks behind. The spec removes them — confirm."
+open question "Secret: the web edit form re-renders the stored secret into a password field, while the API never returns it. The spec treats it as write-only; the Authorization header, however, is returned in clear to managers by the API and form — should it also become write-only?"
+open question "Delivery history is visible on repo/org/user/admin pages, but the admin page only shows history for system hooks it can edit; default hooks never have history. Is there a need for an instance-wide delivery log?"
+open question "Should failed deliveries be retried automatically with backoff? Forgejo never retries (one attempt; manual redelivery only)."
+open question "gitea and gogs kinds exist only to speak older receivers' dialects (short ref names on create/delete for gitea, POST-only for gogs). Keep them as distinct kinds in a rebuild?"
+open question "Test deliveries are only offered for repository webhooks; should org, user and system webhooks have a test action too?"
+
+------------------------------------------------------------
+-- Requests to other modules
+------------------------------------------------------------
+-- REQUEST access/is_repo_admin(user, repository): fixed name; used for repo webhook management.
+-- REQUEST repositories/Repository.owner_user, owner_org: fixed; used for owner-webhook fan-out.
+-- REQUEST repositories/RepositoryCreated(repository, doer), RepositoryMigrated(repository, doer), RepositoryForked(fork, source, doer), RepositoryDeleted(repository, doer): emitted triggers; RepositoryDeleted must be emitted before the repository is removed.
+-- REQUEST repositories/RepositoryGeneratedFromTemplate(repository, template, include_webhooks): template generation with the "webhooks" option.
+-- REQUEST code/PushReceived(push) with push.repository, push.branch_name (null for tags), push.commit_count, push.pusher; also emitted for refs updated by pull-mirror sync.
+-- REQUEST code/RefCreated(repository, ref_name, ref_kind: branch|tag, pusher) and code/RefDeleted(...): also emitted by mirror sync.
+-- REQUEST issues/IssueOpened, IssueTitleChanged, IssueContentChanged, IssueClosed, IssueReopened, IssueAssigneeAdded, IssueAssigneeRemoved, IssueLabelsChanged, IssueLabelsCleared, IssueMilestoneChanged, CommentCreated, CommentEdited, CommentDeleted (signatures in header); issues/Issue.milestone; issues/Comment.kind with value `comment` for plain conversation comments; IssueClosed must not be emitted for a merge.
+-- REQUEST pulls/PullRequestOpened(pr), PullRequestMerged(pr, merger) (incl. auto-merge), PullRequestTargetBranchChanged(pr, doer, old_branch), PullRequestSynchronized(pr, doer), ReviewSubmitted(review), ReviewRequested/ReviewRequestRemoved(pr, doer, reviewer); pulls/Review.kind (approve|comment|reject|pending|request), Review.reviewer, Review.pull_request.
+-- REQUEST wiki/WikiPageCreated, WikiPageEdited, WikiPageDeleted (repository, doer, page).
+-- REQUEST releases/ReleasePublished(release), ReleaseUpdated(release, doer), ReleaseDeleted(release, doer); releases/Release.repository, Release.publisher.
+-- REQUEST packages/PackageVersionCreated(version, doer), PackageVersionDeleted(version, doer); packages/PackageVersion.package; packages/Package.repository?, owner_user?, owner_org?.
+-- REQUEST actions/WorkflowRunStatusChanged(run, prior_status) (incl. new attempts and completion), actions/WorkflowJobStatusChanged(job, prior_status); WorkflowRun.status, repository, trigger_user; Job.status, Job.run.
+-- REQUEST accounts/UserAccountDeleted(user, purge, delete_contributions), organizations/OrganizationDeleted(organization).
+-- REQUEST administration/CronTask: register "cleanup_hook_task_table" (enabled, @midnight, run_at_start false) whose settings are this module's cleanup_* config.
