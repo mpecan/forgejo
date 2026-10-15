@@ -1,0 +1,2935 @@
+-- allium: 3
+-- authentication.allium — who a request is, how they proved it, and the credentials they hold.
+--
+-- Scope: every way a party proves its identity to the forge, and every credential the
+--   forge issues or trusts: registration and account activation, interactive sign-in
+--   (password, second factor, remember-me, external identity providers, OpenID 2.0),
+--   sign-out and sessions, password reset/change/policy, TOTP and WebAuthn second
+--   factors, personal access tokens and their scope taxonomy, request authentication
+--   for the API / git / LFS (basic, token, bearer, HTTP signatures, reverse-proxy
+--   headers, trusted external JWTs), the OAuth2/OIDC provider (applications, consent,
+--   grants, codes, PKCE, refresh, introspection, userinfo), admin-managed external
+--   authentication sources (LDAP, SMTP, PAM, OAuth2/OIDC, remote) with group mapping
+--   and the scheduled directory sync, and linking external identities to accounts.
+--
+-- Includes: Session, LongTermAuthorization (remember-me), EmailVerificationCode
+--   (account activation, password reset, secondary e-mail confirmation),
+--   MailSendThrottle, UserLogin (which source verifies a user's password and the
+--   must-change-password flag), TwoFactor (TOTP + scratch code), WebAuthnCredential,
+--   AccessToken (+ TokenScope taxonomy and repository-specific tokens), AuthSource,
+--   DirectoryEntry (external), ExternalLogin, OpenIDIdentity, OAuth2Application,
+--   OAuth2Grant, OAuth2AuthorizationCode, OAuth2TokenIssuance, AuthorizedIntegration,
+--   ExternalUserSyncJob.
+--
+-- Excludes:
+--   - SSPI (Windows integrated auth): removed from Forgejo; the source kind number is a
+--     tombstone only.
+--   - Gitea-compatibility headers (X-Gitea-OTP alongside X-Forgejo-OTP), the deprecated
+--     `token`/`access_token` query parameters and the legacy "sudo" scope literal:
+--     compatibility accidents, a rebuild needs one OTP header and header-only tokens.
+--   - Password hash algorithm choice and silent re-hashing on sign-in: implementation.
+--   - Token byte lengths, prefixes (gto_/gta_), lookup-key/validator split, LRU caches
+--     of successful tokens, JWT signing key file locations: implementation.
+--   - Actions runner/task tokens, Actions runtime tokens and LFS transfer tokens: these
+--     credentials are minted and owned by actions.allium / code.allium; this module only
+--     lists them as CredentialMethod values so access can tell them apart.
+--   - SSH key authentication on the SSH transport: keys.allium / code.allium.
+--   - Username syntax, reserved names, rename cooldown, e-mail uniqueness: accounts.allium
+--     (called here as black-box checks).
+--   - Admin user management (create user with must-change-password, activate, prohibit
+--     login, delete): administration.allium / accounts.allium; this module only exposes
+--     the fields they set.
+--   - The orphaned-OAuth2-application doctor check: an operational repair tool.
+--   - Remote/placeholder user promotion internals (RemoteSource matching migrated users on
+--     first OAuth2 sign-in): left as one rule; the placeholder users themselves belong to
+--     accounts.allium / migrations.allium.
+--
+-- Emits (other modules react):
+--   UserSignedUp(user)                                   -> notifications (admin notice / welcome), accounts
+--   UserSignedIn(user, method)                           -> accounts (last-login), notifications
+--   UserSignedOut(user, session)                         -> notifications (event stream "logout" to other tabs)
+--   ActivationEmailRequested(user, code)                 -> notifications (MailMessage)
+--   EmailConfirmationRequested(user, email, code)        -> notifications (MailMessage)
+--   AccountActivated(user)                               -> accounts, notifications
+--   EmailConfirmationLinkFollowed(user, email)           -> accounts (EmailAddress.is_activated)
+--   PasswordResetRequested(user, code)                   -> notifications (MailMessage)
+--   PasswordChanged(user)                                -> notifications (security mail)
+--   TotpEnrolled(user) / TotpDisabled(user)              -> notifications (security mail)
+--   SecurityKeyRemoved(user, name)                       -> notifications (security mail)
+--   ExternalGroupsAsserted(user, source, groups)         -> organizations (team mapping), quota (quota-group mapping)
+--   ExternalSshKeysAsserted(user, source, keys)          -> keys (source-managed SSH keys)
+--   ExternalAvatarAsserted(user, url)                    -> accounts (avatar upload)
+--   ExternalAdminFlagsAsserted(user, is_admin, is_restricted) -> accounts
+--   RequestAuthenticated(user, method)                   -> access (scope/repository reducers), accounts (token last use)
+--   AuthSourceDeleted(source)                            -> organizations (clear team-membership provenance)
+--   OAuth2ProviderRedirectRequested(session, source, prompt_none) -> (web layer: redirect to IdP)
+--   ConsentRequested(user, app, redirect_uri, scopes)    -> (web layer: render the consent page)
+--   AuthorizationDenied(user, app)                       -> (web layer: redirect with error=access_denied)
+--   ClientSecretRegenerated(app)                         -> (web layer: show the new secret once)
+--   AuthSourceSyncRequested(source, update_existing)     -> (internal: per-source sync; LDAP handled here)
+--
+-- Reacts to:
+--   accounts/UserEmailAdded(user, address)     -- issue a confirmation code for a new address
+--   accounts/EmailActivationRequested(user, address) -- re-issue it (resend)
+--   accounts/PrimaryEmailChanged(user, old_address, new_address) -- old codes and remember-me die
+--   accounts/UserPurged(user)                  -- end every session at once
+--   accounts/UserAccountDeleted(user, purge, delete_contributions) -- drop every credential
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./repositories.allium" as repositories
+use "./access.allium" as access
+use "./keys.allium" as keys
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- What an external identity provider (OAuth2/OIDC source) told us about the person who
+-- just came back from it. Held in the session while the person decides to link or
+-- register.
+-- from: routers/web/auth/oauth.go:1556
+value ExternalIdentity {
+    source: AuthSource
+    external_id: String                 -- the provider's stable user id ("sub")
+    email: String?
+    nickname: String?
+    preferred_username: String?
+    full_name: String?
+    avatar_url: String?
+    groups: Set<String>                 -- values of the source's group claim
+    quota_groups: Set<String>           -- values of the source's quota-group claim
+    ssh_public_keys: Set<String>        -- values of the source's SSH-key attribute
+    claim_names: Set<String>            -- every claim name present
+}
+
+-- One rule an AuthorizedIntegration applies to a presented JWT's claims.
+-- from: models/auth/authorized_integration.go:116
+value ClaimRule {
+    claim: String
+    comparison: ClaimComparison
+    value: String?                      -- for eq / glob
+    values: Set<String>                 -- for in / glob_in
+    nested: List<ClaimRule>             -- for nest: rules applied inside an object claim
+}
+
+-- Kind-specific settings of an authentication source. Only the group for the source's
+-- kind is meaningful.
+-- from: services/auth/source/ldap/source.go:25
+value AuthSourceSettings {
+    -- LDAP (bind DN search, or direct "simple" bind)
+    host: String?
+    port: Integer?
+    security_protocol: LdapSecurityProtocol?
+    skip_tls_verify: Boolean
+    bind_dn: String?                    -- bind_dn mode: service account used to search
+    user_base: String?                  -- search base
+    user_dn_template: String?           -- simple mode: DN template with the login substituted
+    user_filter: String?                -- entry must match to be allowed to sign in
+    admin_filter: String?               -- entry matching makes the user a site admin
+    restricted_filter: String?          -- entry matching makes the user restricted
+    attribute_username: String?
+    attribute_first_name: String?
+    attribute_surname: String?
+    attribute_mail: String?
+    attribute_ssh_public_key: String?
+    attribute_avatar: String?
+    attributes_in_bind: Boolean
+    search_page_size: Integer?
+    allow_deactivate_all: Boolean       -- an empty directory listing may deactivate everyone
+    groups_enabled: Boolean
+    group_dn: String?
+    group_filter: String?
+    group_member_attribute: String?
+    user_uid_attribute: String?
+    -- SMTP
+    smtp_auth: SmtpAuthKind?
+    smtp_allowed_domains: Set<String>
+    force_smtps: Boolean
+    helo_hostname: String?
+    disable_helo: Boolean
+    -- PAM
+    pam_service_name: String?
+    pam_email_domain: String?
+    -- OAuth2 / OIDC
+    provider: String?                   -- e.g. openidConnect, github, gitlab, gitea, nextcloud, ...
+    client_id: String?
+    openid_discovery_url: String?
+    custom_urls: Set<String>            -- auth/token/profile/email URLs for self-hosted providers
+    icon_url: String?
+    scopes: Set<String>
+    required_claim_name: String?        -- sign-in refused unless the claim is present
+    required_claim_value: String?       -- ...and contains this value
+    group_claim_name: String?
+    admin_group: String?                -- membership makes the user a site admin
+    restricted_group: String?           -- membership makes the user restricted
+    group_team_map: String?             -- JSON {group: {org: [team, ...]}}
+    group_team_map_removal: Boolean     -- remove from mapped teams when the group is gone
+    dynamic_group_maps: String?
+    dynamic_group_maps_removal: Boolean
+    quota_group_claim_name: String?
+    quota_group_map: String?
+    quota_group_map_removal: Boolean
+    allow_username_change: Boolean
+    -- Remote (placeholder users promoted on first external sign-in)
+    remote_url: String?
+    remote_matching_source: String?
+    -- All kinds
+    skip_local_two_factor: Boolean      -- trust the source's own 2FA; skip local TOTP/WebAuthn
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- What a password-verifying source must do when the forge hands it a login and a
+-- password. Local (no source), LDAP, SMTP and PAM all fulfil it.
+contract PasswordAuthenticator {
+    authenticate: (source: AuthSource, login_name: String, password: String) -> DirectoryEntry
+
+    @invariant NoEnumeration
+        -- A wrong password, an unknown login, an unactivated e-mail address and a
+        -- login-prohibited account are indistinguishable to the caller except that a
+        -- prohibited account is told so after the password matched.
+
+    @invariant AutoProvision
+        -- LDAP, SMTP and PAM sources create an active local account on the first
+        -- successful bind of an unknown login (SMTP: name = local part of the address;
+        -- PAM: e-mail = login@pam_email_domain).
+}
+
+-- An external OpenID Connect issuer whose JWTs an AuthorizedIntegration trusts.
+contract TrustedIssuer {
+    discovery: (issuer: String) -> String
+    signing_keys: (issuer: String) -> Set<String>
+
+    @invariant SameHostKeys
+        -- The discovery document's issuer must equal the configured issuer exactly, it
+        -- must advertise signing algorithms and a JWKS URI, and the JWKS URI must be on
+        -- the issuer's own host. Only asymmetric algorithms are accepted.
+
+    @invariant InternalIssuersNeedNoFetch
+        -- Issuers the forge runs itself (Actions OIDC tokens at <app-url>/api/actions)
+        -- are verified with the forge's own key and stored under a placeholder issuer
+        -- so a change of the instance URL does not break stored integrations.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- from: models/auth/source.go:21
+enum AuthSourceKind { ldap_bind_dn | ldap_simple | smtp | pam | oauth2 | remote }
+
+-- from: services/auth/source/ldap/security_protocol.go:11
+enum LdapSecurityProtocol { unencrypted | ldaps | start_tls }
+
+-- from: services/auth/source/smtp/auth.go:45
+enum SmtpAuthKind { plain | login | cram_md5 }
+
+-- Every personal-access-token scope. Write implies read in the same category.
+-- `all` on input expands to every write scope; `public-only` is a separate flag.
+-- from: models/auth/access_token_scope.go:53
+enum TokenScope {
+    read_activitypub | write_activitypub
+    | read_admin | write_admin
+    | read_misc | write_misc
+    | read_notification | write_notification
+    | read_organization | write_organization
+    | read_package | write_package
+    | read_issue | write_issue
+    | read_repository | write_repository
+    | read_user | write_user
+}
+
+-- How a request proved who it is.
+-- from: services/auth/interface.go:26
+enum CredentialMethod {
+    session | password_basic | access_token | oauth2_bearer | http_signature
+    | reverse_proxy | integration_jwt | actions_task_token | actions_runtime_token | lfs_token
+}
+
+-- How an interactive sign-in completed.
+enum SignInMethod { password_login | totp | scratch_code | webauthn | remember_me | external_provider | openid | reverse_proxy | activation | password_reset }
+
+-- from: models/auth/auth_token.go:20
+enum VerificationPurpose { user_activation | password_reset | email_activation }
+
+-- from: modules/setting/service.go:22
+enum CaptchaKind { image | recaptcha | hcaptcha | mcaptcha | cfturnstile }
+
+-- from: modules/auth/password/password.go:36
+enum PasswordCharacterClass { lower | upper | digit | spec }
+
+-- from: modules/setting/security.go:548
+enum TwoFactorRequirement { none | all | admin }
+
+-- from: modules/setting/oauth2.go:14
+enum ExternalUsernameSource { userid | nickname | email | preferred_username }
+
+-- from: modules/setting/oauth2.go:30
+enum AccountLinkingMode { disabled | login | auto }
+
+-- from: models/auth/oauth2.go:428
+enum PkceMethod { s256 | plain | none }
+
+-- from: models/auth/authorized_integration.go:131
+enum ClaimComparison { eq | in | glob | glob_in | nest }
+
+-- from: models/auth/authorized_integration.go:142
+enum IntegrationUi { generic | forgejo_actions_local }
+
+-- from: models/auth/oauth2.go:59
+enum BuiltinOAuth2App { git_credential_oauth | git_credential_manager | tea }
+
+-- What a site administrator's mail-throttle protects.
+enum ThrottleKind { resend | email_change }
+
+enum SessionStatus { anonymous | pending_second_factor | authenticated | destroyed }
+enum RememberMeStatus { active | consumed | revoked | expired }
+enum VerificationCodeStatus { pending | used | expired | revoked }
+-- from: models/auth/oauth2.go:415
+enum AuthorizationCodeStatus { issued | redeemed | expired }
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A browser session. Every web visitor has one; it becomes authenticated by a sign-in.
+-- from: models/auth/session.go:17
+entity Session {
+    status: SessionStatus
+    user: accounts/User?                        -- set once authenticated
+    authenticated_via: SignInMethod?
+    pending_user: accounts/User?                -- passed the first factor, owes a second
+    remember_requested: Boolean                 -- issue a remember-me cookie on completion
+    pending_sso_source: AuthSource?             -- remember-me after 2FA is bound to this IdP
+    pending_external_identity: ExternalIdentity?  -- came back from an IdP, not yet linked
+    pending_link: Boolean                       -- link pending_external_identity after 2FA
+    pending_openid_uri: String?                 -- link this OpenID after 2FA
+    last_activity_at: Timestamp
+
+    is_signed_in: status = authenticated
+
+    transitions status {
+        anonymous -> pending_second_factor
+        anonymous -> authenticated
+        pending_second_factor -> authenticated
+        anonymous -> destroyed
+        pending_second_factor -> destroyed
+        authenticated -> destroyed
+        terminal: destroyed
+    }
+}
+
+-- The "remember me" credential: survives the session, re-establishes it on the next
+-- visit. The SSO variant is bound to an OAuth2 source and, instead of signing in
+-- directly, sends the browser through a silent (prompt=none) re-authentication at that
+-- provider, so a user disabled at the IdP is not kept signed in.
+-- from: models/auth/auth_token.go:31
+entity LongTermAuthorization {
+    user: accounts/User
+    sso_source: AuthSource?
+    expires_at: Timestamp
+    status: RememberMeStatus
+
+    is_sso: sso_source != null
+
+    transitions status {
+        active -> consumed
+        active -> revoked
+        active -> expired
+        terminal: consumed, revoked, expired
+    }
+}
+
+-- A one-time code mailed to a user: activate the account, reset the password, or
+-- confirm an additional e-mail address.
+-- from: models/auth/auth_token.go:31
+entity EmailVerificationCode {
+    user: accounts/User
+    purpose: VerificationPurpose
+    email: String?                      -- the address being confirmed (email_activation)
+    expires_at: Timestamp
+    status: VerificationCodeStatus
+
+    -- Expiry is applied by VerificationCodeExpires, so a pending code is a live one.
+    is_valid: status = pending
+
+    transitions status {
+        pending -> used
+        pending -> expired
+        pending -> revoked
+        terminal: used, expired, revoked
+    }
+}
+
+-- "You asked for a mail very recently." Rate-limits activation resends, password reset
+-- mails and unconfirmed-address changes per user.
+-- from: routers/web/auth/auth.go:687
+entity MailSendThrottle {
+    user: accounts/User
+    kind: ThrottleKind
+    until: Timestamp
+}
+
+-- How a user's password is verified and whether they must change it.
+-- One per user. source = null means the forge's own password store.
+-- from: models/user/user.go:75
+entity UserLogin {
+    user: accounts/User
+    source: AuthSource?
+    login_name: String                  -- the name the source knows the user by
+    has_password: Boolean               -- a local password is set (OAuth2 users may have none)
+    must_change_password: Boolean
+    password_changed_at: Timestamp?
+    last_sign_in_at: Timestamp?
+
+    is_local: source = null
+    may_reset_password: is_local or (source.kind = oauth2 and has_password)
+    has_totp: exists TwoFactor{user: user}
+    has_security_keys: exists WebAuthnCredential{user: user}
+    has_second_factor: has_totp or has_security_keys
+    skips_local_two_factor: source != null and source.settings.skip_local_two_factor
+    requires_two_factor: user.kind = individual and (config.global_two_factor_requirement = all or (config.global_two_factor_requirement = admin and user.is_admin))
+    -- The gate every authenticated request passes through (web shows the activation,
+    -- prohibited, change-password or enrol-2FA page instead; API answers forbidden).
+    may_use_account: user.is_active and not user.prohibit_login and not must_change_password and (requires_two_factor = false or has_second_factor)
+}
+
+-- TOTP second factor. One per user. The scratch code is a single-use recovery code that
+-- is replaced every time it is used.
+-- from: models/auth/twofactor.go:46
+entity TwoFactor {
+    user: accounts/User
+    last_used_passcode: String?          -- a passcode is accepted at most once
+    scratch_code_generation: Integer     -- bumps whenever a new scratch code is issued
+    enrolled_at: Timestamp
+}
+
+-- A WebAuthn security key / passkey registered as a second factor.
+-- from: models/auth/webauthn.go:44
+entity WebAuthnCredential {
+    user: accounts/User
+    name: String                         -- unique per user, case-insensitive
+    sign_count: Integer
+    backup_eligible: Boolean
+    backup_state: Boolean
+    created_at: Timestamp
+}
+
+-- A personal access token. The secret is shown once at creation/regeneration; only the
+-- last eight characters are shown afterwards.
+-- from: models/auth/access_token.go:59
+entity AccessToken {
+    owner: accounts/User
+    name: String                         -- unique per owner, max 255
+    scopes: Set<TokenScope>
+    public_only: Boolean                 -- may only see public orgs/repos/users
+    all_repositories: Boolean            -- false: only `repositories` are reachable
+    repositories: Set<repositories/Repository>
+    last_eight: String
+    created_at: Timestamp
+    last_used_at: Timestamp?
+
+    has_been_used: last_used_at != null
+    has_recent_activity: last_used_at != null and last_used_at + 7.days > now
+}
+
+-- An authentication source configured by a site administrator.
+-- from: models/auth/source.go:99
+entity AuthSource {
+    name: String                         -- unique, max 30; the OAuth2 callback path uses it
+    kind: AuthSourceKind
+    is_active: Boolean
+    sync_enabled: Boolean                -- only meaningful for LDAP sources
+    settings: AuthSourceSettings
+    created_at: Timestamp
+
+    is_ldap: kind in {ldap_bind_dn, ldap_simple}
+    provides_ssh_keys: (is_ldap or kind = oauth2) and settings.attribute_ssh_public_key != null
+    allows_username_change: kind = oauth2 and settings.allow_username_change
+    quota_group_claim_name: settings.quota_group_claim_name
+    verifies_passwords: kind in {ldap_bind_dn, ldap_simple, smtp, pam}
+    logins: UserLogin with source = this
+    external_logins: ExternalLogin with source = this
+    in_use: logins.count > 0 or external_logins.count > 0
+}
+
+-- An entry in an LDAP directory, as the source's search returns it.
+-- from: services/auth/source/ldap/source_search.go:21
+external entity DirectoryEntry {
+    source: AuthSource
+    username: String
+    email: String                       -- <username>@localhost.local when the directory has none
+    first_name: String?
+    surname: String?
+    is_admin: Boolean
+    is_restricted: Boolean
+    ssh_public_keys: Set<String>
+    groups: Set<String>
+}
+
+-- A link between a local account and an identity at an OAuth2/OIDC source.
+-- from: models/user/external_login_user.go:59
+entity ExternalLogin {
+    user: accounts/User
+    source: AuthSource
+    external_id: String
+    provider: String
+    email: String?
+    name: String?
+    nickname: String?
+    avatar_url: String?
+    linked_at: Timestamp
+}
+
+-- An OpenID 2.0 identifier attached to an account.
+-- from: models/user/openid.go:19
+entity OpenIDIdentity {
+    user: accounts/User
+    uri: String                           -- normalised claimed identifier, globally unique
+    show_publicly: Boolean
+}
+
+-- A client registered with the forge's OAuth2/OIDC provider.
+-- Exactly one of owner_user / owner_org, or neither for instance-wide applications
+-- (managed by site admins, including the built-in public clients).
+-- from: models/auth/oauth2.go:31
+entity OAuth2Application {
+    owner_user: accounts/User?
+    owner_org: organizations/Organization?
+    builtin: BuiltinOAuth2App?            -- a locked, configuration-managed public client
+    name: String                          -- max 255
+    client_id: String                     -- unique, generated
+    confidential: Boolean                 -- confidential clients hold a client secret
+    redirect_uris: Set<String>
+    created_at: Timestamp
+
+    is_instance_wide: owner_user = null and owner_org = null
+    is_builtin: builtin != null
+    grants: OAuth2Grant with application = this
+}
+
+-- A user's standing consent for an application. One per (user, application).
+-- from: models/auth/oauth2.go:471
+entity OAuth2Grant {
+    user: accounts/User
+    application: OAuth2Application
+    scopes: Set<String>                   -- openid/profile/email/groups plus optional token scopes
+    nonce: String?
+    counter: Integer                      -- refresh-token generation; a used refresh token is dead
+    created_at: Timestamp
+
+    -- Token scopes (beyond openid/profile/email/groups) narrow what the issued access
+    -- tokens may do; with none, the tokens carry every scope.
+    restricts_token_scopes: grant_token_scopes(scopes).count > 0
+}
+
+-- A one-time authorization code handed to the client via the redirect URI.
+-- from: models/auth/oauth2.go:381
+entity OAuth2AuthorizationCode {
+    grant: OAuth2Grant
+    redirect_uri: String
+    code_challenge: String?
+    pkce_method: PkceMethod
+    issued_at: Timestamp
+    expires_at: Timestamp
+    status: AuthorizationCodeStatus
+
+    transitions status {
+        issued -> redeemed
+        issued -> expired
+        terminal: redeemed, expired
+    }
+}
+
+-- One response from the token endpoint: a signed access token, a refresh token tied to
+-- the grant's counter, and (with the openid scope) an id_token.
+-- from: routers/web/auth/oauth.go:160
+entity OAuth2TokenIssuance {
+    grant: OAuth2Grant
+    refresh_counter: Integer
+    access_expires_at: Timestamp
+    refresh_expires_at: Timestamp
+    includes_id_token: Boolean
+    issued_at: Timestamp
+
+    access_valid: access_expires_at > now
+    refresh_usable: refresh_expires_at > now and (not config.oauth2_invalidate_refresh_tokens or (refresh_counter = grant.counter and refresh_counter > 0))
+}
+
+-- An external system whose JWTs the forge accepts as API credentials for `owner`
+-- (e.g. a CI job's OIDC token). Looked up by exact (issuer, audience).
+-- from: models/auth/authorized_integration.go:30
+entity AuthorizedIntegration {
+    owner: accounts/User
+    name: String
+    description: String?
+    ui: IntegrationUi
+    issuer: String
+    audience: String
+    claim_rules: List<ClaimRule>
+    scopes: Set<TokenScope>
+    public_only: Boolean
+    all_repositories: Boolean
+    repositories: Set<repositories/Repository>
+    created_at: Timestamp
+}
+
+-- The scheduled "synchronise external user data" job.
+-- from: services/cron/tasks_basic.go:90
+entity ExternalUserSyncJob {
+    enabled: Boolean
+    update_existing: Boolean
+    next_run_at: Timestamp
+    last_run_at: Timestamp?
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [service] registration
+    disable_registration: Boolean = false                       -- DISABLE_REGISTRATION
+    allow_only_internal_registration: Boolean = false           -- ALLOW_ONLY_INTERNAL_REGISTRATION
+    allow_only_external_registration: Boolean = false           -- ALLOW_ONLY_EXTERNAL_REGISTRATION (both on = registration disabled)
+    show_registration_button: Boolean = true                    -- SHOW_REGISTRATION_BUTTON (default: registration open)
+    register_email_confirm: Boolean = false                     -- REGISTER_EMAIL_CONFIRM
+    register_manual_confirm: Boolean = false                    -- REGISTER_MANUAL_CONFIRM (ignored when email confirm is on)
+    email_domain_allowlist: Set<String> = {}                    -- EMAIL_DOMAIN_ALLOWLIST (globs)
+    email_domain_blocklist: Set<String> = {}                    -- EMAIL_DOMAIN_BLOCKLIST (globs)
+    email_domain_block_disposable: Boolean = false              -- EMAIL_DOMAIN_BLOCK_DISPOSABLE
+    enable_captcha: Boolean = false                             -- ENABLE_CAPTCHA
+    captcha_kind: CaptchaKind = image                           -- CAPTCHA_TYPE
+    require_captcha_for_login: Boolean = false                  -- REQUIRE_CAPTCHA_FOR_LOGIN
+    require_external_registration_captcha: Boolean = false      -- REQUIRE_EXTERNAL_REGISTRATION_CAPTCHA (default = ENABLE_CAPTCHA)
+    require_external_registration_password: Boolean = false     -- REQUIRE_EXTERNAL_REGISTRATION_PASSWORD
+    default_user_is_restricted: Boolean = false                 -- DEFAULT_USER_IS_RESTRICTED
+    activation_code_lifetime: Duration = 180.minutes            -- ACTIVE_CODE_LIVE_MINUTES
+    reset_code_lifetime: Duration = 180.minutes                 -- RESET_PASSWD_CODE_LIVE_MINUTES (see open question)
+    mail_resend_interval: Duration = 3.minutes                  -- hard-coded 180 s throttle
+    mail_service_configured: Boolean = false                    -- [mailer] ENABLED
+
+    -- [service] sign-in
+    enable_internal_signin: Boolean = true                      -- ENABLE_INTERNAL_SIGNIN
+    require_signin_view: Boolean = false                        -- REQUIRE_SIGNIN_VIEW
+    enable_basic_auth: Boolean = true                           -- ENABLE_BASIC_AUTHENTICATION
+    enable_reverse_proxy_auth: Boolean = false                  -- ENABLE_REVERSE_PROXY_AUTHENTICATION
+    enable_reverse_proxy_auth_api: Boolean = false              -- ENABLE_REVERSE_PROXY_AUTHENTICATION_API
+    enable_reverse_proxy_auto_registration: Boolean = false     -- ENABLE_REVERSE_PROXY_AUTO_REGISTRATION
+    enable_reverse_proxy_email: Boolean = false                 -- ENABLE_REVERSE_PROXY_EMAIL
+    enable_reverse_proxy_full_name: Boolean = false             -- ENABLE_REVERSE_PROXY_FULL_NAME
+    enable_openid_signin: Boolean = false                       -- ENABLE_OPENID_SIGNIN (default true only before install)
+    enable_openid_signup: Boolean = false                       -- ENABLE_OPENID_SIGNUP
+    openid_allowed_uris: Set<String> = {}                       -- [openid] WHITELISTED_URIS (regexes)
+    openid_blocked_uris: Set<String> = {}                       -- [openid] BLACKLISTED_URIS (regexes)
+
+    -- [security]
+    login_remember_days: Duration = 31.days                     -- LOGIN_REMEMBER_DAYS
+    min_password_length: Integer = 8                            -- MIN_PASSWORD_LENGTH
+    password_complexity: Set<PasswordCharacterClass> = {}       -- PASSWORD_COMPLEXITY (default "off")
+    password_check_pwned: Boolean = false                       -- PASSWORD_CHECK_PWN (HaveIBeenPwned k-anonymity)
+    global_two_factor_requirement: TwoFactorRequirement = none  -- GLOBAL_TWO_FACTOR_REQUIREMENT
+    reverse_proxy_user_header: String = "X-WEBAUTH-USER"        -- REVERSE_PROXY_AUTHENTICATION_USER
+    reverse_proxy_email_header: String = "X-WEBAUTH-EMAIL"      -- REVERSE_PROXY_AUTHENTICATION_EMAIL
+    reverse_proxy_full_name_header: String = "X-WEBAUTH-FULLNAME" -- REVERSE_PROXY_AUTHENTICATION_FULL_NAME
+    reverse_proxy_trusted_proxies: Set<String> = {"127.0.0.0/8", "::1/128"} -- REVERSE_PROXY_TRUSTED_PROXIES
+    disable_query_auth_token: Boolean = false                   -- DISABLE_QUERY_AUTH_TOKEN
+
+    -- [session]
+    session_lifetime: Duration = 86400.seconds                  -- SESSION_LIFE_TIME
+    session_gc_interval: Duration = 86400.seconds               -- GC_INTERVAL_TIME
+
+    -- [admin]
+    password_change_disabled: Boolean = false                   -- USER_DISABLED_FEATURES contains manage_password
+    external_password_change_disabled: Boolean = false          -- EXTERNAL_USER_DISABLE_FEATURES contains manage_password
+
+    -- [oauth2] provider
+    oauth2_enabled: Boolean = true                              -- ENABLED
+    oauth2_access_token_lifetime: Duration = 3600.seconds       -- ACCESS_TOKEN_EXPIRATION_TIME
+    oauth2_refresh_token_lifetime: Duration = 730.hours         -- REFRESH_TOKEN_EXPIRATION_TIME
+    oauth2_invalidate_refresh_tokens: Boolean = true            -- INVALIDATE_REFRESH_TOKENS
+    oauth2_default_applications: Set<BuiltinOAuth2App> = {git_credential_oauth, git_credential_manager, tea} -- DEFAULT_APPLICATIONS
+    oauth2_additional_grant_scopes: Boolean = false             -- ENABLE_ADDITIONAL_GRANT_SCOPES (groups claim honours public-only membership)
+    oauth2_authorization_code_lifetime: Duration = 10.minutes   -- not configurable in Forgejo (see open question)
+
+    -- [oauth2_client] behaviour when the forge is an OAuth2 client
+    oauth2_client_register_email_confirm: Boolean = false       -- REGISTER_EMAIL_CONFIRM (default = [service] value)
+    oauth2_client_auto_registration: Boolean = false            -- ENABLE_AUTO_REGISTRATION
+    oauth2_client_username_source: ExternalUsernameSource = nickname -- USERNAME
+    oauth2_client_update_avatar: Boolean = false                -- UPDATE_AVATAR
+    oauth2_client_account_linking: AccountLinkingMode = login   -- ACCOUNT_LINKING
+    oauth2_client_openid_connect_scopes: Set<String> = {}       -- OPENID_CONNECT_SCOPES
+
+    -- [authorized_integration]
+    integration_allowed_domains: Set<String> = {}               -- ALLOWED_DOMAINS
+    integration_blocked_domains: Set<String> = {}               -- BLOCKED_DOMAINS
+    integration_allow_local_networks: Boolean = false           -- ALLOW_LOCALNETWORKS
+    integration_request_timeout: Duration = 10.seconds          -- REQUEST_TIMEOUT
+    integration_cache_ttl: Duration = 10.minutes                -- CACHE_TTL
+
+    -- [cron.sync_external_users]
+    sync_external_users_interval: Duration = 24.hours           -- SCHEDULE @midnight
+    sync_external_users_update_existing: Boolean = true         -- UPDATE_EXISTING
+
+    -- [ssh]
+    ssh_trusted_user_ca_keys_configured: Boolean = false        -- TRUSTED_USER_CA_KEYS (HTTP-signature certificates)
+}
+
+------------------------------------------------------------
+-- Rules: registration
+------------------------------------------------------------
+
+-- Open self-registration with a local password.
+-- from: routers/web/auth/auth.go:484
+rule VisitorRegisters {
+    when: VisitorRegisters(session, name, email, password)
+
+    requires: session.status = anonymous
+    requires: not config.disable_registration
+    requires: not config.allow_only_external_registration
+    requires: config.enable_captcha = false or captcha_solved(session)
+    requires: email_domain_allowed(email)
+    requires: password_acceptable(password)
+    requires: username_available(name)
+    requires: email_available(email)
+
+    let first_user = user_count() = 0
+    let needs_confirmation = (config.register_email_confirm or config.register_manual_confirm) and first_user = false
+
+    ensures:
+        let user = accounts/User.created(
+            name: name,
+            primary_email: email,
+            kind: individual,
+            is_active: needs_confirmation = false,
+            is_admin: first_user,
+            is_restricted: config.default_user_is_restricted,
+            prohibit_login: false
+        )
+        UserLogin.created(user: user, source: null, login_name: name, has_password: true, must_change_password: false, password_changed_at: now, last_sign_in_at: now)
+        UserSignedUp(user)
+        if needs_confirmation and config.register_email_confirm:
+            EmailVerificationCode.created(user: user, purpose: user_activation, email: email, expires_at: now + config.activation_code_lifetime, status: pending)
+            MailSendThrottle.created(user: user, kind: resend, until: now + config.mail_resend_interval)
+        if needs_confirmation = false:
+            session.status = authenticated
+            session.user = user
+            session.authenticated_via = password_login
+            session.last_activity_at = now
+            UserSignedIn(user, password_login)
+
+    @guidance
+        -- Web: GET/POST /user/sign_up. Field limits: username max 40, e-mail max 254,
+        -- password max 255. The first account ever created becomes an active site admin.
+        -- With manual confirmation the new user sees "an administrator must activate
+        -- your account" and nothing is mailed. The password must be typed twice.
+}
+
+-- An inactive, signed-in user asks for the activation mail again.
+-- from: routers/web/auth/auth.go:697
+rule InactiveUserRequestsActivationMail {
+    when: InactiveUserRequestsActivationMail(user)
+
+    requires: not user.is_active
+    requires: config.register_email_confirm
+    requires: not exists MailSendThrottle{user: user, kind: resend}
+
+    ensures:
+        EmailVerificationCode.created(user: user, purpose: user_activation, email: user.primary_email, expires_at: now + config.activation_code_lifetime, status: pending)
+        MailSendThrottle.created(user: user, kind: resend, until: now + config.mail_resend_interval)
+
+    @guidance
+        -- Web: GET /user/activate (no code). While throttled the page says "already sent,
+        -- wait 3 minutes" and nothing is mailed.
+}
+
+-- An inactive user fixes a mistyped address before activating.
+-- from: routers/web/auth/auth.go:767
+rule InactiveUserReplacesUnconfirmedEmail {
+    when: InactiveUserReplacesUnconfirmedEmail(user, email)
+
+    requires: not user.is_active
+    requires: config.register_email_confirm
+    requires: not exists MailSendThrottle{user: user, kind: email_change}
+    requires: email_domain_allowed(email)
+    requires: email_available(email)
+
+    ensures: user.primary_email = email
+    ensures:
+        for c in EmailVerificationCodes where user = user and status = pending:
+            c.status = revoked
+    ensures: MailSendThrottle.created(user: user, kind: email_change, until: now + config.mail_resend_interval)
+    ensures:
+        EmailVerificationCode.created(user: user, purpose: user_activation, email: email, expires_at: now + config.activation_code_lifetime, status: pending)
+
+    @guidance
+        -- Web: POST /user/activate with `email`. The confirmation mail to the new address
+        -- is sent on the follow-up page even if the resend throttle would otherwise apply.
+}
+
+-- Following the activation link. Local accounts must also re-enter their password, so
+-- a leaked link alone cannot take over the account.
+-- from: routers/web/auth/auth.go:767
+rule UserActivatesAccount {
+    when: UserActivatesAccount(session, code, password)
+
+    requires: code.purpose = user_activation
+    requires: code.is_valid
+    let login = UserLogin{user: code.user}
+    requires: login.is_local = false or password_matches(code.user, password)
+
+    ensures: code.status = used
+    ensures: code.user.is_active = true
+    ensures: EmailConfirmationLinkFollowed(code.user, code.email)
+    ensures: AccountActivated(code.user)
+    ensures: login.last_sign_in_at = now
+    ensures:
+        if session.status = anonymous:
+            session.status = authenticated
+            session.user = code.user
+            session.authenticated_via = activation
+            session.last_activity_at = now
+
+    @guidance
+        -- Web: GET /user/activate?code=… then POST with the password. An unknown,
+        -- expired or already-used code shows "invalid or expired". Activation regenerates
+        -- the session and signs the user in.
+}
+
+-- Confirming an additional (non-primary) e-mail address.
+-- from: routers/web/auth/auth.go:897
+rule UserConfirmsEmailAddress {
+    when: UserConfirmsEmailAddress(code, email)
+
+    requires: code.purpose = email_activation
+    requires: code.is_valid
+    requires: code.email = email
+
+    ensures: code.status = used
+    ensures: EmailConfirmationLinkFollowed(code.user, email)
+    ensures:
+        for t in MailSendThrottles where user = code.user and kind = resend:
+            not exists t
+
+    @guidance
+        -- Web: GET/POST /user/activate_email?code=…&email=…. Does not require being
+        -- signed in and does not sign anyone in.
+}
+
+-- accounts asks for an additional address to be confirmed.
+-- from: services/mailer/mail.go:71
+rule IssueEmailConfirmationCode {
+    when: accounts/UserEmailAdded(user, address)
+
+    requires: config.register_email_confirm
+
+    ensures:
+        EmailVerificationCode.created(user: user, purpose: email_activation, email: address, expires_at: now + config.activation_code_lifetime, status: pending)
+}
+
+-- accounts asks for the confirmation mail to be sent again.
+-- from: services/mailer/mail.go:71
+rule ReissueEmailConfirmationCode {
+    when: accounts/EmailActivationRequested(user, address)
+
+    ensures:
+        for c in EmailVerificationCodes where user = user and purpose = email_activation and status = pending:
+            c.status = revoked
+    ensures: EmailVerificationCode.created(user: user, purpose: email_activation, email: address, expires_at: now + config.activation_code_lifetime, status: pending)
+}
+
+-- Replacing the primary address kills every outstanding mailed code and remember-me.
+-- from: services/user/email.go:176
+rule PrimaryEmailChangeRevokesCodes {
+    when: accounts/PrimaryEmailChanged(user, old_address, new_address)
+
+    ensures:
+        for c in EmailVerificationCodes where user = user and status = pending:
+            c.status = revoked
+    ensures:
+        for t in LongTermAuthorizations where user = user and status = active:
+            t.status = revoked
+}
+
+-- Every freshly issued code is mailed to the address it is for.
+-- from: services/mailer/mail.go:39
+rule VerificationCodeMailed {
+    when: code: EmailVerificationCode.created
+    ensures:
+        if code.purpose = user_activation:
+            ActivationEmailRequested(code.user, code)
+        if code.purpose = password_reset:
+            PasswordResetRequested(code.user, code)
+        if code.purpose = email_activation:
+            EmailConfirmationRequested(code.user, code.email, code)
+}
+
+-- from: models/user/user.go:973
+rule VerificationCodeExpires {
+    when: mailed: EmailVerificationCode.expires_at <= now
+    requires: mailed.status = pending
+    ensures: mailed.status = expired
+}
+
+rule MailThrottleLapses {
+    when: throttle: MailSendThrottle.until <= now
+    ensures: not exists throttle
+}
+
+------------------------------------------------------------
+-- Rules: interactive sign-in
+------------------------------------------------------------
+
+-- Password sign-in. The login may be the username or an activated e-mail address; the
+-- password is checked by the user's UserLogin source (local store, LDAP, SMTP, PAM).
+-- Unknown logins are tried against every active password source, which may
+-- auto-provision the account (see ExternalPasswordSourceProvisionsUser).
+-- from: routers/web/auth/auth.go:214
+rule VisitorSignsInWithPassword {
+    when: VisitorSignsInWithPassword(session, user, password, remember)
+
+    let login = UserLogin{user: user}
+
+    requires: session.status = anonymous
+    requires: config.enable_internal_signin
+    requires: config.enable_captcha = false or config.require_captcha_for_login = false or captcha_solved(session)
+    requires: exists login
+    requires: login.source = null or login.source.is_active
+    requires: password_matches(user, password)
+    requires: not user.prohibit_login
+    requires: user.kind = individual
+
+    let needs_second_factor = login.has_second_factor and not login.skips_local_two_factor
+
+    ensures:
+        if needs_second_factor:
+            session.status = pending_second_factor
+            session.pending_user = user
+            session.remember_requested = remember
+        else:
+            session.status = authenticated
+            session.user = user
+            session.authenticated_via = password_login
+            session.last_activity_at = now
+            login.last_sign_in_at = now
+            UserSignedIn(user, password_login)
+            if remember:
+                LongTermAuthorization.created(user: user, sso_source: null, expires_at: now + config.login_remember_days, status: active)
+
+    @guidance
+        -- Web: GET/POST /user/login (form max: login 254, password 255). Failures all say
+        -- "username or password is incorrect"; a prohibited account sees the "sign-in
+        -- prohibited" page. Inactive accounts DO get a session — every page then shows
+        -- the activation page (see UserLogin.may_use_account). When the instance has
+        -- internal sign-in disabled and exactly one OAuth2 source, the login page
+        -- redirects straight to that provider. With WebAuthn enrolled the second-factor
+        -- page offers the security key first, falling back to TOTP.
+}
+
+-- An LDAP/SMTP/PAM bind succeeds for a login no local account has yet.
+-- from: services/auth/source/ldap/source_authenticate.go:30
+rule ExternalPasswordSourceProvisionsUser {
+    when: VisitorSignsInWithExternalPassword(session, source, entry, password)
+
+    requires: session.status = anonymous
+    requires: config.enable_internal_signin
+    requires: source.is_active
+    requires: source.verifies_passwords
+    requires: entry.source = source
+    requires: source_accepts_password(source, entry, password)
+    requires: username_available(entry.username)
+
+    ensures:
+        let user = accounts/User.created(
+            name: entry.username,
+            primary_email: entry.email,
+            kind: individual,
+            is_active: true,
+            is_admin: entry.is_admin,
+            is_restricted: entry.is_restricted,
+            prohibit_login: false
+        )
+        UserLogin.created(user: user, source: source, login_name: entry.username, has_password: false, must_change_password: false, password_changed_at: null, last_sign_in_at: now)
+        UserSignedUp(user)
+        ExternalSshKeysAsserted(user, source, entry.ssh_public_keys)
+        ExternalGroupsAsserted(user, source, entry.groups)
+        session.status = authenticated
+        session.user = user
+        session.authenticated_via = password_login
+        session.last_activity_at = now
+        UserSignedIn(user, password_login)
+
+    @guidance
+        -- LDAP: e-mail defaults to <username>@localhost.local when the directory has none;
+        -- admin/restricted come from the admin/restricted filters. SMTP: the login must be
+        -- an address in an allowed domain; name = lower-cased local part. PAM: e-mail =
+        -- login@pam_email_domain. On every later successful bind LDAP refreshes
+        -- admin/restricted flags, SSH keys and group→team mapping.
+}
+
+-- Second factor: TOTP passcode. A passcode that was already used is refused.
+-- from: routers/web/auth/2fa.go:43
+rule VisitorCompletesTotpChallenge {
+    when: VisitorCompletesTotpChallenge(session, passcode)
+
+    requires: session.status = pending_second_factor
+    let user = session.pending_user
+    let twofa = TwoFactor{user: user}
+    requires: exists twofa
+    requires: totp_valid(twofa, passcode)
+    requires: twofa.last_used_passcode != passcode
+
+    ensures: twofa.last_used_passcode = passcode
+    ensures: session.status = authenticated
+    ensures: session.user = user
+    ensures: session.pending_user = null
+    ensures: session.authenticated_via = totp
+    ensures: session.last_activity_at = now
+    ensures: UserLogin{user: user}.last_sign_in_at = now
+    ensures: UserSignedIn(user, totp)
+    ensures:
+        if session.pending_link and session.pending_external_identity != null:
+            ExternalLogin.created(user: user, source: session.pending_external_identity.source, external_id: session.pending_external_identity.external_id, provider: session.pending_external_identity.source.settings.provider, email: session.pending_external_identity.email, name: session.pending_external_identity.full_name, nickname: session.pending_external_identity.nickname, avatar_url: session.pending_external_identity.avatar_url, linked_at: now)
+        if session.pending_openid_uri != null:
+            OpenIDIdentity.created(user: user, uri: session.pending_openid_uri, show_publicly: false)
+        if session.remember_requested:
+            LongTermAuthorization.created(user: user, sso_source: session.pending_sso_source, expires_at: now + config.login_remember_days, status: active)
+
+    @guidance
+        -- Web: GET/POST /user/two_factor.
+}
+
+-- Second factor: the scratch (recovery) code. It works once and is replaced; the user
+-- lands on the security settings page to note the new one.
+-- from: routers/web/auth/2fa.go:123
+rule VisitorUsesScratchCode {
+    when: VisitorUsesScratchCode(session, scratch_code)
+
+    requires: session.status = pending_second_factor
+    let user = session.pending_user
+    let twofa = TwoFactor{user: user}
+    requires: exists twofa
+    requires: scratch_code_valid(twofa, scratch_code)
+
+    ensures: twofa.scratch_code_generation = twofa.scratch_code_generation + 1
+    ensures: session.status = authenticated
+    ensures: session.user = user
+    ensures: session.pending_user = null
+    ensures: session.authenticated_via = scratch_code
+    ensures: session.last_activity_at = now
+    ensures: UserSignedIn(user, scratch_code)
+    ensures:
+        if session.pending_openid_uri != null:
+            OpenIDIdentity.created(user: user, uri: session.pending_openid_uri, show_publicly: false)
+        if session.remember_requested:
+            LongTermAuthorization.created(user: user, sso_source: session.pending_sso_source, expires_at: now + config.login_remember_days, status: active)
+
+    @guidance
+        -- Web: GET/POST /user/two_factor/scratch.
+}
+
+-- Second factor: a WebAuthn assertion. A signature counter that went backwards means
+-- a cloned authenticator and the assertion is refused.
+-- from: routers/web/auth/webauthn.go:89
+rule VisitorCompletesWebAuthnChallenge {
+    when: VisitorCompletesWebAuthnChallenge(session, credential, sign_count)
+
+    requires: session.status = pending_second_factor
+    let user = session.pending_user
+    requires: credential.user = user
+    requires: webauthn_assertion_valid(credential)
+    requires: sign_count > credential.sign_count or (sign_count = 0 and credential.sign_count = 0)
+
+    ensures: credential.sign_count = sign_count
+    ensures: session.status = authenticated
+    ensures: session.user = user
+    ensures: session.pending_user = null
+    ensures: session.authenticated_via = webauthn
+    ensures: session.last_activity_at = now
+    ensures: UserSignedIn(user, webauthn)
+    ensures:
+        if session.pending_link and session.pending_external_identity != null:
+            ExternalLogin.created(user: user, source: session.pending_external_identity.source, external_id: session.pending_external_identity.external_id, provider: session.pending_external_identity.source.settings.provider, email: session.pending_external_identity.email, name: session.pending_external_identity.full_name, nickname: session.pending_external_identity.nickname, avatar_url: session.pending_external_identity.avatar_url, linked_at: now)
+        if session.pending_openid_uri != null:
+            OpenIDIdentity.created(user: user, uri: session.pending_openid_uri, show_publicly: false)
+        if session.remember_requested:
+            LongTermAuthorization.created(user: user, sso_source: session.pending_sso_source, expires_at: now + config.login_remember_days, status: active)
+
+    @guidance
+        -- Web: GET /user/webauthn, GET/POST /user/webauthn/assertion. Security keys are
+        -- a second factor only; there is no passwordless (discoverable-credential)
+        -- sign-in. Legacy credentials get their backup flags filled in on first use.
+}
+
+-- The remember-me cookie re-establishes a session.
+-- from: routers/web/auth/auth.go:53
+rule VisitorResumesWithRememberMe {
+    when: VisitorResumesWithRememberMe(session, lta)
+
+    requires: session.status = anonymous
+    requires: lta.status = active
+    requires: not lta.is_sso
+
+    ensures: session.status = authenticated
+    ensures: session.user = lta.user
+    ensures: session.authenticated_via = remember_me
+    ensures: session.last_activity_at = now
+    ensures: UserSignedIn(lta.user, remember_me)
+
+    @guidance
+        -- Any page visited without a session but with the remember cookie bounces via
+        -- /user/login, which performs this. An unknown or mismatching cookie is deleted.
+}
+
+-- The SSO-bound remember-me cookie is spent on a silent re-authentication at the IdP.
+-- from: routers/web/auth/auth.go:84
+rule VisitorResumesWithSsoRememberMe {
+    when: VisitorResumesWithRememberMe(session, lta)
+
+    requires: session.status = anonymous
+    requires: lta.status = active
+    requires: lta.is_sso
+    requires: lta.sso_source.is_active
+    requires: lta.sso_source.kind = oauth2
+
+    ensures: lta.status = consumed
+    ensures: OAuth2ProviderRedirectRequested(session, lta.sso_source, true)
+
+    @guidance
+        -- Redirects to /user/oauth2/{source}?prompt=none. If the IdP answers
+        -- login_required / interaction_required / consent_required /
+        -- account_selection_required, the browser is sent through the normal
+        -- interactive provider sign-in instead.
+}
+
+-- from: models/user/user.go:973
+rule LongTermAuthorizationExpires {
+    when: lta: LongTermAuthorization.expires_at <= now
+    requires: lta.status = active
+    ensures: lta.status = expired
+}
+
+-- Any browser request without a session cookie starts an anonymous session.
+-- from: models/auth/session.go:36
+rule VisitorArrives {
+    when: VisitorArrives()
+    ensures: Session.created(status: anonymous, user: null, authenticated_via: null, pending_user: null, remember_requested: false, pending_sso_source: null, pending_external_identity: null, pending_link: false, pending_openid_uri: null, last_activity_at: now)
+}
+
+-- from: routers/web/auth/auth.go:434
+rule UserSignsOut {
+    when: UserSignsOut(session)
+
+    requires: session.status = authenticated
+
+    ensures: session.status = destroyed
+    ensures: UserSignedOut(session.user, session)
+
+    @guidance
+        -- Web: POST /user/logout. Clears the session and the remember-me and redirect
+        -- cookies (the remember-me record itself is left to expire), and tells the
+        -- user's other open tabs via the event stream.
+}
+
+-- from: models/auth/session.go:113
+rule SessionExpires {
+    when: session: Session.last_activity_at + config.session_lifetime <= now
+    requires: session.status in {anonymous, pending_second_factor, authenticated}
+    ensures: session.status = destroyed
+}
+
+------------------------------------------------------------
+-- Rules: external identity providers (forge as OAuth2/OIDC client)
+------------------------------------------------------------
+
+-- from: routers/web/auth/oauth.go:955
+rule VisitorStartsProviderSignIn {
+    when: VisitorStartsProviderSignIn(session, source, prompt_none)
+
+    requires: source.kind = oauth2
+    requires: source.is_active
+
+    ensures: OAuth2ProviderRedirectRequested(session, source, prompt_none)
+
+    @guidance
+        -- Web: GET /user/oauth2/{source-name}. PKCE (S256) is used towards providers that
+        -- support it (OpenID Connect and a few others). `redirect_to` is remembered across
+        -- the round-trip.
+}
+
+-- The provider came back with an identity that maps to an existing account (by the
+-- account's login name at this source, or by an ExternalLogin link).
+-- from: routers/web/auth/oauth.go:1355
+rule ProviderReturnsKnownIdentity {
+    when: ProviderReturnsIdentity(session, identity)
+
+    let source = identity.source
+    let known_login = UserLogin{source: source, login_name: identity.external_id}
+    let known_link = ExternalLogin{source: source, external_id: identity.external_id}
+    let user = if exists known_login: known_login.user else: known_link.user
+
+    requires: source.is_active
+    requires: source.settings.required_claim_name = null or claim_satisfied(identity, source.settings.required_claim_name, source.settings.required_claim_value)
+    requires: exists known_login or exists known_link
+    requires: not user.prohibit_login
+
+    let needs_second_factor = not source.settings.skip_local_two_factor and UserLogin{user: user}.has_second_factor
+
+    ensures: ExternalAvatarAsserted(user, identity.avatar_url)
+    ensures: ExternalSshKeysAsserted(user, source, identity.ssh_public_keys)
+    ensures: ExternalGroupsAsserted(user, source, identity.groups)
+    ensures: ExternalAdminFlagsAsserted(user, admin_from_groups(source, identity), restricted_from_groups(source, identity, user.is_restricted))
+    ensures:
+        if exists known_link:
+            known_link.email = identity.email
+            known_link.nickname = identity.nickname
+            known_link.avatar_url = identity.avatar_url
+    ensures:
+        if needs_second_factor:
+            session.status = pending_second_factor
+            session.pending_user = user
+            session.remember_requested = true
+            session.pending_sso_source = source
+        else:
+            session.status = authenticated
+            session.user = user
+            session.authenticated_via = external_provider
+            session.last_activity_at = now
+            UserSignedIn(user, external_provider)
+            LongTermAuthorization.created(user: user, sso_source: source, expires_at: now + config.login_remember_days, status: active)
+
+    @guidance
+        -- Web: GET /user/oauth2/{source-name}/callback. Provider errors access_denied /
+        -- temporarily_unavailable are shown as a flash on the login page. A missing
+        -- required claim is treated as "sign-in prohibited". Signing in through a
+        -- provider always issues the SSO-bound remember-me.
+}
+
+-- A signed-in user came back from a provider: link that identity to their account.
+-- from: routers/web/auth/oauth.go:1096
+rule ProviderIdentityLinkedToSignedInUser {
+    when: ProviderReturnsIdentity(session, identity)
+
+    let source = identity.source
+    requires: source.is_active
+    requires: session.status = authenticated
+    requires: not exists UserLogin{source: source, login_name: identity.external_id}
+    requires: not exists ExternalLogin{source: source, external_id: identity.external_id}
+
+    ensures: ExternalLogin.created(user: session.user, source: source, external_id: identity.external_id, provider: source.settings.provider, email: identity.email, name: identity.full_name, nickname: identity.nickname, avatar_url: identity.avatar_url, linked_at: now)
+
+    @guidance
+        -- Lands on /user/settings/security. Linking also re-attributes migrated issues and
+        -- comments whose original author had this external id on a supported forge.
+}
+
+-- Unknown identity, nobody signed in, auto-registration on: create the account.
+-- from: routers/web/auth/oauth.go:1104
+rule ProviderIdentityAutoRegisters {
+    when: ProviderReturnsIdentity(session, identity)
+
+    let source = identity.source
+    let name = external_username(identity, config.oauth2_client_username_source)
+    requires: source.is_active
+    requires: session.status = anonymous
+    requires: not exists UserLogin{source: source, login_name: identity.external_id}
+    requires: not exists ExternalLogin{source: source, external_id: identity.external_id}
+    requires: config.oauth2_client_auto_registration
+    requires: not config.allow_only_internal_registration
+    requires: identity.email != null
+    requires: name != null
+    requires: username_available(name)
+    requires: email_available(identity.email)
+
+    let needs_confirmation = config.oauth2_client_register_email_confirm or config.register_manual_confirm
+
+    ensures:
+        let user = accounts/User.created(
+            name: name,
+            primary_email: identity.email,
+            kind: individual,
+            is_active: not needs_confirmation,
+            is_admin: admin_from_groups(source, identity),
+            is_restricted: restricted_from_groups(source, identity, config.default_user_is_restricted),
+            prohibit_login: false
+        )
+        UserLogin.created(user: user, source: source, login_name: identity.external_id, has_password: false, must_change_password: false, password_changed_at: null, last_sign_in_at: now)
+        UserSignedUp(user)
+        ExternalGroupsAsserted(user, source, identity.groups)
+        if needs_confirmation and config.oauth2_client_register_email_confirm:
+            EmailVerificationCode.created(user: user, purpose: user_activation, email: identity.email, expires_at: now + config.activation_code_lifetime, status: pending)
+        session.status = authenticated
+        session.user = user
+        session.authenticated_via = external_provider
+        session.last_activity_at = now
+        UserSignedIn(user, external_provider)
+
+    @guidance
+        -- The username is taken from the configured claim (userid, nickname, the local
+        -- part of the e-mail, or preferred_username) and normalised. If the provider did
+        -- not supply the e-mail or the chosen username claim, the visitor is sent to the
+        -- link-account page instead (ProviderIdentityNeedsLinking). If the name or e-mail
+        -- collides with an existing account, account_linking decides: `auto` links to
+        -- that account (ProviderIdentityAutoLinksExistingAccount), `login` asks the
+        -- visitor to sign in to it, `disabled` fails.
+}
+
+-- Name or e-mail collision with account_linking = auto: link silently.
+-- from: routers/web/auth/auth.go:581
+rule ProviderIdentityAutoLinksExistingAccount {
+    when: ProviderReturnsIdentity(session, identity)
+
+    let source = identity.source
+    let existing = user_by_name_or_email(external_username(identity, config.oauth2_client_username_source), identity.email)
+    requires: source.is_active
+    requires: session.status = anonymous
+    requires: not exists UserLogin{source: source, login_name: identity.external_id}
+    requires: not exists ExternalLogin{source: source, external_id: identity.external_id}
+    requires: config.oauth2_client_auto_registration
+    requires: config.oauth2_client_account_linking = auto
+    requires: existing != null
+    requires: not UserLogin{user: existing}.has_second_factor
+
+    ensures: ExternalLogin.created(user: existing, source: source, external_id: identity.external_id, provider: source.settings.provider, email: identity.email, name: identity.full_name, nickname: identity.nickname, avatar_url: identity.avatar_url, linked_at: now)
+    ensures: session.status = authenticated
+    ensures: session.user = existing
+    ensures: session.authenticated_via = external_provider
+    ensures: session.last_activity_at = now
+    ensures: UserSignedIn(existing, external_provider)
+}
+
+-- Unknown identity and no auto-registration (or missing fields, or linking = login):
+-- park it in the session and offer "link to an existing account" / "register".
+-- from: routers/web/auth/oauth.go:1278
+rule ProviderIdentityNeedsLinking {
+    when: ProviderReturnsIdentity(session, identity)
+
+    let source = identity.source
+    requires: source.is_active
+    requires: session.status = anonymous
+    requires: not exists UserLogin{source: source, login_name: identity.external_id}
+    requires: not exists ExternalLogin{source: source, external_id: identity.external_id}
+    requires: not config.oauth2_client_auto_registration or config.allow_only_internal_registration or identity.email = null
+
+    ensures: session.pending_external_identity = identity
+
+    @guidance
+        -- Web: redirect to GET /user/link_account (only reachable when OpenID or OAuth2 is
+        -- enabled). The page pre-fills the username/e-mail and says when an account with
+        -- that e-mail or name already exists.
+}
+
+-- Link the pending identity by proving ownership of an existing account.
+-- from: routers/web/auth/linkaccount.go:102
+rule VisitorLinksPendingIdentityBySignIn {
+    when: VisitorLinksPendingIdentityBySignIn(session, user, password, remember)
+
+    requires: session.status = anonymous
+    requires: session.pending_external_identity != null
+    requires: config.enable_captcha = false or config.require_external_registration_captcha = false or captcha_solved(session)
+    requires: password_matches(user, password)
+    requires: not user.prohibit_login
+
+    let identity = session.pending_external_identity
+    let needs_second_factor = UserLogin{user: user}.has_second_factor
+
+    ensures:
+        if needs_second_factor:
+            session.status = pending_second_factor
+            session.pending_user = user
+            session.remember_requested = remember
+            session.pending_link = true
+        else:
+            ExternalLogin.created(user: user, source: identity.source, external_id: identity.external_id, provider: identity.source.settings.provider, email: identity.email, name: identity.full_name, nickname: identity.nickname, avatar_url: identity.avatar_url, linked_at: now)
+            session.status = authenticated
+            session.user = user
+            session.authenticated_via = password_login
+            session.last_activity_at = now
+            UserSignedIn(user, password_login)
+
+    @guidance
+        -- Web: POST /user/link_account_signin. With 2FA enrolled the link is made after
+        -- the second factor succeeds.
+}
+
+-- Register a new account for the pending identity.
+-- from: routers/web/auth/linkaccount.go:182
+rule VisitorRegistersFromPendingIdentity {
+    when: VisitorRegistersFromPendingIdentity(session, name, email, password)
+
+    requires: session.status = anonymous
+    requires: session.pending_external_identity != null
+    requires: not config.disable_registration
+    requires: not config.allow_only_internal_registration
+    requires: config.enable_captcha = false or config.require_external_registration_captcha = false or captcha_solved(session)
+    requires: email_domain_allowed(email)
+    requires: password = null or password_acceptable(password)
+    requires: username_available(name)
+    requires: email_available(email)
+
+    let identity = session.pending_external_identity
+    let keeps_password = config.require_external_registration_password and not config.allow_only_external_registration and password != null
+
+    ensures:
+        let user = accounts/User.created(
+            name: name,
+            primary_email: email,
+            kind: individual,
+            is_active: not (config.register_email_confirm or config.register_manual_confirm),
+            is_admin: false,
+            is_restricted: config.default_user_is_restricted,
+            prohibit_login: false
+        )
+        UserLogin.created(user: user, source: identity.source, login_name: identity.external_id, has_password: keeps_password, must_change_password: false, password_changed_at: null, last_sign_in_at: now)
+        ExternalLogin.created(user: user, source: identity.source, external_id: identity.external_id, provider: identity.source.settings.provider, email: identity.email, name: identity.full_name, nickname: identity.nickname, avatar_url: identity.avatar_url, linked_at: now)
+        UserSignedUp(user)
+        ExternalGroupsAsserted(user, identity.source, identity.groups)
+        session.pending_external_identity = null
+        session.status = authenticated
+        session.user = user
+        session.authenticated_via = external_provider
+        session.last_activity_at = now
+        UserSignedIn(user, external_provider)
+
+    @guidance
+        -- Web: POST /user/link_account_signup. A password is only kept when
+        -- REQUIRE_EXTERNAL_REGISTRATION_PASSWORD is on; otherwise the account has no local
+        -- password (the user can still set one via "forgot password" if allowed).
+}
+
+-- from: routers/web/user/setting/security/security.go:42
+rule UserUnlinksExternalLogin {
+    when: UserUnlinksExternalLogin(user, link)
+
+    requires: link.user = user
+    requires: config.oauth2_enabled or config.enable_openid_signin or config.enable_openid_signup
+
+    ensures: not exists link
+
+    @guidance
+        -- Web: POST /user/settings/security/account_link.
+}
+
+------------------------------------------------------------
+-- Rules: OpenID 2.0 relying party
+------------------------------------------------------------
+
+-- from: routers/web/auth/openid.go:127
+rule VisitorSignsInWithOpenID {
+    when: VisitorSignsInWithOpenID(session, uri)
+
+    requires: session.status = anonymous
+    requires: config.enable_openid_signin
+    requires: openid_uri_allowed(uri)
+    requires: openid_assertion_verified(uri)
+    let identity = OpenIDIdentity{uri: uri}
+
+    ensures:
+        if exists identity:
+            if UserLogin{user: identity.user}.has_second_factor:
+                session.status = pending_second_factor
+                session.pending_user = identity.user
+            else:
+                session.status = authenticated
+                session.user = identity.user
+                session.authenticated_via = openid
+                session.last_activity_at = now
+                UserSignedIn(identity.user, openid)
+        else:
+            session.pending_openid_uri = uri
+
+    @guidance
+        -- Web: GET/POST /user/login/openid, then /user/openid/connect (attach to an
+        -- existing account by signing in) or /user/openid/register (needs
+        -- ENABLE_OPENID_SIGNUP). URIs must match an allow-list pattern when one is set
+        -- and must not match a block-list pattern.
+}
+
+-- from: routers/web/auth/openid.go:256
+rule VisitorConnectsOpenIDToAccount {
+    when: VisitorConnectsOpenIDToAccount(session, user, password)
+
+    requires: session.status = anonymous
+    requires: session.pending_openid_uri != null
+    requires: password_matches(user, password)
+    requires: not user.prohibit_login
+
+    ensures:
+        if UserLogin{user: user}.has_second_factor:
+            session.status = pending_second_factor
+            session.pending_user = user
+        else:
+            OpenIDIdentity.created(user: user, uri: session.pending_openid_uri, show_publicly: false)
+            session.status = authenticated
+            session.user = user
+            session.authenticated_via = openid
+            session.last_activity_at = now
+            UserSignedIn(user, openid)
+}
+
+-- from: routers/web/user/setting/security/openid.go:22
+rule UserAddsOpenID {
+    when: UserAddsOpenID(user, uri)
+    requires: config.enable_openid_signin
+    requires: openid_uri_allowed(uri)
+    requires: openid_assertion_verified(uri)
+    requires: not exists OpenIDIdentity{uri: uri}
+    ensures: OpenIDIdentity.created(user: user, uri: uri, show_publicly: false)
+}
+
+-- from: models/user/openid.go:85
+rule UserRemovesOpenID {
+    when: UserRemovesOpenID(user, identity)
+    requires: identity.user = user
+    ensures: not exists identity
+}
+
+-- from: models/user/openid.go:108
+rule UserTogglesOpenIDVisibility {
+    when: UserTogglesOpenIDVisibility(user, identity)
+    requires: identity.user = user
+    ensures: identity.show_publicly = not identity.show_publicly
+}
+
+------------------------------------------------------------
+-- Rules: passwords
+------------------------------------------------------------
+
+-- "Forgot password". The answer is identical whether or not the address is known.
+-- from: routers/web/auth/password.go:52
+rule VisitorRequestsPasswordReset {
+    when: VisitorRequestsPasswordReset(session, user)
+
+    let login = UserLogin{user: user}
+    requires: config.mail_service_configured
+    requires: login.may_reset_password
+    requires: not exists MailSendThrottle{user: user, kind: resend}
+
+    ensures:
+        EmailVerificationCode.created(user: user, purpose: password_reset, email: user.primary_email, expires_at: now + config.activation_code_lifetime, status: pending)
+        MailSendThrottle.created(user: user, kind: resend, until: now + config.mail_resend_interval)
+
+    @guidance
+        -- Web: GET/POST /user/forgot_password (hidden when no mailer is configured). The
+        -- user is found by any of their e-mail addresses. Accounts whose password lives in
+        -- LDAP/SMTP/PAM are told "this is not a local account".
+}
+
+-- Completing the reset. If TOTP is enrolled the user must also give a passcode or the
+-- scratch code (which is then replaced). All remember-me tokens die with the old password.
+-- from: routers/web/auth/password.go:177
+rule VisitorResetsPassword {
+    when: VisitorResetsPassword(session, code, new_password, passcode, scratch_code)
+
+    requires: code.purpose = password_reset
+    requires: code.is_valid
+    requires: session.user = null or session.user = code.user
+    let user = code.user
+    let login = UserLogin{user: user}
+    let twofa = TwoFactor{user: user}
+    requires: login.may_reset_password
+    requires: password_acceptable(new_password)
+    requires: not exists twofa or (passcode != null and totp_valid(twofa, passcode) and twofa.last_used_passcode != passcode) or (scratch_code != null and scratch_code_valid(twofa, scratch_code))
+
+    ensures: code.status = used
+    ensures: login.has_password = true
+    ensures: login.must_change_password = false
+    ensures: login.password_changed_at = now
+    ensures:
+        for t in LongTermAuthorizations where user = user and status = active:
+            t.status = revoked
+    ensures: PasswordChanged(user)
+    ensures:
+        if exists twofa and scratch_code != null:
+            twofa.scratch_code_generation = twofa.scratch_code_generation + 1
+        if exists twofa and passcode != null:
+            twofa.last_used_passcode = passcode
+    ensures: session.status = authenticated
+    ensures: session.user = user
+    ensures: session.authenticated_via = password_reset
+    ensures: session.last_activity_at = now
+    ensures: UserSignedIn(user, password_reset)
+
+    @guidance
+        -- Web: GET/POST /user/recover_account?code=…. The code is only consumed on POST,
+        -- so merely opening the link does not burn it. A signed-in user opening someone
+        -- else's code is told it belongs to another account.
+}
+
+-- from: routers/web/user/setting/account.go:48
+rule UserChangesPassword {
+    when: UserChangesPassword(user, old_password, new_password)
+
+    let login = UserLogin{user: user}
+    requires: not config.password_change_disabled
+    requires: login.is_local or not config.external_password_change_disabled
+    requires: login.is_local or login.source.kind = oauth2
+    requires: login.has_password = false or password_matches(user, old_password)
+    requires: password_acceptable(new_password)
+
+    ensures: login.has_password = true
+    ensures: login.must_change_password = false
+    ensures: login.password_changed_at = now
+    ensures:
+        for t in LongTermAuthorizations where user = user and status = active:
+            t.status = revoked
+    ensures: PasswordChanged(user)
+
+    @guidance
+        -- Web: POST /user/settings/account. If the browser carried a remember-me cookie a
+        -- fresh one is issued so this device stays remembered.
+}
+
+-- An admin-created account (or an admin reset) forces a new password before anything
+-- else can be done.
+-- from: routers/web/auth/password.go:278
+rule UserChangesForcedPassword {
+    when: UserChangesForcedPassword(user, new_password)
+
+    let login = UserLogin{user: user}
+    requires: login.must_change_password
+    requires: password_acceptable(new_password)
+
+    ensures: login.has_password = true
+    ensures: login.must_change_password = false
+    ensures: login.password_changed_at = now
+    ensures:
+        for t in LongTermAuthorizations where user = user and status = active:
+            t.status = revoked
+    ensures: PasswordChanged(user)
+
+    @guidance
+        -- Web: GET/POST /user/settings/change_password. Every other page redirects here
+        -- while the flag is set; git clients get 401 "must change password"; the API
+        -- answers 403.
+}
+
+------------------------------------------------------------
+-- Rules: second factors (settings)
+------------------------------------------------------------
+
+-- from: routers/web/user/setting/security/2fa.go:205
+rule UserEnrolsTotp {
+    when: UserEnrolsTotp(user, passcode)
+
+    requires: not exists TwoFactor{user: user}
+    requires: enrolment_passcode_valid(user, passcode)
+
+    ensures: TwoFactor.created(user: user, last_used_passcode: null, scratch_code_generation: 1, enrolled_at: now)
+    ensures: TotpEnrolled(user)
+
+    @guidance
+        -- Web: GET/POST /user/settings/security/two_factor/enroll. A fresh secret and QR
+        -- code are shown; the first passcode proves the authenticator works. The scratch
+        -- code is displayed once on success.
+}
+
+-- from: routers/web/user/setting/security/2fa.go:294
+rule UserReenrolsTotp {
+    when: UserReenrolsTotp(user, passcode)
+
+    let twofa = TwoFactor{user: user}
+    requires: exists twofa
+    requires: enrolment_passcode_valid(user, passcode)
+
+    ensures: twofa.last_used_passcode = null
+    ensures: twofa.scratch_code_generation = twofa.scratch_code_generation + 1
+    ensures: twofa.enrolled_at = now
+    ensures: TotpEnrolled(user)
+}
+
+-- from: routers/web/user/setting/security/2fa.go:28
+rule UserRegeneratesScratchCode {
+    when: UserRegeneratesScratchCode(user)
+    let twofa = TwoFactor{user: user}
+    requires: exists twofa
+    ensures: twofa.scratch_code_generation = twofa.scratch_code_generation + 1
+}
+
+-- Turning TOTP off is not possible while the instance requires 2FA of this user.
+-- from: routers/web/user/setting/security/2fa.go:55
+rule UserDisablesTotp {
+    when: UserDisablesTotp(user)
+
+    let twofa = TwoFactor{user: user}
+    requires: exists twofa
+    requires: not UserLogin{user: user}.requires_two_factor
+
+    ensures: not exists twofa
+    ensures: TotpDisabled(user)
+}
+
+-- from: routers/web/user/setting/security/webauthn.go:65
+rule UserRegistersSecurityKey {
+    when: UserRegistersSecurityKey(user, name, attestation)
+
+    requires: not exists WebAuthnCredential{user: user, name: name}
+    requires: webauthn_attestation_valid(user, attestation)
+
+    ensures: WebAuthnCredential.created(user: user, name: name, sign_count: 0, backup_eligible: false, backup_state: false, created_at: now)
+
+    @guidance
+        -- Web: POST /user/settings/security/webauthn/request_register then /register.
+        -- An empty name defaults to a timestamp. Names compare case-insensitively.
+}
+
+-- from: routers/web/user/setting/security/webauthn.go:114
+rule UserRemovesSecurityKey {
+    when: UserRemovesSecurityKey(user, credential)
+
+    requires: credential.user = user
+
+    ensures: not exists credential
+    ensures: SecurityKeyRemoved(user, credential.name)
+}
+
+------------------------------------------------------------
+-- Rules: personal access tokens
+------------------------------------------------------------
+
+-- Repository-specific tokens: at least one repository, never public-only, and only the
+-- issue / repository scope categories.
+-- from: routers/api/v1/utils/access_token.go:136
+rule UserCreatesAccessToken {
+    when: UserCreatesAccessToken(actor, owner, name, scopes, public_only, all_repositories, repositories, via)
+
+    requires: actor = owner or actor.is_admin
+    requires: actor != owner or via in {session, password_basic, reverse_proxy}
+    requires: name != ""
+    requires: not exists AccessToken{owner: owner, name: name}
+    requires: scopes.count > 0 or public_only
+    requires: all_repositories or public_only = false
+    requires: all_repositories or repositories.count > 0
+    requires: all_repositories or scopes.all(sc => sc in {read_issue, write_issue, read_repository, write_repository})
+    requires: all_repositories or repositories.all(r => access/can_read(actor, r, code))
+
+    ensures:
+        let token = AccessToken.created(
+            owner: owner,
+            name: name,
+            scopes: scopes,
+            public_only: public_only,
+            all_repositories: all_repositories,
+            repositories: repositories,
+            last_eight: secret_suffix(),
+            created_at: now,
+            last_used_at: null
+        )
+
+    @guidance
+        -- Web: /user/settings/applications/tokens/new (GET pre-fills from query).
+        -- API: POST /users/{username}/tokens (password basic auth or reverse-proxy only —
+        -- a token cannot mint tokens; self or site admin) and POST
+        -- /admin/users/{username}/tokens (site admin, any credential). The secret is
+        -- returned once. `all` expands to every write scope; unknown scope names are
+        -- refused; duplicates are normalised away.
+}
+
+-- Regenerating replaces the secret, keeping name/scopes/repositories.
+-- from: models/auth/access_token.go:246
+rule UserRegeneratesAccessToken {
+    when: UserRegeneratesAccessToken(user, token)
+    requires: token.owner = user
+    ensures: token.last_eight = secret_suffix()
+    ensures: token.last_used_at = null
+}
+
+-- from: routers/api/v1/utils/access_token.go:29
+rule UserDeletesAccessToken {
+    when: UserDeletesAccessToken(actor, token, via)
+
+    requires: actor = token.owner or actor.is_admin
+    requires: actor != token.owner or via in {session, password_basic, reverse_proxy}
+
+    ensures: not exists token
+
+    @guidance
+        -- API: DELETE /users/{username}/tokens/{id-or-name} (a name matching several
+        -- tokens is refused as ambiguous), DELETE /admin/users/{username}/tokens/{id}.
+        -- Web: POST /user/settings/applications/tokens/delete.
+}
+
+------------------------------------------------------------
+-- Rules: authenticating non-interactive requests (API, git, LFS, packages)
+------------------------------------------------------------
+
+-- Methods are tried in order: OAuth2 bearer, HTTP signature (API only), access token,
+-- Actions tokens, authorized-integration JWT, reverse proxy (if enabled), session (web),
+-- password basic. The first that recognises its credential decides; a recognised but
+-- wrong credential fails the request rather than falling through.
+
+-- from: services/auth/method/basic.go:24
+rule ClientAuthenticatesWithPassword {
+    when: ClientPresentsPassword(request, user, password, otp)
+
+    let login = UserLogin{user: user}
+    requires: config.enable_basic_auth
+    requires: password_matches(user, password)
+    requires: not user.prohibit_login
+    requires: user.kind = individual
+    requires: not login.has_security_keys
+    requires: login.skips_local_two_factor or login.has_totp = false or (otp != null and totp_valid(TwoFactor{user: user}, otp))
+    requires: login.may_use_account
+
+    ensures: RequestAuthenticated(user, password_basic)
+
+    @guidance
+        -- `Authorization: Basic` with a username/e-mail and password. With TOTP enrolled
+        -- the current passcode goes in the X-Forgejo-OTP header; with any security key
+        -- enrolled password basic auth is refused outright (use a token). Token creation
+        -- endpoints REQUIRE this method (or reverse-proxy auth).
+}
+
+-- from: services/auth/method/access_token.go:31
+rule ClientAuthenticatesWithAccessToken {
+    when: ClientPresentsAccessToken(request, token)
+
+    requires: UserLogin{user: token.owner}.may_use_account
+
+    ensures: token.last_used_at = now
+    ensures: RequestAuthenticated(token.owner, access_token)
+
+    @guidance
+        -- `Authorization: token <t>`, `Authorization: Bearer <t>`, or as the password
+        -- (or username) of basic auth — the latter is how git over HTTP uses tokens.
+        -- Git LFS accepts tokens only via basic auth. The request is then limited to the
+        -- token's scopes, public-only flag and repository list (access.allium).
+}
+
+-- from: services/auth/method/oauth2.go:58
+rule ClientAuthenticatesWithOAuth2Token {
+    when: ClientPresentsOAuth2AccessToken(request, issuance)
+
+    requires: config.oauth2_enabled
+    requires: exists issuance.grant
+    requires: issuance.access_valid
+    requires: UserLogin{user: issuance.grant.user}.may_use_account
+
+    ensures: RequestAuthenticated(issuance.grant.user, oauth2_bearer)
+
+    @guidance
+        -- Bearer, basic-password, or form `access_token`. A revoked grant kills every
+        -- token issued under it. Effective scopes are the grant's token scopes, or every
+        -- scope when the grant asked only for openid/profile/email/groups.
+}
+
+-- from: services/auth/method/httpsign.go:24
+rule ClientAuthenticatesWithSignedRequest {
+    when: ClientPresentsSignedRequest(request, key, via_certificate)
+
+    requires: via_certificate = false or config.ssh_trusted_user_ca_keys_configured
+    requires: http_signature_valid(request, key)
+    requires: UserLogin{user: key.owner}.may_use_account
+
+    ensures: RequestAuthenticated(key.owner, http_signature)
+
+    @guidance
+        -- API only. `Signature` header (HTTP signatures draft) made with a registered SSH
+        -- key (looked up by fingerprint as keyId), or with an SSH certificate in
+        -- X-Ssh-Certificate signed by a trusted user CA whose principal matches a key.
+        -- A signature that does not verify is "not attempted", not a failure.
+}
+
+-- from: services/auth/method/reverseproxy.go:72
+rule TrustedProxyAssertsUser {
+    when: TrustedProxyAssertsUser(request, user, via_api)
+
+    requires: config.enable_reverse_proxy_auth
+    requires: via_api = false or config.enable_reverse_proxy_auth_api
+    requires: request.via_trusted_proxy
+    requires: UserLogin{user: user}.may_use_account
+
+    ensures: RequestAuthenticated(user, reverse_proxy)
+
+    @guidance
+        -- The user is named in X-WEBAUTH-USER (or found by X-WEBAUTH-EMAIL when e-mail
+        -- lookup is enabled). On web and git routes a session is created as well. Only
+        -- requests from REVERSE_PROXY_TRUSTED_PROXIES are believed.
+}
+
+-- from: services/auth/method/reverseproxy.go:145
+rule TrustedProxyRegistersUser {
+    when: TrustedProxyRegistersUser(request, name, email, full_name)
+
+    requires: config.enable_reverse_proxy_auth
+    requires: config.enable_reverse_proxy_auto_registration
+    requires: request.via_trusted_proxy
+    requires: username_available(name)
+
+    ensures:
+        let user = accounts/User.created(
+            name: name,
+            primary_email: email,
+            kind: individual,
+            is_active: true,
+            is_admin: user_count() = 0,
+            is_restricted: config.default_user_is_restricted,
+            prohibit_login: false
+        )
+        UserLogin.created(user: user, source: null, login_name: name, has_password: false, must_change_password: false, password_changed_at: null, last_sign_in_at: now)
+        UserSignedUp(user)
+        RequestAuthenticated(user, reverse_proxy)
+
+    @guidance
+        -- E-mail comes from X-WEBAUTH-EMAIL when ENABLE_REVERSE_PROXY_EMAIL is on, else a
+        -- random <uuid>@localhost; full name from X-WEBAUTH-FULLNAME when enabled.
+}
+
+-- from: services/auth/method/authorized_integration.go:60
+rule ClientAuthenticatesWithIntegrationJwt {
+    when: ClientPresentsIntegrationJwt(request, integration, claims)
+
+    requires: jwt_signature_valid(integration.issuer, claims)
+    requires: claims_satisfy(claims, integration.claim_rules)
+    requires: UserLogin{user: integration.owner}.may_use_account
+
+    ensures: RequestAuthenticated(integration.owner, integration_jwt)
+
+    @guidance
+        -- Bearer JWT (also accepted as basic-auth password on git and LFS routes). The
+        -- integration is found by the JWT's exact `iss` and its single `aud`; claim rules
+        -- are checked before any key is fetched; `iat`/`exp` are enforced. The request is
+        -- then limited to the integration's scopes and repositories.
+}
+
+-- Site admins may act as another user on the API.
+-- from: routers/api/v1/api.go:96
+rule AdminSudoes {
+    when: AdminSudoes(admin, target)
+    requires: admin.is_admin
+    ensures: RequestAuthenticated(target, session)
+
+    @guidance
+        -- `?sudo=<name>` or `Sudo: <name>` header on any API call. Non-admins get 403.
+        -- The `method` passed on is the admin's own method in practice.
+}
+
+------------------------------------------------------------
+-- Rules: authorized integrations (trusted external JWT issuers)
+------------------------------------------------------------
+
+-- from: services/auth/authorized_integration.go:223
+rule UserCreatesAuthorizedIntegration {
+    when: UserCreatesAuthorizedIntegration(user, name, ui, issuer, audience, claim_rules, scopes, public_only, all_repositories, repositories)
+
+    requires: not exists AuthorizedIntegration{issuer: issuer, audience: audience}
+    requires: issuer_trustworthy(issuer)
+    requires: claim_rules_well_formed(claim_rules)
+    requires: all_repositories or public_only = false
+    requires: all_repositories or repositories.count > 0
+    requires: all_repositories or scopes.all(sc => sc in {read_issue, write_issue, read_repository, write_repository})
+    requires: all_repositories or repositories.all(r => access/can_read(user, r, code))
+
+    ensures: AuthorizedIntegration.created(owner: user, name: name, description: null, ui: ui, issuer: issuer, audience: audience, claim_rules: claim_rules, scopes: scopes, public_only: public_only, all_repositories: all_repositories, repositories: repositories, created_at: now)
+
+    @guidance
+        -- Web: /user/settings/authorized-integrations/{generic|forgejo-actions-local}/new.
+        -- Every rule needs a claim; eq/glob need a value; in/glob_in need values (no empty
+        -- glob, which would match anything); nest needs nested rules. External issuers
+        -- are fetched under the [authorized_integration] host allow/block lists.
+}
+
+-- from: routers/web/user/setting/authorized_integrations.go:182
+rule UserUpdatesAuthorizedIntegration {
+    when: UserUpdatesAuthorizedIntegration(user, integration, claim_rules, scopes, public_only, all_repositories, repositories)
+    requires: integration.owner = user
+    requires: claim_rules_well_formed(claim_rules)
+    requires: all_repositories or public_only = false
+    requires: all_repositories or repositories.count > 0
+    ensures: integration.claim_rules = claim_rules
+    ensures: integration.scopes = scopes
+    ensures: integration.public_only = public_only
+    ensures: integration.all_repositories = all_repositories
+    ensures: integration.repositories = repositories
+}
+
+-- from: routers/web/user/setting/authorized_integrations.go:418
+rule UserDeletesAuthorizedIntegration {
+    when: UserDeletesAuthorizedIntegration(user, integration)
+    requires: integration.owner = user
+    ensures: not exists integration
+}
+
+------------------------------------------------------------
+-- Rules: OAuth2 / OIDC provider — applications
+------------------------------------------------------------
+
+-- A user, an organisation owner, or a site admin (instance-wide) registers a client.
+-- from: models/auth/oauth2.go:265
+rule OwnerRegistersOAuth2Application {
+    when: OwnerRegistersOAuth2Application(actor, owner_user, owner_org, name, redirect_uris, confidential)
+
+    requires: config.oauth2_enabled
+    requires: owner_user = null or owner_org = null
+    requires: owner_user = null or owner_user = actor
+    requires: owner_org = null or is_org_owner(actor, owner_org)
+    requires: owner_user != null or owner_org != null or actor.is_admin
+    requires: name != ""
+    requires: redirect_uris.count > 0
+    requires: redirect_uris.all(u => valid_url(u))
+
+    ensures: OAuth2Application.created(owner_user: owner_user, owner_org: owner_org, builtin: null, name: name, client_id: new_client_id(), confidential: confidential, redirect_uris: redirect_uris, created_at: now)
+
+    @guidance
+        -- Web: /user/settings/applications/oauth2, /org/{org}/settings/applications/oauth2,
+        -- /admin/applications/oauth2. API: POST /user/applications/oauth2 (personal only).
+        -- The client secret is shown once on creation.
+}
+
+-- from: models/auth/oauth2.go:290
+rule OwnerUpdatesOAuth2Application {
+    when: OwnerUpdatesOAuth2Application(actor, app, name, redirect_uris, confidential)
+
+    requires: may_manage_application(actor, app)
+    requires: not app.is_builtin
+    requires: redirect_uris.count > 0
+
+    ensures: app.name = name
+    ensures: app.redirect_uris = redirect_uris
+    ensures: app.confidential = confidential
+
+    @guidance
+        -- API: PATCH /user/applications/oauth2/{id} also regenerates the secret.
+}
+
+-- from: routers/web/user/setting/oauth2_common.go:132
+rule OwnerRegeneratesClientSecret {
+    when: OwnerRegeneratesClientSecret(actor, app)
+    requires: may_manage_application(actor, app)
+    requires: not app.is_builtin
+    ensures: ClientSecretRegenerated(app)
+}
+
+-- Deleting an application drops all its grants and outstanding codes.
+-- from: models/auth/oauth2.go:358
+rule OwnerDeletesOAuth2Application {
+    when: OwnerDeletesOAuth2Application(actor, app)
+
+    requires: may_manage_application(actor, app)
+    requires: not app.is_builtin
+
+    ensures:
+        for g in app.grants:
+            for c in OAuth2AuthorizationCodes where grant = g:
+                not exists c
+            not exists g
+    ensures: not exists app
+}
+
+-- The built-in public clients (git-credential-oauth, Git Credential Manager, tea) exist
+-- exactly when listed in DEFAULT_APPLICATIONS; they are instance-wide and locked.
+-- from: models/auth/oauth2.go:86
+rule BuiltinApplicationsReconciled {
+    when: InstanceStarted()
+    ensures:
+        for b in config.oauth2_default_applications:
+            if not exists OAuth2Application{builtin: b}:
+                OAuth2Application.created(owner_user: null, owner_org: null, builtin: b, name: builtin_display_name(b), client_id: builtin_client_id(b), confidential: false, redirect_uris: {"http://127.0.0.1", "https://127.0.0.1"}, created_at: now)
+    ensures:
+        for app in OAuth2Applications where builtin != null:
+            if app.builtin not in config.oauth2_default_applications:
+                not exists app
+}
+
+------------------------------------------------------------
+-- Rules: OAuth2 / OIDC provider — authorization code flow
+------------------------------------------------------------
+
+-- The authorize endpoint. Public clients must use PKCE. A confidential client the user
+-- has already granted gets a code without asking again.
+-- from: routers/web/auth/oauth.go:423
+rule UserRequestsAuthorization {
+    when: UserRequestsAuthorization(user, app, redirect_uri, response_type, pkce_method, code_challenge, scopes, nonce)
+
+    let grant = OAuth2Grant{user: user, application: app}
+
+    requires: config.oauth2_enabled
+    requires: redirect_uri_registered(app, redirect_uri)
+    requires: response_type = "code"
+    requires: app.confidential or pkce_method != none
+
+    ensures:
+        if app.confidential and exists grant:
+            OAuth2AuthorizationCode.created(grant: grant, redirect_uri: redirect_uri, code_challenge: code_challenge, pkce_method: pkce_method, issued_at: now, expires_at: now + config.oauth2_authorization_code_lifetime, status: issued)
+            if nonce != null:
+                grant.nonce = nonce
+        else:
+            ConsentRequested(user, app, redirect_uri, scopes)
+
+    @guidance
+        -- Web: GET/POST /login/oauth/authorize (sign-in required). Redirect URIs match
+        -- exactly (case-insensitive, ignoring a trailing slash); for public clients an
+        -- http loopback URI matches whatever port is used (RFC 8252). Unknown client or
+        -- unregistered redirect URI → error page; other errors are redirected back to
+        -- the client with error/error_description/state. The consent page names the
+        -- application, its owner (or the instance) and the redirect target.
+}
+
+-- from: routers/web/auth/oauth.go:595
+rule UserGrantsConsent {
+    when: UserGrantsConsent(user, app, redirect_uri, scopes, pkce_method, code_challenge, nonce)
+
+    let existing = OAuth2Grant{user: user, application: app}
+
+    requires: config.oauth2_enabled
+    requires: redirect_uri_registered(app, redirect_uri)
+    requires: not exists existing or existing.scopes = scopes
+
+    ensures:
+        if exists existing:
+            OAuth2AuthorizationCode.created(grant: existing, redirect_uri: redirect_uri, code_challenge: code_challenge, pkce_method: pkce_method, issued_at: now, expires_at: now + config.oauth2_authorization_code_lifetime, status: issued)
+        else:
+            let grant = OAuth2Grant.created(user: user, application: app, scopes: scopes, nonce: nonce, counter: 1, created_at: now)
+            OAuth2AuthorizationCode.created(grant: grant, redirect_uri: redirect_uri, code_challenge: code_challenge, pkce_method: pkce_method, issued_at: now, expires_at: now + config.oauth2_authorization_code_lifetime, status: issued)
+
+    @guidance
+        -- Web: POST /login/oauth/grant. client_id/state/redirect_uri must match what the
+        -- authorize step stored in the session. A grant that exists with a different
+        -- scope is an error (the user must revoke it first).
+}
+
+-- from: routers/web/auth/oauth.go:603
+rule UserDeniesConsent {
+    when: UserDeniesConsent(user, app, redirect_uri)
+    requires: redirect_uri_registered(app, redirect_uri)
+    ensures: AuthorizationDenied(user, app)
+}
+
+-- The token endpoint, authorization_code grant. The code is single-use.
+-- from: routers/web/auth/oauth.go:844
+rule ClientExchangesAuthorizationCode {
+    when: ClientExchangesAuthorizationCode(app, client_secret_valid, code, code_verifier, redirect_uri)
+
+    requires: config.oauth2_enabled
+    requires: app.confidential = false or client_secret_valid
+    requires: code.status = issued
+    requires: code.grant.application = app
+    requires: code.redirect_uri = redirect_uri
+    requires: pkce_verifier_matches(code, code_verifier)
+
+    let grant = code.grant
+
+    ensures: code.status = redeemed
+    ensures: grant.counter = grant.counter + 1
+    ensures: OAuth2TokenIssuance.created(grant: grant, refresh_counter: grant.counter, access_expires_at: now + config.oauth2_access_token_lifetime, refresh_expires_at: now + config.oauth2_refresh_token_lifetime, includes_id_token: "openid" in grant.scopes, issued_at: now)
+
+    @guidance
+        -- POST /login/oauth/access_token (CORS-enabled, no CSRF). Client credentials in
+        -- the body or HTTP basic; if both, they must agree. A replayed code fails because
+        -- it was deleted on first use. With PKCE S256 the verifier's SHA-256 must equal
+        -- the challenge; `plain` compares directly; a challenge with no verifier fails.
+        -- The id_token (openid scope) carries iss=<app url>, aud=client_id, sub=user id,
+        -- nonce, and name/preferred_username/profile/picture/website/locale/updated_at
+        -- (profile), email/email_verified (email), groups "org" and "org:team" (groups).
+        -- With a symmetric signing key the id_token is signed with the client secret.
+}
+
+-- The token endpoint, refresh_token grant. Each refresh token works once.
+-- from: routers/web/auth/oauth.go:763
+rule ClientRefreshesToken {
+    when: ClientRefreshesToken(app, client_secret_valid, previous)
+
+    requires: config.oauth2_enabled
+    requires: app.confidential = false or client_secret_valid
+    requires: previous.grant.application = app
+    requires: previous.refresh_usable
+
+    let grant = previous.grant
+
+    ensures: grant.counter = grant.counter + 1
+    ensures: OAuth2TokenIssuance.created(grant: grant, refresh_counter: grant.counter, access_expires_at: now + config.oauth2_access_token_lifetime, refresh_expires_at: now + config.oauth2_refresh_token_lifetime, includes_id_token: "openid" in grant.scopes, issued_at: now)
+
+    @guidance
+        -- A refresh token presented a second time ("already used") is refused and logged
+        -- as a possible replay; with INVALIDATE_REFRESH_TOKENS off they stay reusable
+        -- until expiry.
+}
+
+-- from: routers/web/user/setting/oauth2_common.go:168
+rule UserRevokesGrant {
+    when: UserRevokesGrant(user, grant)
+
+    requires: grant.user = user
+
+    ensures:
+        for c in OAuth2AuthorizationCodes where grant = grant:
+            not exists c
+    ensures: not exists grant
+
+    @guidance
+        -- Web: POST /user/settings/applications/oauth2/{id}/revoke/{grantId}. All access
+        -- and refresh tokens issued under the grant stop working immediately.
+}
+
+-- from: models/auth/oauth2.go:389
+rule AuthorizationCodeExpires {
+    when: auth_code: OAuth2AuthorizationCode.expires_at <= now
+    requires: auth_code.status = issued
+    ensures: auth_code.status = expired
+}
+
+------------------------------------------------------------
+-- Rules: authentication sources (site admin)
+------------------------------------------------------------
+
+-- from: routers/web/admin/auths.go:203
+rule AdminCreatesAuthSource {
+    when: AdminCreatesAuthSource(admin, name, kind, is_active, sync_enabled, settings)
+
+    requires: admin.is_admin
+    requires: name != ""
+    requires: not exists AuthSource{name: name}
+    requires: kind != remote
+    requires: kind != oauth2 or settings.provider != "openidConnect" or http_url(settings.openid_discovery_url)
+    requires: kind != oauth2 or is_active = false or provider_initialisable(settings)
+
+    ensures: AuthSource.created(name: name, kind: kind, is_active: is_active, sync_enabled: sync_enabled and kind in {ldap_bind_dn, ldap_simple}, settings: settings, created_at: now)
+
+    @guidance
+        -- Web: /admin/auths/new. LDAP bind passwords and OAuth2 client secrets are stored
+        -- encrypted and never shown back. An active OAuth2 source is registered with the
+        -- provider library immediately; if that fails (e.g. OIDC discovery unreachable)
+        -- the source is not saved.
+}
+
+-- from: routers/web/admin/auths.go:314
+rule AdminUpdatesAuthSource {
+    when: AdminUpdatesAuthSource(admin, source, name, is_active, sync_enabled, settings)
+
+    requires: admin.is_admin
+    requires: name != ""
+    requires: name = source.name or not exists AuthSource{name: name}
+    requires: source.kind != oauth2 or is_active = false or provider_initialisable(settings)
+
+    ensures: source.name = name
+    ensures: source.is_active = is_active
+    ensures: source.sync_enabled = sync_enabled and source.is_ldap
+    ensures: source.settings = settings
+}
+
+-- A source still used by any account (as its password source or as a linked external
+-- login) cannot be deleted.
+-- from: services/auth/source.go:14
+rule AdminDeletesAuthSource {
+    when: AdminDeletesAuthSource(admin, source)
+
+    requires: admin.is_admin
+    requires: not source.in_use
+
+    ensures:
+        for t in LongTermAuthorizations where sso_source = source:
+            not exists t
+    ensures: AuthSourceDeleted(source)
+    ensures: not exists source
+
+    @guidance
+        -- Web: POST /admin/auths/{id}/delete; "still in use" is shown as a flash.
+}
+
+------------------------------------------------------------
+-- Rules: scheduled directory synchronisation
+------------------------------------------------------------
+
+-- from: services/cron/tasks_basic.go:90
+rule ExternalUserSyncDue {
+    when: job: ExternalUserSyncJob.next_run_at <= now
+
+    requires: job.enabled
+
+    ensures: job.last_run_at = now
+    ensures: job.next_run_at = now + config.sync_external_users_interval
+    ensures:
+        for source in AuthSources where is_active = true and sync_enabled = true:
+            AuthSourceSyncRequested(source, job.update_existing)
+
+    @guidance
+        -- Cron task `sync_external_users`, @midnight by default. Cancelling stops between
+        -- sources.
+}
+
+-- The admin dashboard's "synchronise external user data" button.
+-- from: routers/web/admin/admin.go:162
+rule AdminRunsExternalUserSync {
+    when: AdminRunsExternalUserSync(admin)
+
+    requires: admin.is_admin
+
+    ensures:
+        for source in AuthSources where is_active = true and sync_enabled = true:
+            AuthSourceSyncRequested(source, config.sync_external_users_update_existing)
+}
+
+-- Synchronise one LDAP source against its directory: create missing accounts, refresh
+-- existing ones, deactivate accounts whose entry disappeared.
+-- from: services/auth/source/ldap/source_sync.go:17
+rule LdapSourceSynchronised {
+    when: AuthSourceSyncRequested(src, update_existing)
+
+    requires: src.is_ldap
+    let entries = DirectoryEntries where source = src
+    requires: entries.count > 0 or src.settings.allow_deactivate_all
+
+    ensures:
+        for e in entries:
+            if not exists UserLogin{source: src, login_name: e.username}:
+                let user = accounts/User.created(
+                    name: e.username,
+                    primary_email: e.email,
+                    kind: individual,
+                    is_active: true,
+                    is_admin: e.is_admin,
+                    is_restricted: e.is_restricted,
+                    prohibit_login: false
+                )
+                UserLogin.created(user: user, source: src, login_name: e.username, has_password: false, must_change_password: false, password_changed_at: null, last_sign_in_at: null)
+                UserSignedUp(user)
+                ExternalSshKeysAsserted(user, src, e.ssh_public_keys)
+    ensures:
+        if update_existing:
+            for login in UserLogins where source = src:
+                if exists DirectoryEntry{source: src, username: login.login_name}:
+                    login.user.is_active = true
+                    ExternalAdminFlagsAsserted(login.user, DirectoryEntry{source: src, username: login.login_name}.is_admin, DirectoryEntry{source: src, username: login.login_name}.is_restricted)
+                    ExternalSshKeysAsserted(login.user, src, DirectoryEntry{source: src, username: login.login_name}.ssh_public_keys)
+    ensures:
+        for login in UserLogins where source = src:
+            if not exists DirectoryEntry{source: src, username: login.login_name}:
+                login.user.is_active = false
+
+    @guidance
+        -- Existing accounts get full name, primary e-mail, admin (only when an admin filter
+        -- is set) and restricted (only when a restricted filter is set and the user is not
+        -- admin) refreshed. Users are matched by login name, then by e-mail. If the search
+        -- returns nothing and allow_deactivate_all is off, the sync is refused rather than
+        -- deactivating everyone.
+}
+
+------------------------------------------------------------
+-- Rules: account removal
+------------------------------------------------------------
+
+-- A purge ends every session of the account immediately.
+-- from: services/user/user.go:183
+rule PurgedUserSessionsEnd {
+    when: accounts/UserPurged(user)
+
+    ensures:
+        for s in Sessions where user = user and status = authenticated:
+            s.status = destroyed
+    ensures:
+        for t in LongTermAuthorizations where user = user and status = active:
+            t.status = revoked
+}
+
+-- from: models/auth/oauth2.go:647
+rule DeletedUserLosesCredentials {
+    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
+
+    ensures:
+        for t in AccessTokens where owner = user:
+            not exists t
+        for t in TwoFactors where user = user:
+            not exists t
+        for c in WebAuthnCredentials where user = user:
+            not exists c
+        for l in ExternalLogins where user = user:
+            not exists l
+        for o in OpenIDIdentities where user = user:
+            not exists o
+        for g in OAuth2Grants where user = user:
+            not exists g
+        for a in OAuth2Applications where owner_user = user:
+            not exists a
+        for i in AuthorizedIntegrations where owner = user:
+            not exists i
+        for t in LongTermAuthorizations where user = user:
+            not exists t
+        for c in EmailVerificationCodes where user = user:
+            not exists c
+        for l in UserLogins where user = user:
+            not exists l
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant UniqueAuthSourceName {
+    for a in AuthSources:
+        for b in AuthSources:
+            (a != b) implies a.name != b.name
+}
+
+invariant UniqueAccessTokenNamePerOwner {
+    for a in AccessTokens:
+        for b in AccessTokens:
+            (a != b and a.owner = b.owner) implies a.name != b.name
+}
+
+invariant RepositoryScopedTokensAreNarrow {
+    for t in AccessTokens:
+        (not t.all_repositories) implies (t.repositories.count > 0 and not t.public_only and t.scopes.all(s => s in {read_issue, write_issue, read_repository, write_repository}))
+}
+
+invariant AtMostOneTotpPerUser {
+    for a in TwoFactors:
+        for b in TwoFactors:
+            (a != b) implies a.user != b.user
+}
+
+invariant UniqueSecurityKeyNamePerUser {
+    for a in WebAuthnCredentials:
+        for b in WebAuthnCredentials:
+            (a != b and a.user = b.user) implies a.name != b.name
+}
+
+invariant OneLoginPerUser {
+    for a in UserLogins:
+        for b in UserLogins:
+            (a != b) implies a.user != b.user
+}
+
+invariant UniqueExternalIdentity {
+    for a in ExternalLogins:
+        for b in ExternalLogins:
+            (a != b and a.source = b.source) implies a.external_id != b.external_id
+}
+
+invariant UniqueOpenID {
+    for a in OpenIDIdentities:
+        for b in OpenIDIdentities:
+            (a != b) implies a.uri != b.uri
+}
+
+invariant UniqueClientId {
+    for a in OAuth2Applications:
+        for b in OAuth2Applications:
+            (a != b) implies a.client_id != b.client_id
+}
+
+invariant ApplicationHasAtMostOneOwner {
+    for a in OAuth2Applications:
+        a.owner_user = null or a.owner_org = null
+}
+
+invariant BuiltinApplicationsArePublicAndInstanceWide {
+    for a in OAuth2Applications:
+        a.is_builtin implies (a.is_instance_wide and not a.confidential)
+}
+
+invariant OneGrantPerUserAndApplication {
+    for a in OAuth2Grants:
+        for b in OAuth2Grants:
+            (a != b and a.user = b.user) implies a.application != b.application
+}
+
+invariant UniqueIntegrationIssuerAudience {
+    for a in AuthorizedIntegrations:
+        for b in AuthorizedIntegrations:
+            (a != b and a.issuer = b.issuer) implies a.audience != b.audience
+}
+
+invariant SyncOnlyForLdap {
+    for s in AuthSources:
+        s.sync_enabled implies s.is_ldap
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- A browser session nobody has signed in to yet.
+actor Visitor {
+    identified_by: Session where status = anonymous
+}
+
+-- A browser session that passed the password step and owes a second factor.
+actor SecondFactorChallenger {
+    identified_by: Session where status = pending_second_factor
+}
+
+-- Any account holder with a usable account (active, not prohibited).
+actor SignedInUser {
+    identified_by: accounts/User where is_active = true and prohibit_login = false
+}
+
+-- Signed in but not yet activated: may only use the activation page.
+actor InactiveUser {
+    identified_by: accounts/User where is_active = false and prohibit_login = false
+}
+
+actor SiteAdmin {
+    identified_by: accounts/User where is_admin = true and is_active = true and prohibit_login = false
+}
+
+-- A program on the other end of an HTTP request carrying some credential.
+actor CredentialBearer {
+    identified_by: ClientRequest where carries_credentials = true
+}
+
+-- A front proxy the instance has been told to trust for identity headers.
+actor TrustedReverseProxy {
+    identified_by: ClientRequest where via_trusted_proxy = true
+}
+
+-- A registered OAuth2 client talking to the token / introspection endpoints.
+actor OAuth2Client {
+    identified_by: OAuth2Application where client_id != ""
+}
+
+-- An external identity provider delivering the sign-in callback.
+actor IdentityProvider {
+    identified_by: AuthSource where kind = oauth2 and is_active = true
+}
+
+-- An incoming HTTP request, as far as authentication can tell.
+-- from: services/auth/interface.go:26
+external entity ClientRequest {
+    carries_credentials: Boolean
+    method: CredentialMethod?           -- which kind of credential it carries
+    via_trusted_proxy: Boolean
+    from_git_client: Boolean
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The sign-in / sign-up / recovery pages for somebody not signed in.
+surface SignInPage {
+    facing visitor: Visitor
+
+    exposes:
+        config.enable_internal_signin
+        config.show_registration_button
+        config.enable_captcha
+        config.captcha_kind
+        config.enable_openid_signin
+        config.mail_service_configured
+        for source in AuthSources where kind = oauth2 and is_active = true:
+            source.name
+            source.settings.icon_url
+
+    provides:
+        VisitorSignsInWithPassword(visitor, user, password, remember)
+            when config.enable_internal_signin
+        VisitorSignsInWithExternalPassword(visitor, source, entry, password)
+            when config.enable_internal_signin
+        VisitorRegisters(visitor, name, email, password)
+            when not config.disable_registration and not config.allow_only_external_registration
+        VisitorStartsProviderSignIn(visitor, source, prompt_none)
+        VisitorResumesWithRememberMe(visitor, lta)
+        VisitorSignsInWithOpenID(visitor, uri)
+            when config.enable_openid_signin
+        VisitorConnectsOpenIDToAccount(visitor, user, password)
+            when visitor.pending_openid_uri != null
+        VisitorRequestsPasswordReset(visitor, user)
+            when config.mail_service_configured
+        VisitorLinksPendingIdentityBySignIn(visitor, user, password, remember)
+            when visitor.pending_external_identity != null
+        VisitorRegistersFromPendingIdentity(visitor, name, email, password)
+            when visitor.pending_external_identity != null and not config.disable_registration
+
+    @guarantee SameAnswerForUnknownAccounts
+        -- Wrong password, unknown user and unactivated e-mail produce the same message;
+        -- the reset form says "mail sent" whether or not the address exists.
+
+    @guidance
+        -- Web: /user/login, /user/sign_up, /user/login/openid, /user/openid/connect,
+        -- /user/openid/register, /user/link_account, /user/link_account_signin,
+        -- /user/link_account_signup, /user/forgot_password, /user/oauth2/{source}.
+        -- A signed-in visitor opening these is redirected to `redirect_to` or home.
+}
+
+surface SecondFactorChallenge {
+    facing session: SecondFactorChallenger
+
+    exposes:
+        UserLogin{user: session.pending_user}.has_totp
+        UserLogin{user: session.pending_user}.has_security_keys
+
+    provides:
+        VisitorCompletesTotpChallenge(session, passcode)
+        VisitorUsesScratchCode(session, scratch_code)
+        VisitorCompletesWebAuthnChallenge(session, credential, sign_count)
+
+    @guidance
+        -- Web: /user/two_factor, /user/two_factor/scratch, /user/webauthn,
+        -- /user/webauthn/assertion.
+}
+
+-- Following a mailed link (activation, reset, e-mail confirmation).
+surface MailedCodeLanding {
+    facing visitor: Session
+
+    context code: EmailVerificationCode
+
+    exposes:
+        code.purpose
+        code.is_valid
+        code.user.primary_email
+
+    provides:
+        UserActivatesAccount(visitor, code, password)
+            when code.purpose = user_activation and code.is_valid
+        VisitorResetsPassword(visitor, code, new_password, passcode, scratch_code)
+            when code.purpose = password_reset and code.is_valid
+        UserConfirmsEmailAddress(code, email)
+            when code.purpose = email_activation and code.is_valid
+
+    timeout:
+        VerificationCodeExpires
+
+    @guidance
+        -- Web: /user/activate?code=, /user/recover_account?code=, /user/activate_email.
+}
+
+surface AccountActivation {
+    facing user: InactiveUser
+
+    exposes:
+        user.primary_email
+        config.activation_code_lifetime
+        config.register_manual_confirm
+        exists MailSendThrottle{user: user, kind: resend}
+
+    provides:
+        InactiveUserRequestsActivationMail(user)
+            when config.register_email_confirm and not exists MailSendThrottle{user: user, kind: resend}
+        InactiveUserReplacesUnconfirmedEmail(user, email)
+            when config.register_email_confirm
+        UserSignsOut(session)
+
+    timeout:
+        MailThrottleLapses
+}
+
+-- Security settings of the signed-in user.
+surface SecuritySettings {
+    facing user: SignedInUser
+
+    let login = UserLogin{user: user}
+
+    exposes:
+        login.has_totp
+        login.requires_two_factor
+        login.must_change_password
+        login.is_local
+        for key in WebAuthnCredentials where user = user:
+            key.name
+            key.created_at
+        for link in ExternalLogins where user = user:
+            link.source.name
+            link.provider
+            link.email
+        for oid in OpenIDIdentities where user = user:
+            oid.uri
+            oid.show_publicly
+
+    provides:
+        UserChangesPassword(user, old_password, new_password)
+            when not config.password_change_disabled
+        UserChangesForcedPassword(user, new_password)
+            when login.must_change_password
+        UserEnrolsTotp(user, passcode)
+            when not login.has_totp
+        UserReenrolsTotp(user, passcode)
+            when login.has_totp
+        UserRegeneratesScratchCode(user)
+            when login.has_totp
+        UserDisablesTotp(user)
+            when login.has_totp and not login.requires_two_factor
+        UserRegistersSecurityKey(user, name, attestation)
+        UserRemovesSecurityKey(user, key)
+        UserUnlinksExternalLogin(user, link)
+        UserAddsOpenID(user, uri)
+            when config.enable_openid_signin
+        UserRemovesOpenID(user, oid)
+        UserTogglesOpenIDVisibility(user, oid)
+        VisitorStartsProviderSignIn(session, source, prompt_none)
+        UserSignsOut(session)
+
+    @guarantee TwoFactorEnrolmentAlwaysReachable
+        -- When 2FA is required and missing, every other page redirects here and the
+        -- navigation is hidden until a factor is enrolled.
+
+    @guidance
+        -- Web: /user/settings/security (+ /two_factor/*, /webauthn/*, /openid/*,
+        -- /account_link), /user/settings/account (password), /user/settings/change_password.
+}
+
+-- Applications settings: tokens, own OAuth2 apps, granted apps.
+surface ApplicationSettings {
+    facing user: SignedInUser
+
+    exposes:
+        for token in AccessTokens where owner = user:
+            token.name
+            token.scopes
+            token.public_only
+            token.repositories
+            token.last_eight
+            token.created_at
+            token.has_recent_activity
+            token.has_been_used
+        for app in OAuth2Applications where owner_user = user:
+            app.name
+            app.client_id
+            app.confidential
+            app.redirect_uris
+        for grant in OAuth2Grants where user = user:
+            grant.application.name
+            grant.scopes
+            grant.created_at
+        for integration in AuthorizedIntegrations where owner = user:
+            integration.name
+            integration.issuer
+            integration.audience
+            integration.claim_rules
+            integration.scopes
+
+    provides:
+        UserCreatesAccessToken(user, user, name, scopes, public_only, all_repositories, repositories, via)
+        UserRegeneratesAccessToken(user, token)
+        UserDeletesAccessToken(user, token, via)
+        OwnerRegistersOAuth2Application(user, user, owner_org, name, redirect_uris, confidential)
+            when config.oauth2_enabled
+        OwnerUpdatesOAuth2Application(user, app, name, redirect_uris, confidential)
+        OwnerRegeneratesClientSecret(user, app)
+        OwnerDeletesOAuth2Application(user, app)
+        UserRevokesGrant(user, grant)
+        UserCreatesAuthorizedIntegration(user, name, ui, issuer, audience, claim_rules, scopes, public_only, all_repositories, repositories)
+        UserUpdatesAuthorizedIntegration(user, integration, claim_rules, scopes, public_only, all_repositories, repositories)
+        UserDeletesAuthorizedIntegration(user, integration)
+
+    @guarantee TokenSecretShownOnce
+        -- The full token / client secret is revealed only in the response that created
+        -- or regenerated it.
+
+    @guidance
+        -- Web: /user/settings/applications, /tokens/new, /tokens/delete,
+        -- /tokens/regenerate, /oauth2/{id}, /oauth2/{id}/regenerate_secret,
+        -- /oauth2/{id}/delete, /oauth2/{id}/revoke/{grantId},
+        -- /user/settings/authorized-integrations/*.
+        -- API: GET/POST /users/{username}/tokens, DELETE /users/{username}/tokens/{id},
+        -- GET/POST /user/applications/oauth2, GET/PATCH/DELETE /user/applications/oauth2/{id}.
+        -- Token listings show repositories only where the viewer can still see them.
+}
+
+surface OrganizationOAuth2Applications {
+    facing user: SignedInUser
+
+    context org: organizations/Organization
+
+    exposes:
+        for app in OAuth2Applications where owner_org = org:
+            app.name
+            app.client_id
+            app.confidential
+            app.redirect_uris
+
+    provides:
+        OwnerRegistersOAuth2Application(user, owner_user, org, name, redirect_uris, confidential)
+            when is_org_owner(user, org) and config.oauth2_enabled
+        OwnerUpdatesOAuth2Application(user, app, name, redirect_uris, confidential)
+            when is_org_owner(user, org)
+        OwnerRegeneratesClientSecret(user, app)
+            when is_org_owner(user, org)
+        OwnerDeletesOAuth2Application(user, app)
+            when is_org_owner(user, org)
+
+    @guidance
+        -- Web: /org/{org}/settings/applications(/oauth2/{id}...). Org owners only.
+}
+
+-- The consent screen of the OAuth2 provider.
+surface OAuth2Consent {
+    facing user: SignedInUser
+
+    context app: OAuth2Application
+
+    exposes:
+        app.name
+        app.owner_user.name
+        app.owner_org.name
+        app.is_instance_wide
+
+    provides:
+        UserRequestsAuthorization(user, app, redirect_uri, response_type, pkce_method, code_challenge, scopes, nonce)
+            when config.oauth2_enabled
+        UserGrantsConsent(user, app, redirect_uri, scopes, pkce_method, code_challenge, nonce)
+            when config.oauth2_enabled
+        UserDeniesConsent(user, app, redirect_uri)
+
+    @guidance
+        -- Web: /login/oauth/authorize, /login/oauth/grant.
+}
+
+-- Endpoints a registered client calls directly.
+surface OAuth2ClientEndpoints {
+    facing client: OAuth2Client
+
+    exposes:
+        client.client_id
+        config.oauth2_access_token_lifetime
+        for grant in client.grants:
+            grant.user.name
+            grant.scopes
+
+    provides:
+        ClientExchangesAuthorizationCode(client, client_secret_valid, code, code_verifier, redirect_uri)
+            when config.oauth2_enabled
+        ClientRefreshesToken(client, client_secret_valid, previous)
+            when config.oauth2_enabled
+
+    @guarantee IntrospectionNeedsClientCredentials
+        -- POST /login/oauth/introspect answers {active, scope, username, iss, aud, sub,
+        -- exp} only to a caller presenting valid client credentials via basic auth;
+        -- an invalid token yields active=false, never an error.
+
+    @guidance
+        -- /login/oauth/access_token, /login/oauth/introspect, /login/oauth/keys (JWKS),
+        -- /.well-known/openid-configuration (issuer = app URL, code flow only),
+        -- /login/oauth/userinfo (OAuth2 bearer only: sub, name, preferred_username,
+        -- email, picture, groups; groups omit private org memberships unless the grant
+        -- has read:organization / read:admin / all and additional grant scopes are on).
+}
+
+-- Whatever presents credentials on API, git-over-HTTP, LFS and package routes.
+surface RequestAuthentication {
+    facing caller: CredentialBearer
+
+    provides:
+        ClientPresentsPassword(caller, user, password, otp)
+            when config.enable_basic_auth
+        ClientPresentsAccessToken(caller, token)
+        ClientPresentsOAuth2AccessToken(caller, issuance)
+            when config.oauth2_enabled
+        ClientPresentsSignedRequest(caller, key, via_certificate)
+        ClientPresentsIntegrationJwt(caller, integration, claims)
+        AdminSudoes(admin, target)
+
+    @guarantee AccountGateApplies
+        -- Whatever the credential, an inactive (when e-mail confirmation is on), login-
+        -- prohibited, must-change-password or missing-required-2FA account is refused
+        -- with 403 and a reason; REQUIRE_SIGNIN_VIEW refuses anonymous API calls.
+
+    @guidance
+        -- Order of methods per route family:
+        --   API: OAuth2, HTTP signature, access token, Actions tokens, integration JWT,
+        --        password basic, reverse proxy (when enabled for the API).
+        --   git HTTP: OAuth2, access token, Actions tokens, integration JWT (basic too),
+        --        reverse proxy, password basic.
+        --   LFS: LFS token, OAuth2, access token (basic only), Actions task token (basic
+        --        only), integration JWT, reverse proxy, password basic.
+        --   web: reverse proxy (when enabled), session.
+}
+
+surface ReverseProxyBoundary {
+    facing proxy: TrustedReverseProxy
+
+    provides:
+        TrustedProxyAssertsUser(proxy, user, via_api)
+            when config.enable_reverse_proxy_auth
+        TrustedProxyRegistersUser(proxy, name, email, full_name)
+            when config.enable_reverse_proxy_auth and config.enable_reverse_proxy_auto_registration
+}
+
+-- The callback leg of an external sign-in.
+surface IdentityProviderCallback {
+    facing provider: IdentityProvider
+
+    context session: Session
+
+    exposes:
+        provider.name
+
+    provides:
+        ProviderReturnsIdentity(session, identity)
+
+    @guidance
+        -- /user/oauth2/{source}/callback. Supported providers include generic OpenID
+        -- Connect (discovery URL), GitHub, GitLab, Gitea/Forgejo, Bitbucket, Nextcloud,
+        -- Mastodon, Azure AD, Microsoft, Google, Discord, Twitter, Dropbox, Facebook,
+        -- Yandex; self-hosted ones accept custom auth/token/profile/email URLs.
+}
+
+surface AuthSourceAdministration {
+    facing admin: SiteAdmin
+
+    exposes:
+        for source in AuthSources:
+            source.name
+            source.kind
+            source.is_active
+            source.sync_enabled
+            source.in_use
+            source.created_at
+
+    provides:
+        AdminCreatesAuthSource(admin, name, kind, is_active, sync_enabled, settings)
+        AdminUpdatesAuthSource(admin, source, name, is_active, sync_enabled, settings)
+        AdminDeletesAuthSource(admin, source)
+        OwnerRegistersOAuth2Application(admin, owner_user, owner_org, name, redirect_uris, confidential)
+            when config.oauth2_enabled
+        OwnerUpdatesOAuth2Application(admin, app, name, redirect_uris, confidential)
+        OwnerDeletesOAuth2Application(admin, app)
+        UserCreatesAccessToken(admin, owner, name, scopes, public_only, all_repositories, repositories, via)
+        AdminRunsExternalUserSync(admin)
+
+    timeout:
+        ExternalUserSyncDue
+
+    @guidance
+        -- Web: /admin/auths, /admin/auths/new, /admin/auths/{id}, /admin/auths/{id}/delete,
+        -- /admin/applications(/oauth2/{id}...). Admin dashboard: "synchronise external
+        -- user data" runs ExternalUserSyncDue now. API: /admin/users/{username}/tokens.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred AccessToken.enforcement           -- see: access.allium (scope/public-only/repository reducers per endpoint)
+deferred ExternalGroupsAsserted.team_mapping -- see: organizations.allium (group_team_map, dynamic maps, removal)
+deferred ExternalGroupsAsserted.quota_mapping -- see: quota.allium (quota_group_map)
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Password-reset codes expire after ACTIVE_CODE_LIVE_MINUTES although RESET_PASSWD_CODE_LIVE_MINUTES is shown to the user; should reset codes honour reset_code_lifetime?"
+open question "OAuth2 authorization codes have a valid-until column that is never set, so codes never expire until used; the spec assumes a 10-minute lifetime — is that the intended behaviour?"
+open question "Sign-in does not refuse inactive accounts; they get a session that can only reach the activation page. Should an unconfirmed account rather be refused at sign-in?"
+open question "Password basic auth on the API is marked FIXME for removal; should the rebuild keep it (git clients rely on it) only for git/LFS routes?"
+open question "Signing out does not delete the remember-me record server-side (only the cookie); should sign-out revoke it?"
+open question "The mail throttle key is shared between activation resend and password reset, so one blocks the other for 3 minutes; intended?"
+open question "WebAuthn is a second factor only; should discoverable-credential (passkey) passwordless sign-in be specified for the rebuild?"
+open question "Account-link auto mode trusts an IdP-asserted e-mail or username to link to an existing local account; should this require the IdP's email_verified claim?"
+open question "A grant that exists with a different scope makes consent fail until the user revokes it; should a re-consent update the scope instead?"
+open question "Disabling TOTP is blocked when 2FA is required, but removing the last security key is not; should that be blocked too?"
+
+------------------------------------------------------------
+-- Requests to other modules
+------------------------------------------------------------
+-- REQUEST accounts/User.kind: individual | bot | ... — used to refuse password sign-in for non-individuals.
+-- REQUEST accounts/User.primary_email is writable (InactiveUserReplacesUnconfirmedEmail).
+-- REQUEST accounts/username_available(name): black-box check covering syntax, reserved names, cooldown, uniqueness.
+-- REQUEST accounts/email_available(email): black-box uniqueness check across all addresses.
+-- REQUEST accounts/user_count(): number of user accounts (first account becomes admin).
+-- REQUEST accounts/user_by_name_or_email(name, email): lookup for account-link auto mode.
+-- REQUEST accounts: react to EmailConfirmationLinkFollowed(user, email), AccountActivated(user), ExternalAvatarAsserted(user, url), ExternalAdminFlagsAsserted(user, is_admin, is_restricted).
+-- REQUEST accounts: your CreateAccountBySelfRegistration(AccountRegistrationAccepted) duplicates VisitorRegisters / ProviderIdentityAutoRegisters / ExternalPasswordSourceProvisionsUser / TrustedProxyRegistersUser / LdapSourceSynchronised, which create accounts/User directly because the same act must bind the session and UserLogin to the new account; integration should keep one creation path (account defaults such as visibility and keep_email_private can stay in accounts as a reaction to UserSignedUp). Both modules currently declare UserSignedUp(user).
+-- REQUEST accounts: User.login_source duplicates authentication/UserLogin.source; keep one (UserLogin also carries login_name and must_change_password).
+-- REQUEST accounts/EmailActivationRequested(user, address): authentication issues the EmailVerificationCode the mail links to (IssueEmailConfirmationCode); notifications reacts to the accounts trigger, so EmailConfirmationRequested(user, email, code) carries the code it needs.
+-- REQUEST accounts: UserLogin is created by authentication for self-registration; administration's "admin creates user" must create a UserLogin (with must_change_password) too.
+-- REQUEST organizations: react to ExternalGroupsAsserted(user, source, groups) per the source's group_team_map / dynamic maps; react to AuthSourceDeleted(source) by clearing membership provenance.
+-- REQUEST organizations/is_owner(user, org) — used here as is_org_owner(user, org).
+-- REQUEST quota: react to ExternalGroupsAsserted for quota-group mapping.
+-- REQUEST keys/SshKey.owner: accounts/User — the key an HTTP signature is verified against; react to ExternalSshKeysAsserted(user, source, keys) (source-managed keys).
+-- REQUEST access: consume RequestAuthenticated(user, method) and the token's scopes / public_only / repositories to reduce permissions; access/can_read(user, repository, unit).
+-- REQUEST notifications: send mail for ActivationEmailRequested, EmailConfirmationRequested, PasswordResetRequested, PasswordChanged, TotpEnrolled, TotpDisabled, SecurityKeyRemoved; push "logout" on UserSignedOut.
+-- REQUEST administration: InstanceStarted() trigger; the sync_external_users cron task maps to ExternalUserSyncJob.

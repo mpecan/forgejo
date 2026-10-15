@@ -1,0 +1,535 @@
+-- Journeys through authentication.allium: registration, sign-in, second factors,
+-- recovery, tokens, the OAuth2 provider, external sources and the directory sync.
+--
+-- Every journey runs on the instance defaults (open registration, no e-mail
+-- confirmation, no mailer, OAuth2 provider enabled), because a journey cannot change
+-- configuration.
+
+journey SomebodyRegistersOnAnOpenInstance {
+    goal: On a default instance anyone may sign up. Ada fills in the form, her account
+          is usable straight away and she is signed in; later she signs out.
+
+    cast:
+        s: Session
+
+    given:
+        s.status = anonymous
+
+    1. she fills in the sign-up form
+        stipulate email_domain_allowed("ada@example.com") = true
+        stipulate password_acceptable("correct horse battery") = true
+        stipulate username_available("ada") = true
+        stipulate email_available("ada@example.com") = true
+        stipulate user_count() = 3
+        s does VisitorRegisters(s, "ada", "ada@example.com", "correct horse battery") on SignInPage
+            creating login: UserLogin
+        then VisitorRegisters fires
+        then login.source = null
+        then login.has_password = true
+        then login.must_change_password = false
+        then s.status = authenticated
+        then s.authenticated_via = password_login
+
+    2. she signs out again
+        s does UserSignsOut(s) on SecuritySettings
+        then UserSignsOut fires
+        then s.status = destroyed
+
+    ends: Ada has an active account and her browser session is gone.
+}
+
+journey AWeakPasswordIsRefusedAtSignUp {
+    goal: The password policy (length, character classes, breach list) is checked
+          before any account exists.
+
+    cast:
+        s: Session
+
+    given:
+        s.status = anonymous
+
+    1. bob tries a password that is too weak
+        stipulate email_domain_allowed("bob@example.com") = true
+        stipulate password_acceptable("1234") = false
+        stipulate username_available("bob") = true
+        stipulate email_available("bob@example.com") = true
+        s cannot do VisitorRegisters(s, "bob", "bob@example.com", "1234") on SignInPage
+        then s.status = anonymous
+
+    ends: No account was created and bob is still anonymous.
+}
+
+journey AnActivationLinkActivatesTheAccount {
+    goal: An account waiting for confirmation is activated by the mailed link; the user
+          re-enters their password so a forwarded link alone is not enough. The link
+          works once.
+
+    cast:
+        s:     Session
+        other: Session
+        ada:   accounts/User
+
+    given:
+        s.status = anonymous
+        other.status = anonymous
+        ada.is_active = false
+        ada.prohibit_login = false
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+        code: EmailVerificationCode { user: ada, purpose: user_activation, email: "ada@example.com", status: pending }
+
+    1. she follows the link and types her password
+        stipulate password_matches(ada, "correct horse battery") = true
+        s does UserActivatesAccount(s, code, "correct horse battery") on MailedCodeLanding
+        then UserActivatesAccount fires
+        then code.status = used
+        then ada.is_active = true
+        then s.status = authenticated
+        then s.user = ada
+
+    2. the same link cannot be used a second time
+        other cannot do UserActivatesAccount(other, code, "correct horse battery") on MailedCodeLanding
+
+    ends: Ada is active and signed in; the code is spent.
+}
+
+journey SignInWithAnAuthenticatorApp {
+    goal: Ada has TOTP enrolled. Her password only gets her half way; the passcode
+          from her app completes the sign-in, and the same passcode cannot be replayed.
+
+    cast:
+        s:   Session
+        eve: Session
+        ada: accounts/User
+
+    given:
+        s.status = anonymous
+        eve.status = anonymous
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.kind = individual
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+        totp: TwoFactor { user: ada, last_used_passcode: null, scratch_code_generation: 1 }
+
+    1. the password is right, so a second factor is asked for
+        stipulate password_matches(ada, "correct horse battery") = true
+        s does VisitorSignsInWithPassword(s, ada, "correct horse battery", false) on SignInPage
+        then VisitorSignsInWithPassword fires
+        then s.status = pending_second_factor
+        then s.pending_user = ada
+
+    2. the passcode from her app finishes it
+        stipulate totp_valid(totp, "492039") = true
+        s does VisitorCompletesTotpChallenge(s, "492039") on SecondFactorChallenge
+        then VisitorCompletesTotpChallenge fires
+        then s.status = authenticated
+        then s.user = ada
+        then totp.last_used_passcode = "492039"
+
+    3. somebody who shoulder-surfed both cannot reuse that passcode
+        eve does VisitorSignsInWithPassword(eve, ada, "correct horse battery", false) on SignInPage
+        then eve.status = pending_second_factor
+        eve cannot do VisitorCompletesTotpChallenge(eve, "492039") on SecondFactorChallenge
+        then eve.status = pending_second_factor
+
+    ends: Ada is signed in; the eavesdropper is stuck at the second-factor step.
+}
+
+journey TheScratchCodeIsARecoveryCodeThatWorksOnce {
+    goal: Ada lost her phone. The scratch code gets her in once and is replaced.
+
+    cast:
+        s:   Session
+        ada: accounts/User
+
+    given:
+        s.status = anonymous
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.kind = individual
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+        totp: TwoFactor { user: ada, last_used_passcode: null, scratch_code_generation: 1 }
+
+    1. password first
+        stipulate password_matches(ada, "correct horse battery") = true
+        s does VisitorSignsInWithPassword(s, ada, "correct horse battery", false) on SignInPage
+        then s.status = pending_second_factor
+
+    2. then the scratch code
+        stipulate scratch_code_valid(totp, "K7QF9PXA2M") = true
+        s does VisitorUsesScratchCode(s, "K7QF9PXA2M") on SecondFactorChallenge
+        then VisitorUsesScratchCode fires
+        then s.status = authenticated
+        then totp.scratch_code_generation = 2
+
+    ends: Ada is in and has a new scratch code to write down.
+}
+
+journey RememberMeLapsesAfterAMonth {
+    goal: Ticking "remember me" keeps Ada signed in across browser restarts, but only
+          for LOGIN_REMEMBER_DAYS; after that she has to sign in again.
+
+    cast:
+        s:     Session
+        later: Session
+        ada:   accounts/User
+
+    given:
+        s.status = anonymous
+        later.status = anonymous
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.kind = individual
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+
+    1. she signs in and asks to be remembered
+        stipulate password_matches(ada, "correct horse battery") = true
+        s does VisitorSignsInWithPassword(s, ada, "correct horse battery", true) on SignInPage
+            creating lta: LongTermAuthorization
+        then s.status = authenticated
+        then lta.status = active
+        then lta.user = ada
+
+    2. thirty-two days pass
+        after 32.days
+        then LongTermAuthorizationExpires fires
+        then lta.status = expired
+
+    3. the old cookie no longer signs her in
+        later cannot do VisitorResumesWithRememberMe(later, lta) on SignInPage
+        then later.status = anonymous
+
+    ends: The remember-me credential is dead; Ada must sign in with her password.
+}
+
+journey IdleSessionsEnd {
+    goal: A browser session that sees no activity for SESSION_LIFE_TIME is discarded.
+
+    cast:
+        s:   Session
+        ada: accounts/User
+
+    given:
+        s.status = anonymous
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.kind = individual
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+
+    1. ada signs in without "remember me"
+        stipulate password_matches(ada, "correct horse battery") = true
+        s does VisitorSignsInWithPassword(s, ada, "correct horse battery", false) on SignInPage
+        then s.status = authenticated
+
+    2. she leaves the tab for a day and a bit
+        after 25.hours
+        then SessionExpires fires
+        then s.status = destroyed
+
+    ends: The session is gone; the next request is anonymous.
+}
+
+journey PasswordRecoveryNeedsAMailer {
+    goal: Without an outgoing mail service the forge cannot prove an address belongs to
+          somebody, so "forgot password" is unavailable.
+
+    cast:
+        s:   Session
+        ada: accounts/User
+
+    given:
+        s.status = anonymous
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+
+    1. she asks for a reset mail
+        s cannot do VisitorRequestsPasswordReset(s, ada) on SignInPage
+
+    ends: Nothing was mailed; an administrator has to reset the password.
+}
+
+journey ARecoveryLinkResetsThePasswordAndForgetsOldDevices {
+    goal: Ada follows a password-reset link. Setting the new password signs her in and
+          revokes every remember-me cookie issued under the old password.
+
+    cast:
+        s:   Session
+        ada: accounts/User
+
+    given:
+        s.status = anonymous
+        s.user = null
+        ada.is_active = true
+        ada.prohibit_login = false
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: true }
+        code: EmailVerificationCode { user: ada, purpose: password_reset, email: "ada@example.com", status: pending }
+        laptop: LongTermAuthorization { user: ada, sso_source: null, status: active }
+
+    1. she chooses a new password
+        stipulate password_acceptable("a much better passphrase") = true
+        s does VisitorResetsPassword(s, code, "a much better passphrase", null, null) on MailedCodeLanding
+        then VisitorResetsPassword fires
+        then code.status = used
+        then login.must_change_password = false
+        then laptop.status = revoked
+        then s.status = authenticated
+        then s.user = ada
+
+    ends: Only the browser she just used is signed in.
+}
+
+journey APersonalAccessTokenForTheCommandLine {
+    goal: Ada makes a token for her scripts, sees only its last eight characters
+          afterwards, cannot reuse the name, and Bob never sees it.
+
+    cast:
+        ada: accounts/User
+        bob: accounts/User
+
+    given:
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.is_admin = false
+        bob.is_active = true
+        bob.prohibit_login = false
+        bob.is_admin = false
+
+    1. she creates a read-only repository token from the settings page
+        stipulate secret_suffix() = "9f3c1a7e"
+        ada does UserCreatesAccessToken(ada, ada, "ci", {read_repository}, false, true, {}, session) on ApplicationSettings
+            creating token: AccessToken
+        then UserCreatesAccessToken fires
+        then token.owner = ada
+        then token.all_repositories = true
+        then token.last_eight = "9f3c1a7e"
+        ada sees token.last_eight on ApplicationSettings
+
+    2. a second token with the same name is refused
+        ada cannot do UserCreatesAccessToken(ada, ada, "ci", {write_issue}, false, true, {}, session) on ApplicationSettings
+
+    3. bob cannot see it
+        bob cannot see token.last_eight on ApplicationSettings
+
+    4. she deletes it
+        ada does UserDeletesAccessToken(ada, token, session) on ApplicationSettings
+        then token does not exist
+
+    ends: The token is gone.
+}
+
+journey ATokenCannotMintAnotherToken {
+    goal: Token creation needs proof of the password (or the trusted proxy); a leaked
+          token cannot be used to make more tokens. Repository-specific tokens may not
+          be public-only.
+
+    cast:
+        ada:  accounts/User
+        repo: repositories/Repository
+
+    given:
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.is_admin = false
+
+    1. a script authenticated with a token asks for a new token for ada
+        ada cannot do UserCreatesAccessToken(ada, ada, "more", {write_repository}, false, true, {}, access_token) on ApplicationSettings
+
+    2. a repository-specific token that is also public-only is refused
+        stipulate access/can_read(ada, repo, code) = true
+        ada cannot do UserCreatesAccessToken(ada, ada, "narrow", {read_repository}, true, false, {repo}, session) on ApplicationSettings
+
+    ends: No tokens were created.
+}
+
+journey AnAppSignsInWithTheForgeUsingPkce {
+    goal: A public client (a desktop app) asks Ada for access. She consents, the app
+          swaps the code — with its PKCE verifier — for tokens, refreshes once, and a
+          replayed refresh token is refused.
+
+    cast:
+        ada: accounts/User
+        app: OAuth2Application
+
+    given:
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.kind = individual
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+        app.owner_user = null
+        app.owner_org = null
+        app.builtin = null
+        app.confidential = false
+        app.client_id = "d5a1"
+
+    1. she is asked to consent
+        stipulate redirect_uri_registered(app, "loopback-callback") = true
+        ada does UserRequestsAuthorization(ada, app, "loopback-callback", "code", s256, "E9Melhoa2Owv", {"openid", "profile"}, null) on OAuth2Consent
+        then UserRequestsAuthorization fires
+
+    2. she approves and the app receives a code
+        ada does UserGrantsConsent(ada, app, "loopback-callback", {"openid", "profile"}, s256, "E9Melhoa2Owv", null) on OAuth2Consent
+            creating code: OAuth2AuthorizationCode
+        then UserGrantsConsent fires
+        then code.status = issued
+        then code.pkce_method = s256
+
+    3. the app exchanges code and verifier for tokens
+        stipulate pkce_verifier_matches(code, "dBjftJeZ4CVP") = true
+        app does ClientExchangesAuthorizationCode(app, false, code, "dBjftJeZ4CVP", "loopback-callback") on OAuth2ClientEndpoints
+            creating first: OAuth2TokenIssuance
+        then ClientExchangesAuthorizationCode fires
+        then code.status = redeemed
+        then first.includes_id_token = true
+
+    4. the code cannot be exchanged twice
+        app cannot do ClientExchangesAuthorizationCode(app, false, code, "dBjftJeZ4CVP", "loopback-callback") on OAuth2ClientEndpoints
+
+    5. an hour later it refreshes
+        after 2.hours
+        app does ClientRefreshesToken(app, false, first) on OAuth2ClientEndpoints
+            creating second: OAuth2TokenIssuance
+        then ClientRefreshesToken fires
+
+    6. presenting the first refresh token again is refused
+        app cannot do ClientRefreshesToken(app, false, first) on OAuth2ClientEndpoints
+
+    ends: The app holds one live token pair; the earlier refresh token is dead.
+}
+
+journey AuthorizationCodesAreShortLived {
+    goal: A confidential client that already holds Ada's grant gets a code without a
+          consent screen, but if it does not redeem the code promptly the code expires.
+
+    cast:
+        ada: accounts/User
+        app: OAuth2Application
+
+    given:
+        ada.is_active = true
+        ada.prohibit_login = false
+        app.owner_user = null
+        app.owner_org = null
+        app.builtin = null
+        app.confidential = true
+        app.client_id = "c0ff"
+        grant: OAuth2Grant { user: ada, application: app, scopes: {"openid"}, nonce: null, counter: 1 }
+
+    1. she visits the authorize endpoint again
+        stipulate redirect_uri_registered(app, "ci-callback") = true
+        ada does UserRequestsAuthorization(ada, app, "ci-callback", "code", none, null, {"openid"}, null) on OAuth2Consent
+            creating code: OAuth2AuthorizationCode
+        then code.status = issued
+        then code.grant = grant
+
+    2. the client sits on it for a quarter of an hour
+        after 15.minutes
+        then AuthorizationCodeExpires fires
+        then code.status = expired
+
+    3. it is too late to redeem
+        stipulate pkce_verifier_matches(code, null) = true
+        app cannot do ClientExchangesAuthorizationCode(app, true, code, null, "ci-callback") on OAuth2ClientEndpoints
+
+    ends: No tokens were issued from the stale code.
+}
+
+journey AnAdministratorConnectsTheCompanyDirectory {
+    goal: Root adds an LDAP source; an ordinary user cannot; a source that accounts
+          still sign in through cannot be deleted.
+
+    cast:
+        root:   accounts/User
+        mallory: accounts/User
+        ada:    accounts/User
+        legacy: AuthSource
+
+    given:
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+        mallory.is_admin = false
+        mallory.is_active = true
+        mallory.prohibit_login = false
+        legacy.name = "legacy-ldap"
+        legacy.kind = ldap_bind_dn
+        legacy.is_active = true
+        legacy.sync_enabled = false
+        login: UserLogin { user: ada, source: legacy, login_name: "ada", has_password: false, must_change_password: false }
+
+    1. root creates a sync-enabled LDAP source
+        root does AdminCreatesAuthSource(root, "corp-ldap", ldap_bind_dn, true, true, legacy.settings) on AuthSourceAdministration
+            creating corp: AuthSource
+        then AdminCreatesAuthSource fires
+        then corp.sync_enabled = true
+        then corp.is_active = true
+
+    2. a non-admin cannot
+        mallory cannot do AdminCreatesAuthSource(mallory, "shadow", smtp, true, false, legacy.settings) on AuthSourceAdministration
+
+    3. the legacy source is still used by ada's account, so it stays
+        stipulate legacy.in_use = true
+        root cannot do AdminDeletesAuthSource(root, legacy) on AuthSourceAdministration
+        then legacy exists
+
+    ends: The new source is active; the legacy one is untouched.
+}
+
+journey TheDirectorySyncDeactivatesPeopleWhoLeft {
+    goal: When an LDAP entry disappears, the next synchronisation deactivates the
+          matching local account.
+
+    cast:
+        root: accounts/User
+        ada:  accounts/User
+        bob:  accounts/User
+        corp: AuthSource
+
+    given:
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+        ada.is_active = true
+        corp.name = "corp-ldap"
+        corp.kind = ldap_bind_dn
+        corp.is_active = true
+        corp.sync_enabled = true
+        login: UserLogin { user: ada, source: corp, login_name: "ada", has_password: false, must_change_password: false }
+        bob_login: UserLogin { user: bob, source: corp, login_name: "bob", has_password: false, must_change_password: false }
+        bob_entry: DirectoryEntry { source: corp, username: "bob", email: "bob@corp.example", is_admin: false, is_restricted: false }
+
+    1. root runs the synchronisation from the dashboard
+        root does AdminRunsExternalUserSync(root) on AuthSourceAdministration
+        then AdminRunsExternalUserSync fires
+        then LdapSourceSynchronised fires
+        then ada.is_active = false
+        then bob.is_active = true
+
+    ends: Ada's account is inactive; she can no longer sign in or use tokens.
+}
+
+journey PasswordBasicAuthIsRefusedOnceASecurityKeyIsEnrolled {
+    goal: A security key makes the password insufficient for scripts too: basic auth
+          with the password is refused and a token must be used instead.
+
+    cast:
+        req: ClientRequest
+        ada: accounts/User
+
+    given:
+        req.carries_credentials = true
+        req.via_trusted_proxy = false
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.kind = individual
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+        key: WebAuthnCredential { user: ada, name: "yubikey", sign_count: 7 }
+        token: AccessToken { owner: ada, name: "git", scopes: {write_repository}, public_only: false, all_repositories: true }
+
+    1. git sends ada's password
+        stipulate password_matches(ada, "correct horse battery") = true
+        req cannot do ClientPresentsPassword(req, ada, "correct horse battery", null) on RequestAuthentication
+
+    2. git sends her token instead
+        req does ClientPresentsAccessToken(req, token) on RequestAuthentication
+        then ClientAuthenticatesWithAccessToken fires
+
+    ends: The request is authenticated as ada through the token, never the password.
+}
