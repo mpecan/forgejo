@@ -1,0 +1,1915 @@
+-- allium: 3
+-- packages.allium — the package registry: per-owner registries of typed packages, versions, files and deduplicated blobs.
+--
+-- Scope: everything a user or organisation can publish to, download from and
+--   administer in the built-in package registry, across all 23 supported
+--   package kinds, plus the background housekeeping that keeps it tidy.
+-- Includes:
+--   - OwnerRegistry (the per-user / per-organisation package namespace), its
+--     access derivation, its per-kind signing keys and Cargo git index
+--   - Package, PackageVersion, PackageFile, PackageBlob (content addressed,
+--     deduplicated across the whole instance), package/version/file properties
+--     and metadata extracted from uploads
+--   - KindPolicy: the per-kind behaviour table (version immutability, file
+--     overwrite, repository indexes, signing, size limits, endpoint roots)
+--   - publishing (generic path, additive versions, file overwrite), container
+--     (OCI) chunked blob uploads, blob mounting, manifests, tags vs digests,
+--     image auto-linking to repositories
+--   - kind-specific state changes that are not wire-protocol details: Cargo
+--     yank / unyank, npm dist-tags, RPM / Arch server-side signing,
+--     Debian / Alpine / RPM / Arch / ALT repository index regeneration,
+--     Chef client public keys, container registry bearer tokens
+--   - linking / unlinking a package to a repository, the repository
+--     "packages" tab
+--   - download counting, deletion of versions / files / whole packages
+--   - CleanupRule (keep count, keep pattern, last-download windows, remove
+--     age, remove pattern, full-name matching, enable/disable, preview) and
+--     the scheduled cleanup task, expired-data purge
+--   - instance limits LIMIT_TOTAL_OWNER_COUNT, LIMIT_TOTAL_OWNER_SIZE,
+--     LIMIT_SIZE_<KIND>, DEFAULT_RPM_SIGN_ENABLED, ENABLED
+--   - owner package settings pages, site-admin package overview
+-- Excludes:
+--   - the per-ecosystem wire protocols (URL layouts, JSON/XML/tar formats,
+--     client handshakes): implementation detail of each client adapter; only
+--     endpoint roots are listed in @guidance on the client surfaces
+--   - storage backend selection (STORAGE_TYPE, MINIO_*), CHUNKED_UPLOAD_PATH,
+--     serve-direct redirects: infrastructure
+--   - the "container.repository" owner-name property rewrite on user rename:
+--     a denormalisation; image coordinates are always derived from the
+--     owner's current name
+--   - the v1.20 "blob missing from storage" self-heal in container uploads,
+--     Conan v1 / v2 API duality, NuGet v2 OData feeds, the Gitea-compatible
+--     `/api/packages` vs `/api/v1/packages` naming: legacy / compatibility
+--   - quota groups and rules (owned by `quota`); this module only asks quota
+--     whether the owner may store more package data
+--   - token issuance and scopes (owned by `authentication`); this module only
+--     states which scope a request needs
+-- Emits:
+--   - PackageVersionCreated(version, publisher)        -- a new version became visible
+--                                                  -- (incl. every container manifest push)
+--   - PackageVersionDeleted(version, actor) -- a visible version was removed by a person
+--   (webhooks, actions `on: package`, notifications react to these)
+-- Reacts to:
+--   - repositories/RepositoryDeleted(repository, doer) -- unlink all packages linked to it
+--   - accounts/UserPurged(user)                    -- remove everything in the user's registry
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./repositories.allium" as repositories
+use "./access.allium" as access
+use "./authentication.allium" as authentication
+use "./quota.allium" as quota
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+given {
+    cleanup_schedule: PackageCleanupSchedule
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A name/value pair attached to a package, version or file. Several
+-- properties may share a name (e.g. npm dist-tags, container manifest
+-- references). Properties are how per-kind facts (distribution, component,
+-- architecture, group, provider, yanked flag, digests ...) are recorded and
+-- queried; the UI shows them on the version page.
+-- from: models/packages/package_property.go:30
+value PackageProperty {
+    name: String
+    value: String
+}
+
+-- Metadata extracted from the uploaded artefact (pom.xml, package.json,
+-- .nuspec, METADATA, control file, Chart.yaml, image config ...). The common
+-- shape below is what the UI renders; each kind keeps its full document in
+-- `kind_document`.
+-- from: modules/packages/npm/metadata.go:1
+value PackageMetadata {
+    description: String?
+    readme: String?
+    license: String?
+    project_url: String?
+    repository_url: String?
+    authors: Set<String>
+    keywords: Set<String>
+    dependencies: Set<String>
+    kind_document: String
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Every supported package kind.
+-- from: models/packages/package.go:31
+enum PackageKind {
+    alpine | alt | arch | cargo | chef | composer | conan | conda | container
+    | cran | debian | generic | go | helm | maven | npm | nuget | pub | pypi
+    | rpm | rubygems | swift | vagrant
+}
+
+-- How a kind treats an upload naming an existing version.
+--   immutable  : a version is published once, complete; re-publishing it is refused
+--   additive   : further files may be added to an existing version
+--   reference  : (container) a tag or digest reference is re-pointed by a new push
+enum VersionMode { immutable | additive | reference }
+
+-- How a kind treats an upload naming a file the version already has.
+--   refuse          : conflict
+--   replace         : the new content replaces the old file
+--   replace_metadata: only registry-metadata files (maven-metadata.xml and its
+--                     checksums) are replaced; other files are refused
+enum FileOverwrite { refuse | replace | replace_metadata }
+
+-- Server-held key used to sign a kind's repository metadata.
+enum SigningScheme { none | pgp | rsa }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The package namespace of one user or one organisation. Exactly one exists
+-- per owner; it comes into being with the owner and is never created by a
+-- rule here. All packages, cleanup rules, signing keys and the Cargo index
+-- of that owner hang off it.
+-- from: services/context/package.go:16
+entity OwnerRegistry {
+    owner_user: accounts/User?
+    owner_org: organizations/Organization?
+
+    packages: Package with registry = this
+    cleanup_rules: CleanupRule with registry = this
+    signing_keys: RegistrySigningKey with registry = this
+    repository_indexes: RepositoryIndex with registry = this
+    container_uploads: ContainerUploadedBlob with registry = this
+    cargo_index: CargoIndex with registry = this
+
+    visible_packages: packages where is_internal = false
+
+    -- Number of non-internal versions across all packages of this owner.
+    visible_version_count: visible_version_count_of(this)
+    -- Sum of the sizes of the files of all versions (internal included) of
+    -- this owner. Shared blobs are counted once per file referencing them.
+    stored_size: stored_size_of(this)
+
+    owner_is_org: owner_org != null
+    has_packages: visible_version_count > 0
+}
+
+-- Behaviour of one package kind. One default instance exists per kind
+-- (see Defaults); rules consult it with KindPolicy{kind: k}.
+-- from: services/packages/packages.go:366
+entity KindPolicy {
+    kind: PackageKind
+    display_name: String
+    version_mode: VersionMode
+    file_overwrite: FileOverwrite
+    -- Package names compare case-insensitively except where this is true.
+    name_case_sensitive: Boolean
+    -- Owner-wide index files (APKINDEX, Packages/Release, repodata, pacman db)
+    -- are regenerated after every change.
+    has_repository_index: Boolean
+    signing: SigningScheme
+    -- Maximum bytes of a single uploaded file; -1 means unlimited.
+    size_limit: Integer
+    -- Root under which the client protocol for this kind is served,
+    -- relative to the instance URL; {owner} is the registry owner's name.
+    endpoint_root: String
+}
+
+-- A named package of one kind in one registry.
+-- from: models/packages/package.go:190
+entity Package {
+    registry: OwnerRegistry
+    kind: PackageKind
+    name: String
+    -- Whether versions sort by semantic version (npm, helm, cargo ...).
+    semver_compatible: Boolean
+    -- Internal packages hold registry machinery (repository index files) and
+    -- are never listed, counted or individually addressable by users.
+    is_internal: Boolean
+    linked_repository: repositories/Repository?
+    properties: Set<PackageProperty>
+    -- convenience views used by webhooks / actions payloads
+    repository: linked_repository
+    owner_user: registry.owner_user
+    owner_org: registry.owner_org
+    -- container only: auto-linking is attempted once, on the first manifest
+    -- push after creation
+    autolink_pending: Boolean
+
+    versions: PackageVersion with package = this
+    visible_versions: versions where is_internal = false
+    has_versions: versions.count > 0
+    latest_version: latest_of(visible_versions)
+}
+
+-- One version of a package. Has no lifecycle status: it exists until it is
+-- deleted (by a person, a cleanup rule, or owner purge).
+-- from: models/packages/package_version.go:29
+entity PackageVersion {
+    package: Package
+    creator: accounts/User
+    version: String
+    created_at: Timestamp
+    is_internal: Boolean
+    metadata: PackageMetadata?
+    properties: Set<PackageProperty>
+    download_count: Integer
+    last_downloaded_at: Timestamp?
+
+    -- container: true when the reference pushed was a tag (not a digest)
+    is_tagged: Boolean
+    -- cargo: a yanked version stays downloadable but is excluded from
+    -- dependency resolution in the index
+    is_yanked: Boolean
+    -- npm: dist-tags pointing at this version (a tag points at one version
+    -- of a package at a time)
+    dist_tags: Set<String>
+
+    files: PackageFile with version = this
+    total_size: size_sum_of(files)
+    -- container digest-named versions not referenced by any image index and
+    -- not tagged
+    is_dangling_container_digest: dangling_digest_check(this)
+}
+
+-- One file of a version. The (version, name, composite_key) triple is unique.
+-- composite_key scopes a file inside a version: Debian "distribution|component",
+-- RPM / ALT group, Conan recipe/package revision, Arch distribution ...
+-- from: models/packages/package_file.go:34
+entity PackageFile {
+    version: PackageVersion
+    blob: PackageBlob
+    name: String
+    composite_key: String?
+    -- The file that represents the version (the .deb, the .tgz, the .nupkg,
+    -- the .pom ...). Only lead-file downloads count as version downloads.
+    is_lead: Boolean
+    created_at: Timestamp
+    properties: Set<PackageProperty>
+}
+
+-- Content-addressed bytes, stored once per distinct content across the
+-- whole instance and shared by every file with that content.
+-- from: models/packages/package_blob.go:30
+entity PackageBlob {
+    size: Integer
+    hash_md5: String
+    hash_sha1: String
+    hash_sha256: String
+    hash_sha512: String
+    hash_blake2b: String
+    created_at: Timestamp
+
+    files: PackageFile with blob = this
+    is_referenced: files.count > 0
+}
+
+-- An in-progress chunked container blob upload (OCI upload session).
+-- from: models/packages/package_blob_upload.go:24
+entity BlobUpload {
+    registry: OwnerRegistry
+    image: String
+    bytes_received: Integer
+    created_at: Timestamp
+    updated_at: Timestamp
+}
+
+-- A blob pushed (or mounted) into an image of a registry that no manifest
+-- references yet. Manifests may only reference blobs that are known here or
+-- already part of the image.
+-- from: services/packages/container/blob.go:49
+entity ContainerUploadedBlob {
+    registry: OwnerRegistry
+    image: String
+    blob: PackageBlob
+    uploaded_at: Timestamp
+}
+
+-- Per-owner, per-kind retention policy. At most one per (owner, kind).
+-- from: models/packages/package_cleanup_rule.go:25
+entity CleanupRule {
+    registry: OwnerRegistry
+    kind: PackageKind
+    enabled: Boolean
+    keep_count: Integer
+    keep_pattern: String
+    keep_last_download_days: Integer
+    remove_days: Integer
+    remove_last_download_days: Integer
+    remove_pattern: String
+    match_full_name: Boolean
+    created_at: Timestamp
+    updated_at: Timestamp
+
+    -- The versions the rule would delete if it ran now (see guidance on
+    -- ApplyCleanupRule for the algorithm). The preview page shows these.
+    targets: cleanup_targets_of(this)
+}
+
+-- Key pair a registry uses to sign its repository metadata for one kind
+-- (Debian Release, Alpine APKINDEX, RPM repomd / packages, Arch databases /
+-- packages). Generated on first need and kept forever.
+-- from: services/packages/debian/repository.go:42
+entity RegistrySigningKey {
+    registry: OwnerRegistry
+    kind: PackageKind
+    scheme: SigningScheme
+    public_key: String
+    created_at: Timestamp
+}
+
+-- Owner-wide index files for an indexed kind, for one scope
+-- (Debian distribution/component/architecture, Alpine branch/repository/
+-- architecture, RPM / ALT group, Arch distribution/architecture).
+-- from: services/packages/debian/repository.go:101
+entity RepositoryIndex {
+    registry: OwnerRegistry
+    kind: PackageKind
+    scope: String
+    built_at: Timestamp
+}
+
+-- The Cargo sparse/git index of a registry: a git repository named
+-- `_cargo-index` in the owner's namespace holding one file per crate plus
+-- config.json (download URL, auth-required = owner not public).
+-- from: services/packages/cargo/index.go:51
+entity CargoIndex {
+    registry: OwnerRegistry
+    repository_name: String
+    built_at: Timestamp
+}
+
+-- RSA public key a user registers for Chef client request signing.
+-- from: routers/web/user/setting/packages.go:103
+entity ChefClientKey {
+    user: accounts/User
+    public_key: String
+    created_at: Timestamp
+}
+
+-- Short-lived bearer token issued to container clients (docker login).
+-- from: services/packages/auth.go:28
+entity RegistryBearerToken {
+    -- null for an anonymous pull token
+    user: accounts/User?
+    scope: String?
+    issued_at: Timestamp
+    expires_at: Timestamp
+}
+
+-- The single schedule of the `cleanup_packages` cron task.
+-- from: services/cron/tasks_basic.go:145
+entity PackageCleanupSchedule {
+    next_run_at: Timestamp
+    last_run_at: Timestamp?
+    is_due: next_run_at <= now
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [packages] ENABLED: the whole registry (client endpoints, UI, API)
+    packages_enabled: Boolean = true
+    -- [service] REQUIRE_SIGNIN_VIEW, owned by access
+    require_signin_view: Boolean = access/config.require_signin_view
+    -- [packages] LIMIT_TOTAL_OWNER_COUNT: max visible versions per owner, -1 unlimited
+    limit_total_owner_count: Integer = -1
+    -- [packages] LIMIT_TOTAL_OWNER_SIZE: max bytes stored per owner, -1 unlimited
+    limit_total_owner_size: Integer = -1
+    -- [packages] LIMIT_SIZE_<KIND>: max bytes of one uploaded file, -1 unlimited
+    limit_size_alpine: Integer = -1
+    limit_size_alt: Integer = -1
+    limit_size_arch: Integer = -1
+    limit_size_cargo: Integer = -1
+    limit_size_chef: Integer = -1
+    limit_size_composer: Integer = -1
+    limit_size_conan: Integer = -1
+    limit_size_conda: Integer = -1
+    limit_size_container: Integer = -1
+    limit_size_cran: Integer = -1
+    limit_size_debian: Integer = -1
+    limit_size_generic: Integer = -1
+    limit_size_go: Integer = -1
+    limit_size_helm: Integer = -1
+    limit_size_maven: Integer = -1
+    limit_size_npm: Integer = -1
+    limit_size_nuget: Integer = -1
+    limit_size_pub: Integer = -1
+    limit_size_pypi: Integer = -1
+    limit_size_rpm: Integer = -1
+    limit_size_rubygems: Integer = -1
+    limit_size_swift: Integer = -1
+    limit_size_vagrant: Integer = -1
+    -- [packages] DEFAULT_RPM_SIGN_ENABLED: sign every uploaded RPM with the
+    -- owner's RPM key even when the uploader did not ask for it
+    default_rpm_sign_enabled: Boolean = false
+    -- [cron.cleanup_packages] ENABLED / RUN_AT_START / SCHEDULE / OLDER_THAN
+    cleanup_enabled: Boolean = true
+    cleanup_run_at_start: Boolean = true
+    cleanup_interval: Duration = 1.day
+    cleanup_older_than: Duration = 24.hours
+    -- lifetime of container registry bearer tokens (capped by the lifetime of
+    -- the credential used to obtain them)
+    registry_token_lifetime: Duration = 24.hours
+    -- [ui] PACKAGES_PAGING_NUM
+    packages_paging_num: Integer = 20
+    -- page size cap of the container catalog / tag list
+    container_list_max: Integer = 100
+}
+
+------------------------------------------------------------
+-- Defaults
+------------------------------------------------------------
+
+-- from: routers/api/packages/api.go:200 (endpoint roots) and the Create* call per kind
+default KindPolicy alpine_policy = { kind: alpine, display_name: "Alpine", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: true, signing: rsa, size_limit: config.limit_size_alpine, endpoint_root: "/api/packages/{owner}/alpine" }
+default KindPolicy alt_policy = { kind: alt, display_name: "ALT", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: true, signing: none, size_limit: config.limit_size_alt, endpoint_root: "/api/packages/{owner}/alt" }
+default KindPolicy arch_policy = { kind: arch, display_name: "Arch", version_mode: additive, file_overwrite: replace, name_case_sensitive: false, has_repository_index: true, signing: pgp, size_limit: config.limit_size_arch, endpoint_root: "/api/packages/{owner}/arch" }
+default KindPolicy cargo_policy = { kind: cargo, display_name: "Cargo", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_cargo, endpoint_root: "/api/packages/{owner}/cargo" }
+default KindPolicy chef_policy = { kind: chef, display_name: "Chef", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_chef, endpoint_root: "/api/packages/{owner}/chef" }
+default KindPolicy composer_policy = { kind: composer, display_name: "Composer", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_composer, endpoint_root: "/api/packages/{owner}/composer" }
+default KindPolicy conan_policy = { kind: conan, display_name: "Conan", version_mode: additive, file_overwrite: replace, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_conan, endpoint_root: "/api/packages/{owner}/conan" }
+default KindPolicy conda_policy = { kind: conda, display_name: "Conda", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_conda, endpoint_root: "/api/packages/{owner}/conda" }
+default KindPolicy container_policy = { kind: container, display_name: "Container", version_mode: reference, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_container, endpoint_root: "/v2/{owner}" }
+default KindPolicy cran_policy = { kind: cran, display_name: "CRAN", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_cran, endpoint_root: "/api/packages/{owner}/cran" }
+default KindPolicy debian_policy = { kind: debian, display_name: "Debian", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: true, signing: pgp, size_limit: config.limit_size_debian, endpoint_root: "/api/packages/{owner}/debian" }
+default KindPolicy generic_policy = { kind: generic, display_name: "Generic", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_generic, endpoint_root: "/api/packages/{owner}/generic" }
+default KindPolicy go_policy = { kind: go, display_name: "Go", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_go, endpoint_root: "/api/packages/{owner}/go" }
+default KindPolicy helm_policy = { kind: helm, display_name: "Helm", version_mode: additive, file_overwrite: replace, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_helm, endpoint_root: "/api/packages/{owner}/helm" }
+default KindPolicy maven_policy = { kind: maven, display_name: "Maven", version_mode: additive, file_overwrite: replace_metadata, name_case_sensitive: true, has_repository_index: false, signing: none, size_limit: config.limit_size_maven, endpoint_root: "/api/packages/{owner}/maven" }
+default KindPolicy npm_policy = { kind: npm, display_name: "npm", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_npm, endpoint_root: "/api/packages/{owner}/npm" }
+default KindPolicy nuget_policy = { kind: nuget, display_name: "NuGet", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_nuget, endpoint_root: "/api/packages/{owner}/nuget" }
+default KindPolicy pub_policy = { kind: pub, display_name: "Pub", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_pub, endpoint_root: "/api/packages/{owner}/pub" }
+default KindPolicy pypi_policy = { kind: pypi, display_name: "PyPI", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_pypi, endpoint_root: "/api/packages/{owner}/pypi" }
+default KindPolicy rpm_policy = { kind: rpm, display_name: "RPM", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: true, signing: pgp, size_limit: config.limit_size_rpm, endpoint_root: "/api/packages/{owner}/rpm" }
+default KindPolicy rubygems_policy = { kind: rubygems, display_name: "RubyGems", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_rubygems, endpoint_root: "/api/packages/{owner}/rubygems" }
+default KindPolicy swift_policy = { kind: swift, display_name: "Swift", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_swift, endpoint_root: "/api/packages/{owner}/swift" }
+default KindPolicy vagrant_policy = { kind: vagrant, display_name: "Vagrant", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_vagrant, endpoint_root: "/api/packages/{owner}/vagrant" }
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+------------------------------------------------------------
+-- Access derivation and black-box functions
+------------------------------------------------------------
+--
+-- can_read_packages(user, registry) / can_write_packages(user, registry):
+--   the package access mode of `user` (null = anonymous) on `registry`.
+--   from: services/packages/perm.go:16
+--   1. Packages disabled, or REQUIRE_SIGNIN_VIEW and anonymous, or the user
+--      is inactive / prohibited from logging in: none.
+--   2. User-owned registry: the owner has owner access; any other signed-in
+--      user has read when the owner is public or limited; anonymous has
+--      read when the owner is public. A private user's registry is visible
+--      only to that user.
+--   3. Organisation registry: a signed-in member gets the highest of the
+--      org-wide authorize level of their teams (owners team = owner) and
+--      each team's access to the `packages` unit; if that is none and the
+--      organisation is visible to the user (public; limited and signed in;
+--      private and member) the user gets read.
+--   4. Site administrators may do anything (read and write), regardless of
+--      the derived mode.
+--   5. A request authenticated with a scoped token additionally needs
+--      read:package (read) / write:package (write); a public-only token is
+--      refused on a private owner's registry. Actions task tokens act with
+--      their workflow user's mode.
+--   can_read_packages is true for mode >= read; can_write_packages for
+--   mode >= write.
+--
+-- can_manage_registry(user, registry): the user is the registry's owning
+--   user, or an owner of the owning organisation (organizations/
+--   is_org_owner). Gates the owner package settings (cleanup rules, Cargo
+--   index). from: routers/web/web.go:836, routers/web/web.go:1189
+--
+-- quota_allows_package_upload(registry): quota/quota_allows(<owner>,
+--   size_assets_packages_all), i.e. the QuotaGate gate_package_upload
+--   charged to the registry owner (an organisation's quota for org
+--   registries), evaluated before the upload is stored.
+--   from: routers/api/packages/api.go:96
+--
+-- same_owner(registry, repository): repository.owner_user = registry.owner_user
+--   and repository.owner_org = registry.owner_org.
+-- valid_coordinates(kind, name, version, file_name), valid_image_reference
+--   (image, reference): per-kind naming rules (see PublishFirstVersionOf-
+--   NewPackage guidance); container references are tags or sha256 digests.
+-- same_package_name(kind, a, b): equal, case-insensitively unless
+--   KindPolicy.name_case_sensitive (Maven). lower(s): lower-cased string.
+-- is_semver_kind(kind): versions of this kind follow semantic versioning
+--   (cargo, helm, npm, nuget, composer, pub, swift, go ...).
+-- extracted_metadata / extracted_*_properties / extracted_image_*(…):
+--   what the per-kind parser reads from the uploaded artefact.
+-- initial_dist_tags(kind, sha256): npm dist-tags in the publish document.
+-- md5_of / sha1_of / sha512_of / blake2b_of(sha256): the other digests of
+--   the same content, computed while streaming.
+-- is_registry_metadata_file(kind, file_name): Maven maven-metadata.xml and
+--   its checksum files under a -SNAPSHOT version.
+-- index_scopes_of(registry, kind): the distribution/component/arch (etc.)
+--   scopes that currently have packages, plus the one just changed.
+-- generated_public_key / generated_chef_public_key: fresh key material.
+-- upload_digest_matches(upload, sha256): the digest the client declared
+--   equals the digest of the bytes received.
+-- manifest_references_resolve(registry, image, sha256): every config and
+--   layer blob (or, for an index, every sub-manifest) the manifest names is
+--   known to the image (uploaded, mounted or already part of a version).
+-- manifest_references_blob(version, blob), manifest_file_name(sha256):
+--   manifest content navigation; files are named after their digest.
+-- autolink_candidate(package): the repository named by the image source
+--   annotation, else label, else by the first image-name segment.
+-- blob_readable_by(blob, user): see ContainerMountsBlob guidance.
+-- staged_anywhere(blob): some ContainerUploadedBlob refers to the blob.
+-- dangling_digest_check(version): see PurgeExpiredPackageData guidance.
+-- cleanup_targets_of(rule): see ApplyCleanupRule guidance.
+-- latest_of(versions): newest by semver when the package is
+--   semver-compatible, else by creation time.
+-- stored_size_of / visible_version_count_of / size_sum_of: sums and
+--   counts over the registry's files and versions.
+-- is_valid_regex(p), is_valid_version_string(s), earliest(a, b): helpers.
+
+------------------------------------------------------------
+-- Publishing (all kinds except the container blob/manifest flow)
+------------------------------------------------------------
+
+-- The first upload under a new package name creates the package and its
+-- first version.
+-- from: services/packages/packages.go:174
+rule PublishFirstVersionOfNewPackage {
+    when: PublisherUploadsPackageFile(publisher, registry, kind, name, version, file_name, composite_key, is_lead, size, sha256)
+    let policy = KindPolicy{kind: kind}
+    let existing = Package{registry: registry, kind: kind, name: name}
+    requires: config.packages_enabled
+    requires: kind != container
+    requires: can_write_packages(publisher, registry)
+    requires: valid_coordinates(kind, name, version, file_name)
+    requires: quota_allows_package_upload(registry)
+    requires: not exists existing
+    requires: publisher.is_admin or policy.size_limit < 0 or size <= policy.size_limit
+    requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + size <= config.limit_total_owner_size
+    requires: publisher.is_admin or config.limit_total_owner_count < 0 or registry.visible_version_count < config.limit_total_owner_count
+    ensures:
+        let package = Package.created(
+            registry: registry,
+            kind: kind,
+            name: name,
+            semver_compatible: is_semver_kind(kind),
+            is_internal: false,
+            linked_repository: null,
+            properties: extracted_package_properties(kind, sha256),
+            autolink_pending: false
+        )
+        let new_version = PackageVersion.created(
+            package: package,
+            creator: publisher,
+            version: version,
+            created_at: now,
+            is_internal: false,
+            metadata: extracted_metadata(kind, sha256),
+            properties: extracted_version_properties(kind, sha256),
+            download_count: 0,
+            last_downloaded_at: null,
+            is_tagged: false,
+            is_yanked: false,
+            dist_tags: initial_dist_tags(kind, sha256)
+        )
+        FileStored(new_version, file_name, composite_key, is_lead, size, sha256)
+        PackageVersionCreated(new_version, publisher)
+        RegistryContentChanged(registry, kind, package)
+    @guidance
+        -- Package names are compared case-insensitively (stored as given)
+        -- except Maven, whose group:artifact ids are case-sensitive
+        -- (KindPolicy.name_case_sensitive). Version strings always compare
+        -- case-insensitively.
+        -- valid_coordinates is per kind, e.g. generic: name matches
+        -- [-_+.\w]+ (not "..", a single character must be alphanumeric),
+        -- filename matches [-_+=:;.()\[\]{}~!@#$%^& \w]+ without surrounding
+        -- whitespace and not "."/".."; version has no surrounding
+        -- whitespace. npm: (@scope/)?[a-z0-9-][a-z0-9-._]*. PyPI: PEP 440
+        -- versions. Cargo: [a-zA-Z][a-zA-Z0-9-_]{0,63}. Swift: scope
+        -- [a-zA-Z0-9][a-zA-Z0-9-]{0,38}, name [a-zA-Z0-9][a-zA-Z0-9-_]{0,99}.
+        -- Container image: [a-z0-9]+([._-][a-z0-9]+)*(/...)*. Debian/Arch/
+        -- CRAN/NuGet/Composer/Chef/RubyGems/Conan names follow their
+        -- ecosystem rules. Metadata is parsed from the artefact itself and an
+        -- unparseable artefact is refused.
+        -- Site administrators bypass the per-kind size limit and the owner
+        -- count/size limits, but not the quota module.
+        -- RPM uploads are re-signed with the owner's RPM key when
+        -- config.default_rpm_sign_enabled or the uploader asks (?sign=true);
+        -- Arch packages uploaded without a detached signature get one made
+        -- with the owner's Arch key. Either way the owner key is created on
+        -- first need (EnsureSigningKey).
+}
+
+-- A new version of a package that already exists.
+-- from: services/packages/packages.go:213
+rule PublishNewVersionOfExistingPackage {
+    when: PublisherUploadsPackageFile(publisher, registry, kind, name, version, file_name, composite_key, is_lead, size, sha256)
+    let policy = KindPolicy{kind: kind}
+    let package = Package{registry: registry, kind: kind, name: name}
+    requires: config.packages_enabled
+    requires: kind != container
+    requires: can_write_packages(publisher, registry)
+    requires: valid_coordinates(kind, name, version, file_name)
+    requires: quota_allows_package_upload(registry)
+    requires: exists package
+    requires: package.is_internal = false
+    requires: not exists PackageVersion{package: package, version: version}
+    requires: publisher.is_admin or policy.size_limit < 0 or size <= policy.size_limit
+    requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + size <= config.limit_total_owner_size
+    requires: publisher.is_admin or config.limit_total_owner_count < 0 or registry.visible_version_count < config.limit_total_owner_count
+    ensures:
+        let new_version = PackageVersion.created(
+            package: package,
+            creator: publisher,
+            version: version,
+            created_at: now,
+            is_internal: false,
+            metadata: extracted_metadata(kind, sha256),
+            properties: extracted_version_properties(kind, sha256),
+            download_count: 0,
+            last_downloaded_at: null,
+            is_tagged: false,
+            is_yanked: false,
+            dist_tags: initial_dist_tags(kind, sha256)
+        )
+        FileStored(new_version, file_name, composite_key, is_lead, size, sha256)
+        PackageVersionCreated(new_version, publisher)
+        RegistryContentChanged(registry, kind, package)
+    @guidance
+        -- npm: dist-tags supplied with the publish are moved onto the new
+        -- version (removed from whichever version held them before).
+}
+
+-- Additive kinds accept further files into an existing version
+-- (another architecture of a .deb, another wheel, another Vagrant provider,
+-- the jar next to the pom, another Conan revision file ...).
+-- No PackageVersionCreated is emitted: the version was already published.
+-- from: services/packages/packages.go:229
+rule AddFileToExistingVersion {
+    when: PublisherUploadsPackageFile(publisher, registry, kind, name, version, file_name, composite_key, is_lead, size, sha256)
+    let policy = KindPolicy{kind: kind}
+    let package = Package{registry: registry, kind: kind, name: name}
+    let target = PackageVersion{package: package, version: version}
+    requires: config.packages_enabled
+    requires: kind != container
+    requires: can_write_packages(publisher, registry)
+    requires: valid_coordinates(kind, name, version, file_name)
+    requires: quota_allows_package_upload(registry)
+    requires: exists target
+    requires: target.is_internal = false
+    requires: policy.version_mode = additive
+    requires: not exists PackageFile{version: target, name: file_name, composite_key: composite_key}
+    requires: publisher.is_admin or policy.size_limit < 0 or size <= policy.size_limit
+    requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + size <= config.limit_total_owner_size
+    ensures:
+        FileStored(target, file_name, composite_key, is_lead, size, sha256)
+        RegistryContentChanged(registry, kind, package)
+    @guidance
+        -- Maven checksum uploads (.md5/.sha1/.sha256/.sha512) are not stored:
+        -- they are verified against the existing file and acknowledged.
+        -- Maven: uploading the .pom (the lead file) also refreshes the
+        -- version metadata. maven-metadata.xml at artifact level (no version)
+        -- is acknowledged and discarded; under a -SNAPSHOT version it is
+        -- stored and replaced on every upload.
+}
+
+-- Kinds whose files may be replaced in place (Helm charts, Conan recipe and
+-- package files, Arch signatures, Maven snapshot metadata).
+-- from: services/packages/packages.go:310
+rule ReplaceFileInExistingVersion {
+    when: PublisherUploadsPackageFile(publisher, registry, kind, name, version, file_name, composite_key, is_lead, size, sha256)
+    let policy = KindPolicy{kind: kind}
+    let package = Package{registry: registry, kind: kind, name: name}
+    let target = PackageVersion{package: package, version: version}
+    let old_file = PackageFile{version: target, name: file_name, composite_key: composite_key}
+    requires: config.packages_enabled
+    requires: kind != container
+    requires: can_write_packages(publisher, registry)
+    requires: quota_allows_package_upload(registry)
+    requires: exists old_file
+    requires: policy.file_overwrite = replace or (policy.file_overwrite = replace_metadata and is_registry_metadata_file(kind, file_name))
+    requires: publisher.is_admin or policy.size_limit < 0 or size <= policy.size_limit
+    requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + size <= config.limit_total_owner_size
+    ensures: not exists old_file
+    ensures:
+        FileStored(target, file_name, composite_key, is_lead, size, sha256)
+        RegistryContentChanged(registry, kind, package)
+    @guidance
+        -- When the new content equals the old (same blob) nothing changes.
+}
+
+-- Stores content once (deduplicated by hash) and attaches it to a version
+-- as a file.
+-- from: services/packages/packages.go:283
+rule StoreFileContent {
+    when: FileStored(version, file_name, composite_key, is_lead, size, sha256)
+    let existing_blob = PackageBlob{hash_sha256: sha256}
+    ensures:
+        if exists existing_blob:
+            PackageFile.created(version: version, blob: existing_blob, name: file_name, composite_key: composite_key, is_lead: is_lead, created_at: now, properties: extracted_file_properties(version.package.kind, sha256))
+        else:
+            let blob = PackageBlob.created(size: size, hash_md5: md5_of(sha256), hash_sha1: sha1_of(sha256), hash_sha256: sha256, hash_sha512: sha512_of(sha256), hash_blake2b: blake2b_of(sha256), created_at: now)
+            PackageFile.created(version: version, blob: blob, name: file_name, composite_key: composite_key, is_lead: is_lead, created_at: now, properties: extracted_file_properties(version.package.kind, sha256))
+    @guidance
+        -- All five digests are computed while streaming the upload; the
+        -- blob is identified by all of them together. If any later step of
+        -- the publish fails, a blob created by this publish is discarded.
+}
+
+-- Changes to indexed kinds and to Cargo trigger regeneration of the
+-- owner-wide index for that kind.
+-- from: routers/api/packages/rpm/rpm.go:216
+rule RefreshIndexesAfterChange {
+    when: RegistryContentChanged(registry, kind, package)
+    let policy = KindPolicy{kind: kind}
+    ensures:
+        if policy.has_repository_index:
+            RepositoryIndexStale(registry, kind)
+        if kind = cargo:
+            CargoIndexEntryStale(registry, package)
+}
+
+------------------------------------------------------------
+-- Repository indexes, signing keys, Cargo index, Chef keys
+------------------------------------------------------------
+
+-- from: services/packages/debian/repository.go:101
+rule RebuildRepositoryIndex {
+    when: RepositoryIndexStale(registry, kind)
+    let policy = KindPolicy{kind: kind}
+    requires: policy.has_repository_index
+    ensures:
+        for scope in index_scopes_of(registry, kind):
+            if exists RepositoryIndex{registry: registry, kind: kind, scope: scope}:
+                RepositoryIndex{registry: registry, kind: kind, scope: scope}.built_at = now
+            else:
+                RepositoryIndex.created(registry: registry, kind: kind, scope: scope, built_at: now)
+    ensures:
+        if policy.signing != none:
+            SigningKeyNeeded(registry, kind)
+    @guidance
+        -- Debian: Packages(.gz/.xz) per distribution/component/architecture,
+        -- Release + InRelease + Release.gpg per distribution, by-hash
+        -- addressing. Alpine: APKINDEX.tar.gz per branch/repository/
+        -- architecture, RSA-signed. RPM: repomd.xml (+ .asc), primary,
+        -- filelists, other per group. ALT: base/ release + pkglist per
+        -- group/architecture. Arch: <distribution>.db / .files (+ .sig)
+        -- per distribution/architecture, "any" packages appear in every
+        -- architecture. A scope with no packages left has its index removed.
+        -- The index files live in an internal package/version of the owner
+        -- and are never listed or counted.
+}
+
+-- from: services/packages/debian/repository.go:42
+rule EnsureSigningKey {
+    when: SigningKeyNeeded(registry, kind)
+    let policy = KindPolicy{kind: kind}
+    requires: policy.signing != none
+    requires: not exists RegistrySigningKey{registry: registry, kind: kind}
+    ensures: RegistrySigningKey.created(registry: registry, kind: kind, scheme: policy.signing, public_key: generated_public_key(registry, kind), created_at: now)
+    @guidance
+        -- The private half is held server side in the owner's settings and
+        -- never shown. Debian/RPM/Arch use OpenPGP; Alpine uses RSA.
+}
+
+-- Clients fetch the public key to trust the repository; fetching creates
+-- the key if the owner has none yet.
+-- from: routers/api/packages/debian/debian.go:30
+rule ClientFetchesRepositoryKey {
+    when: ClientRequestsRepositoryKey(client, registry, kind)
+    let policy = KindPolicy{kind: kind}
+    requires: config.packages_enabled
+    requires: can_read_packages(client, registry)
+    requires: policy.signing != none
+    ensures: SigningKeyNeeded(registry, kind)
+}
+
+-- from: services/packages/cargo/index.go:109
+rule UpdateCargoIndexEntry {
+    when: CargoIndexEntryStale(registry, package)
+    let index = CargoIndex{registry: registry}
+    requires: exists index
+    ensures: index.built_at = now
+    @guidance
+        -- Rewrites the crate's line-delimited JSON file in the index git
+        -- repository (one line per version with deps, features, checksum,
+        -- yanked flag) as a commit by the acting user. Does nothing if the
+        -- owner never initialised the index.
+}
+
+-- from: services/packages/cargo/index.go:51
+rule OwnerInitializesCargoIndex {
+    when: ManagerInitializesCargoIndex(manager, registry)
+    requires: config.packages_enabled
+    requires: can_manage_registry(manager, registry)
+    requires: not exists CargoIndex{registry: registry}
+    ensures: CargoIndex.created(registry: registry, repository_name: "_cargo-index", built_at: now)
+    @guidance
+        -- Creates (or reuses) the owner repository `_cargo-index` and writes
+        -- config.json: { dl: download URL, api: registry API URL,
+        -- auth-required: owner is not public }.
+}
+
+-- from: services/packages/cargo/index.go:64
+rule OwnerRebuildsCargoIndex {
+    when: ManagerRebuildsCargoIndex(manager, registry)
+    let index = CargoIndex{registry: registry}
+    requires: config.packages_enabled
+    requires: can_manage_registry(manager, registry)
+    requires: exists index
+    ensures: index.built_at = now
+    @guidance
+        -- Removes every crate file and rewrites config.json and one file per
+        -- cargo package from current data in a single commit.
+}
+
+-- A user creates a new Chef client key pair; the private key is handed to
+-- the user once and only the public key is kept.
+-- from: routers/web/user/setting/packages.go:103
+rule UserRegeneratesChefKey {
+    when: UserRegeneratesChefKeyPair(user)
+    let existing = ChefClientKey{user: user}
+    requires: config.packages_enabled
+    ensures:
+        if exists existing:
+            existing.public_key = generated_chef_public_key(user)
+            existing.created_at = now
+        else:
+            ChefClientKey.created(user: user, public_key: generated_chef_public_key(user), created_at: now)
+    @guidance
+        -- RSA key; the private PEM is returned as a file download named
+        -- <user>.priv. Chef clients authenticate by signing requests with it.
+}
+
+------------------------------------------------------------
+-- Kind-specific version state
+------------------------------------------------------------
+
+-- from: routers/api/packages/cargo/cargo.go:264
+rule CargoYanksVersion {
+    when: PublisherYanksCargoVersion(publisher, version)
+    let registry = version.package.registry
+    requires: config.packages_enabled
+    requires: version.package.kind = cargo
+    requires: can_write_packages(publisher, registry)
+    requires: version.is_yanked = false
+    ensures: version.is_yanked = true
+    ensures: CargoIndexEntryStale(registry, version.package)
+}
+
+-- from: routers/api/packages/cargo/cargo.go:264
+rule CargoUnyanksVersion {
+    when: PublisherUnyanksCargoVersion(publisher, version)
+    let registry = version.package.registry
+    requires: config.packages_enabled
+    requires: version.package.kind = cargo
+    requires: can_write_packages(publisher, registry)
+    requires: quota_allows_package_upload(registry)
+    requires: version.is_yanked = true
+    ensures: version.is_yanked = false
+    ensures: CargoIndexEntryStale(registry, version.package)
+}
+
+-- Point an npm dist-tag at a version; the tag leaves whichever version of the
+-- package held it before.
+-- from: routers/api/packages/npm/npm.go:345
+rule NpmAddsDistTag {
+    when: PublisherSetsNpmDistTag(publisher, version, tag)
+    let registry = version.package.registry
+    requires: config.packages_enabled
+    requires: version.package.kind = npm
+    requires: can_write_packages(publisher, registry)
+    requires: tag != ""
+    requires: not is_valid_version_string(tag)
+    ensures:
+        for other in version.package.versions:
+            if tag in other.dist_tags:
+                other.dist_tags.remove(tag)
+    ensures: version.dist_tags.add(tag)
+}
+
+-- from: routers/api/packages/npm/npm.go:376
+rule NpmRemovesDistTag {
+    when: PublisherRemovesNpmDistTag(publisher, package, tag)
+    requires: config.packages_enabled
+    requires: package.kind = npm
+    requires: can_write_packages(publisher, package.registry)
+    ensures:
+        for v in package.versions:
+            if tag in v.dist_tags:
+                v.dist_tags.remove(tag)
+}
+
+------------------------------------------------------------
+-- Container (OCI) registry
+------------------------------------------------------------
+
+-- from: routers/api/packages/container/container.go:218
+rule ContainerStartsBlobUpload {
+    when: ContainerClientStartsBlobUpload(publisher, registry, image)
+    requires: config.packages_enabled
+    requires: can_write_packages(publisher, registry)
+    requires: valid_image_reference(image, "")
+    requires: quota_allows_package_upload(registry)
+    ensures: BlobUpload.created(registry: registry, image: image, bytes_received: 0, created_at: now, updated_at: now)
+    @guidance
+        -- A monolithic upload (digest given on the POST) completes in one
+        -- request; otherwise an upload session is returned and chunks follow.
+}
+
+-- from: routers/api/packages/container/container.go:300
+rule ContainerAppendsChunk {
+    when: ContainerClientAppendsChunk(publisher, upload, chunk_size)
+    requires: config.packages_enabled
+    requires: can_write_packages(publisher, upload.registry)
+    requires: quota_allows_package_upload(upload.registry)
+    ensures: upload.bytes_received = upload.bytes_received + chunk_size
+    ensures: upload.updated_at = now
+    @guidance
+        -- Chunks must arrive in order: a chunk whose start offset differs
+        -- from bytes_received is refused (range not satisfiable).
+}
+
+-- from: services/packages/container/blob.go:49
+rule ContainerCompletesBlobUpload {
+    when: ContainerClientCompletesBlobUpload(publisher, upload, sha256)
+    let registry = upload.registry
+    let policy = KindPolicy{kind: container}
+    let existing_blob = PackageBlob{hash_sha256: sha256}
+    requires: config.packages_enabled
+    requires: can_write_packages(publisher, registry)
+    requires: quota_allows_package_upload(registry)
+    requires: upload_digest_matches(upload, sha256)
+    requires: publisher.is_admin or policy.size_limit < 0 or upload.bytes_received <= policy.size_limit
+    requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + upload.bytes_received <= config.limit_total_owner_size
+    ensures: not exists upload
+    ensures:
+        if exists existing_blob:
+            ContainerUploadedBlob.created(registry: registry, image: upload.image, blob: existing_blob, uploaded_at: now)
+        else:
+            let blob = PackageBlob.created(size: upload.bytes_received, hash_md5: md5_of(sha256), hash_sha1: sha1_of(sha256), hash_sha256: sha256, hash_sha512: sha512_of(sha256), hash_blake2b: blake2b_of(sha256), created_at: now)
+            ContainerUploadedBlob.created(registry: registry, image: upload.image, blob: blob, uploaded_at: now)
+}
+
+-- from: routers/api/packages/container/container.go:395
+rule ContainerCancelsBlobUpload {
+    when: ContainerClientCancelsBlobUpload(publisher, upload)
+    requires: config.packages_enabled
+    requires: can_write_packages(publisher, upload.registry)
+    ensures: not exists upload
+}
+
+-- Cross-repository blob mount: reuse a blob the pusher can already read
+-- (in any registry) without re-uploading it.
+-- from: services/packages/container/blob.go:110
+rule ContainerMountsBlob {
+    when: ContainerClientMountsBlob(publisher, registry, image, blob)
+    requires: config.packages_enabled
+    requires: can_write_packages(publisher, registry)
+    requires: quota_allows_package_upload(registry)
+    requires: blob_readable_by(blob, publisher)
+    ensures: ContainerUploadedBlob.created(registry: registry, image: image, blob: blob, uploaded_at: now)
+    @guidance
+        -- blob_readable_by: the user is a site admin, or the blob belongs to
+        -- a file of a version whose owner is the user, a public or limited
+        -- user/org, or an organisation in which the user has at least read on
+        -- the packages unit through a team. If the blob is not readable the
+        -- client is told to upload it normally instead.
+}
+
+-- Deleting a blob by digest removes it from the image's uploaded blobs and
+-- from every version of the image that has it as a file.
+-- from: services/packages/container/blob.go:166
+rule ContainerDeletesBlob {
+    when: ContainerClientDeletesBlob(publisher, registry, image, blob)
+    requires: config.packages_enabled
+    requires: can_write_packages(publisher, registry)
+    ensures:
+        for staged in registry.container_uploads:
+            if staged.image = image and staged.blob = blob:
+                not exists staged
+    ensures:
+        for f in blob.files:
+            if f.version.package.registry = registry and f.version.package.name = image:
+                not exists f
+}
+
+-- Pushing a manifest (image manifest or image index) under a tag or digest
+-- reference publishes that reference as a version of the image package.
+-- The first push for an image creates the package and attempts auto-linking.
+-- from: services/packages/container/manifest.go:388
+rule ContainerPushesManifestForNewImage {
+    when: ContainerClientPushesManifest(publisher, registry, image, reference, is_tag, size, sha256)
+    let policy = KindPolicy{kind: container}
+    requires: config.packages_enabled
+    requires: can_write_packages(publisher, registry)
+    requires: valid_image_reference(image, reference)
+    requires: quota_allows_package_upload(registry)
+    requires: not exists Package{registry: registry, kind: container, name: image}
+    requires: manifest_references_resolve(registry, image, sha256)
+    requires: publisher.is_admin or config.limit_total_owner_count < 0 or registry.visible_version_count < config.limit_total_owner_count
+    ensures:
+        let package = Package.created(registry: registry, kind: container, name: image, semver_compatible: false, is_internal: false, linked_repository: null, properties: {}, autolink_pending: true)
+        let new_version = PackageVersion.created(package: package, creator: publisher, version: reference, created_at: now, is_internal: false, metadata: extracted_image_metadata(sha256), properties: extracted_image_properties(sha256), download_count: 0, last_downloaded_at: null, is_tagged: is_tag, is_yanked: false, dist_tags: {})
+        FileStored(new_version, manifest_file_name(sha256), null, true, size, sha256)
+        ContainerManifestLayersAttached(new_version, registry, image)
+        ContainerImageCreated(package, publisher)
+        PackageVersionCreated(new_version, publisher)
+    @guidance
+        -- Schema version must be 2; media type is taken from the request or
+        -- the manifest; image index entries must themselves be image
+        -- manifests already pushed to this image (each recorded with its
+        -- platform os/arch[/variant] and size). Config and layer blobs must
+        -- be known to the image. Image config labels/annotations become the
+        -- version metadata (description, licenses, source URL, ...).
+        -- Reference names are stored lower-cased.
+}
+
+-- from: services/packages/container/manifest.go:388
+rule ContainerPushesNewReference {
+    when: ContainerClientPushesManifest(publisher, registry, image, reference, is_tag, size, sha256)
+    let package = Package{registry: registry, kind: container, name: image}
+    requires: config.packages_enabled
+    requires: can_write_packages(publisher, registry)
+    requires: valid_image_reference(image, reference)
+    requires: quota_allows_package_upload(registry)
+    requires: exists package
+    requires: not exists PackageVersion{package: package, version: reference}
+    requires: manifest_references_resolve(registry, image, sha256)
+    requires: publisher.is_admin or config.limit_total_owner_count < 0 or registry.visible_version_count < config.limit_total_owner_count
+    ensures:
+        let new_version = PackageVersion.created(package: package, creator: publisher, version: reference, created_at: now, is_internal: false, metadata: extracted_image_metadata(sha256), properties: extracted_image_properties(sha256), download_count: 0, last_downloaded_at: null, is_tagged: is_tag, is_yanked: false, dist_tags: {})
+        FileStored(new_version, manifest_file_name(sha256), null, true, size, sha256)
+        ContainerManifestLayersAttached(new_version, registry, image)
+        PackageVersionCreated(new_version, publisher)
+    ensures:
+        if package.autolink_pending:
+            ContainerImageCreated(package, publisher)
+}
+
+-- Re-pushing an existing tag (or digest) re-points it: the old version is
+-- replaced by the new manifest; the download count carries over.
+-- from: services/packages/container/manifest.go:448
+rule ContainerRepointsReference {
+    when: ContainerClientPushesManifest(publisher, registry, image, reference, is_tag, size, sha256)
+    let package = Package{registry: registry, kind: container, name: image}
+    let previous = PackageVersion{package: package, version: reference}
+    let carried_downloads = previous.download_count
+    let carried_last_download = previous.last_downloaded_at
+    requires: config.packages_enabled
+    requires: can_write_packages(publisher, registry)
+    requires: quota_allows_package_upload(registry)
+    requires: exists previous
+    requires: manifest_references_resolve(registry, image, sha256)
+    ensures: not exists previous
+    ensures:
+        let new_version = PackageVersion.created(package: package, creator: publisher, version: reference, created_at: now, is_internal: false, metadata: extracted_image_metadata(sha256), properties: extracted_image_properties(sha256), download_count: carried_downloads, last_downloaded_at: carried_last_download, is_tagged: is_tag, is_yanked: false, dist_tags: {})
+        FileStored(new_version, manifest_file_name(sha256), null, true, size, sha256)
+        ContainerManifestLayersAttached(new_version, registry, image)
+        PackageVersionCreated(new_version, publisher)
+    @guidance
+        -- The superseded manifest's own digest version (if any) is left in
+        -- place; it becomes dangling and is purged by the expired-data
+        -- cleanup once older than config.cleanup_older_than.
+}
+
+-- The config and layer blobs a manifest references become files of the
+-- manifest's version and leave the image's uploaded-blob staging area.
+-- from: services/packages/container/manifest.go:500
+rule AttachManifestLayers {
+    when: ContainerManifestLayersAttached(version, registry, image)
+    ensures:
+        for staged in registry.container_uploads:
+            if staged.image = image and manifest_references_blob(version, staged.blob):
+                not exists staged
+                PackageFile.created(version: version, blob: staged.blob, name: manifest_file_name(staged.blob.hash_sha256), composite_key: null, is_lead: false, created_at: now, properties: {})
+}
+
+-- Auto-link a new image to a repository: by the
+-- org.opencontainers.image.source annotation, else the same label, else by
+-- image name "<repo>[/...]" under the same owner. Linking only happens when
+-- the pusher could link it by hand. Attempted once per package.
+-- from: services/packages/container/manifest.go:585
+rule AutolinkContainerImage {
+    when: ContainerImageCreated(package, publisher)
+    let candidate = autolink_candidate(package)
+    requires: package.autolink_pending
+    ensures: package.autolink_pending = false
+    ensures:
+        if candidate != null and package.linked_repository = null and same_owner(package.registry, candidate) and access/can_write(publisher, candidate, packages):
+            package.linked_repository = candidate
+    @guidance
+        -- The source URL must start with this instance's URL and have the
+        -- form <instance>/<owner>/<repo>. Failures are silent.
+}
+
+-- Deleting a manifest reference (tag or digest) removes every version of the
+-- image matching it.
+-- from: routers/api/packages/container/container.go:604
+rule ContainerDeletesManifest {
+    when: ContainerClientDeletesManifest(publisher, version)
+    let package = version.package
+    let version_name = version.version
+    requires: config.packages_enabled
+    requires: package.kind = container
+    requires: can_write_packages(publisher, package.registry)
+    ensures: not exists version
+    ensures: PackageVersionDeleted(version, publisher)
+}
+
+-- `docker login` exchange: issue a bearer token for the authenticated user,
+-- or an anonymous pull token when sign-in is not required to view.
+-- from: routers/api/packages/container/container.go:148
+rule ContainerIssuesBearerToken {
+    when: ContainerClientRequestsToken(client, credential_expires_at, scope)
+    requires: config.packages_enabled
+    requires: client != null or not config.require_signin_view
+    ensures: RegistryBearerToken.created(user: client, scope: scope, issued_at: now, expires_at: earliest(now + config.registry_token_lifetime, credential_expires_at))
+    @guidance
+        -- The token carries the credential's scope (so a read:package token
+        -- stays read-only) and never outlives the credential it was minted
+        -- from. Anonymous clients get a token for the ghost user.
+}
+
+------------------------------------------------------------
+-- Download counting
+------------------------------------------------------------
+
+-- from: services/packages/packages.go:707
+rule DownloadLeadFileCountsDownload {
+    when: ClientDownloadsPackageFile(client, file)
+    let version = file.version
+    requires: config.packages_enabled
+    requires: can_read_packages(client, version.package.registry)
+    requires: file.is_lead
+    ensures: version.download_count = version.download_count + 1
+    ensures: version.last_downloaded_at = now
+    @guidance
+        -- Downloading a non-lead file (signature, checksum, layer, index
+        -- file) streams it without counting. Web-UI downloads count too.
+}
+
+------------------------------------------------------------
+-- Deletion
+------------------------------------------------------------
+
+-- Delete one version with all its files (web settings page, REST API,
+-- client protocols: npm unpublish, chef, nuget, debian, rpm, arch, alt,
+-- conan, pub/rubygems yank, container manifest delete, site admin).
+-- from: services/packages/packages.go:510
+rule UserDeletesPackageVersion {
+    when: UserRemovesPackageVersion(actor, version)
+    let package = version.package
+    let registry = package.registry
+    let kind = package.kind
+    let version_name = version.version
+    requires: config.packages_enabled
+    requires: version.is_internal = false
+    requires: can_write_packages(actor, registry)
+    ensures:
+        for f in version.files:
+            not exists f
+    ensures: not exists version
+    ensures: PackageVersionDeleted(version, actor)
+    ensures: RegistryContentChanged(registry, kind, package)
+    @guidance
+        -- RubyGems "yank" and the generic/npm "delete version" endpoints are
+        -- deletions. A package left without versions disappears from listings
+        -- immediately and is removed by the next expired-data purge.
+}
+
+-- Delete every version of a package (npm unpublish-all, chef, conan recipe).
+-- from: routers/api/packages/npm/npm.go:295
+rule UserDeletesWholePackage {
+    when: UserRemovesPackage(actor, package)
+    requires: config.packages_enabled
+    requires: package.is_internal = false
+    requires: can_write_packages(actor, package.registry)
+    requires: package.visible_versions.count > 0
+    ensures:
+        for v in package.visible_versions:
+            not exists v
+            PackageVersionDeleted(v, actor)
+    ensures: RegistryContentChanged(package.registry, package.kind, package)
+}
+
+-- Delete a single file; when it was the last file of its version the version
+-- goes too (generic, debian/alpine/rpm/arch per-architecture deletes).
+-- from: services/packages/packages.go:534
+rule UserDeletesPackageFile {
+    when: UserRemovesPackageFile(actor, file)
+    let version = file.version
+    let package = version.package
+    let registry = package.registry
+    let version_name = version.version
+    let was_last_file = version.files.count = 1
+    requires: config.packages_enabled
+    requires: version.is_internal = false
+    requires: can_write_packages(actor, registry)
+    ensures: not exists file
+    ensures:
+        if was_last_file:
+            not exists version
+            PackageVersionDeleted(version, actor)
+    ensures: RegistryContentChanged(registry, package.kind, package)
+}
+
+------------------------------------------------------------
+-- Linking packages to repositories
+------------------------------------------------------------
+
+-- from: services/packages/package_update.go:19
+rule UserLinksPackageToRepository {
+    when: UserLinksPackage(actor, package, repository)
+    requires: config.packages_enabled
+    requires: can_write_packages(actor, package.registry)
+    requires: same_owner(package.registry, repository)
+    requires: package.linked_repository = null
+    requires: access/can_write(actor, repository, packages)
+    ensures: package.linked_repository = repository
+}
+
+-- from: services/packages/package_update.go:41
+rule UserUnlinksPackageFromRepository {
+    when: UserUnlinksPackage(actor, package)
+    let repository = package.linked_repository
+    let registry = package.registry
+    requires: config.packages_enabled
+    requires: can_write_packages(actor, registry)
+    requires: repository != null
+    requires: access/can_write(actor, repository, packages)
+    requires: actor.is_admin or registry.owner_user = actor or (registry.owner_is_org and organizations/is_org_owner(registry.owner_org, actor))
+    ensures: package.linked_repository = null
+}
+
+-- from: services/repository/delete.go:347
+rule RepositoryDeletionUnlinksPackages {
+    when: repositories/RepositoryDeleted(repository, _)
+    ensures:
+        for p in Packages:
+            if p.linked_repository = repository:
+                p.linked_repository = null
+}
+
+------------------------------------------------------------
+-- Owner removal
+------------------------------------------------------------
+
+-- Purging a user (admin delete with purge) removes everything in its
+-- registry first. No PackageVersionDeleted events are emitted.
+-- from: services/packages/packages.go:719
+rule PurgeOwnerPackages {
+    when: accounts/UserPurged(user)
+    let registry = OwnerRegistry{owner_user: user}
+    requires: exists registry
+    ensures:
+        for p in registry.packages:
+            for v in p.versions:
+                not exists v
+    @guidance
+        -- Non-purge deletion of a user or organisation is refused while
+        -- OwnerRegistry.has_packages (see Requests). Packages, blobs and
+        -- leftovers are removed by the next expired-data purge.
+}
+
+------------------------------------------------------------
+-- Cleanup rules (owner settings)
+------------------------------------------------------------
+
+-- from: routers/web/shared/packages/packages.go:88
+rule ManagerCreatesCleanupRule {
+    when: ManagerAddsCleanupRule(manager, registry, kind, enabled, keep_count, keep_pattern, keep_last_download_days, remove_days, remove_last_download_days, remove_pattern, match_full_name)
+    requires: config.packages_enabled
+    requires: can_manage_registry(manager, registry)
+    requires: not exists CleanupRule{registry: registry, kind: kind}
+    requires: keep_count in {0, 1, 5, 10, 25, 50, 100}
+    requires: remove_days in {0, 7, 14, 30, 60, 90, 180}
+    requires: keep_last_download_days in {0, 7, 14, 30, 60, 90, 180}
+    requires: remove_last_download_days in {0, 7, 14, 30, 60, 90, 180}
+    requires: is_valid_regex(keep_pattern) and is_valid_regex(remove_pattern)
+    ensures: CleanupRule.created(registry: registry, kind: kind, enabled: enabled, keep_count: keep_count, keep_pattern: keep_pattern, keep_last_download_days: keep_last_download_days, remove_days: remove_days, remove_last_download_days: remove_last_download_days, remove_pattern: remove_pattern, match_full_name: match_full_name, created_at: now, updated_at: now)
+}
+
+-- The kind of an existing rule cannot change.
+-- from: routers/web/shared/packages/packages.go:88
+rule ManagerUpdatesCleanupRule {
+    when: ManagerEditsCleanupRule(manager, rule, enabled, keep_count, keep_pattern, keep_last_download_days, remove_days, remove_last_download_days, remove_pattern, match_full_name)
+    requires: config.packages_enabled
+    requires: can_manage_registry(manager, rule.registry)
+    requires: keep_count in {0, 1, 5, 10, 25, 50, 100}
+    requires: remove_days in {0, 7, 14, 30, 60, 90, 180}
+    requires: keep_last_download_days in {0, 7, 14, 30, 60, 90, 180}
+    requires: remove_last_download_days in {0, 7, 14, 30, 60, 90, 180}
+    requires: is_valid_regex(keep_pattern) and is_valid_regex(remove_pattern)
+    ensures: rule.enabled = enabled
+    ensures: rule.keep_count = keep_count
+    ensures: rule.keep_pattern = keep_pattern
+    ensures: rule.keep_last_download_days = keep_last_download_days
+    ensures: rule.remove_days = remove_days
+    ensures: rule.remove_last_download_days = remove_last_download_days
+    ensures: rule.remove_pattern = remove_pattern
+    ensures: rule.match_full_name = match_full_name
+    ensures: rule.updated_at = now
+}
+
+-- from: routers/web/shared/packages/packages.go:74
+rule ManagerDeletesCleanupRule {
+    when: ManagerRemovesCleanupRule(manager, rule)
+    requires: config.packages_enabled
+    requires: can_manage_registry(manager, rule.registry)
+    ensures: not exists rule
+}
+
+------------------------------------------------------------
+-- Scheduled cleanup
+------------------------------------------------------------
+
+-- The `cleanup_packages` cron task: apply every enabled cleanup rule, then
+-- purge expired registry data.
+-- from: services/cron/tasks_basic.go:145
+rule RunScheduledPackageCleanup {
+    when: schedule: PackageCleanupSchedule.is_due
+    requires: config.packages_enabled
+    requires: config.cleanup_enabled
+    ensures: schedule.last_run_at = now
+    ensures: schedule.next_run_at = now + config.cleanup_interval
+    ensures:
+        for rule in CleanupRules:
+            if rule.enabled:
+                CleanupRuleDue(rule)
+    ensures: ExpiredPackageDataPurgeDue(config.cleanup_older_than)
+    @guidance
+        -- Default schedule "@midnight" and RUN_AT_START = true; modelled as a
+        -- fixed interval. Each rule runs in its own transaction and is
+        -- retried a few times; a failing rule aborts the task run.
+}
+
+-- from: services/packages/cleanup/cleanup.go:36
+rule ApplyCleanupRule {
+    when: CleanupRuleDue(rule)
+    requires: rule.enabled
+    ensures:
+        for v in rule.targets:
+            for f in v.files:
+                not exists f
+            not exists v
+    ensures: RepositoryIndexStale(rule.registry, rule.kind)
+    ensures:
+        if rule.kind = cargo:
+            for p in rule.registry.packages:
+                if p.kind = cargo:
+                    CargoIndexEntryStale(rule.registry, p)
+    @guidance
+        -- cleanup_targets_of(rule): for each non-internal package of
+        -- rule.kind in rule.registry, walk its non-internal versions newest
+        -- first. Container versions named "latest" or named by a digest
+        -- (sha256:...) are skipped entirely and not counted. For every other
+        -- version, in order:
+        --   1. the first keep_count versions are kept (0 = no count keep)
+        --   2. the match subject is the version, or "<name>/<version>" when
+        --      match_full_name; kept if keep_pattern matches it
+        --   3. "last used" = last download, or creation if never downloaded;
+        --      kept if last used is within keep_last_download_days
+        --   4. kept if created within remove_days
+        --   5. kept if last used is within remove_last_download_days
+        --   6. kept if remove_pattern is set and does not match
+        --   7. otherwise removed.
+        -- Patterns are case-insensitive regular expressions that must match
+        -- the whole subject. A zero-day window keeps nothing.
+        -- Cleanup deletions emit no PackageVersionDeleted events. Index rebuilds
+        -- only happen when at least one version was removed.
+}
+
+-- Purge leftovers: stale upload sessions, never-referenced container
+-- uploads, dangling container digest versions, packages without versions,
+-- and blobs no file references. Everything time-based uses older_than.
+-- from: services/packages/cleanup/cleanup.go:183
+rule PurgeExpiredPackageData {
+    when: ExpiredPackageDataPurgeDue(older_than)
+    ensures:
+        for u in BlobUploads:
+            if u.updated_at + older_than <= now:
+                not exists u
+    ensures:
+        for staged in ContainerUploadedBlobs:
+            if staged.uploaded_at + older_than <= now:
+                not exists staged
+    ensures:
+        for v in PackageVersions:
+            if v.is_dangling_container_digest and v.created_at + older_than <= now:
+                not exists v
+    ensures:
+        for p in Packages:
+            if not p.has_versions:
+                not exists p
+    ensures:
+        for b in PackageBlobs:
+            if not b.is_referenced and not staged_anywhere(b) and b.created_at + older_than <= now:
+                not exists b
+    @guidance
+        -- A dangling container digest version is one whose version is a
+        -- "sha256:" digest, that is not tagged and that no image index
+        -- version references. Blob content is removed from storage after the
+        -- records are gone.
+}
+
+-- Site administrators can run the purge immediately, with no age threshold.
+-- from: routers/web/admin/packages.go:102
+rule AdminPurgesExpiredDataNow {
+    when: AdminRunsPackageDataPurge(admin)
+    requires: config.packages_enabled
+    requires: admin.is_admin
+    ensures:
+        for u in BlobUploads:
+            not exists u
+    ensures:
+        for staged in ContainerUploadedBlobs:
+            not exists staged
+    ensures:
+        for v in PackageVersions:
+            if v.is_dangling_container_digest:
+                not exists v
+    ensures:
+        for p in Packages:
+            if not p.has_versions:
+                not exists p
+    ensures:
+        for b in PackageBlobs:
+            if not b.is_referenced and not staged_anywhere(b):
+                not exists b
+    @guidance
+        -- Same purge as PurgeExpiredPackageData with an age threshold of
+        -- zero: everything that qualifies is removed now.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- from: models/packages/package.go:193
+invariant UniquePackageNamePerOwnerAndKind {
+    for a in Packages:
+        for b in Packages:
+            (a != b and a.registry = b.registry and a.kind = b.kind) implies not same_package_name(a.kind, a.name, b.name)
+}
+
+-- from: models/packages/package_version.go:31
+invariant UniqueVersionPerPackage {
+    for a in PackageVersions:
+        for b in PackageVersions:
+            (a != b and a.package = b.package) implies lower(a.version) != lower(b.version)
+}
+
+-- from: models/packages/package_file.go:36
+invariant UniqueFilePerVersionAndKey {
+    for a in PackageFiles:
+        for b in PackageFiles:
+            (a != b and a.version = b.version and a.composite_key = b.composite_key) implies lower(a.name) != lower(b.name)
+}
+
+-- Content is stored once.
+-- from: models/packages/package_blob.go:35
+invariant BlobsAreContentAddressed {
+    for a in PackageBlobs:
+        for b in PackageBlobs:
+            a != b implies a.hash_sha256 != b.hash_sha256
+}
+
+-- from: models/packages/package_cleanup_rule.go:28
+invariant OneCleanupRulePerOwnerAndKind {
+    for a in CleanupRules:
+        for b in CleanupRules:
+            (a != b and a.registry = b.registry) implies a.kind != b.kind
+}
+
+-- A package may only be linked to a repository of the same owner.
+-- from: services/packages/package_update.go:20
+invariant LinkedRepositoryHasSameOwner {
+    for p in Packages:
+        p.linked_repository != null implies same_owner(p.registry, p.linked_repository)
+}
+
+-- Every registry belongs to exactly one owner.
+-- from: models/packages/package.go:189
+invariant RegistryHasExactlyOneOwner {
+    for r in OwnerRegistries:
+        (r.owner_user != null) != (r.owner_org != null)
+}
+
+-- Internal versions hold registry machinery only and never count.
+-- from: models/packages/package.go:281
+invariant InternalVersionsAreNeverPublishedByUsers {
+    for v in PackageVersions:
+        v.is_internal implies v.package.is_internal or v.package.kind = container
+}
+
+-- from: services/packages/packages.go:707
+invariant DownloadCountNeverNegative {
+    for v in PackageVersions:
+        v.download_count >= 0
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Anyone who may read the registry (see guidance on PackageBrowsing).
+actor PackageReader {
+    within: OwnerRegistry
+    identified_by: accounts/User where can_read_packages(this, within)
+}
+
+-- Owner, or org member with write on the packages unit, or site admin, acting
+-- through a credential that permits package writes.
+actor PackagePublisher {
+    within: OwnerRegistry
+    identified_by: accounts/User where can_write_packages(this, within)
+}
+
+-- The user themselves for a user registry; an owner of the organisation for
+-- an organisation registry.
+actor RegistryManager {
+    within: OwnerRegistry
+    identified_by: accounts/User where can_manage_registry(this, within)
+}
+
+actor PackageSiteAdmin {
+    identified_by: accounts/User where is_admin = true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- Package-manager clients talking the per-kind protocol (all kinds except
+-- the container registry, which has its own surface).
+surface PackageClientProtocol {
+    facing client: accounts/User
+    context registry: OwnerRegistry
+
+    exposes:
+        for p in registry.visible_packages where can_read_packages(client, registry):
+            p.name
+            p.kind
+        for v in PackageVersions where v.package.registry = registry and v.is_internal = false and can_read_packages(client, registry):
+            v.version
+            v.metadata
+            v.is_yanked
+            v.dist_tags
+        for f in PackageFiles where f.version.package.registry = registry and f.version.is_internal = false and can_read_packages(client, registry):
+            f.name
+            f.blob.size
+            f.blob.hash_sha256
+        for i in registry.repository_indexes where can_read_packages(client, registry):
+            i.scope
+            i.built_at
+        for k in registry.signing_keys where can_read_packages(client, registry):
+            k.public_key
+
+    provides:
+        PublisherUploadsPackageFile(client, registry, kind, name, version, file_name, composite_key, is_lead, size, sha256)
+            when can_write_packages(client, registry)
+        ClientDownloadsPackageFile(client, file)
+            when can_read_packages(client, registry)
+        ClientRequestsRepositoryKey(client, registry, kind)
+            when can_read_packages(client, registry)
+        UserRemovesPackageVersion(client, version)
+            when can_write_packages(client, registry)
+        UserRemovesPackage(client, package)
+            when can_write_packages(client, registry)
+        UserRemovesPackageFile(client, file)
+            when can_write_packages(client, registry)
+        PublisherYanksCargoVersion(client, version)
+            when can_write_packages(client, registry)
+        PublisherUnyanksCargoVersion(client, version)
+            when can_write_packages(client, registry)
+        PublisherSetsNpmDistTag(client, version, tag)
+            when can_write_packages(client, registry)
+        PublisherRemovesNpmDistTag(client, package, tag)
+            when can_write_packages(client, registry)
+
+    @guarantee ScopedCredentialsAreHonoured
+        -- A request authenticated with a scoped token needs read:package to
+        -- read and write:package to change anything; a token restricted to
+        -- public resources is refused on a private owner's registry.
+        -- Site administrators bypass the access mode check but not the
+        -- token scope check.
+
+    @guarantee LimitsAreReportedDistinctly
+        -- Exceeding a per-kind size limit, the owner size limit or the owner
+        -- version count is refused as a limit violation; exceeding the quota
+        -- module's limit is refused as "quota exceeded"; a duplicate version
+        -- or file is refused as a conflict.
+
+    @guidance
+        -- Credentials accepted: OAuth2 bearer, access tokens (basic or
+        -- bearer), Actions runtime / task tokens, basic auth, reverse proxy
+        -- auth; Chef requests signed with the user's ChefClientKey; NuGet
+        -- API key; Conan/Swift/Vagrant login handshakes return tokens.
+        -- Endpoint roots (under the instance URL, {owner} = registry owner):
+        --   /api/packages/{owner}/alpine     key, {branch}/{repo}[/{arch}]
+        --   /api/packages/{owner}/alt        {group}.repo, upload, RPMS.*, base/
+        --   /api/packages/{owner}/arch       repository.key, {distro}/{arch}/...
+        --   /api/packages/{owner}/cargo      api/v1/crates, config.json, index paths
+        --   /api/packages/{owner}/chef       api/v1/universe|search|cookbooks
+        --   /api/packages/{owner}/composer   packages.json, p2/, files/
+        --   /api/packages/{owner}/conan      v1/ and v2/ (ping, users, conans, files)
+        --   /api/packages/{owner}/conda      {channel}/{subdir}/repodata.json, uploads
+        --   /api/packages/{owner}/cran       src/contrib, bin/{platform}/contrib/{rversion}
+        --   /api/packages/{owner}/debian     repository.key, dists/, pool/
+        --   /api/packages/{owner}/generic    {name}/{version}/{filename}
+        --   /api/packages/{owner}/go         upload, module proxy paths
+        --   /api/packages/{owner}/helm       index.yaml, {filename}, api/charts
+        --   /api/packages/{owner}/maven      {group path}/{artifact}/{version}/{file}
+        --   /api/packages/{owner}/npm        {id}, @{scope}/{id}, -/package/.../dist-tags, -/v1/search
+        --   /api/packages/{owner}/nuget      index.json, query, registration/, package/, symbols/
+        --   /api/packages/{owner}/pub        api/packages/versions/new, {id}
+        --   /api/packages/{owner}/pypi       upload POST /, simple/{id}, files/
+        --   /api/packages/{owner}/rpm        repository.key, {group}.repo, upload, repodata/, package/
+        --   /api/packages/{owner}/rubygems   specs, info/, gems/, api/v1/gems
+        --   /api/packages/{owner}/swift      {scope}/{name}[/{version}], identifiers, login
+        --   /api/packages/{owner}/vagrant    authenticate, {name}/{version}/{provider}
+        -- Discovery endpoints (NuGet service index, Swift login, Vagrant
+        -- authenticate, Conan ping) answer without authentication so clients
+        -- can negotiate.
+}
+
+-- The OCI distribution API served at /v2.
+surface ContainerRegistryProtocol {
+    facing client: accounts/User
+    context registry: OwnerRegistry
+
+    exposes:
+        for p in registry.visible_packages where p.kind = container and can_read_packages(client, registry):
+            p.name
+        for v in PackageVersions where v.package.registry = registry and v.package.kind = container and v.is_tagged and can_read_packages(client, registry):
+            v.version
+        for staged in registry.container_uploads where can_read_packages(client, registry):
+            staged.blob.hash_sha256
+            staged.blob.size
+        for u in BlobUploads where u.registry = registry and can_write_packages(client, registry):
+            u.bytes_received
+
+    provides:
+        ContainerClientRequestsToken(client, credential_expires_at, scope)
+        ContainerClientStartsBlobUpload(client, registry, image)
+            when can_write_packages(client, registry)
+        ContainerClientAppendsChunk(client, upload, chunk_size)
+            when can_write_packages(client, registry)
+        ContainerClientCompletesBlobUpload(client, upload, sha256)
+            when can_write_packages(client, registry)
+        ContainerClientCancelsBlobUpload(client, upload)
+            when can_write_packages(client, registry)
+        ContainerClientMountsBlob(client, registry, image, blob)
+            when can_write_packages(client, registry)
+        ContainerClientDeletesBlob(client, registry, image, blob)
+            when can_write_packages(client, registry)
+        ContainerClientPushesManifest(client, registry, image, reference, is_tag, size, sha256)
+            when can_write_packages(client, registry)
+        ContainerClientDeletesManifest(client, version)
+            when can_write_packages(client, registry)
+        ClientDownloadsPackageFile(client, file)
+            when can_read_packages(client, registry)
+
+    @guarantee SignedInClientsOnly
+        -- Every /v2 request other than the token exchange needs a signed-in
+        -- user or a registry bearer token; an anonymous bearer token is
+        -- issued only when the instance does not require sign-in to view.
+
+    @guidance
+        -- GET /v2 (support check), GET /v2/token, GET /v2/_catalog (images
+        -- the caller can read, max config.container_list_max per page),
+        -- /v2/{owner}/{image}/blobs/uploads[/{uuid}] (POST/GET/PATCH/PUT/
+        -- DELETE, ?mount=&from=), /v2/{owner}/{image}/blobs/{digest}
+        -- (HEAD/GET/DELETE), /v2/{owner}/{image}/manifests/{reference}
+        -- (PUT/HEAD/GET/DELETE), /v2/{owner}/{image}/tags/list (?n=&last=).
+        -- Image names may contain "/" segments.
+}
+
+-- Web UI and REST API (/api/v1/packages/{owner}) read views of a registry.
+surface PackageBrowsing {
+    facing viewer: accounts/User
+    context registry: OwnerRegistry
+
+    exposes:
+        registry.has_packages when can_read_packages(viewer, registry)
+        for p in registry.visible_packages where can_read_packages(viewer, registry):
+            p.name
+            p.kind
+            p.properties
+            p.latest_version
+        for p in registry.visible_packages where p.linked_repository != null and can_read_packages(viewer, registry) and access/can_read(viewer, p.linked_repository, code):
+            p.linked_repository
+        for v in PackageVersions where v.package.registry = registry and v.is_internal = false and can_read_packages(viewer, registry):
+            v.version
+            v.creator
+            v.created_at
+            v.metadata
+            v.properties
+            v.download_count
+            v.last_downloaded_at
+            v.total_size
+            v.is_tagged
+            v.dist_tags
+            v.is_yanked
+        for f in PackageFiles where f.version.package.registry = registry and f.version.is_internal = false and can_read_packages(viewer, registry):
+            f.name
+            f.created_at
+            f.properties
+            f.blob.size
+            f.blob.hash_md5
+            f.blob.hash_sha1
+            f.blob.hash_sha256
+            f.blob.hash_sha512
+        for policy in KindPolicies:
+            policy.display_name
+            policy.endpoint_root
+            policy.name_case_sensitive
+
+    provides:
+        ClientDownloadsPackageFile(viewer, file)
+            when can_read_packages(viewer, registry)
+
+    related:
+        PackageVersionSettings(registry)
+            when can_write_packages(viewer, registry)
+
+    @guarantee VisibilityFollowsOwner
+        -- Reading a registry depends only on its owner, never on a linked
+        -- repository: a public owner's packages are readable by everyone
+        -- (anonymous included unless sign-in is required to view), a
+        -- limited owner's by every signed-in user, a private user's only by
+        -- that user, a private organisation's only by its members.
+        -- Linking a package to a private repository does not hide it;
+        -- the linked repository is only shown to viewers who can read it.
+
+    @guidance
+        -- Web: /{owner}/-/packages (latest version of each package; filter
+        -- by kind and name; paging config.packages_paging_num),
+        -- /{owner}/-/packages/{kind}/{name} (redirects to latest version),
+        -- .../versions (container: tagged / untagged filter; sort by name,
+        -- version, created, size), .../{version} (install instructions per
+        -- kind, metadata, properties, files, other versions, download count,
+        -- linked repository), .../{version}/files/{fileid} (download).
+        -- REST: GET /api/v1/packages/{owner} (?type=&q=, paged),
+        -- GET /api/v1/packages/{owner}/{type}/{name}/{version},
+        -- GET .../{version}/files. Also faces the anonymous visitor (see
+        -- access) with the same can_read_packages guard.
+}
+
+-- What a package writer can do with one package from the web UI and REST API.
+surface PackageVersionSettings {
+    facing writer: accounts/User
+    context registry: OwnerRegistry
+
+    exposes:
+        for p in registry.visible_packages where can_write_packages(writer, registry):
+            p.linked_repository
+
+    provides:
+        UserLinksPackage(writer, package, repository)
+            when can_write_packages(writer, registry)
+        UserUnlinksPackage(writer, package)
+            when can_write_packages(writer, registry)
+        UserRemovesPackageVersion(writer, version)
+            when can_write_packages(writer, registry)
+
+    @guidance
+        -- Web: /{owner}/-/packages/{kind}/{name}/{version}/settings (link to
+        -- a repository of the same owner, delete this version).
+        -- REST: DELETE /api/v1/packages/{owner}/{type}/{name}/{version},
+        -- POST /api/v1/packages/{owner}/{type}/{name}/-/link/{repo_name},
+        -- POST /api/v1/packages/{owner}/{type}/{name}/-/unlink.
+        -- All REST writes require a token with write:package.
+}
+
+-- Owner-level package settings: cleanup rules, Cargo index, Chef key.
+surface OwnerPackageSettings {
+    facing manager: accounts/User
+    context registry: OwnerRegistry
+
+    exposes:
+        for rule in registry.cleanup_rules where can_manage_registry(manager, registry):
+            rule.kind
+            rule.enabled
+            rule.keep_count
+            rule.keep_pattern
+            rule.keep_last_download_days
+            rule.remove_days
+            rule.remove_last_download_days
+            rule.remove_pattern
+            rule.match_full_name
+            rule.targets
+        for index in registry.cargo_index where can_manage_registry(manager, registry):
+            index.repository_name
+            index.built_at
+        for key in ChefClientKeys where key.user = manager and registry.owner_user = manager:
+            key.public_key
+
+    provides:
+        ManagerAddsCleanupRule(manager, registry, kind, enabled, keep_count, keep_pattern, keep_last_download_days, remove_days, remove_last_download_days, remove_pattern, match_full_name)
+            when can_manage_registry(manager, registry)
+        ManagerEditsCleanupRule(manager, rule, enabled, keep_count, keep_pattern, keep_last_download_days, remove_days, remove_last_download_days, remove_pattern, match_full_name)
+            when can_manage_registry(manager, registry)
+        ManagerRemovesCleanupRule(manager, rule)
+            when can_manage_registry(manager, registry)
+        ManagerInitializesCargoIndex(manager, registry)
+            when can_manage_registry(manager, registry)
+        ManagerRebuildsCargoIndex(manager, registry)
+            when can_manage_registry(manager, registry)
+        UserRegeneratesChefKeyPair(manager)
+            when registry.owner_user = manager
+
+    @guidance
+        -- Web: /user/settings/packages[/rules/add | /rules/{id} |
+        -- /rules/{id}/preview | /cargo/initialize | /cargo/rebuild |
+        -- /chef/regenerate_keypair] and
+        -- /org/{org}/settings/packages[/rules/... | /cargo/...] (org owners).
+        -- The preview lists rule.targets without deleting anything.
+}
+
+-- A repository's "Packages" tab lists packages linked to it.
+surface RepositoryPackages {
+    facing viewer: accounts/User
+    context repository: repositories/Repository
+
+    exposes:
+        for p in Packages where p.linked_repository = repository and p.is_internal = false and access/can_read(viewer, repository, code):
+            p.name
+            p.kind
+            p.latest_version
+
+    @guidance
+        -- Web: /{owner}/{repo}/packages (latest version per linked package,
+        -- filter by kind / name). Shown as a tab when the repository's
+        -- `packages` unit is enabled.
+}
+
+-- Site administration of the registry.
+surface SiteAdminPackages {
+    facing admin: PackageSiteAdmin
+
+    exposes:
+        for v in PackageVersions:
+            v.version
+            v.package.name
+            v.package.kind
+            v.total_size
+            v.created_at
+        for b in PackageBlobs:
+            b.size
+            b.is_referenced
+
+    provides:
+        UserRemovesPackageVersion(admin, version)
+        AdminRunsPackageDataPurge(admin)
+
+    @guidance
+        -- Web: /admin/packages (all non-internal versions, filter by kind and
+        -- name, sort; total referenced and unreferenced blob size),
+        -- POST /admin/packages/delete, POST /admin/packages/cleanup.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred KindProtocols.wire_formats    -- see: detailed/package-protocols.allium (one adapter per kind; endpoint roots on PackageClientProtocol)
+deferred RepositoryIndex.file_formats  -- see: detailed/package-repository-indexes.allium (Debian/Alpine/RPM/ALT/Arch layouts)
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "The web settings page links a package to any repository of the same owner without checking the user's write access to that repository and without requiring the package to be unlinked first, while the REST API checks both. The spec adopts the API behaviour for both; confirm."
+open question "Unlinking requires the actor to be a site admin, the owning user, or an organisation owner, on top of package write access; linking only needs package write and repository write. Is this asymmetry intended?"
+open question "The cleanup-rule form renders keep/remove last-download-days fields but never binds them, so they cannot be set from the UI today. The spec lets managers set them; confirm they should be user-editable."
+open question "A token restricted to public resources is refused only for private owners; limited owners are allowed. Should 'public only' also exclude limited owners?"
+open question "Actions workflow tokens can publish to the repository owner's registry with the owner's package permissions (marked TODO in Forgejo). Should they be narrowed to the workflow's own repository / linked packages?"
+open question "Owner count/size limits (LIMIT_TOTAL_OWNER_*) and the quota module overlap. Should a rebuild keep both mechanisms or express the LIMIT_* settings as default quota rules?"
+open question "Dangling container digest versions are purged only by the expired-data cleanup; cleanup rules deliberately skip them and the 'latest' tag. Keep this split?"
+open question "Owner deletion: users/orgs are refused deletion while they own packages unless purged; org purge does not exist. Should organisation deletion also be able to purge packages?"
+
+------------------------------------------------------------
+-- Requests to other modules
+------------------------------------------------------------
+-- REQUEST accounts/UserPurged(user): emitted when an admin deletes a user with purge; packages removes the user's registry content.
+-- REQUEST accounts/owns_packages(user): answer with packages/OwnerRegistry{owner_user: user}.has_packages (non-internal versions exist); refuse non-purge deletion while true.
+-- REQUEST accounts/UserRenamed: no package reaction needed; image and registry coordinates are derived from the owner's current name.
+-- REQUEST organizations/Organization.deletion: refuse deletion while packages/OwnerRegistry{owner_org: org}.has_packages.
+-- REQUEST organizations/is_org_owner(org, user): used by can_manage_registry and unlinking.
+-- REQUEST organizations/TeamUnitAccess for unit `packages`: needed to derive can_read/can_write_packages for org registries (max of team authorize level and team packages-unit access).
+-- REQUEST repositories/RepositoryDeleted(repository, doer): already emitted; packages unlinks linked packages.
+-- REQUEST repositories/Repository: creating the `_cargo-index` repository on behalf of the owner (OwnerInitializesCargoIndex).
+-- REQUEST access/can_write(user, repository, packages) and access/can_read(user, repository, code): used for linking and for showing linked repositories.
+-- REQUEST access/config.require_signin_view: imported as config.require_signin_view (used by can_read_packages and the container token exchange).
+-- REQUEST authentication/TokenScope: read:package / write:package and public-only flag consumed by can_read/can_write_packages.
+-- REQUEST quota/quota_allows(owner, size_assets_packages_all) (QuotaGate gate_package_upload, charged: package_owner): quota_allows_package_upload(registry) is exactly this, evaluated for the registry owner (not the uploader) before every write that stores data; quota/QuotaUsage.packages should sum packages/PackageFile sizes per owner (blob shared by two files counts twice, as LIMIT_TOTAL_OWNER_SIZE does).
+-- REQUEST webhooks, actions: already react to PackageVersionCreated(version, doer) / PackageVersionDeleted(version, doer) (names aligned with their requests).

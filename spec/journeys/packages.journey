@@ -1,0 +1,374 @@
+-- Journeys through the package registry (spec/packages.allium).
+--
+-- Access to a registry is derived from its owner (user / org visibility,
+-- org team packages-unit access, token scope); the spec names that
+-- derivation can_read_packages / can_write_packages / can_manage_registry,
+-- so each journey says which way it falls for the people in it.
+--
+-- The per-kind behaviour table (KindPolicy) is a set of spec defaults; the
+-- world lays down the rows these journeys rely on, with Forgejo's values.
+
+world {
+    cast:
+        ada:  accounts/User
+        bob:  accounts/User
+        eve:  accounts/User
+        reg:  OwnerRegistry
+    given:
+        reg.owner_user = ada
+        reg.owner_org = null
+        ada.is_admin = false
+        bob.is_admin = false
+        eve.is_admin = false
+        generic_row:   KindPolicy { kind: generic, version_mode: additive, file_overwrite: refuse, has_repository_index: false, signing: none, size_limit: -1 }
+        npm_row:       KindPolicy { kind: npm, version_mode: immutable, file_overwrite: refuse, has_repository_index: false, signing: none, size_limit: -1 }
+        helm_row:      KindPolicy { kind: helm, version_mode: additive, file_overwrite: replace, has_repository_index: false, signing: none, size_limit: 1000 }
+        debian_row:    KindPolicy { kind: debian, version_mode: additive, file_overwrite: refuse, has_repository_index: true, signing: pgp, size_limit: -1 }
+        maven_row:     KindPolicy { kind: maven, version_mode: additive, file_overwrite: replace_metadata, has_repository_index: false, signing: none, size_limit: -1 }
+        cargo_row:     KindPolicy { kind: cargo, version_mode: immutable, file_overwrite: refuse, has_repository_index: false, signing: none, size_limit: -1 }
+        container_row: KindPolicy { kind: container, version_mode: reference, file_overwrite: refuse, has_repository_index: false, signing: none, size_limit: -1 }
+}
+
+-- The happy path of the generic registry: the first upload of a new name
+-- creates package, version, file and blob, and announces the version.
+journey AdaPublishesAGenericPackage {
+    goal: Ada uploads build output under a new name and version and it
+          becomes a package other tools can be told about.
+
+    1. she uploads the first file of a new package
+        stipulate can_write_packages(ada, reg) = true
+        stipulate valid_coordinates(generic, "tool", "1.0.0", "tool.tar.gz") = true
+        stipulate quota_allows_package_upload(reg) = true
+        stipulate reg.stored_size = 0
+        stipulate reg.visible_version_count = 0
+        ada does PublisherUploadsPackageFile(ada, reg, generic, "tool", "1.0.0", "tool.tar.gz", null, true, 2048, "abc123") on PackageClientProtocol
+            creating release: PackageVersion
+        then PublishFirstVersionOfNewPackage fires
+        then StoreFileContent fires
+        then release.version = "1.0.0"
+        then release.download_count = 0
+        then release.creator = ada
+
+    2. she sees it in her package list
+        stipulate can_read_packages(ada, reg) = true
+        ada sees release.version on PackageBrowsing in reg
+
+    ends: A generic package "tool" exists in Ada's registry with its first
+          version holding one file, and PackageVersionCreated has been emitted
+          for webhooks and Actions to react to.
+}
+
+-- Additive kinds take more files into an existing version.
+journey AdaAddsASecondFileToTheSameVersion {
+    given:
+        tool:  Package { registry: reg, kind: generic, name: "tool", is_internal: false, autolink_pending: false }
+        v1:    PackageVersion { package: tool, creator: ada, version: "1.0.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
+        blob:  PackageBlob { size: 2048, hash_sha256: "abc123" }
+        file:  PackageFile { version: v1, blob: blob, name: "tool.tar.gz", composite_key: null, is_lead: true }
+
+    1. she uploads a checksum file next to the archive
+        stipulate can_write_packages(ada, reg) = true
+        stipulate quota_allows_package_upload(reg) = true
+        stipulate reg.stored_size = 2048
+        stipulate reg.visible_version_count = 1
+        stipulate valid_coordinates(generic, "tool", "1.0.0", "tool.sha256") = true
+        ada does PublisherUploadsPackageFile(ada, reg, generic, "tool", "1.0.0", "tool.sha256", null, false, 64, "def456") on PackageClientProtocol
+        then AddFileToExistingVersion fires
+        then StoreFileContent fires
+        then PublishNewVersionOfExistingPackage does not fire
+
+    2. the same file name again is a conflict
+        stipulate valid_coordinates(generic, "tool", "1.0.0", "tool.tar.gz") = true
+        ada cannot do PublisherUploadsPackageFile(ada, reg, generic, "tool", "1.0.0", "tool.tar.gz", null, true, 99, "fff000") on PackageClientProtocol
+
+    ends: The version now has two files; no second "published" event, and
+          generic files are never overwritten.
+}
+
+-- Immutable kinds refuse a second publish of the same version.
+journey NpmRefusesToRepublishAVersion {
+    goal: Ada tries to overwrite an npm version she already published.
+
+    given:
+        lib:  Package { registry: reg, kind: npm, name: "left-pad", is_internal: false, autolink_pending: false }
+        v1:   PackageVersion { package: lib, creator: ada, version: "1.0.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
+
+    1. the same version again is a conflict
+        stipulate can_write_packages(ada, reg) = true
+        stipulate valid_coordinates(npm, "left-pad", "1.0.0", "left-pad-1.0.0.tgz") = true
+        stipulate quota_allows_package_upload(reg) = true
+        stipulate reg.stored_size = 0
+        stipulate reg.visible_version_count = 1
+        ada cannot do PublisherUploadsPackageFile(ada, reg, npm, "left-pad", "1.0.0", "left-pad-1.0.0.tgz", null, true, 512, "aaa111") on PackageClientProtocol
+
+    2. a new version is fine
+        stipulate valid_coordinates(npm, "left-pad", "1.0.1", "left-pad-1.0.1.tgz") = true
+        ada does PublisherUploadsPackageFile(ada, reg, npm, "left-pad", "1.0.1", "left-pad-1.0.1.tgz", null, true, 512, "aaa222") on PackageClientProtocol
+        then PublishNewVersionOfExistingPackage fires
+
+    ends: 1.0.0 is unchanged and 1.0.1 sits beside it.
+}
+
+-- Somebody without write access to the registry cannot publish into it.
+journey BobCannotPublishIntoAdasRegistry {
+    goal: Bob, who can read Ada's public packages, tries to push one.
+
+    1. his upload is refused
+        stipulate can_write_packages(bob, reg) = false
+        bob cannot do PublisherUploadsPackageFile(bob, reg, generic, "tool", "9.9.9", "evil.tar.gz", null, true, 10, "bad000") on PackageClientProtocol
+
+    ends: Nothing was stored.
+}
+
+-- A per-kind size limit stops an oversized upload.
+journey AnOversizedHelmChartIsRefused {
+    goal: The instance limits Helm uploads to 1000 bytes; Ada's chart is
+          bigger.
+
+    1. a chart bigger than the limit is refused
+        stipulate can_write_packages(ada, reg) = true
+        stipulate valid_coordinates(helm, "web", "0.1.0", "web-0.1.0.tgz") = true
+        stipulate quota_allows_package_upload(reg) = true
+        stipulate reg.stored_size = 0
+        stipulate reg.visible_version_count = 0
+        ada cannot do PublisherUploadsPackageFile(ada, reg, helm, "web", "0.1.0", "web-0.1.0.tgz", null, true, 5000, "big999") on PackageClientProtocol
+
+    ends: The chart was not stored.
+}
+
+-- Downloading the lead file counts a download; visibility follows the owner.
+journey BobDownloadsAndEveCannotSee {
+    goal: Bob may read Ada's registry, Eve may not (Ada's account is
+          private to her). Bob's download is counted.
+
+    given:
+        tool:  Package { registry: reg, kind: generic, name: "tool", is_internal: false, autolink_pending: false }
+        v1:    PackageVersion { package: tool, creator: ada, version: "1.0.0", is_internal: false, download_count: 3, is_tagged: false, is_yanked: false }
+        blob:  PackageBlob { size: 2048, hash_sha256: "abc123" }
+        file:  PackageFile { version: v1, blob: blob, name: "tool.tar.gz", is_lead: true }
+
+    1. bob downloads the archive
+        stipulate can_read_packages(bob, reg) = true
+        bob does ClientDownloadsPackageFile(bob, file) on PackageClientProtocol
+        then DownloadLeadFileCountsDownload fires
+        then v1.download_count = 4
+
+    2. bob sees the count, eve does not
+        stipulate can_read_packages(eve, reg) = false
+        bob sees v1.download_count on PackageBrowsing in reg
+        eve cannot see v1.download_count on PackageBrowsing in reg
+        eve cannot see tool.name on PackageBrowsing in reg
+
+    3. eve cannot download it either
+        eve cannot do ClientDownloadsPackageFile(eve, file) on PackageClientProtocol
+
+    ends: The version shows four downloads to those allowed to see it.
+}
+
+-- Deleting a Debian version tells the world and regenerates the signed
+-- repository index, creating the owner's signing key on first need.
+journey AdaDeletesADebianVersion {
+    given:
+        pkg:  Package { registry: reg, kind: debian, name: "hello", is_internal: false, autolink_pending: false }
+        v2:   PackageVersion { package: pkg, creator: ada, version: "2.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
+
+    1. she deletes the version from its settings page
+        stipulate can_write_packages(ada, reg) = true
+        stipulate index_scopes_of(reg, debian) = {}
+        stipulate generated_public_key(reg, debian) = "PGP KEY"
+        ada does UserRemovesPackageVersion(ada, v2) on PackageVersionSettings
+        then UserDeletesPackageVersion fires
+        then RefreshIndexesAfterChange fires
+        then RebuildRepositoryIndex fires
+        then EnsureSigningKey fires
+        then v2 does not exist
+
+    ends: hello 2.0 is gone, PackageVersionDeleted was emitted, and the Debian
+          Release files are rebuilt and signed with Ada's registry key.
+}
+
+-- Linking a package to a repository needs write on both sides.
+journey AdaLinksAPackageToHerRepository {
+    given:
+        repo: repositories/Repository { owner_user: ada, is_private: false }
+        pkg:  Package { registry: reg, kind: generic, name: "tool", is_internal: false, linked_repository: null, autolink_pending: false }
+
+    1. she links it
+        stipulate can_write_packages(ada, reg) = true
+        stipulate same_owner(reg, repo) = true
+        stipulate access/can_write(ada, repo, packages) = true
+        ada does UserLinksPackage(ada, pkg, repo) on PackageVersionSettings
+        then UserLinksPackageToRepository fires
+        then pkg.linked_repository = repo
+
+    2. bob, who cannot write packages here, cannot unlink it
+        stipulate can_write_packages(bob, reg) = false
+        bob cannot do UserUnlinksPackage(bob, pkg) on PackageVersionSettings
+
+    ends: The package appears on the repository's Packages tab.
+}
+
+-- A Cargo version can be yanked and unyanked without deleting it.
+journey AdaYanksACrate {
+    given:
+        crate: Package { registry: reg, kind: cargo, name: "fastmath", is_internal: false, autolink_pending: false }
+        v3:    PackageVersion { package: crate, creator: ada, version: "0.3.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
+
+    1. she yanks it
+        stipulate can_write_packages(ada, reg) = true
+        ada does PublisherYanksCargoVersion(ada, v3) on PackageClientProtocol
+        then CargoYanksVersion fires
+        then v3.is_yanked = true
+
+    2. yanking twice is refused
+        ada cannot do PublisherYanksCargoVersion(ada, v3) on PackageClientProtocol
+
+    3. and she brings it back
+        stipulate quota_allows_package_upload(reg) = true
+        ada does PublisherUnyanksCargoVersion(ada, v3) on PackageClientProtocol
+        then CargoUnyanksVersion fires
+        then v3.is_yanked = false
+
+    ends: 0.3.0 is resolvable again.
+}
+
+-- Container: a chunked blob upload, then a manifest under a tag creates the
+-- image package and tries to auto-link it.
+journey AdaPushesAContainerImage {
+    1. she starts a blob upload
+        stipulate can_write_packages(ada, reg) = true
+        stipulate valid_image_reference("web", "") = true
+        stipulate quota_allows_package_upload(reg) = true
+        ada does ContainerClientStartsBlobUpload(ada, reg, "web") on ContainerRegistryProtocol
+            creating upload: BlobUpload
+        then upload.bytes_received = 0
+
+    2. she sends one chunk
+        ada does ContainerClientAppendsChunk(ada, upload, 4096) on ContainerRegistryProtocol
+        then upload.bytes_received = 4096
+
+    3. she completes it with the digest
+        stipulate upload_digest_matches(upload, "layer1") = true
+        stipulate reg.stored_size = 0
+        ada does ContainerClientCompletesBlobUpload(ada, upload, "layer1") on ContainerRegistryProtocol
+        then ContainerCompletesBlobUpload fires
+        then upload does not exist
+
+    4. she pushes the manifest as "v1"
+        stipulate valid_image_reference("web", "v1") = true
+        stipulate manifest_references_resolve(reg, "web", "man1") = true
+        stipulate reg.visible_version_count = 0
+        ada does ContainerClientPushesManifest(ada, reg, "web", "v1", true, 512, "man1") on ContainerRegistryProtocol
+            creating image: Package
+        then ContainerPushesManifestForNewImage fires
+        then AttachManifestLayers fires
+        then AutolinkContainerImage fires
+        then image.autolink_pending = false
+
+    ends: Ada's registry has image "web" with tag v1; auto-linking was tried
+          once and will not be tried again.
+}
+
+-- Container tags move: re-pushing a tag replaces the version but keeps its
+-- download count.
+journey AdaRepointsTheLatestTag {
+    given:
+        image: Package { registry: reg, kind: container, name: "web", is_internal: false, autolink_pending: false }
+        old:   PackageVersion { package: image, creator: ada, version: "latest", is_internal: false, download_count: 42, is_tagged: true, is_yanked: false }
+
+    1. she pushes a new manifest as latest
+        stipulate can_write_packages(ada, reg) = true
+        stipulate quota_allows_package_upload(reg) = true
+        stipulate manifest_references_resolve(reg, "web", "man2") = true
+        ada does ContainerClientPushesManifest(ada, reg, "web", "latest", true, 600, "man2") on ContainerRegistryProtocol
+            creating fresh: PackageVersion
+        then ContainerRepointsReference fires
+        then old does not exist
+        then fresh.download_count = 42
+
+    ends: "latest" points at the new manifest with its history of downloads.
+}
+
+-- The owner manages cleanup rules; others cannot; the nightly task applies
+-- enabled rules.
+journey AdaKeepsOnlyRecentSnapshots {
+    goal: Ada adds a Maven cleanup rule, Bob cannot add one to her registry,
+          and the next scheduled cleanup removes what the rule targets.
+
+    cast:
+        sched: PackageCleanupSchedule
+    given:
+        sched.next_run_at = 1.day
+        sched.last_run_at = null
+        lib:  Package { registry: reg, kind: maven, name: "com.example:lib", is_internal: false, autolink_pending: false }
+        snap: PackageVersion { package: lib, creator: ada, version: "1.0-SNAPSHOT", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
+
+    1. she adds a rule
+        stipulate can_manage_registry(ada, reg) = true
+        stipulate is_valid_regex(".*-SNAPSHOT") = true
+        stipulate is_valid_regex("") = true
+        ada does ManagerAddsCleanupRule(ada, reg, maven, true, 5, "", 0, 30, 0, ".*-SNAPSHOT", false) on OwnerPackageSettings
+            creating rule: CleanupRule
+        then ManagerCreatesCleanupRule fires
+        then rule.enabled = true
+        ada sees rule.remove_pattern on OwnerPackageSettings in reg
+
+    2. bob cannot add rules to Ada's registry
+        stipulate can_manage_registry(bob, reg) = false
+        bob cannot do ManagerAddsCleanupRule(bob, reg, npm, true, 1, "", 0, 7, 0, "", false) on OwnerPackageSettings
+        bob cannot see rule.remove_pattern on OwnerPackageSettings in reg
+
+    3. the nightly cleanup runs
+        stipulate rule.targets = {snap}
+        stipulate sched.is_due = true
+        after 1.day
+        then RunScheduledPackageCleanup fires
+        then ApplyCleanupRule fires
+        then PurgeExpiredPackageData fires
+        then snap does not exist
+
+    ends: The old snapshot is gone; the rule stays enabled for tomorrow.
+}
+
+-- A second rule for the same kind is refused, and so are values outside the
+-- offered choices.
+journey OneRulePerKind {
+    given:
+        existing: CleanupRule { registry: reg, kind: npm, enabled: true, keep_count: 5, keep_pattern: "", keep_last_download_days: 0, remove_days: 30, remove_last_download_days: 0, remove_pattern: "", match_full_name: false }
+
+    1. adding another npm rule is refused
+        stipulate can_manage_registry(ada, reg) = true
+        stipulate is_valid_regex("") = true
+        ada cannot do ManagerAddsCleanupRule(ada, reg, npm, true, 10, "", 0, 7, 0, "", false) on OwnerPackageSettings
+
+    2. a keep count that is not offered is refused
+        ada cannot do ManagerAddsCleanupRule(ada, reg, pypi, true, 3, "", 0, 7, 0, "", false) on OwnerPackageSettings
+
+    3. a valid rule for another kind is accepted
+        ada does ManagerAddsCleanupRule(ada, reg, pypi, true, 10, "", 0, 7, 0, "", false) on OwnerPackageSettings
+        then ManagerCreatesCleanupRule fires
+
+    ends: Ada edits the existing npm rule instead of adding a second one.
+}
+
+-- A site administrator purges leftovers immediately.
+journey AdminPurgesLeftovers {
+    cast:
+        root: accounts/User
+    given:
+        root.is_admin = true
+        empty:  Package { registry: reg, kind: generic, name: "abandoned", is_internal: false, autolink_pending: false }
+        orphan: PackageBlob { size: 99, hash_sha256: "zzz", created_at: 0.days }
+
+    1. an ordinary user cannot run it
+        bob cannot do AdminRunsPackageDataPurge(bob) on SiteAdminPackages
+
+    2. the admin runs the purge from the admin panel
+        stipulate staged_anywhere(orphan) = false
+        root does AdminRunsPackageDataPurge(root) on SiteAdminPackages
+        then AdminPurgesExpiredDataNow fires
+        then empty does not exist
+        then orphan does not exist
+
+    ends: Packages without versions and unreferenced blobs are gone.
+}
