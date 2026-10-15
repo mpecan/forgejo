@@ -1,0 +1,457 @@
+-- Journeys through code.allium: branches, pushes, protection, tags, statuses, LFS.
+--
+-- alice can write the code unit of `repo`; bob can only read it; carol is another
+-- writer who is not on any allowlist. Permission answers come from access and are
+-- stipulated per journey.
+
+world {
+    cast:
+        alice: accounts/User
+        bob:   accounts/User
+        carol: accounts/User
+        repo:  repositories/Repository
+    given:
+        alice.is_active = true
+        alice.prohibit_login = false
+        alice.is_admin = false
+        bob.is_active = true
+        bob.prohibit_login = false
+        bob.is_admin = false
+        carol.is_active = true
+        carol.prohibit_login = false
+        carol.is_admin = false
+        repo.status = ready
+        repo.default_branch = "main"
+        repo.is_archived = false
+        repo.is_mirror = false
+        repo.is_empty = false
+        repo.is_fork = false
+        repo.is_private = false
+}
+
+-- The everyday branch life: create from a commit, delete, find it in the deleted list.
+journey AWriterBranchesOffAndCleansUp {
+    goal: Alice creates a feature branch from a commit, deletes it when done, and can
+          still find it among the deleted branches to restore.
+
+    1. she creates the branch from a commit
+        stipulate can_write_code(alice, repo) = true
+        stipulate valid_ref_name("feature") = true
+        stipulate length("feature") = 7
+        stipulate branch_name_conflicts(repo, "feature") = false
+        stipulate commit_exists(repo, "c0ffee") = true
+        stipulate exceeds_git_quota(repo) = false
+        alice does UserCreatesBranch(alice, repo, "feature", "c0ffee") on CodeWriting
+            creating branch: Branch
+        then BranchCreatedByPush fires
+        then branch.status = live
+        then branch.head_commit_sha = "c0ffee"
+        alice sees branch.head_commit_sha on BranchView in branch
+
+    2. she deletes it
+        stipulate protection_for(repo, "feature") = null
+        alice does UserDeletesBranch(alice, branch) on BranchView
+        then branch.status = deleted
+        then branch.deleted_by = alice
+
+    3. it is listed for restoring, and no longer as a live branch
+        alice sees branch.deleted_by on DeletedBranchView in branch
+        alice cannot see branch.head_commit_sha on BranchView in branch
+
+    ends: The branch is gone from git; its record waits to be restored or to expire.
+}
+
+-- A deleted branch comes back, and a forgotten one expires.
+journey ADeletedBranchIsRestoredOrForgotten {
+    goal: Alice restores a branch she deleted by mistake. Another deleted branch nobody
+          restores is purged once the retention period has passed.
+
+    cast:
+        oops:  Branch
+        stale: Branch
+
+    given:
+        oops.repository = repo
+        oops.name = "oops"
+        oops.head_commit_sha = "0a0a0a"
+        oops.status = live
+        stale.repository = repo
+        stale.name = "stale"
+        stale.head_commit_sha = "0b0b0b"
+        stale.status = live
+
+    1. both branches are deleted
+        stipulate can_write_code(alice, repo) = true
+        stipulate protection_for(repo, "oops") = null
+        stipulate protection_for(repo, "stale") = null
+        alice does UserDeletesBranch(alice, oops) on BranchView
+        alice does UserDeletesBranch(alice, stale) on BranchView
+        then oops.status = deleted
+        then stale.status = deleted
+
+    2. she restores the one she needs
+        stipulate exceeds_git_quota(repo) = false
+        alice does UserRestoresBranch(alice, oops) on DeletedBranchView
+        then oops.status = live
+        then oops.head_commit_sha = "0a0a0a"
+        then UserRestoresBranch fires
+
+    3. two days later the other record has expired
+        after 2.days
+        then DeletedBranchRecordExpires fires
+        then stale does not exist
+        then oops exists
+
+    ends: Restoring is possible for a day; after that the record is gone.
+}
+
+-- Readers cannot delete; nobody deletes the default branch.
+journey TheDefaultBranchStays {
+    goal: Bob, a reader, cannot delete a branch. Alice, a writer, cannot delete the
+          default branch — neither in the UI nor by pushing a deletion.
+
+    cast:
+        main: Branch
+
+    given:
+        main.repository = repo
+        main.name = "main"
+        main.head_commit_sha = "aaa111"
+        main.status = live
+
+    1. bob cannot delete anything
+        stipulate can_write_code(bob, repo) = false
+        bob cannot do UserDeletesBranch(bob, main) on BranchView
+
+    2. alice cannot delete the default branch in the UI
+        stipulate can_write_code(alice, repo) = true
+        stipulate protection_for(repo, "main") = null
+        alice cannot do UserDeletesBranch(alice, main) on BranchView
+
+    3. nor by pushing a deletion
+        stipulate can_read_code(alice, repo) = true
+        alice does GitClientPushes(alice, repo, ssh, null, null, null, null, null, null, null, false) on GitTransport
+            creating push: Push
+        stipulate may_write_branch(alice, push, "main") = true
+        alice cannot do PusherProposesRefUpdate(alice, push, branch_ref, "main", "aaa111", null) on GitTransport
+        then main.status = live
+
+    ends: The default branch can only be replaced, never removed.
+}
+
+-- Branch protection: the push allowlist decides; protected files and force pushes never pass.
+journey AProtectedBranchTakesOnlyAllowlistedPushes {
+    goal: `main` is protected with a push allowlist naming only alice. Carol, also a
+          writer, is refused; alice's fast-forward goes through; a force push is refused
+          even for alice.
+
+    cast:
+        main: Branch
+        prot: ProtectedBranch
+
+    given:
+        main.repository = repo
+        main.name = "main"
+        main.head_commit_sha = "aaa111"
+        main.status = live
+        prot.repository = repo
+        prot.rule_name = "main"
+        prot.enable_push = true
+        prot.push_allowlist_enabled = true
+        prot.push_allowlist_deploy_keys = false
+        prot.require_signed_commits = false
+        prot.apply_to_admins = false
+
+    1. carol opens a push
+        stipulate prot.push_allowlist_users = {alice}
+        stipulate prot.push_allowlist_teams = {}
+        stipulate member_of_any_team(carol, {}) = false
+        stipulate can_read_code(carol, repo) = true
+        carol does GitClientPushes(carol, repo, http, null, null, null, null, null, null, null, false) on GitTransport
+            creating carols: Push
+
+    2. her update to main is refused: she is not on the allowlist
+        stipulate protection_for(repo, "main") = prot
+        stipulate may_write_branch(carol, carols, "main") = true
+        stipulate is_force_push(repo, "aaa111", "bbb222") = false
+        stipulate touches_protected_files(prot, repo, "aaa111", "bbb222") = false
+        stipulate touches_only_unprotected_files(prot, repo, "aaa111", "bbb222") = false
+        stipulate exceeds_git_quota(repo) = false
+        carol cannot do PusherProposesRefUpdate(carol, carols, branch_ref, "main", "aaa111", "bbb222") on GitTransport
+        then main.head_commit_sha = "aaa111"
+
+    3. alice pushes the same fast-forward
+        stipulate can_read_code(alice, repo) = true
+        alice does GitClientPushes(alice, repo, ssh, null, null, null, null, null, null, null, false) on GitTransport
+            creating alices: Push
+        stipulate may_write_branch(alice, alices, "main") = true
+        alice does PusherProposesRefUpdate(alice, alices, branch_ref, "main", "aaa111", "bbb222") on GitTransport
+        then AcceptProtectedBranchPush fires
+        then BranchUpdatedByPush fires
+        then main.head_commit_sha = "bbb222"
+        then main.pusher = alice
+
+    4. a force push is refused even for her
+        stipulate is_force_push(repo, "bbb222", "ccc333") = true
+        alice cannot do PusherProposesRefUpdate(alice, alices, branch_ref, "main", "bbb222", "ccc333") on GitTransport
+        then main.head_commit_sha = "bbb222"
+
+    5. she announces the push
+        alice does GitClientFinishesPush(alice, alices) on GitTransport
+        then alices.status = completed
+        then PushCompletes fires
+
+    ends: main moved once, by the one person allowed to move it.
+}
+
+-- Protected tags: only the allowlist may create matching tags; admins are not exempt.
+journey OnlyTheReleaseManagerTagsReleases {
+    goal: Tags matching `v*` are protected with alice on the allowlist. Carol cannot
+          push v1.0; alice can, and the tag appears in the tag list.
+
+    cast:
+        guard: ProtectedTag
+
+    given:
+        guard.repository = repo
+        guard.name_pattern = "v*"
+
+    1. carol tries to push the tag
+        stipulate guard.allowlist_users = {alice}
+        stipulate guard.allowlist_teams = {}
+        stipulate member_of_any_team(carol, {}) = false
+        stipulate can_read_code(carol, repo) = true
+        carol does GitClientPushes(carol, repo, ssh, null, null, null, null, null, null, null, false) on GitTransport
+            creating carols: Push
+        stipulate may_write_code(carol, carols) = true
+        stipulate tag_pattern_matches("v*", "v1.0") = true
+        stipulate exceeds_git_quota(repo) = false
+        carol cannot do PusherProposesRefUpdate(carol, carols, tag_ref, "v1.0", null, "fff000") on GitTransport
+
+    2. alice pushes it
+        stipulate can_read_code(alice, repo) = true
+        alice does GitClientPushes(alice, repo, ssh, null, null, null, null, null, null, null, false) on GitTransport
+            creating alices: Push
+        stipulate may_write_code(alice, alices) = true
+        alice does PusherProposesRefUpdate(alice, alices, tag_ref, "v1.0", null, "fff000") on GitTransport
+            creating v1: Tag
+        then TagCreatedByPush fires
+        then v1.commit_sha = "fff000"
+
+    3. everyone reading the code sees it
+        bob sees v1.commit_sha on TagView in v1
+
+    ends: v1.0 exists and points where the release manager put it.
+}
+
+-- The first push into an empty repository decides its default branch.
+journey TheFirstPushFillsAnEmptyRepository {
+    goal: Alice pushes `trunk` into a freshly created, empty repository. It becomes the
+          default branch and the repository is no longer empty.
+
+    given:
+        repo.is_empty = true
+
+    1. she pushes trunk
+        stipulate can_read_code(alice, repo) = true
+        alice does GitClientPushes(alice, repo, http, null, null, null, null, null, null, null, false) on GitTransport
+            creating push: Push
+        stipulate may_write_branch(alice, push, "trunk") = true
+        stipulate protection_for(repo, "trunk") = null
+        stipulate exceeds_git_quota(repo) = false
+        alice does PusherProposesRefUpdate(alice, push, branch_ref, "trunk", null, "123abc") on GitTransport
+            creating trunk: Branch
+        then BranchCreatedByPush fires
+        then repo.default_branch = "trunk"
+        then repo.is_empty = false
+
+    2. the push completes and is announced
+        alice does GitClientFinishesPush(alice, push) on GitTransport
+        then push.status = completed
+        then PushCompletes fires
+
+    ends: The repository has content and a default branch named after the first push.
+}
+
+-- Archived repositories can be cloned but not pushed to; private ones need a reader.
+journey AnArchiveIsReadOnly {
+    goal: The repository is archived and private. Alice can still clone it; nobody can
+          push to it; bob, who has no access, cannot even fetch it.
+
+    given:
+        repo.is_archived = true
+        repo.is_private = true
+
+    1. alice clones it over SSH
+        stipulate can_read_code(alice, repo) = true
+        stipulate must_have_two_factor(alice) = false
+        stipulate authenticated_by_password(alice) = false
+        alice does GitClientFetches(alice, repo, ssh) on GitTransport
+        then GitClientFetchesRepository fires
+
+    2. nobody can push
+        stipulate can_write_code(alice, repo) = true
+        alice cannot do GitClientPushes(alice, repo, ssh, null, null, null, null, null, null, null, false) on GitTransport
+
+    3. bob cannot fetch a private repository he cannot read
+        stipulate can_read_code(bob, repo) = false
+        stipulate must_have_two_factor(bob) = false
+        stipulate authenticated_by_password(bob) = true
+        stipulate has_two_factor(bob) = false
+        bob cannot do GitClientFetches(bob, repo, http) on GitTransport
+
+    ends: The archive serves reads to its readers and refuses every write.
+}
+
+-- AGit: a reader proposes a change without a fork.
+journey AReaderProposesAChangeWithAGit {
+    goal: Bob cannot push to main, but he can push to refs/for/main/fix-typo, which asks
+          pulls to open a pull request with head `bob/fix-typo`.
+
+    cast:
+        main: Branch
+
+    given:
+        main.repository = repo
+        main.name = "main"
+        main.head_commit_sha = "aaa111"
+        main.status = live
+
+    1. bob opens a push
+        stipulate can_read_code(bob, repo) = true
+        bob does GitClientPushes(bob, repo, ssh, null, null, null, null, null, null, null, false) on GitTransport
+            creating push: Push
+
+    2. pushing straight to main is refused
+        stipulate may_write_branch(bob, push, "main") = false
+        bob cannot do PusherProposesRefUpdate(bob, push, branch_ref, "main", "aaa111", "ddd444") on GitTransport
+
+    3. pushing for review is accepted and asks for a pull request
+        stipulate can_read_pulls(bob, repo) = true
+        stipulate review_target_branch(repo, "main/fix-typo") = "main"
+        stipulate review_topic("main/fix-typo", null) = "fix-typo"
+        stipulate agit_head_branch(bob, "fix-typo") = "bob/fix-typo"
+        stipulate open_agit_pull(repo, "bob/fix-typo", "main") = null
+        stipulate branch_contains(repo, "main", "ddd444") = false
+        stipulate commit_summary(repo, "ddd444") = "Fix typo"
+        stipulate commit_body(repo, "ddd444") = ""
+        bob does PusherProposesRefUpdate(bob, push, for_review, "main/fix-typo", null, "ddd444") on GitTransport
+        then AcceptReviewRefPush fires
+        then AgitPushOpensPullRequest fires
+        then main.head_commit_sha = "aaa111"
+
+    ends: main is untouched; a pull request from bob/fix-typo is on its way.
+}
+
+-- Commit statuses from CI.
+journey CiReportsABuild {
+    goal: The CI service, which has write access through its token, reports a pending
+          and then a successful build for a commit. Bob, a reader, sees the result but
+          cannot report statuses himself.
+
+    cast:
+        ci: accounts/User
+
+    1. the build starts
+        stipulate can_write_code(ci, repo) = true
+        stipulate commit_exists(repo, "abc123") = true
+        stipulate full_sha(repo, "abc123") = "abc123"
+        stipulate trim("ci/build") = "ci/build"
+        ci does CommitStatusReported(ci, repo, "abc123", pending, "ci/build", "https://ci.example/1", "running") on CommitStatusApi
+            creating first: CommitStatus
+        then first.state = pending
+        then CommitStatusIsReported fires
+
+    2. and passes
+        ci does CommitStatusReported(ci, repo, "abc123", success, "ci/build", "https://ci.example/1", "passed") on CommitStatusApi
+            creating second: CommitStatus
+        then second.state = success
+        then second.status_context = "ci/build"
+
+    3. bob reads it but cannot write one
+        bob sees second.state on CommitStatusView in second
+        stipulate can_write_code(bob, repo) = false
+        bob cannot do CommitStatusReported(bob, repo, "abc123", failure, "ci/build", null, null) on CommitStatusApi
+
+    ends: The commit carries a pending and a success status for ci/build; success wins.
+}
+
+-- LFS is off unless the instance turns it on (LFS_START_SERVER, default false).
+journey LfsIsOffUntilTheInstanceEnablesIt {
+    goal: On an instance that has not enabled the LFS server, even a code writer cannot
+          lock files or upload LFS objects.
+
+    1. alice cannot lock a file
+        stipulate can_write_code(alice, repo) = true
+        stipulate normalise_path("assets/logo.psd") = "assets/logo.psd"
+        alice cannot do UserLocksLfsPath(alice, repo, "assets/logo.psd") on LfsApi
+
+    2. nor upload an object
+        stipulate exceeds_lfs_quota(repo) = false
+        alice cannot do LfsClientRequestsUpload(alice, repo, {}) on LfsApi
+
+    ends: With LFS disabled, pointer files are just small text files in git.
+}
+
+-- Editing on a protected branch: commit to a new branch instead.
+journey AnEditGoesToANewBranchWhenMainIsProtected {
+    goal: Alice edits the README in the browser. main is protected and she may not push
+          to it, so committing directly is refused; she commits to a new branch, which
+          leaves main untouched and sets up a pull request.
+
+    -- `{"README.md"}` stands for the one FileChange (update README.md); value types
+    -- cannot be cast in a journey.
+    cast:
+        main: Branch
+
+    given:
+        main.repository = repo
+        main.name = "main"
+        main.head_commit_sha = "aaa111"
+        main.status = live
+
+    1. committing straight to main is refused
+        stipulate may_write_branch_as_user(alice, repo, "main") = true
+        stipulate all_paths_valid({"README.md"}) = true
+        stipulate none_locked_by_other(repo, {"README.md"}, alice) = true
+        stipulate exceeds_git_quota(repo) = false
+        stipulate protection_allows_files(main, alice, {"README.md"}) = false
+        alice cannot do UserCommitsFileChanges(alice, main, direct, null, {"README.md"}, "Fix README", null, false) on BranchView
+
+    2. committing to a new branch works
+        stipulate commit_for_changes(main, {"README.md"}, "Fix README", alice) = "e1e1e1"
+        alice does UserCommitsFileChanges(alice, main, new_branch, "alice-patch-1", {"README.md"}, "Fix README", null, false) on BranchView
+            creating patch: Branch
+        then BranchCreatedByPush fires
+        then patch.name = "alice-patch-1"
+        then patch.head_commit_sha = "e1e1e1"
+        then main.head_commit_sha = "aaa111"
+
+    ends: The change waits on alice-patch-1 for review; main is as it was.
+}
+
+-- Only repository admins manage protection, and the rule is theirs to see.
+journey AnAdminProtectsReleaseTags {
+    goal: Alice, a writer but not an admin, cannot add a tag protection rule. The
+          repository admin adds one for `v*`; carol, a writer, cannot see its allowlist.
+
+    cast:
+        admin: accounts/User
+
+    1. alice is not an admin
+        stipulate is_repo_admin(alice, repo) = false
+        alice cannot do AdminCreatesTagProtection(alice, repo, "v*", {alice}, {}) on CodeSettings
+
+    2. the admin adds the rule
+        stipulate is_repo_admin(admin, repo) = true
+        stipulate valid_tag_pattern("v*") = true
+        admin does AdminCreatesTagProtection(admin, repo, "v*", {alice}, {}) on CodeSettings
+            creating guard: ProtectedTag
+        then guard.name_pattern = "v*"
+        admin sees guard.allowlist_users on TagProtectionView in guard
+
+    3. writers do not see allowlists
+        carol cannot see guard.allowlist_users on CodeWriting in repo
+
+    ends: Release tags are guarded, and only admins know by whom.
+}
