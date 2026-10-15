@@ -1,0 +1,279 @@
+-- Journeys through federation: remote servers discovering this instance,
+-- remote people following and starring, local people following out, and
+-- the delivery queue retrying.
+
+world {
+    cast:
+        peer:     RemoteParty
+        bob_doc:  RemoteActor
+        alice:    accounts/User
+        repo:     repositories/Repository
+    given:
+        peer.origin = "https://code.example"
+        peer.signing_key_id = "https://code.example/api/v1/activitypub/user-id/7#main-key"
+        peer.signature_valid = true
+        bob_doc.uri = "https://code.example/api/v1/activitypub/user-id/7"
+        bob_doc.canonical_uri = "https://code.example/api/v1/activitypub/user-id/7"
+        bob_doc.scheme = "https"
+        bob_doc.host_fqdn = "code.example"
+        bob_doc.host_port = 443
+        bob_doc.external_id = "7"
+        bob_doc.kind = person
+        bob_doc.preferred_username = "bob"
+        bob_doc.display_name = "Bob"
+        bob_doc.inbox_path = "/api/v1/activitypub/user-id/7/inbox"
+        bob_doc.key_id = "https://code.example/api/v1/activitypub/user-id/7#main-key"
+        bob_doc.public_key = "-----BEGIN PUBLIC KEY-----"
+        bob_doc.host_software = forgejo
+        alice.kind = individual
+        alice.prohibit_login = false
+}
+
+journey ARemotePersonIsMetForTheFirstTime {
+    goal: A Forgejo server we have never heard of sends its first signed
+          request on behalf of Bob. We learn the server (from its NodeInfo)
+          and Bob becomes a remote account here that can never sign in.
+
+    1. bob's server signs a request with bob's key
+        peer does RemoteRequestSigned(peer, bob_doc) on PersonActorEndpoint
+            creating bob: FederatedUser
+        then ResolveSigningActor fires
+        then DiscoverFederationHost fires
+        then MaterialiseFederatedUser fires
+        then bob.external_id = "7"
+        then bob.inbox_path = "/api/v1/activitypub/user-id/7/inbox"
+        then bob.key_id = "https://code.example/api/v1/activitypub/user-id/7#main-key"
+
+    2. the host is remembered with the software its NodeInfo reported
+        then bob.host.software = forgejo
+        then bob.host.host_fqdn = "code.example"
+
+    ends: code.example is a known FederationHost and Bob is a FederatedUser
+          backed by an activitypub account with login prohibited.
+}
+
+journey AServerRunningUnknownSoftwareIsIgnored {
+    goal: A server whose NodeInfo names software we do not federate with
+          is not remembered.
+
+    given:
+        bob_doc.host_software = other
+
+    1. it presents an actor
+        peer does RemoteRequestSigned(peer, bob_doc) on PersonActorEndpoint
+        then ResolveSigningActor fires
+        then DiscoverFederationHost does not fire
+        then MaterialiseFederatedUser does not fire
+
+    ends: Nothing is stored about the unknown server.
+}
+
+journey BobFollowsAliceThenThinksBetterOfIt {
+    goal: Bob, on another server, follows Alice. Alice's Accept is queued
+          for delivery to Bob's inbox, signed with Alice's key. A repeated
+          Follow changes nothing; Undo(Follow) ends it.
+
+    after: ARemotePersonIsMetForTheFirstTime
+
+    1. bob sends Follow to alice's inbox
+        peer does RemoteActorFollowsUser(peer, bob, alice) on PersonActorEndpoint
+            creating follow: FederatedFollower
+        then AcceptRemoteFollow fires
+        then follow.followed = alice
+        then follow.follower = bob
+
+    2. a second Follow is not a second follower
+        peer cannot do RemoteActorFollowsUser(peer, bob, alice) on PersonActorEndpoint
+
+    3. bob sends Undo(Follow)
+        peer does RemoteActorUndoesFollow(peer, bob, alice) on PersonActorEndpoint
+        then AcceptRemoteUnfollow fires
+        then follow does not exist
+
+    4. undoing again is refused as there is nothing to undo
+        peer cannot do RemoteActorUndoesFollow(peer, bob, alice) on PersonActorEndpoint
+
+    ends: Bob no longer follows Alice; her public activity stops reaching him.
+}
+
+journey AForgedSignatureIsRefused {
+    goal: With signature enforcement on, an inbox request whose HTTP
+          signature does not verify is refused before anything happens.
+
+    after: ARemotePersonIsMetForTheFirstTime
+
+    given:
+        peer.signature_valid = false
+
+    1. a Follow arrives with a bad signature
+        peer cannot do RemoteActorFollowsUser(peer, bob, alice) on PersonActorEndpoint
+
+    ends: No follow is recorded.
+}
+
+journey BobStarsARepositoryFromAfar {
+    goal: Bob likes one of our repositories; it counts as his star. A Like
+          that is not newer than the last one from his server is replayed
+          and refused.
+
+    after: ARemotePersonIsMetForTheFirstTime
+
+    1. bob's Like arrives
+        stipulate repository_actor_uri(repo) = "https://forge.local/api/v1/activitypub/repository-id/3"
+        peer does RemoteActorLikesRepository(peer, bob, repo, "https://forge.local/api/v1/activitypub/repository-id/3", now) on RepositoryActorEndpoint
+        then AcceptFederatedLike fires
+        then bob.host.latest_activity != null
+
+    2. the same Like is replayed
+        peer cannot do RemoteActorLikesRepository(peer, bob, repo, "https://forge.local/api/v1/activitypub/repository-id/3", now) on RepositoryActorEndpoint
+
+    ends: Bob has starred the repository once; the replay was dropped.
+}
+
+journey BobSendsAliceANote {
+    goal: Bob's server tells Alice about something Bob did; it appears on
+          Alice's own feed tab and nowhere else.
+
+    after: ARemotePersonIsMetForTheFirstTime
+
+    cast:
+        carol: accounts/User
+
+    1. a Create(Note) arrives in alice's inbox
+        peer does RemoteActorSendsNote(peer, bob, alice, "bob pushed to main", "https://code.example/api/v1/activitypub/user-id/7/activities/1", "{}") on PersonActorEndpoint
+            creating note: FederatedActivity
+        then RecordFederatedNote fires
+        then note.recipient = alice
+        then note.actor = bob
+
+    2. alice reads it on her feed
+        alice sees note.note_content on FederationForLocalUser
+
+    3. carol, another local user, does not see it
+        carol cannot see note.note_content on FederationForLocalUser
+
+    ends: The note is in Alice's federated feed only.
+}
+
+journey AliceFollowsSomeoneElsewhere {
+    goal: Alice looks up Bob by his actor URI and follows him; a signed
+          Follow is queued for Bob's inbox, retried until it is accepted.
+
+    1. alice resolves bob
+        alice does UserLooksUpRemoteActor(alice, bob_doc) on FederationForLocalUser
+            creating bob: FederatedUser
+        then MaterialiseFederatedUser fires
+
+    2. alice follows bob
+        alice does UserFollowsRemoteActor(alice, bob) on FederationForLocalUser
+            creating delivery: Delivery
+        then delivery.kind = follow
+        then delivery.status = queued
+        then delivery.attempts = 0
+
+    3. the remote inbox is down for the first attempt
+        stipulate remote_inbox_accepts(delivery, 1) = false
+        after 1.second
+        then AttemptDelivery fires
+        then delivery.attempts = 1
+        then delivery.status = queued
+
+    4. it comes back
+        stipulate remote_inbox_accepts(delivery, 2) = true
+        after 5.seconds
+        then delivery.status = delivered
+        then delivery.attempts = 2
+
+    ends: Bob's server received Alice's Follow on the second attempt.
+}
+
+journey ADeliveryIsEventuallyAbandoned {
+    goal: An inbox that never accepts is given up on after the configured
+          number of attempts.
+
+    given:
+        dead: Delivery { sender: alice, inbox_uri: "https://gone.example/inbox", kind: user_activity, attempts: 9, max_attempts: 10, status: queued, next_attempt_at: now }
+
+    1. the last attempt fails
+        stipulate remote_inbox_accepts(dead, 10) = false
+        after 1.second
+        then AttemptDelivery fires
+        then dead.attempts = 10
+        then dead.status = abandoned
+
+    ends: The delivery is abandoned and never retried.
+}
+
+journey ARepositoryAdminFollowsARemoteRepository {
+    goal: A repository admin points the repository at a remote repository;
+          a non-admin cannot.
+
+    cast:
+        upstream: RemoteActor
+        mallory:  accounts/User
+
+    given:
+        upstream.kind = repository
+        upstream.uri = "https://code.example/api/v1/activitypub/repository-id/12"
+        upstream.scheme = "https"
+        upstream.host_fqdn = "code.example"
+        upstream.host_port = 443
+        upstream.external_id = "12"
+        upstream.host_software = forgejo
+
+    1. mallory, who is not an admin of the repository, tries
+        stipulate access/is_repo_admin(mallory, repo) = false
+        mallory cannot do RepoAdminSetsFollowingRepos(mallory, repo, {upstream}) on RepositoryFederationSettings
+
+    2. alice, a repository admin, sets it
+        stipulate access/is_repo_admin(alice, repo) = true
+        stipulate following_input_length({upstream}) = 58
+        alice does RepoAdminSetsFollowingRepos(alice, repo, {upstream}) on RepositoryFederationSettings
+        then RepoAdminSetsFollowingRepos fires
+        then DiscoverFederationHost fires
+        then RecordFollowingRepo fires
+
+    ends: The repository follows code.example's repository 12; local stars on
+          it will be sent there as Likes.
+}
+
+journey FederationAdminPagesAreForAdminsOnly {
+    goal: Site admins can list known hosts; others cannot see them.
+
+    after: ARemotePersonIsMetForTheFirstTime
+
+    cast:
+        root: accounts/User
+
+    given:
+        root.is_admin = true
+        alice.is_admin = false
+
+    1. the site admin sees the host list
+        root sees bob.host.host_fqdn on FederationAdministration
+
+    2. alice does not
+        alice cannot see bob.host.host_fqdn on FederationAdministration
+
+    ends: Federation hosts are visible to site admins only.
+}
+
+journey WebFingerResolvesOnlyPublicAccounts {
+    goal: A remote server resolves acct:alice@<this host> to Alice's Person
+          actor; a private account is not discoverable.
+
+    cast:
+        dave: accounts/User
+
+    given:
+        alice.visibility = public
+        dave.visibility = private
+
+    1. alice is found
+        peer sees alice.name on WebFingerLookup in alice
+
+    2. dave is not
+        peer cannot see dave.name on WebFingerLookup in dave
+
+    ends: Only public accounts are discoverable anonymously.
+}
