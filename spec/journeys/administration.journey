@@ -37,7 +37,7 @@ journey FirstRunInstallCreatesTheAdministrator {
     world: none
 
     cast:
-        mira:     Visitor
+        mira:     access/RequestParty
         site:     Instance
         settings: InstallSettings
 
@@ -88,7 +88,7 @@ journey InstallRefusesToLockEveryoneOut {
     world: none
 
     cast:
-        mira:     Visitor
+        mira:     access/RequestParty
         site:     Instance
         settings: InstallSettings
 
@@ -385,15 +385,14 @@ journey AdministratorAdoptsAStrayRepository {
           private repository of ada's.
 
     given:
-        stray: UnadoptedRepository { owner: ada, name: "old-notes" }
+        stray: repositories/UnadoptedRepository { owner_name: "ada", name: "old-notes" }
 
     1. root sees it listed
         root sees stray.name on UnadoptedRepositories in stray
 
     2. root adopts it
-        stipulate repository_exists(ada, "old-notes") = false
-        root does AdminAdoptsRepository(root, stray) on UnadoptedRepositories
-        then AdminAdoptsRepository fires
+        root does UserAdoptsRepository(root, stray, ada) on RepositoryAdministration
+        then UserAdoptsRepository fires
         then stray does not exist
 
     ends: ada owns a private repository "old-notes".
@@ -405,7 +404,7 @@ journey AProbeChecksTheInstanceHealth {
           answer it reports pass.
 
     cast:
-        lb: Visitor
+        lb: access/RequestParty
 
     given:
         lb.is_signed_in = false

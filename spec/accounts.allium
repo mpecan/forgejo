@@ -59,7 +59,6 @@
 --
 -- Emits:
 --   UserAccountCreated(user)                       -- any new account
---   UserSignedUp(user)                             -- self-registration only (admin notify mail)
 --   UserProfileUpdated(user)                       -- profile fields changed
 --   UserRenamed(user, old_name, new_name)          -- repositories update owner names,
 --                                                  -- packages update container image names,
@@ -68,7 +67,8 @@
 --   UserAvatarChanged(user)
 --   UserEmailAdded(user, address)                  -- notifications sends activation mail
 --                                                  -- when confirmation is required
---   EmailActivationRequested(user, address)        -- resend; notifications sends mail
+--   EmailActivationRequested(user, address)        -- authentication issues and mails a
+--                                                  -- confirmation code (address is the string)
 --   EmailAddressActivated(user, address)
 --   PrimaryEmailChanged(user, old_address, new_address) -- notifications mails the old address
 --   UserFollowed(follower, followee)
@@ -91,22 +91,24 @@
 --                                                  -- rows (see DeleteUserAccount guidance)
 --
 -- Reacts to:
---   authentication/SelfRegistrationAccepted(name, email, password_set)
---   authentication/ExternalAccountAutoRegistered(name, email, full_name)
+--   authentication/UserSignedUp(user)              -- authentication created the account
+--                                                  -- (every registration path); this module
+--                                                  -- initialises the account-side records
 --   authentication/RemoteUserClaimed(user, email)  -- OAuth2 login matched an F3 placeholder
---   authentication/EmailConfirmationLinkFollowed(user, address)
+--   authentication/EmailConfirmationLinkFollowed(user, email) -- mark the address activated
+--   authentication/AccountActivated(user)          -- mark the primary address activated
+--   authentication/UnconfirmedPrimaryEmailReplaced(user, new_address) -- swap the primary row
 --   federation/RemoteActorDiscovered(name, full_name, email)
 --   administration/UserRenamedByAdmin(admin, user, old_name, new_name)
 --   administration/UserDeletedByAdmin(admin, user, purge)
 --   administration/UserAvatarChangedByAdmin(admin, user)
 --   administration/UserAvatarRemovedByAdmin(admin, user)
 --   administration/InactiveAccountCleanupDue(older_than)
---   (named locally below as triggers with the same parameters; the integration
---   pass should bind them to the owning modules' emissions)
 
 use "./authentication.allium" as authentication
 use "./organizations.allium" as organizations
 use "./administration.allium" as administration
+use "./access.allium" as access
 
 ------------------------------------------------------------
 -- Enumerations
@@ -251,7 +253,7 @@ entity User {
     effective_repo_limit:
         if max_repo_creation != null: max_repo_creation
         else: config.max_repo_creation_default
-    can_create_organization: is_admin or (allow_create_organization and not config.disable_regular_org_creation)
+    can_create_organization: is_admin or (allow_create_organization and not config.org_creation_disabled)
     can_edit_git_hooks: not config.disable_git_hooks and (is_admin or allow_git_hook)
     can_import_local: config.import_local_paths and (is_admin or allow_import_local)
     pronouns_for(signed_in): if keep_pronouns_private and not signed_in: "" else: pronouns
@@ -366,7 +368,8 @@ config {
     activation_resend_cooldown: Duration = 3.minutes         -- hard-coded mail resend limit
 
     -- [admin]
-    disable_regular_org_creation: Boolean = false            -- DISABLE_REGULAR_ORG_CREATION
+    -- DISABLE_REGULAR_ORG_CREATION is owned by organizations; read here, not redeclared.
+    org_creation_disabled: Boolean = organizations/config.disable_regular_org_creation
     default_email_notifications: EmailNotificationPreference = enabled  -- DEFAULT_EMAIL_NOTIFICATIONS
     user_disabled_features: Set<UserFeature> = {}            -- USER_DISABLED_FEATURES
     external_user_disabled_features: Set<UserFeature> = {}   -- EXTERNAL_USER_DISABLE_FEATURES
@@ -424,48 +427,39 @@ config {
 -- ActivityPub mirrors instead use the handle form "@user@host[:port]".
 -- from: models/user/user.go:621
 
--- Self-registration (also used by external-login auto-registration).
+-- Self-registration, on every path (sign-up form, external-login
+-- auto-registration, reverse-proxy and directory provisioning). authentication
+-- owns the registration checks and creates the accounts/User (the same act
+-- binds the session and the UserLogin to it) and emits UserSignedUp; this
+-- module then initialises the account-side records and defaults.
+-- Name rules applied by authentication's checks: USERNAME_PREFIX is prepended
+-- when set and missing; the name must be usable, free, and not a redirect
+-- still in its cooldown; the address must be valid, allowed and unused.
 -- from: models/user/user.go:681
-rule CreateAccountBySelfRegistration {
-    when: AccountRegistrationAccepted(name, email, full_name)
-    let final_name = if config.username_prefix != "" and not starts_with(name, config.username_prefix): config.username_prefix + name else: name
-    requires: is_usable_username(final_name)
-    requires: not name_taken(final_name)
-    let claimed = UserRedirect{old_name: final_name}
-    requires: not exists claimed or not claimed.in_cooldown
-    requires: is_valid_email(email) and email_domain_allowed(email)
-    requires: not exists EmailAddress{address: email}
+rule InitialiseSelfRegisteredAccount {
+    when: authentication/UserSignedUp(user)
+    ensures: user.created_at = now
+    ensures: user.full_name = ""
+    ensures: user.keep_email_private = config.default_keep_email_private
+    ensures: user.keep_pronouns_private = false
+    ensures: user.keep_activity_private = false
+    ensures: user.visibility = config.default_user_visibility
+    ensures: user.use_custom_avatar = false
+    ensures: user.avatar_email = user.primary_email
+    ensures: user.email_notifications = config.default_email_notifications
+    ensures: user.allow_git_hook = false
+    ensures: user.allow_import_local = false
+    ensures: user.allow_create_organization = config.default_allow_create_organization and not config.org_creation_disabled
+    ensures: user.theme = config.default_theme
+    ensures: user.diff_view_style = unified
+    ensures: user.enable_repo_unit_hints = true
     ensures:
-        let user = User.created(
-            name: final_name,
-            kind: individual,
-            created_at: now,
-            full_name: full_name,
-            description: "", website: "", location: "", pronouns: "",
-            keep_pronouns_private: false,
-            keep_email_private: config.default_keep_email_private,
-            keep_activity_private: false,
-            visibility: config.default_user_visibility,
-            use_custom_avatar: false,
-            avatar_email: email,
-            primary_email: email,
-            email_notifications: config.default_email_notifications,
-            is_active: not config.require_email_confirmation and not config.require_manual_confirmation,
-            is_admin: false,
-            is_restricted: config.default_user_is_restricted,
-            prohibit_login: false,
-            allow_git_hook: false,
-            allow_import_local: false,
-            allow_create_organization: config.default_allow_create_organization and not config.disable_regular_org_creation,
-            theme: config.default_theme,
-            diff_view_style: unified,
-            enable_repo_unit_hints: true
-        )
-        EmailAddress.created(user: user, address: email, is_activated: user.is_active, is_primary: true)
-        for r in UserRedirects where same_name(old_name, final_name):
+        if not exists EmailAddress{address: user.primary_email}:
+            EmailAddress.created(user: user, address: user.primary_email, is_activated: user.is_active, is_primary: true)
+    ensures:
+        for r in UserRedirects where same_name(old_name, user.name):
             not exists r
-        UserAccountCreated(user: user)
-        UserSignedUp(user: user)
+    ensures: UserAccountCreated(user: user)
 }
 
 -- A fediverse actor seen for the first time gets a local mirror account.
@@ -781,9 +775,7 @@ rule UserAddsEmail {
     requires: not exists EmailAddress{address: address}
     ensures:
         let added = EmailAddress.created(user: user, address: address, is_activated: not config.require_email_confirmation, is_primary: false)
-        UserEmailAdded(user: user, address: added)
-        if config.require_email_confirmation:
-            EmailActivationRequested(user: user, address: added)
+        UserEmailAdded(user: user, address: address)
 }
 
 -- Resend an activation mail for an unactivated address (rate limited).
@@ -794,16 +786,18 @@ rule UserResendsEmailActivation {
     requires: address.user = user
     requires: not address.is_activated
     requires: not activation_mail_recently_sent(user)
-    ensures: EmailActivationRequested(user: user, address: address)
+    ensures: EmailActivationRequested(user: user, address: address.address)
 }
 
--- The user followed a valid activation link (token checked by
--- authentication). Activating the primary address also activates the account.
--- An address already active on another account cannot be activated.
--- Web: /user/activate_email, /user/activate.
+-- The user followed a valid confirmation link. authentication owns the link,
+-- the code and the page (UserConfirmsEmailAddress, UserActivatesAccount); this
+-- module marks the address record. Activating the primary address also
+-- activates the account. An address already active on another account cannot
+-- be activated.
 -- from: models/user/email_address.go:367
-rule UserConfirmsEmailAddress {
-    when: UserConfirmsEmailAddress(user, address)
+rule ConfirmedAddressIsActivated {
+    when: authentication/EmailConfirmationLinkFollowed(user, email)
+    let address = EmailAddress{address: email}
     requires: address.user = user
     requires: not address.is_activated
     requires: not activated_elsewhere(address)
@@ -812,6 +806,15 @@ rule UserConfirmsEmailAddress {
         if address.is_primary:
             user.is_active = true
     ensures: EmailAddressActivated(user: user, address: address)
+}
+
+-- An activated account has an activated primary address.
+-- from: models/user/user.go:1105
+rule ActivatedAccountActivatesPrimaryAddress {
+    when: authentication/AccountActivated(user)
+    ensures:
+        for e in user.email_addresses where is_primary:
+            e.is_activated = true
 }
 
 -- Make an activated secondary address the primary; the old primary stays as
@@ -832,21 +835,18 @@ rule UserMakesEmailPrimary {
     ensures: PrimaryEmailChanged(user: user, old_address: old_primary, new_address: address.address)
 }
 
--- An unactivated account may replace its (unconfirmed) primary address,
--- e.g. after a typo during registration; a fresh activation mail follows.
--- Web: POST /user/activate (change_email).
+-- An unactivated account replaced its (unconfirmed) primary address, e.g.
+-- after a typo during registration. authentication owns the entry point, its
+-- checks and the fresh activation code (InactiveUserReplacesUnconfirmedEmail);
+-- this module swaps the address record.
 -- from: services/user/email.go:168
-rule UserReplacesInactivePrimaryEmail {
-    when: UserReplacesInactivePrimaryEmail(user, new_address)
-    requires: not user.is_active
-    requires: is_valid_email(new_address) and email_domain_allowed(new_address)
-    requires: not exists EmailAddress{address: new_address}
+rule InactivePrimaryEmailReplaced {
+    when: authentication/UnconfirmedPrimaryEmailReplaced(user, new_address)
     ensures:
         for e in user.email_addresses where is_primary:
             not exists e
-        let added = EmailAddress.created(user: user, address: new_address, is_activated: not config.require_email_confirmation, is_primary: true)
+        EmailAddress.created(user: user, address: new_address, is_activated: false, is_primary: true)
         user.primary_email = new_address
-        EmailActivationRequested(user: user, address: added)
 }
 
 -- Remove secondary addresses; the primary can never be removed.
@@ -1150,21 +1150,9 @@ invariant VisibilityAllowed {
 -- Actor Declarations
 ------------------------------------------------------------
 
--- Anyone signed in to a usable account.
-actor SignedInUser {
-    identified_by: User where is_active = true and prohibit_login = false
-}
-
--- A signed-in account whose primary email is not yet confirmed: it may only
--- manage its account (activation / change address), nothing else.
-actor UnactivatedUser {
-    identified_by: User where is_active = false and prohibit_login = false
-}
-
-actor OrganizationOwner {
-    within: organizations/Organization
-    identified_by: User where is_org_owner(within, this)
-}
+-- Signed-in users are access/SignedInUser; organization owners are
+-- organizations/OrgOwner. An unactivated account's activation page is
+-- authentication/AccountActivation.
 
 ------------------------------------------------------------
 -- Surfaces
@@ -1172,7 +1160,7 @@ actor OrganizationOwner {
 
 -- The account holder's own settings: profile, appearance, avatar.
 surface OwnProfileSettings {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
 
     exposes:
         user.name
@@ -1229,7 +1217,7 @@ surface OwnProfileSettings {
 -- The account holder's addresses, notification mail preference and the
 -- delete-account form.
 surface OwnAccountSettings {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
 
     exposes:
         user.primary_email
@@ -1264,25 +1252,9 @@ surface OwnAccountSettings {
         -- Password change on the same page belongs to authentication.
 }
 
--- What an unactivated account can do.
-surface AccountActivation {
-    facing user: UnactivatedUser
-
-    exposes:
-        user.primary_email
-
-    provides:
-        UserConfirmsEmailAddress(user, address)
-        UserReplacesInactivePrimaryEmail(user, new_address)
-        UserResendsEmailActivation(user, address)
-
-    @guidance
-        -- Web: GET/POST /user/activate, /user/activate_email.
-}
-
 -- A signed-in user looking at someone's profile.
 surface UserProfile {
-    facing viewer: SignedInUser
+    facing viewer: access/SignedInUser
     context profile: User where visible_to(viewer)
 
     exposes:
@@ -1353,7 +1325,7 @@ surface UserProfile {
 
 -- An organization page's follow button.
 surface OrganizationFollowButton {
-    facing viewer: SignedInUser
+    facing viewer: access/SignedInUser
     context organization: organizations/Organization
 
     provides:
@@ -1363,7 +1335,7 @@ surface OrganizationFollowButton {
 
 -- The user's own block list.
 surface OwnBlockList {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
 
     exposes:
         for b in user.blocks_given:
@@ -1380,7 +1352,7 @@ surface OwnBlockList {
 
 -- An organization's block list, managed by its owners.
 surface OrganizationBlockList {
-    facing owner: OrganizationOwner
+    facing owner: organizations/OrgOwner
     context organization: organizations/Organization
 
     provides:
@@ -1395,7 +1367,7 @@ surface OrganizationBlockList {
 -- The block contract other modules must enforce. Stated here because the
 -- block is defined here; each module states its own rule-level check.
 surface BlockEnforcement {
-    facing actor: SignedInUser
+    facing actor: access/SignedInUser
     context block: UserBlock where blocked = actor
 
     exposes:
@@ -1446,7 +1418,7 @@ open question "Purge disables the account outside the deletion transaction so a 
 -- Requests to other modules
 ------------------------------------------------------------
 -- REQUEST authentication/AuthSource.allows_username_change: OAuth2 sources may allow users to rename themselves (UserRenamesSelf).
--- REQUEST authentication: emit AccountRegistrationAccepted(name, email, full_name) after sign-up / auto-registration checks pass; emit UserConfirmsEmailAddress(user, address) after a valid activation link; emit RemoteUserClaimed(user, email) when an OAuth2 login matches an F3 placeholder; react to UserPurged by ending all sessions.
+-- REQUEST authentication: emit RemoteUserClaimed(user, email) when an OAuth2 login matches an F3 placeholder.
 -- REQUEST authentication: the password re-entry for UserDeletesOwnAccount and the "manage_password" feature flag (UserFeature) are yours.
 -- REQUEST organizations: provide is_org_owner(organization, user) and shares_organization(a, b) (both users are members of a common organization, or one is the organization); react to UserPurged by removing memberships and deleting organizations where the user is the last owner; org renames should go through RenameNamespace semantics (UserRedirect with organization set); names are unique across users and organizations.
 -- REQUEST organizations/Organization.follows: Follow.followee_organization relationship for follower counts on org pages.
@@ -1461,7 +1433,7 @@ open question "Purge disables the account outside the deletion transaction so a 
 -- REQUEST administration: admin user management entry points stay yours; this module reacts to UserRenamedByAdmin (redirect), UserDeletedByAdmin (purge disable + cascade), UserAvatarChangedByAdmin / UserAvatarRemovedByAdmin, InactiveAccountCleanupDue(older_than).
 -- REQUEST administration: AdminSetsUserPrimaryEmail must keep EmailAddress rows consistent (promote an existing address of the same user or create one, mark it primary and activated, keep the old primary as a secondary address, skip email-domain lists) and emit accounts' PrimaryEmailChanged; AdminCreatesUser must create the primary EmailAddress (activated), delete any UserRedirect for the name, and apply the same creation defaults as CreateAccountBySelfRegistration minus prefix/cooldown/domain checks.
 -- REQUEST administration: AdminSetsUserAdmin / AdminDeletesUser must refuse removing the last admin (invariant AtLeastOneAdmin).
--- REQUEST notifications: send activation mail on EmailActivationRequested, primary-change mail to the old address on PrimaryEmailChanged; honour User.email_notifications and User.can_receive_mail; honour activity_readable_by for feeds and heatmap.
+-- REQUEST notifications: send the confirmation mail on authentication/EmailConfirmationRequested (not on EmailActivationRequested), primary-change mail to the old address on PrimaryEmailChanged; honour User.email_notifications and User.can_receive_mail; honour activity_readable_by for feeds and heatmap.
 -- REQUEST federation: emit RemoteActorDiscovered(handle, full_name, email); react to UserPurged (delete FederatedUser).
 -- REQUEST access: anonymous visitors see only public profiles; restricted users see only public profiles (plus their own and admins' rules); expose an anonymous actor this module's profile surface can face.
 -- REQUEST moderation: keep a shadow copy of a reported user's profile fields before UserProfileUpdated / PrimaryEmailChanged / deletion.

@@ -71,7 +71,7 @@ journey APushOverQuotaIsRefused {
 
     1. the push asks the gate
         stipulate quota_allows(acct, size_repos_all) = false
-        ada cannot do StorageConsumptionRequested(ada, acct, size_repos_all, git_push) on QuotaGate
+        ada cannot do StorageConsumptionRequested(ada, acct, size_repos_all, git_push) on QuotaGateReference
 
     ends: Nothing was stored; she is told her quota is exceeded.
 }
@@ -81,7 +81,7 @@ journey AnUploadUnderQuotaGoesThrough {
 
     1. the upload asks the gate
         stipulate quota_allows(acct, size_assets_attachments_issues) = true
-        ada does StorageConsumptionRequested(ada, acct, size_assets_attachments_issues, upload_issue_attachment) on QuotaGate
+        ada does StorageConsumptionRequested(ada, acct, size_assets_attachments_issues, upload_issue_attachment) on QuotaGateReference
         then StorageConsumptionGated fires
 
     ends: The attachment is stored and charged to the repository owner.
@@ -135,22 +135,35 @@ journey AnAdminReplacesAdasGroups {
 }
 
 journey SignInGrantsAQuotaGroup {
-    goal: Ada signs in through an OAuth2 provider that says she is in the
+    goal: Ada comes back from an OAuth2 provider that says she is in the
           "sponsors" group, which the source maps to the "supporter" quota group.
+          She links the identity to her account by signing in.
 
     cast:
         source:    authentication/AuthSource
         supporter: QuotaGroup
+        s:         authentication/Session
 
     given:
         supporter.name = "supporter"
+        source.kind = oauth2
+        source.is_active = true
         source.quota_group_map_removal = false
+        s.status = anonymous
+        pid: authentication/ExternalIdentity { source: source, external_id: "ada-sub" }
+        s.pending_external_identity = pid
+        ada.prohibit_login = false
+        login: authentication/UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
 
-    1. authentication hands over her claimed groups
+    1. she links the identity and authentication hands over her groups
+        stipulate s.pending_external_identity.groups = {"sponsors"}
+        stipulate password_matches(ada, "correct horse battery") = true
+        stipulate login.has_second_factor = false
         stipulate quota_groups_mapped_from(source, {"sponsors"}) = {supporter}
         stipulate quota_groups_mapped_from_unclaimed(source, {"sponsors"}) = {}
-        ada does LoginSourceGroupsClaimed(ada, source, {"sponsors"}) on LoginSourceQuotaSync
+        s does VisitorLinksPendingIdentityBySignIn(s, ada, "correct horse battery", false) on SignInPage
             creating granted: QuotaGroupMembership
+        then VisitorLinksPendingIdentityBySignIn fires
         then LoginSourceSyncsQuotaGroups fires
         then granted.origin = login_source_sync
         then granted.group = supporter

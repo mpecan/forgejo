@@ -175,11 +175,15 @@ journey AdaConfirmsAnAddress {
     2. she asks for the activation mail again
         stipulate activation_mail_recently_sent(ada) = false
         ada does UserResendsEmailActivation(ada, pending) on OwnAccountSettings
+            creating code: authentication/EmailVerificationCode
         then UserResendsEmailActivation fires
+        then ReissueEmailConfirmationCode fires
+        then code.email = "ada@lab.example"
 
     3. she follows the link
         stipulate activated_elsewhere(pending) = false
-        ada does UserConfirmsEmailAddress(ada, pending) on AccountActivation
+        ada does UserConfirmsEmailAddress(code, "ada@lab.example") on MailedCodeLanding
+        then ConfirmedAddressIsActivated fires
         then pending.is_activated = true
 
     4. now it can be primary

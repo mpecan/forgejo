@@ -8,7 +8,7 @@
 -- somebody's behalf.
 --
 -- Includes:
---   - SshKey: personal SSH public keys (kind user), the shared key material of
+--   - SshKey: personal SSH public keys (kind personal), the shared key material of
 --     deploy keys (kind deploy) and SSH certificate principals (kind principal)
 --   - DeployKey: a key attached to one repository with read-only or read-write
 --     access; the same key material may be attached to several repositories
@@ -82,15 +82,17 @@
 --
 -- Reacts to:
 --   accounts/UserAccountDeleted(user, purge, delete_contributions)  -- remove the user's keys
---   repositories/RepositoryDeleted(repository)                       -- detach deploy keys
+--   repositories/RepositoryDeleted(repository, doer)                 -- detach deploy keys
+--   authentication/ExternalSshKeysAsserted(user, source, keys)       -- source-managed keys (LDAP login /
+--                                                                    -- LDAP sync / OAuth2 login)
 --   administration/SshKeyAddedForUserByAdmin(admin, user, key_content, title)   -- admin API adds a key
 --   administration/SshKeyRemovedForUserByAdmin(admin, user, key)                -- admin API removes a key
---   administration/AuthorizedKeysRewriteDue, AuthorizedPrincipalsRewriteDue,
---   AuthorizedKeysRegenerationRequested: no domain reaction — rebuilding the
---   SSH daemon's key files is implementation (see Excludes).
+--   administration/AuthorizedKeysRewriteDue(), AuthorizedPrincipalsRewriteDue():
+--   documented no-op reactions (AuthorizedKeysRewrite / AuthorizedPrincipalsRewrite)
+--   — rebuilding the SSH daemon's key files is implementation (see Excludes).
+--   administration/AuthorizedKeysRegenerationRequested: likewise, no domain reaction.
 --   Requests from other modules, modelled as external stimuli on the
 --   ForgeSubsystem surfaces below:
---     ExternalSshKeysPresented        (authentication: LDAP login / LDAP sync / OAuth2 login)
 --     SshClientPresentsPublicKey, SshClientPresentsCertificate, SshKeyUsedForRepository  (code: SSH transport)
 --     SignatureVerificationRequested  (code, pulls, releases, webhooks payloads, API)
 --     InitialCommitSigningRequested, WebEditSigningRequested, WikiEditSigningRequested,
@@ -101,6 +103,7 @@ use "./authentication.allium" as authentication
 use "./repositories.allium" as repositories
 use "./pulls.allium" as pulls
 use "./administration.allium" as administration
+use "./access.allium" as access
 
 ------------------------------------------------------------
 -- External Entities
@@ -169,7 +172,7 @@ enum SigningRefusal {
 ------------------------------------------------------------
 
 -- A registered SSH public key, or an SSH certificate principal.
---   kind user      : a personal key of `owner`; authenticates as that user.
+--   kind personal  : a personal key of `owner`; authenticates as that user.
 --   kind deploy    : key material attached to one or more repositories through
 --                    DeployKey; it has no owner and authenticates only for
 --                    the repositories it is attached to.
@@ -178,7 +181,7 @@ enum SigningRefusal {
 --                    authenticates as `owner`.
 -- from: models/asymkey/ssh_key.go:38
 entity SshKey {
-    kind: user | deploy | principal
+    kind: personal | deploy | principal
     owner: accounts/User?                 -- set for user and principal keys, absent for deploy keys
     name: String                          -- title; for a principal it equals the principal
     content: String                       -- one normalised OpenSSH line ("type base64 comment"), or the principal
@@ -413,7 +416,7 @@ rule UserAddsSshKey {
 
     ensures:
         let key = SshKey.created(
-            kind: user,
+            kind: personal,
             owner: owner,
             name: title,
             content: ssh_normalised(content),
@@ -440,16 +443,16 @@ rule UserAddsSshKey {
 -- the key-side effect with the same validation as a user's own addition.
 -- from: routers/api/v1/admin/user.go:329
 rule AddSshKeyForUserByAdmin {
-    when: administration/SshKeyAddedForUserByAdmin(admin, subject, content, title)
+    when: administration/SshKeyAddedForUserByAdmin(admin, user, key_content, title)
 
-    let fingerprint = ssh_fingerprint(content)
-    let algorithm = ssh_key_algorithm(content)
-    let bits = ssh_key_bits(content)
+    let fingerprint = ssh_fingerprint(key_content)
+    let algorithm = ssh_key_algorithm(key_content)
+    let bits = ssh_key_bits(key_content)
 
     requires: admin.is_admin
     requires: manages_own_ssh_keys(admin)
     requires: title != ""
-    requires: ssh_parse_outcome(content) = valid
+    requires: ssh_parse_outcome(key_content) = valid
     requires: not config.minimum_key_size_check
         or (algorithm = ed25519 and config.min_bits_ed25519 >= 0 and bits >= config.min_bits_ed25519)
         or (algorithm = ed25519_sk and config.min_bits_ed25519_sk >= 0 and bits >= config.min_bits_ed25519_sk)
@@ -458,14 +461,14 @@ rule AddSshKeyForUserByAdmin {
         or (algorithm = rsa and config.min_bits_rsa >= 0 and bits >= config.min_bits_rsa)
         or (algorithm = dsa and config.min_bits_dsa >= 0 and bits >= config.min_bits_dsa)
     requires: not exists SshKey{fingerprint: fingerprint}
-    requires: not exists SshKey{owner: subject, name: title}
+    requires: not exists SshKey{owner: user, name: title}
 
     ensures:
         let key = SshKey.created(
-            kind: user,
-            owner: subject,
+            kind: personal,
+            owner: user,
             name: title,
-            content: ssh_normalised(content),
+            content: ssh_normalised(key_content),
             fingerprint: fingerprint,
             algorithm: algorithm,
             bits: bits,
@@ -514,7 +517,7 @@ rule UserVerifiesSshKey {
     when: UserVerifiesSshKey(owner, key, challenge, signature)
 
     requires: manages_own_ssh_keys(owner)
-    requires: key.kind = user
+    requires: key.kind = personal
     requires: key.owner = owner
     requires: challenge.owner = owner
     requires: challenge.status = open
@@ -535,7 +538,7 @@ rule UserDeletesSshKey {
     when: UserDeletesSshKey(actor, key)
 
     requires: manages_own_ssh_keys(actor)
-    requires: key.kind = user
+    requires: key.kind = personal
     requires: key.owner = actor or actor.is_admin
     requires: not key.is_externally_managed
 
@@ -550,14 +553,14 @@ rule UserDeletesSshKey {
 -- admin surface lives in administration.
 -- from: routers/api/v1/admin/user.go:361
 rule RemoveSshKeyOfUserByAdmin {
-    when: administration/SshKeyRemovedForUserByAdmin(admin, subject, key)
+    when: administration/SshKeyRemovedForUserByAdmin(admin, user, key)
 
     requires: admin.is_admin
-    requires: key.kind in {user, principal}
-    requires: key.owner = subject
+    requires: key.kind in {personal, principal}
+    requires: key.owner = user
 
     ensures: not exists key
-    ensures: SshKeyDeleted(owner: subject, fingerprint: key.fingerprint, actor: admin)
+    ensures: SshKeyDeleted(owner: user, fingerprint: key.fingerprint, actor: admin)
 
     @guidance
         -- API: DELETE /api/v1/admin/users/{username}/keys/{id}. Unlike the
@@ -627,16 +630,16 @@ rule UserDeletesPrincipal {
 -- are skipped silently.
 -- from: models/asymkey/ssh_key.go:321
 rule AddExternallySuppliedSshKeys {
-    when: ExternalSshKeysPresented(subject, source, presented)
+    when: authentication/ExternalSshKeysAsserted(user, source, keys)
 
     requires: source.provides_ssh_keys
 
     ensures:
-        for content in presented:
+        for content in keys:
             if ssh_parse_outcome(content) = valid and not exists SshKey{fingerprint: ssh_fingerprint(content)}:
                 let key = SshKey.created(
-                    kind: user,
-                    owner: subject,
+                    kind: personal,
+                    owner: user,
                     name: source.name + "-" + ssh_fingerprint(content),
                     content: ssh_normalised(content),
                     fingerprint: ssh_fingerprint(content),
@@ -647,7 +650,7 @@ rule AddExternallySuppliedSshKeys {
                     created_at: now,
                     last_used_at: null
                 )
-                SshKeyAdded(key: key, actor: subject)
+                SshKeyAdded(key: key, actor: user)
 
     @guidance
         -- Key size and algorithm policy is NOT applied to externally supplied
@@ -658,17 +661,17 @@ rule AddExternallySuppliedSshKeys {
 -- Keys previously supplied by this source that it no longer reports are removed.
 -- from: models/asymkey/ssh_key.go:359
 rule RemoveWithdrawnExternalSshKeys {
-    when: ExternalSshKeysPresented(subject, source, presented)
+    when: authentication/ExternalSshKeysAsserted(user, source, keys)
 
-    let still_published = presented_public_lines(presented)
+    let still_published = presented_public_lines(keys)
 
     requires: source.provides_ssh_keys
 
     ensures:
-        for key in SshKeys where owner = subject and auth_source = source:
+        for key in SshKeys where owner = user and auth_source = source:
             if key.public_line not in still_published:
                 not exists key
-                SshKeyDeleted(owner: subject, fingerprint: key.fingerprint, actor: subject)
+                SshKeyDeleted(owner: user, fingerprint: key.fingerprint, actor: user)
 }
 
 ------------------------------------------------------------
@@ -770,7 +773,7 @@ rule RepoAdminDeletesDeployKey {
 -- no other repository uses).
 -- from: services/repository/delete.go:106
 rule DetachDeployKeysOfDeletedRepository {
-    when: repositories/RepositoryDeleted(repository)
+    when: repositories/RepositoryDeleted(repository, _)
 
     for deploy_key in DeployKeys where repository = repository:
         let material = deploy_key.key
@@ -782,22 +785,44 @@ rule DetachDeployKeysOfDeletedRepository {
 }
 
 ------------------------------------------------------------
+-- Rules: scheduled key-file rewrites
+------------------------------------------------------------
+
+-- administration's resync_all_sshkeys cron task. Rewriting the SSH daemon's
+-- authorized_keys file from SshKeys is an implementation detail (see
+-- Excludes): the keys themselves do not change, so this reaction is a
+-- documented no-op that only marks that the rewrite was asked for.
+-- from: services/cron/tasks_extended.go (resync_all_sshkeys)
+rule AuthorizedKeysRewrite {
+    when: administration/AuthorizedKeysRewriteDue()
+    ensures: KeyFileRewriteRequested(kind: authorized_keys)
+}
+
+-- administration's resync_all_sshprincipals cron task; as above, for the
+-- authorized_principals file.
+-- from: services/cron/tasks_extended.go (resync_all_sshprincipals)
+rule AuthorizedPrincipalsRewrite {
+    when: administration/AuthorizedPrincipalsRewriteDue()
+    ensures: KeyFileRewriteRequested(kind: authorized_principals)
+}
+
+------------------------------------------------------------
 -- Rules: account deletion
 ------------------------------------------------------------
 
 -- Deleting an account removes its SSH keys, principals, GPG keys and imports.
 -- from: services/user/delete.go:213
 rule RemoveKeysOfDeletedAccount {
-    when: accounts/UserAccountDeleted(subject, _, _)
+    when: accounts/UserAccountDeleted(user, _, _)
 
     ensures:
-        for key in SshKeys where owner = subject:
+        for key in SshKeys where owner = user:
             not exists key
     ensures:
-        for gpg in GpgKeys where owner = subject:
+        for gpg in GpgKeys where owner = user:
             not exists gpg
     ensures:
-        for imported in GpgKeyImports where key.owner = subject:
+        for imported in GpgKeyImports where key.owner = user:
             not exists imported
 }
 
@@ -1082,7 +1107,7 @@ rule VerifySshSignature {
 
     ensures:
         if committer != null and signing_key != null
-            and signing_key.kind = user and signing_key.owner = committer and signing_key.is_verified:
+            and signing_key.kind = personal and signing_key.owner = committer and signing_key.is_verified:
             let verification = CommitVerification.created(
                 repository: repository, object_kind: object_kind, object_id: object_id,
                 committer_email: committer_email, committer: committer, format: ssh,
@@ -1315,7 +1340,7 @@ rule AuthenticateSshPublicKey {
 
     requires: not config.ssh_disabled
     requires: exists key
-    requires: key.kind in {user, deploy}
+    requires: key.kind in {personal, deploy}
 
     ensures: SshKeyAuthenticated(connection: connection, key: key)
 
@@ -1474,11 +1499,7 @@ invariant RefusalExplainsDecision {
 ------------------------------------------------------------
 
 -- An administrator of one repository (owner, org owner, team or collaborator
--- with admin access, or site admin).
-actor RepositoryAdministrator {
-    within: repositories/Repository
-    identified_by: accounts/User where is_repo_admin(this, within)
-}
+-- with admin access, or site admin) is access/RepoAdmin.
 
 -- An administrator of the repository a deploy key is attached to.
 actor DeployKeyAdministrator {
@@ -1497,7 +1518,7 @@ actor InternalCaller {
 
 -- The signed-in user's key settings page: adding keys and asking for a token.
 surface KeySettings {
-    facing owner: accounts/SignedInUser
+    facing owner: access/SignedInUser
 
     exposes:
         config.ssh_disabled
@@ -1529,7 +1550,7 @@ surface KeySettings {
 
 -- The token a user is asked to sign.
 surface VerificationTokenView {
-    facing owner: accounts/SignedInUser
+    facing owner: access/SignedInUser
     context challenge: VerificationChallenge where owner = owner and status = open
 
     exposes:
@@ -1542,8 +1563,8 @@ surface VerificationTokenView {
 
 -- One of the user's own personal SSH keys.
 surface OwnSshKey {
-    facing owner: accounts/SignedInUser
-    context key: SshKey where owner = owner and kind = user
+    facing owner: access/SignedInUser
+    context key: SshKey where owner = owner and kind = personal
 
     exposes:
         key.name
@@ -1570,7 +1591,7 @@ surface OwnSshKey {
 
 -- One of the user's own SSH certificate principals.
 surface OwnPrincipal {
-    facing owner: accounts/SignedInUser
+    facing owner: access/SignedInUser
     context key: SshKey where owner = owner and kind = principal
 
     exposes:
@@ -1584,7 +1605,7 @@ surface OwnPrincipal {
 
 -- One of the user's own primary GPG keys.
 surface OwnGpgKey {
-    facing owner: accounts/SignedInUser
+    facing owner: access/SignedInUser
     context key: GpgKey where owner = owner and primary = null
 
     exposes:
@@ -1613,7 +1634,7 @@ surface OwnGpgKey {
 
 -- The deploy keys page of a repository.
 surface RepositoryDeployKeys {
-    facing admin: RepositoryAdministrator
+    facing admin: access/RepoAdmin
     context repository: repositories/Repository
 
     exposes:
@@ -1651,7 +1672,7 @@ surface RepositoryDeployKey {
 -- them. Principals and deploy keys are never listed.
 surface PublicSshKeys {
     facing viewer: accounts/User
-    context key: SshKey where kind = user and owner.visible_to(viewer)
+    context key: SshKey where kind = personal and owner.visible_to(viewer)
 
     exposes:
         key.public_line
@@ -1745,14 +1766,6 @@ surface SshKeyResolution {
         -- POST /api/internal/ssh/authorized_keys (fingerprint lookup).
 }
 
--- External authentication sources reporting a user's SSH keys.
-surface ExternalKeySynchronisation {
-    facing _: InternalCaller
-
-    provides:
-        ExternalSshKeysPresented(subject, source, presented)
-}
-
 -- Other modules asking for verification and signing decisions.
 surface SigningService {
     facing _: InternalCaller
@@ -1785,7 +1798,6 @@ open question "When several principals of one certificate are registered, Forgej
 
 -- REQUEST authentication/AuthSource.provides_ssh_keys: true for LDAP sources with an SSH public key attribute and OAuth2 sources configured to provide SSH keys; drives is_externally_managed and key sync.
 -- REQUEST authentication/AuthSource.name: used to name synchronised keys "<source>-<fingerprint>".
--- REQUEST authentication: raise keys ExternalSshKeysPresented(subject, source, presented) on LDAP login, LDAP periodic sync (when the SSH attribute is configured) and OAuth2 login (when the source provides SSH keys).
 -- REQUEST authentication: provide has_two_factor(user) (TOTP or WebAuthn enrolled) — used locally as black box has_two_factor.
 -- REQUEST repositories/Repository.trust_model: keys/TrustModel, settable by repo admins (web settings, API create/edit `trust_model`) — used locally as black box repository_trust_model.
 -- REQUEST repositories: emit RepositoryDeleted(repository) so deploy keys are detached.

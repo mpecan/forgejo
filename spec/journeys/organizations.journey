@@ -332,7 +332,7 @@ journey RepoAdminAndTeamAccess {
         api.owner_org = org
 
     1. bob is refused while the org does not allow it
-        stipulate access/is_repo_admin(bob, api) = true
+        stipulate is_repo_admin(bob, api) = true
         stipulate is_org_owner(org, bob) = false
         stipulate team_covers(devs, api) = false
         bob cannot do RepoAdminAddsTeamToRepository(bob, api, devs) on RepositoryTeamAccess
@@ -414,7 +414,7 @@ journey PrivateOrganizationIsInvisibleAnonymously {
     goal: acme goes private. An anonymous visitor can no longer see its name.
 
     cast:
-        stranger: Visitor
+        stranger: access/RequestParty
 
     given:
         stranger.is_signed_in = false

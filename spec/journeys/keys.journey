@@ -44,7 +44,7 @@ journey AdaAddsAnSshKey {
         ada does UserAddsSshKey(ada, "laptop", "ssh-ed25519 AAAAada ada@laptop") on KeySettings
             creating laptop: SshKey
         then UserAddsSshKey fires
-        then laptop.kind = user
+        then laptop.kind = personal
         then laptop.owner = ada
         then laptop.fingerprint = "SHA256:ada-laptop"
         then laptop.is_verified = false
@@ -66,7 +66,7 @@ journey AdaProvesSheHoldsHerKey {
         laptop: SshKey
 
     given:
-        laptop.kind = user
+        laptop.kind = personal
         laptop.owner = ada
         laptop.name = "laptop"
         laptop.content = "ssh-ed25519 AAAAada ada@laptop"
@@ -102,7 +102,7 @@ journey TheTokenRunsOut {
         laptop: SshKey
 
     given:
-        laptop.kind = user
+        laptop.kind = personal
         laptop.owner = ada
         laptop.name = "laptop"
         laptop.content = "ssh-ed25519 AAAAada ada@laptop"
@@ -174,7 +174,7 @@ journey AdasKeyIsHers {
         laptop: SshKey
 
     given:
-        laptop.kind = user
+        laptop.kind = personal
         laptop.owner = ada
         laptop.name = "laptop"
         laptop.content = "ssh-ed25519 AAAAada ada@laptop"
@@ -259,7 +259,7 @@ journey DeployKeysAreForRepositoryAdmins {
         app:    repositories/Repository
 
     given:
-        laptop.kind = user
+        laptop.kind = personal
         laptop.owner = ada
         laptop.name = "laptop"
         laptop.content = "ssh-ed25519 AAAAada ada@laptop"
@@ -466,20 +466,23 @@ journey AForgedSignatureRaisesAWarning {
 
 -- Keys supplied by a directory are managed there.
 journey TheDirectoryManagesHerKeys {
-    goal: Ada's company directory publishes her SSH key. On login it appears
-          on her account, marked as managed; she cannot delete it. When the
-          directory drops it, it disappears from her account.
+    goal: Ada's company directory publishes her SSH key. On the directory sync
+          it appears on her account, marked as managed; she cannot delete it.
+          When the directory drops it, it disappears from her account.
 
     cast:
         corp:  authentication/AuthSource
-        forge: ForgeSubsystem
 
     given:
-        forge.name = "ldap-sync"
         corp.name = "corp"
+        corp.kind = ldap_bind_dn
+        corp.is_active = true
+        corp.sync_enabled = true
         corp.provides_ssh_keys = true
+        login: authentication/UserLogin { user: ada, source: corp, login_name: "ada", has_password: false, must_change_password: false }
+        entry: authentication/DirectoryEntry { source: corp, username: "ada", email: "ada@example.org", is_admin: false, is_restricted: false, ssh_public_keys: {"ssh-ed25519 AAAAcorp ada@corp"} }
 
-    1. the directory reports her key at login
+    1. the directory reports her key on the sync
         stipulate ssh_parse_outcome("ssh-ed25519 AAAAcorp ada@corp") = valid
         stipulate ssh_fingerprint("ssh-ed25519 AAAAcorp ada@corp") = "SHA256:corp"
         stipulate ssh_key_algorithm("ssh-ed25519 AAAAcorp ada@corp") = ed25519
@@ -487,8 +490,9 @@ journey TheDirectoryManagesHerKeys {
         stipulate ssh_normalised("ssh-ed25519 AAAAcorp ada@corp") = "ssh-ed25519 AAAAcorp ada@corp"
         stipulate presented_public_lines({"ssh-ed25519 AAAAcorp ada@corp"}) = {"ssh-ed25519 AAAAcorp"}
         stipulate without_comment("ssh-ed25519 AAAAcorp ada@corp") = "ssh-ed25519 AAAAcorp"
-        forge does ExternalSshKeysPresented(ada, corp, {"ssh-ed25519 AAAAcorp ada@corp"}) on ExternalKeySynchronisation
+        root does AdminRunsExternalUserSync(root) on AuthSourceAdministration
             creating corp_key: SshKey
+        then LdapSourceSynchronised fires
         then AddExternallySuppliedSshKeys fires
         then corp_key.auth_source = corp
         then corp_key.owner = ada
@@ -498,8 +502,9 @@ journey TheDirectoryManagesHerKeys {
         ada cannot do UserDeletesSshKey(ada, corp_key) on OwnSshKey
 
     3. the directory stops publishing it
+        stipulate entry.ssh_public_keys = {}
         stipulate presented_public_lines({}) = {}
-        forge does ExternalSshKeysPresented(ada, corp, {}) on ExternalKeySynchronisation
+        root does AdminRunsExternalUserSync(root) on AuthSourceAdministration
         then RemoveWithdrawnExternalSshKeys fires
         then corp_key does not exist
 
@@ -584,7 +589,7 @@ journey HerKeyOpensTheDoor {
         app:    repositories/Repository
 
     given:
-        laptop.kind = user
+        laptop.kind = personal
         laptop.owner = ada
         laptop.name = "laptop"
         laptop.content = "ssh-ed25519 AAAAada ada@laptop"

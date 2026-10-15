@@ -37,15 +37,18 @@
 --       -- a holder's explicit group set changed (admin or login sync).
 -- Reacts to:
 --   StorageConsumptionRequested(requester, account, subject, operation)
---       -- raised by repositories, code, releases, issues, wiki, pulls,
---          packages, actions before a storage-growing operation.
---   LoginSourceGroupsClaimed(user, source, claimed_groups)
---       -- raised by authentication after an OAuth2 sign-in / registration /
---          account link whose source has a quota group mapping.
+--       -- the gate contract (surface QuotaGateReference). Gated operations in
+--          repositories, code, releases, issues, wiki, pulls, packages and
+--          actions honour it as `requires: quota_allows(<charged>, <subject>)`
+--          in their own rules; nothing emits it as a trigger.
+--   authentication/ExternalGroupsAsserted(user, source, groups)
+--       -- authentication's sign-in / registration / account link through an
+--          external source; the source's quota group mapping applies.
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
 use "./authentication.allium" as authentication
+use "./access.allium" as access
 
 ------------------------------------------------------------
 -- External Entities
@@ -469,13 +472,16 @@ rule AdminSetsHolderQuotaGroups {
 -- each mapped quota group (if not already); when the source has "remove
 -- unmapped" enabled, the user is removed from each quota group mapped from a
 -- source group they are NOT in. Quota groups named by the mapping that do not
--- exist are skipped. LDAP sources do not sync quota groups.
+-- exist are skipped. LDAP sources do not sync quota groups (their mapping is
+-- empty, so the black boxes return nothing). The mapping reads the source's
+-- quota-group claim (AuthSource.quota_group_claim_name) from what the provider
+-- asserted.
 -- from: services/auth/source/source_quota_group_sync.go:15
 rule LoginSourceSyncsQuotaGroups {
-    when: LoginSourceGroupsClaimed(user, source, claimed_groups)
+    when: authentication/ExternalGroupsAsserted(user, source, groups)
     let account = QuotaAccount{user: user}
-    let to_add = quota_groups_mapped_from(source, claimed_groups)
-    let to_remove = quota_groups_mapped_from_unclaimed(source, claimed_groups)
+    let to_add = quota_groups_mapped_from(source, groups)
+    let to_remove = quota_groups_mapped_from_unclaimed(source, groups)
     requires: exists account
     ensures:
         if source.quota_group_map_removal:
@@ -530,15 +536,8 @@ invariant HolderAtMostOnceInGroup {
 -- Actor Declarations
 ------------------------------------------------------------
 
-actor SiteAdmin {
-    identified_by: accounts/User where is_admin = true
-}
-
--- An organization owner looking at their organization's storage.
-actor OrganizationOwner {
-    within: QuotaAccount
-    identified_by: accounts/User where is_org_owner(this, within.organization)
-}
+-- Site administrators are access/SiteAdmin; an organization's owners are
+-- organizations/OrgOwner.
 
 -- Any part of the system about to grow someone's storage.
 actor StorageConsumer {
@@ -551,7 +550,7 @@ actor StorageConsumer {
 
 -- Site-admin quota management. Present only when quota is enabled.
 surface QuotaAdministration {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
 
     exposes:
         for r in QuotaRules:
@@ -632,8 +631,8 @@ surface OwnStorageOverview {
 
 -- An organization owner looking at the organization's storage.
 surface OrganizationStorageOverview {
-    facing owner: OrganizationOwner
-    context account: QuotaAccount where organization != null
+    facing owner: organizations/OrgOwner
+    context account: QuotaAccount where organization != null and is_org_owner(organization, owner)
 
     exposes:
         account.usage.repos_public
@@ -653,8 +652,11 @@ surface OrganizationStorageOverview {
         --      (token + organization ownership required).
 }
 
--- The integration boundary every storage-growing operation crosses.
-surface QuotaGate {
+-- The integration boundary every storage-growing operation crosses: the
+-- contract each gated operation honours (as quota_allows in its own requires),
+-- stated here as one stimulus so the gate itself can be exercised. Named apart
+-- from the QuotaGate value (one row of the enforcement table).
+surface QuotaGateReference {
     facing consumer: StorageConsumer
     context account: QuotaAccount
 
@@ -667,20 +669,6 @@ surface QuotaGate {
 
     @guarantee DisabledMeansUngated
         -- With quota disabled every request is admitted.
-}
-
--- The hand-off from authentication after an OAuth2 sign-in.
-surface LoginSourceQuotaSync {
-    facing user: accounts/User
-
-    provides:
-        LoginSourceGroupsClaimed(user, source, claimed_groups)
-
-    @guidance
-        -- Raised by authentication (routers/web/auth/oauth.go) on sign-in,
-        -- auto-registration and account linking through an OAuth2 source
-        -- whose quota group map is set or whose removal flag is on. The
-        -- claimed groups come from the source's quota group claim.
 }
 
 ------------------------------------------------------------
@@ -709,11 +697,10 @@ open question "Quota group sync from login sources exists only for OAuth2 source
 
 -- Requests to other modules
 -- REQUEST accounts/User: a QuotaAccount must exist for every user (or accounts exposes user.quota_account).
--- REQUEST organizations/Organization: a QuotaAccount must exist for every organization; is_org_owner(user, org) predicate.
+-- REQUEST organizations/Organization: a QuotaAccount must exist for every organization; is_org_owner(organization, user) predicate.
 -- REQUEST authentication/AuthSource.quota_group_claim_name: OAuth2 claim carrying the groups used for quota sync.
 -- REQUEST authentication/AuthSource.quota_group_map: mapping source-group -> set of quota group names (validated JSON).
 -- REQUEST authentication/AuthSource.quota_group_map_removal: Boolean, remove memberships for unclaimed mapped groups.
--- REQUEST authentication: emit quota/LoginSourceGroupsClaimed(user, source, claimed_groups) after OAuth2 sign-in, auto-registration and account linking when the source has a quota group map or removal enabled.
--- REQUEST repositories, code, releases, issues, wiki, pulls, packages, actions: guard each operation listed in the QuotaGate defaults with `requires: quota/quota_allows(<charged account>, <subject>)` (or raise quota/StorageConsumptionRequested and proceed on StorageConsumptionAdmitted).
+-- REQUEST repositories, code, releases, issues, wiki, pulls, packages, actions: guard each operation listed in the QuotaGate defaults with `requires: quota/quota_allows(<charged account>, <subject>)` (the contract stated by surface QuotaGateReference).
 -- REQUEST repositories/Repository.git_size, lfs_size; issues/Attachment.size (+ whether it belongs to a release); actions/Artifact.compressed_size and status; packages/PackageBlob.size: the figures QuotaUsage is computed from.
 -- REQUEST repositories (mirror scheduler): skip a scheduled pull-mirror sync, without error, while the owner's quota does not allow size_repos_all.

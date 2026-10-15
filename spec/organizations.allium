@@ -79,7 +79,8 @@
 --       (see REQUESTs: emitted by repositories on transfer/delete)
 --   authentication/ExternalGroupsAsserted(user, source, groups)  -- group-to-team sync
 --   authentication/AuthSourceDeleted(source)                      -- forget provenance
---   accounts/UserPurgeStarted(user)  -- leave every org; purge orgs where last owner
+--   accounts/UserPurged(user)  -- leave every org; purge orgs where last owner
+--   administration/OrganizationCreatedForUserByAdmin(admin, user, name, visibility)  -- found it
 --   moderation/ModeratorDeletesOrganization(admin, organization)  -- purge the org
 
 use "./accounts.allium" as accounts
@@ -87,16 +88,7 @@ use "./access.allium" as access
 use "./repositories.allium" as repositories
 use "./authentication.allium" as authentication
 use "./moderation.allium" as moderation
-
-------------------------------------------------------------
--- External Entities
-------------------------------------------------------------
-
--- A request with no signed-in identity. access.allium owns the canonical
--- anonymous actor; this stands in for it until the integration pass.
-external entity Visitor {
-    is_signed_in: Boolean
-}
+use "./administration.allium" as administration
 
 ------------------------------------------------------------
 -- Enumerations
@@ -266,6 +258,8 @@ entity TeamInvite {
 
 config {
     -- [admin] DISABLE_REGULAR_ORG_CREATION: only site admins may create orgs.
+    -- This module owns it; accounts and administration read
+    -- organizations/config.disable_regular_org_creation.
     disable_regular_org_creation: Boolean = false
     -- [service] DEFAULT_ORG_VISIBILITY: preselected visibility on the create form.
     default_org_visibility: accounts/Visibility = public
@@ -344,12 +338,14 @@ rule UserCreatesOrganization {
 }
 
 -- A site admin founds an organization on behalf of an existing person, who
--- becomes its first owner.
+-- becomes its first owner. administration owns the admin entry point
+-- (AdminCreatesOrganizationForUser) and its admin check; this module owns the
+-- creation.
 -- from: routers/api/v1/admin/org.go:24
-rule AdminCreatesOrganizationForUser {
-    when: AdminCreatesOrganizationForUser(admin, owner, name, visibility)
+rule CreateOrganizationForUserByAdmin {
+    when: administration/OrganizationCreatedForUserByAdmin(admin, user, name, visibility)
 
-    requires: admin.is_admin
+    let owner = user
     requires: owner.kind in {individual, bot}
     requires: owner.is_admin
         or (owner.allow_create_organization and not config.disable_regular_org_creation)
@@ -558,12 +554,12 @@ rule OwnerDeletesOrganization {
 -- its last owner's account is purged, or by moderation.
 -- from: services/org/org.go:23
 rule SystemPurgesOrganization {
-    when: OrganizationPurgeRequested(org)
+    when: OrganizationPurgeRequested(organization)
 
     ensures:
-        for i in org.invites:
+        for i in organization.invites:
             not exists i
-        for t in org.teams:
+        for t in organization.teams:
             for tm in t.memberships:
                 not exists tm
             for tu in t.unit_accesses:
@@ -571,15 +567,15 @@ rule SystemPurgesOrganization {
             for tr in t.repository_links:
                 not exists tr
             not exists t
-        for m in org.memberships:
+        for m in organization.memberships:
             not exists m
-        not exists org
-        OrganizationPurgeStarted(organization: org)
-        OrganizationDeleted(organization: org)
+        not exists organization
+        OrganizationPurgeStarted(organization: organization)
+        OrganizationDeleted(organization: organization)
 
     @guidance
         -- repositories and packages react to OrganizationPurgeStarted by
-        -- deleting every repository and package the org owns before the org
+        -- deleting every repository and package the organization owns before the organization
         -- record goes. Triggered by accounts (purging a user who is last
         -- owner) and moderation (admin acting on an abuse report).
 }
@@ -589,7 +585,7 @@ rule SystemPurgesOrganization {
 rule ModeratorPurgesOrganization {
     when: moderation/ModeratorDeletesOrganization(admin, organization)
 
-    ensures: OrganizationPurgeRequested(organization)
+    ensures: OrganizationPurgeRequested(organization: organization)
 }
 
 ------------------------------------------------------------
@@ -678,7 +674,7 @@ rule OwnerAddsMemberToOrganization {
 
     ensures:
         for t in teams:
-            OwnerAddsTeamMember(actor, t, user)
+            OwnerAddsTeamMember(actor: actor, team: t, user: user)
 
     @guidance
         -- Web: POST /org/{org}/members/action/add with uname and team_<id>
@@ -691,12 +687,12 @@ rule OwnerAddsMemberToOrganization {
 -- belongs to any organization.)
 -- from: services/user/user.go:244
 rule RemoveDeletedUserFromOrganizations {
-    when: accounts/UserPurgeStarted(user)
+    when: accounts/UserPurged(user)
 
     ensures:
         for m in OrgMemberships where user = user:
             if is_org_owner(m.organization, user) and owner_count(m.organization) = 1:
-                OrganizationPurgeRequested(m.organization)
+                OrganizationPurgeRequested(organization: m.organization)
             else:
                 for tm in m.team_memberships:
                     not exists tm
@@ -1206,7 +1202,7 @@ rule OwnerAddsRepositoryToTeam {
 rule RepoAdminAddsTeamToRepository {
     when: RepoAdminAddsTeamToRepository(actor, repository, team)
 
-    requires: access/is_repo_admin(actor, repository) or actor.is_admin
+    requires: is_repo_admin(actor, repository) or actor.is_admin
     requires: repository.owner_org = team.organization
     requires: team.organization.repo_admin_change_team_access
         or is_org_owner(team.organization, actor) or actor.is_admin
@@ -1247,7 +1243,7 @@ rule RepoAdminRemovesTeamFromRepository {
 
     let link = TeamRepository{team: team, repository: repository}
 
-    requires: access/is_repo_admin(actor, repository) or actor.is_admin
+    requires: is_repo_admin(actor, repository) or actor.is_admin
     requires: team.organization.repo_admin_change_team_access
         or is_org_owner(team.organization, actor) or actor.is_admin
     requires: exists link
@@ -1444,13 +1440,8 @@ invariant AccountInviteAddressed {
 -- Actor Declarations
 ------------------------------------------------------------
 
-actor SignedInUser {
-    identified_by: accounts/User where prohibit_login = false
-}
-
-actor SiteAdmin {
-    identified_by: accounts/User where is_admin = true
-}
+-- Signed-in users, site administrators and anonymous visitors are the shared
+-- actors access/SignedInUser, access/SiteAdmin and access/Visitor.
 
 -- A member of the Owners team (site admins act as owners everywhere).
 actor OrgOwner {
@@ -1470,15 +1461,7 @@ actor TeamViewer {
     identified_by: accounts/User where can_view_team(within, this) or is_admin = true
 }
 
--- An admin of a repository owned by an organization.
-actor OrgRepoAdmin {
-    within: repositories/Repository
-    identified_by: accounts/User where access/is_repo_admin(this, within) or is_admin = true
-}
-
-actor AnonymousVisitor {
-    identified_by: Visitor where is_signed_in = false
-}
+-- An admin of a repository owned by an organization is access/RepoAdmin.
 
 ------------------------------------------------------------
 -- Surfaces
@@ -1486,7 +1469,7 @@ actor AnonymousVisitor {
 
 -- Founding an organization.
 surface OrganizationCreation {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
 
     exposes:
         config.default_org_visibility
@@ -1505,7 +1488,7 @@ surface OrganizationCreation {
 -- The org profile as an anonymous visitor sees it: public orgs only, public
 -- members only, no teams.
 surface AnonymousOrganizationProfile {
-    facing visitor: AnonymousVisitor
+    facing visitor: access/Visitor
 
     context org: Organization where visibility = public
 
@@ -1533,7 +1516,7 @@ surface AnonymousOrganizationProfile {
 
 -- The org profile as any signed-in person who may see the org sees it.
 surface OrganizationProfile {
-    facing viewer: SignedInUser
+    facing viewer: access/SignedInUser
 
     context org: Organization
 
@@ -1754,7 +1737,7 @@ surface OrganizationSettings {
 
 -- Accepting or declining an invitation.
 surface TeamInvitation {
-    facing invitee: SignedInUser
+    facing invitee: access/SignedInUser
 
     context invite: TeamInvite where status = pending
 
@@ -1788,7 +1771,7 @@ surface TeamInvitation {
 
 -- Team access managed from the repository side.
 surface RepositoryTeamAccess {
-    facing admin: OrgRepoAdmin
+    facing admin: access/RepoAdmin
 
     context repository: repositories/Repository where owner_org != null
 
@@ -1811,7 +1794,7 @@ surface RepositoryTeamAccess {
 
 -- Site administration of organizations.
 surface OrganizationAdministration {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
 
     context org: Organization
 
@@ -1823,12 +1806,12 @@ surface OrganizationAdministration {
         org.max_repo_creation
 
     provides:
-        AdminCreatesOrganizationForUser(admin, owner, name, visibility)
         AdminSetsOrganizationRepoLimit(admin, org, limit)
 
     @guidance
         -- Web: GET /admin/orgs (list all, including private). API: GET
-        -- /admin/orgs, POST /admin/users/{username}/orgs. Site admins also
+        -- /admin/orgs. Creating an org for a user (POST /admin/users/{username}/orgs)
+        -- enters through administration/AdminUserAccount. Site admins also
         -- pass every owner check on OrganizationSettings.
 }
 
@@ -1873,6 +1856,8 @@ open question "Expired invitations are never cleaned up automatically; they stay
 --                                      -- when org is public, or limited and the user is signed in
 --                                      -- (same as access/organization_unit_mode)
 -- Other black boxes:
+--   is_repo_admin(user, repository)    -- access/is_repo_admin(user, repository): admin
+--                                      -- (or owner) mode on the repository
 --   team_name_taken(org, name)         -- some team of org has this name, ignoring case
 --   team_name_taken_by_other(team, name)
 --   grants_some_unit(grants)           -- at least one grant above none
@@ -1900,8 +1885,7 @@ open question "Expired invitations are never cleaned up automatically; they stay
 -- REQUEST accounts: react to OrganizationRenamed(organization, old_name, new_name) with RenameNamespace semantics (UserRedirect with organization set, MAX_USER_REDIRECTS); react to OrganizationCreated by dropping any redirect holding the new name; follows and blocks of an org removed on OrganizationDeleted.
 -- REQUEST accounts: OrganizationBlocksUser should also require that the blocked user is not the acting owner (Forgejo refuses blocking yourself).
 -- REQUEST accounts: owner-name namespace — a name may be held by a User or an Organization, never both (is_usable_owner_name, owner_name_available, owner_name_claimable as black boxes over accounts' rules).
--- REQUEST access/is_repo_admin(user, repository): black box used by OrgRepoAdmin.
--- REQUEST access: derive repository permission for org repositories from TeamRepository + TeamUnitAccess + Team.access_mode (owner/admin teams: all units), and org-level unit read (projects/packages/code) from team units or org visibility; provide the anonymous actor to replace local Visitor.
+-- REQUEST access: derive repository permission for org repositories from TeamRepository + TeamUnitAccess + Team.access_mode (owner/admin teams: all units), and org-level unit read (projects/packages/code) from team units or org visibility.
 -- REQUEST repositories: emit OrgRepositoryArrived(repository) after a transfer into an org, and OrgRepositoryDeparted(repository, organization) when an org repository is transferred out or deleted.
 -- REQUEST repositories: when an org repository is created and no team gives its creator admin, add the creator as an admin Collaboration; check can_create_repository_in(user, org) and Organization.max_repo_creation for creation, forks, transfers and push-to-create.
 -- REQUEST repositories: react to TeamMemberAdded / TeamRepositoryAdded with auto-watch when AUTO_WATCH_NEW_REPOS; react to TeamMemberRemoved / OrgMemberRemoved / TeamRepositoryRemoved by unwatching repositories the user can no longer read; react to OrganizationPurgeStarted by deleting all org repositories.
@@ -1911,6 +1895,5 @@ open question "Expired invitations are never cleaned up automatically; they stay
 -- REQUEST code: react to TeamDeleted by removing the team from ProtectedBranch / ProtectedTag allow lists.
 -- REQUEST pulls: react to TeamDeleted by removing team ReviewRequests.
 -- REQUEST notifications: react to TeamInviteCreated by mailing invite.email with the invite link (inviter, org, team).
--- REQUEST authentication: is_org_owner takes (org, user) here — authentication.allium uses is_org_owner(user, org); align on (org, user). Black boxes teams_mapped_from(source, groups) / teams_unmapped_from(source, user, groups) read the source's group_team_map, dynamic maps and group_team_map_removal.
+-- REQUEST authentication: black boxes teams_mapped_from(source, groups) / teams_unmapped_from(source, user, groups) read the source's group_team_map, dynamic maps and group_team_map_removal.
 -- REQUEST moderation: ReportableContentChanging is not raised from here yet; the integration pass should decide how org profile edits (OrganizationProfileUpdated, OrganizationRenamed, OrganizationAvatarChanged) feed moderation's shadow copies.
--- REQUEST quota: is_org_owner takes (org, user) here — quota.allium names it is_org_owner(user, org); align on (org, user).

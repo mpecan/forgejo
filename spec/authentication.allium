@@ -46,6 +46,9 @@
 --
 -- Emits (other modules react):
 --   UserSignedUp(user)                                   -> notifications (admin notice / welcome), accounts
+--                                                           (this module is its only emitter: every
+--                                                           registration path creates the accounts/User here)
+--   UnconfirmedPrimaryEmailReplaced(user, new_address)   -> accounts (swap the primary EmailAddress row)
 --   UserSignedIn(user, method)                           -> accounts (last-login), notifications
 --   UserSignedOut(user, session)                         -> notifications (event stream "logout" to other tabs)
 --   ActivationEmailRequested(user, code)                 -> notifications (MailMessage)
@@ -74,12 +77,15 @@
 --   accounts/PrimaryEmailChanged(user, old_address, new_address) -- old codes and remember-me die
 --   accounts/UserPurged(user)                  -- end every session at once
 --   accounts/UserAccountDeleted(user, purge, delete_contributions) -- drop every credential
+--   administration/InstanceStarted(instance)   -- reconcile the built-in OAuth2 applications
+--   administration/ExternalUserSyncDue(update_existing) -- the sync_external_users cron task
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
 use "./repositories.allium" as repositories
 use "./access.allium" as access
 use "./keys.allium" as keys
+use "./administration.allium" as administration
 
 ------------------------------------------------------------
 -- Value Types
@@ -719,7 +725,7 @@ rule VisitorRegisters {
             session.user = user
             session.authenticated_via = password_login
             session.last_activity_at = now
-            UserSignedIn(user, password_login)
+            UserSignedIn(user: user, method: password_login)
 
     @guidance
         -- Web: GET/POST /user/sign_up. Field limits: username max 40, e-mail max 254,
@@ -757,10 +763,10 @@ rule InactiveUserReplacesUnconfirmedEmail {
     requires: email_domain_allowed(email)
     requires: email_available(email)
 
-    ensures: user.primary_email = email
     ensures:
         for c in EmailVerificationCodes where user = user and status = pending:
             c.status = revoked
+    ensures: UnconfirmedPrimaryEmailReplaced(user: user, new_address: email)
     ensures: MailSendThrottle.created(user: user, kind: email_change, until: now + config.mail_resend_interval)
     ensures:
         EmailVerificationCode.created(user: user, purpose: user_activation, email: email, expires_at: now + config.activation_code_lifetime, status: pending)
@@ -783,8 +789,8 @@ rule UserActivatesAccount {
 
     ensures: code.status = used
     ensures: code.user.is_active = true
-    ensures: EmailConfirmationLinkFollowed(code.user, code.email)
-    ensures: AccountActivated(code.user)
+    ensures: EmailConfirmationLinkFollowed(user: code.user, email: code.email)
+    ensures: AccountActivated(user: code.user)
     ensures: login.last_sign_in_at = now
     ensures:
         if session.status = anonymous:
@@ -809,7 +815,7 @@ rule UserConfirmsEmailAddress {
     requires: code.email = email
 
     ensures: code.status = used
-    ensures: EmailConfirmationLinkFollowed(code.user, email)
+    ensures: EmailConfirmationLinkFollowed(user: code.user, email: email)
     ensures:
         for t in MailSendThrottles where user = code.user and kind = resend:
             not exists t
@@ -860,11 +866,11 @@ rule VerificationCodeMailed {
     when: code: EmailVerificationCode.created
     ensures:
         if code.purpose = user_activation:
-            ActivationEmailRequested(code.user, code)
+            ActivationEmailRequested(user: code.user, code: code)
         if code.purpose = password_reset:
-            PasswordResetRequested(code.user, code)
+            PasswordResetRequested(user: code.user, code: code)
         if code.purpose = email_activation:
-            EmailConfirmationRequested(code.user, code.email, code)
+            EmailConfirmationRequested(user: code.user, email: code.email, code: code)
 }
 
 -- from: models/user/user.go:973
@@ -915,7 +921,7 @@ rule VisitorSignsInWithPassword {
             session.authenticated_via = password_login
             session.last_activity_at = now
             login.last_sign_in_at = now
-            UserSignedIn(user, password_login)
+            UserSignedIn(user: user, method: password_login)
             if remember:
                 LongTermAuthorization.created(user: user, sso_source: null, expires_at: now + config.login_remember_days, status: active)
 
@@ -954,13 +960,13 @@ rule ExternalPasswordSourceProvisionsUser {
         )
         UserLogin.created(user: user, source: source, login_name: entry.username, has_password: false, must_change_password: false, password_changed_at: null, last_sign_in_at: now)
         UserSignedUp(user)
-        ExternalSshKeysAsserted(user, source, entry.ssh_public_keys)
-        ExternalGroupsAsserted(user, source, entry.groups)
+        ExternalSshKeysAsserted(user: user, source: source, keys: entry.ssh_public_keys)
+        ExternalGroupsAsserted(user: user, source: source, groups: entry.groups)
         session.status = authenticated
         session.user = user
         session.authenticated_via = password_login
         session.last_activity_at = now
-        UserSignedIn(user, password_login)
+        UserSignedIn(user: user, method: password_login)
 
     @guidance
         -- LDAP: e-mail defaults to <username>@localhost.local when the directory has none;
@@ -989,7 +995,7 @@ rule VisitorCompletesTotpChallenge {
     ensures: session.authenticated_via = totp
     ensures: session.last_activity_at = now
     ensures: UserLogin{user: user}.last_sign_in_at = now
-    ensures: UserSignedIn(user, totp)
+    ensures: UserSignedIn(user: user, method: totp)
     ensures:
         if session.pending_link and session.pending_external_identity != null:
             ExternalLogin.created(user: user, source: session.pending_external_identity.source, external_id: session.pending_external_identity.external_id, provider: session.pending_external_identity.source.settings.provider, email: session.pending_external_identity.email, name: session.pending_external_identity.full_name, nickname: session.pending_external_identity.nickname, avatar_url: session.pending_external_identity.avatar_url, linked_at: now)
@@ -1020,7 +1026,7 @@ rule VisitorUsesScratchCode {
     ensures: session.pending_user = null
     ensures: session.authenticated_via = scratch_code
     ensures: session.last_activity_at = now
-    ensures: UserSignedIn(user, scratch_code)
+    ensures: UserSignedIn(user: user, method: scratch_code)
     ensures:
         if session.pending_openid_uri != null:
             OpenIDIdentity.created(user: user, uri: session.pending_openid_uri, show_publicly: false)
@@ -1049,7 +1055,7 @@ rule VisitorCompletesWebAuthnChallenge {
     ensures: session.pending_user = null
     ensures: session.authenticated_via = webauthn
     ensures: session.last_activity_at = now
-    ensures: UserSignedIn(user, webauthn)
+    ensures: UserSignedIn(user: user, method: webauthn)
     ensures:
         if session.pending_link and session.pending_external_identity != null:
             ExternalLogin.created(user: user, source: session.pending_external_identity.source, external_id: session.pending_external_identity.external_id, provider: session.pending_external_identity.source.settings.provider, email: session.pending_external_identity.email, name: session.pending_external_identity.full_name, nickname: session.pending_external_identity.nickname, avatar_url: session.pending_external_identity.avatar_url, linked_at: now)
@@ -1077,7 +1083,7 @@ rule VisitorResumesWithRememberMe {
     ensures: session.user = lta.user
     ensures: session.authenticated_via = remember_me
     ensures: session.last_activity_at = now
-    ensures: UserSignedIn(lta.user, remember_me)
+    ensures: UserSignedIn(user: lta.user, method: remember_me)
 
     @guidance
         -- Any page visited without a session but with the remember cookie bounces via
@@ -1096,7 +1102,7 @@ rule VisitorResumesWithSsoRememberMe {
     requires: lta.sso_source.kind = oauth2
 
     ensures: lta.status = consumed
-    ensures: OAuth2ProviderRedirectRequested(session, lta.sso_source, true)
+    ensures: OAuth2ProviderRedirectRequested(session: session, source: lta.sso_source, prompt_none: true)
 
     @guidance
         -- Redirects to /user/oauth2/{source}?prompt=none. If the IdP answers
@@ -1126,7 +1132,7 @@ rule UserSignsOut {
     requires: session.status = authenticated
 
     ensures: session.status = destroyed
-    ensures: UserSignedOut(session.user, session)
+    ensures: UserSignedOut(user: session.user, session: session)
 
     @guidance
         -- Web: POST /user/logout. Clears the session and the remember-me and redirect
@@ -1178,10 +1184,10 @@ rule ProviderReturnsKnownIdentity {
 
     let needs_second_factor = not source.settings.skip_local_two_factor and UserLogin{user: user}.has_second_factor
 
-    ensures: ExternalAvatarAsserted(user, identity.avatar_url)
-    ensures: ExternalSshKeysAsserted(user, source, identity.ssh_public_keys)
-    ensures: ExternalGroupsAsserted(user, source, identity.groups)
-    ensures: ExternalAdminFlagsAsserted(user, admin_from_groups(source, identity), restricted_from_groups(source, identity, user.is_restricted))
+    ensures: ExternalAvatarAsserted(user: user, url: identity.avatar_url)
+    ensures: ExternalSshKeysAsserted(user: user, source: source, keys: identity.ssh_public_keys)
+    ensures: ExternalGroupsAsserted(user: user, source: source, groups: identity.groups)
+    ensures: ExternalAdminFlagsAsserted(user: user, is_admin: admin_from_groups(source, identity), is_restricted: restricted_from_groups(source, identity, user.is_restricted))
     ensures:
         if exists known_link:
             known_link.email = identity.email
@@ -1198,7 +1204,7 @@ rule ProviderReturnsKnownIdentity {
             session.user = user
             session.authenticated_via = external_provider
             session.last_activity_at = now
-            UserSignedIn(user, external_provider)
+            UserSignedIn(user: user, method: external_provider)
             LongTermAuthorization.created(user: user, sso_source: source, expires_at: now + config.login_remember_days, status: active)
 
     @guidance
@@ -1258,14 +1264,14 @@ rule ProviderIdentityAutoRegisters {
         )
         UserLogin.created(user: user, source: source, login_name: identity.external_id, has_password: false, must_change_password: false, password_changed_at: null, last_sign_in_at: now)
         UserSignedUp(user)
-        ExternalGroupsAsserted(user, source, identity.groups)
+        ExternalGroupsAsserted(user: user, source: source, groups: identity.groups)
         if needs_confirmation and config.oauth2_client_register_email_confirm:
             EmailVerificationCode.created(user: user, purpose: user_activation, email: identity.email, expires_at: now + config.activation_code_lifetime, status: pending)
         session.status = authenticated
         session.user = user
         session.authenticated_via = external_provider
         session.last_activity_at = now
-        UserSignedIn(user, external_provider)
+        UserSignedIn(user: user, method: external_provider)
 
     @guidance
         -- The username is taken from the configured claim (userid, nickname, the local
@@ -1298,7 +1304,7 @@ rule ProviderIdentityAutoLinksExistingAccount {
     ensures: session.user = existing
     ensures: session.authenticated_via = external_provider
     ensures: session.last_activity_at = now
-    ensures: UserSignedIn(existing, external_provider)
+    ensures: UserSignedIn(user: existing, method: external_provider)
 }
 
 -- Unknown identity and no auto-registration (or missing fields, or linking = login):
@@ -1348,7 +1354,8 @@ rule VisitorLinksPendingIdentityBySignIn {
             session.user = user
             session.authenticated_via = password_login
             session.last_activity_at = now
-            UserSignedIn(user, password_login)
+            UserSignedIn(user: user, method: password_login)
+            ExternalGroupsAsserted(user: user, source: identity.source, groups: identity.groups)
 
     @guidance
         -- Web: POST /user/link_account_signin. With 2FA enrolled the link is made after
@@ -1386,13 +1393,13 @@ rule VisitorRegistersFromPendingIdentity {
         UserLogin.created(user: user, source: identity.source, login_name: identity.external_id, has_password: keeps_password, must_change_password: false, password_changed_at: null, last_sign_in_at: now)
         ExternalLogin.created(user: user, source: identity.source, external_id: identity.external_id, provider: identity.source.settings.provider, email: identity.email, name: identity.full_name, nickname: identity.nickname, avatar_url: identity.avatar_url, linked_at: now)
         UserSignedUp(user)
-        ExternalGroupsAsserted(user, identity.source, identity.groups)
+        ExternalGroupsAsserted(user: user, source: identity.source, groups: identity.groups)
         session.pending_external_identity = null
         session.status = authenticated
         session.user = user
         session.authenticated_via = external_provider
         session.last_activity_at = now
-        UserSignedIn(user, external_provider)
+        UserSignedIn(user: user, method: external_provider)
 
     @guidance
         -- Web: POST /user/link_account_signup. A password is only kept when
@@ -1437,7 +1444,7 @@ rule VisitorSignsInWithOpenID {
                 session.user = identity.user
                 session.authenticated_via = openid
                 session.last_activity_at = now
-                UserSignedIn(identity.user, openid)
+                UserSignedIn(user: identity.user, method: openid)
         else:
             session.pending_openid_uri = uri
 
@@ -1467,7 +1474,7 @@ rule VisitorConnectsOpenIDToAccount {
             session.user = user
             session.authenticated_via = openid
             session.last_activity_at = now
-            UserSignedIn(user, openid)
+            UserSignedIn(user: user, method: openid)
 }
 
 -- from: routers/web/user/setting/security/openid.go:22
@@ -1551,7 +1558,7 @@ rule VisitorResetsPassword {
     ensures: session.user = user
     ensures: session.authenticated_via = password_reset
     ensures: session.last_activity_at = now
-    ensures: UserSignedIn(user, password_reset)
+    ensures: UserSignedIn(user: user, method: password_reset)
 
     @guidance
         -- Web: GET/POST /user/recover_account?code=…. The code is only consumed on POST,
@@ -1683,7 +1690,7 @@ rule UserRemovesSecurityKey {
     requires: credential.user = user
 
     ensures: not exists credential
-    ensures: SecurityKeyRemoved(user, credential.name)
+    ensures: SecurityKeyRemoved(user: user, name: credential.name)
 }
 
 ------------------------------------------------------------
@@ -1704,7 +1711,7 @@ rule UserCreatesAccessToken {
     requires: all_repositories or public_only = false
     requires: all_repositories or repositories.count > 0
     requires: all_repositories or scopes.all(sc => sc in {read_issue, write_issue, read_repository, write_repository})
-    requires: all_repositories or repositories.all(r => access/can_read(actor, r, code))
+    requires: all_repositories or repositories.all(r => can_read_code(actor, r))
 
     ensures:
         let token = AccessToken.created(
@@ -1774,7 +1781,7 @@ rule ClientAuthenticatesWithPassword {
     requires: login.skips_local_two_factor or login.has_totp = false or (otp != null and totp_valid(TwoFactor{user: user}, otp))
     requires: login.may_use_account
 
-    ensures: RequestAuthenticated(user, password_basic)
+    ensures: RequestAuthenticated(user: user, method: password_basic)
 
     @guidance
         -- `Authorization: Basic` with a username/e-mail and password. With TOTP enrolled
@@ -1790,7 +1797,7 @@ rule ClientAuthenticatesWithAccessToken {
     requires: UserLogin{user: token.owner}.may_use_account
 
     ensures: token.last_used_at = now
-    ensures: RequestAuthenticated(token.owner, access_token)
+    ensures: RequestAuthenticated(user: token.owner, method: access_token)
 
     @guidance
         -- `Authorization: token <t>`, `Authorization: Bearer <t>`, or as the password
@@ -1808,7 +1815,7 @@ rule ClientAuthenticatesWithOAuth2Token {
     requires: issuance.access_valid
     requires: UserLogin{user: issuance.grant.user}.may_use_account
 
-    ensures: RequestAuthenticated(issuance.grant.user, oauth2_bearer)
+    ensures: RequestAuthenticated(user: issuance.grant.user, method: oauth2_bearer)
 
     @guidance
         -- Bearer, basic-password, or form `access_token`. A revoked grant kills every
@@ -1824,7 +1831,7 @@ rule ClientAuthenticatesWithSignedRequest {
     requires: http_signature_valid(request, key)
     requires: UserLogin{user: key.owner}.may_use_account
 
-    ensures: RequestAuthenticated(key.owner, http_signature)
+    ensures: RequestAuthenticated(user: key.owner, method: http_signature)
 
     @guidance
         -- API only. `Signature` header (HTTP signatures draft) made with a registered SSH
@@ -1842,7 +1849,7 @@ rule TrustedProxyAssertsUser {
     requires: request.via_trusted_proxy
     requires: UserLogin{user: user}.may_use_account
 
-    ensures: RequestAuthenticated(user, reverse_proxy)
+    ensures: RequestAuthenticated(user: user, method: reverse_proxy)
 
     @guidance
         -- The user is named in X-WEBAUTH-USER (or found by X-WEBAUTH-EMAIL when e-mail
@@ -1871,7 +1878,7 @@ rule TrustedProxyRegistersUser {
         )
         UserLogin.created(user: user, source: null, login_name: name, has_password: false, must_change_password: false, password_changed_at: null, last_sign_in_at: now)
         UserSignedUp(user)
-        RequestAuthenticated(user, reverse_proxy)
+        RequestAuthenticated(user: user, method: reverse_proxy)
 
     @guidance
         -- E-mail comes from X-WEBAUTH-EMAIL when ENABLE_REVERSE_PROXY_EMAIL is on, else a
@@ -1886,7 +1893,7 @@ rule ClientAuthenticatesWithIntegrationJwt {
     requires: claims_satisfy(claims, integration.claim_rules)
     requires: UserLogin{user: integration.owner}.may_use_account
 
-    ensures: RequestAuthenticated(integration.owner, integration_jwt)
+    ensures: RequestAuthenticated(user: integration.owner, method: integration_jwt)
 
     @guidance
         -- Bearer JWT (also accepted as basic-auth password on git and LFS routes). The
@@ -1900,7 +1907,7 @@ rule ClientAuthenticatesWithIntegrationJwt {
 rule AdminSudoes {
     when: AdminSudoes(admin, target)
     requires: admin.is_admin
-    ensures: RequestAuthenticated(target, session)
+    ensures: RequestAuthenticated(user: target, method: session)
 
     @guidance
         -- `?sudo=<name>` or `Sudo: <name>` header on any API call. Non-admins get 403.
@@ -1921,7 +1928,7 @@ rule UserCreatesAuthorizedIntegration {
     requires: all_repositories or public_only = false
     requires: all_repositories or repositories.count > 0
     requires: all_repositories or scopes.all(sc => sc in {read_issue, write_issue, read_repository, write_repository})
-    requires: all_repositories or repositories.all(r => access/can_read(user, r, code))
+    requires: all_repositories or repositories.all(r => can_read_code(user, r))
 
     ensures: AuthorizedIntegration.created(owner: user, name: name, description: null, ui: ui, issuer: issuer, audience: audience, claim_rules: claim_rules, scopes: scopes, public_only: public_only, all_repositories: all_repositories, repositories: repositories, created_at: now)
 
@@ -1965,7 +1972,7 @@ rule OwnerRegistersOAuth2Application {
     requires: config.oauth2_enabled
     requires: owner_user = null or owner_org = null
     requires: owner_user = null or owner_user = actor
-    requires: owner_org = null or is_org_owner(actor, owner_org)
+    requires: owner_org = null or is_org_owner(owner_org, actor)
     requires: owner_user != null or owner_org != null or actor.is_admin
     requires: name != ""
     requires: redirect_uris.count > 0
@@ -2023,7 +2030,7 @@ rule OwnerDeletesOAuth2Application {
 -- exactly when listed in DEFAULT_APPLICATIONS; they are instance-wide and locked.
 -- from: models/auth/oauth2.go:86
 rule BuiltinApplicationsReconciled {
-    when: InstanceStarted()
+    when: administration/InstanceStarted(instance)
     ensures:
         for b in config.oauth2_default_applications:
             if not exists OAuth2Application{builtin: b}:
@@ -2233,8 +2240,11 @@ rule AdminDeletesAuthSource {
 -- Rules: scheduled directory synchronisation
 ------------------------------------------------------------
 
+-- The sync_external_users schedule. Both this temporal rule and the reaction to
+-- administration's cron dispatch (ScheduledExternalUserSync) end in the same
+-- per-source AuthSourceSyncRequested.
 -- from: services/cron/tasks_basic.go:90
-rule ExternalUserSyncDue {
+rule ExternalUserSyncJobFallsDue {
     when: job: ExternalUserSyncJob.next_run_at <= now
 
     requires: job.enabled
@@ -2243,11 +2253,23 @@ rule ExternalUserSyncDue {
     ensures: job.next_run_at = now + config.sync_external_users_interval
     ensures:
         for source in AuthSources where is_active = true and sync_enabled = true:
-            AuthSourceSyncRequested(source, job.update_existing)
+            AuthSourceSyncRequested(source: source, update_existing: job.update_existing)
 
     @guidance
         -- Cron task `sync_external_users`, @midnight by default. Cancelling stops between
         -- sources.
+}
+
+-- administration's sync_external_users cron task ran (on its schedule or "run now").
+-- from: services/cron/tasks_basic.go:90
+rule ScheduledExternalUserSync {
+    when: administration/ExternalUserSyncDue(update_existing)
+    ensures:
+        for job in ExternalUserSyncJobs:
+            job.last_run_at = now
+    ensures:
+        for source in AuthSources where is_active = true and sync_enabled = true:
+            AuthSourceSyncRequested(source: source, update_existing: update_existing)
 }
 
 -- The admin dashboard's "synchronise external user data" button.
@@ -2259,15 +2281,16 @@ rule AdminRunsExternalUserSync {
 
     ensures:
         for source in AuthSources where is_active = true and sync_enabled = true:
-            AuthSourceSyncRequested(source, config.sync_external_users_update_existing)
+            AuthSourceSyncRequested(source: source, update_existing: config.sync_external_users_update_existing)
 }
 
 -- Synchronise one LDAP source against its directory: create missing accounts, refresh
 -- existing ones, deactivate accounts whose entry disappeared.
 -- from: services/auth/source/ldap/source_sync.go:17
 rule LdapSourceSynchronised {
-    when: AuthSourceSyncRequested(src, update_existing)
+    when: AuthSourceSyncRequested(source, update_existing)
 
+    let src = source
     requires: src.is_ldap
     let entries = DirectoryEntries where source = src
     requires: entries.count > 0 or src.settings.allow_deactivate_all
@@ -2286,14 +2309,14 @@ rule LdapSourceSynchronised {
                 )
                 UserLogin.created(user: user, source: src, login_name: e.username, has_password: false, must_change_password: false, password_changed_at: null, last_sign_in_at: null)
                 UserSignedUp(user)
-                ExternalSshKeysAsserted(user, src, e.ssh_public_keys)
+                ExternalSshKeysAsserted(user: user, source: src, keys: e.ssh_public_keys)
     ensures:
         if update_existing:
             for login in UserLogins where source = src:
                 if exists DirectoryEntry{source: src, username: login.login_name}:
                     login.user.is_active = true
-                    ExternalAdminFlagsAsserted(login.user, DirectoryEntry{source: src, username: login.login_name}.is_admin, DirectoryEntry{source: src, username: login.login_name}.is_restricted)
-                    ExternalSshKeysAsserted(login.user, src, DirectoryEntry{source: src, username: login.login_name}.ssh_public_keys)
+                    ExternalAdminFlagsAsserted(user: login.user, is_admin: DirectoryEntry{source: src, username: login.login_name}.is_admin, is_restricted: DirectoryEntry{source: src, username: login.login_name}.is_restricted)
+                    ExternalSshKeysAsserted(user: login.user, source: src, keys: DirectoryEntry{source: src, username: login.login_name}.ssh_public_keys)
     ensures:
         for login in UserLogins where source = src:
             if not exists DirectoryEntry{source: src, username: login.login_name}:
@@ -2441,8 +2464,9 @@ invariant SyncOnlyForLdap {
 -- Actor Declarations
 ------------------------------------------------------------
 
--- A browser session nobody has signed in to yet.
-actor Visitor {
+-- A browser session nobody has signed in to yet. Not access/Visitor (a party
+-- behind one request): the sign-in flows act on the anonymous session itself.
+actor AnonymousSession {
     identified_by: Session where status = anonymous
 }
 
@@ -2451,18 +2475,12 @@ actor SecondFactorChallenger {
     identified_by: Session where status = pending_second_factor
 }
 
--- Any account holder with a usable account (active, not prohibited).
-actor SignedInUser {
-    identified_by: accounts/User where is_active = true and prohibit_login = false
-}
+-- Signed-in users and site administrators are access/SignedInUser and
+-- access/SiteAdmin.
 
 -- Signed in but not yet activated: may only use the activation page.
 actor InactiveUser {
     identified_by: accounts/User where is_active = false and prohibit_login = false
-}
-
-actor SiteAdmin {
-    identified_by: accounts/User where is_admin = true and is_active = true and prohibit_login = false
 }
 
 -- A program on the other end of an HTTP request carrying some credential.
@@ -2500,7 +2518,7 @@ external entity ClientRequest {
 
 -- The sign-in / sign-up / recovery pages for somebody not signed in.
 surface SignInPage {
-    facing visitor: Visitor
+    facing visitor: AnonymousSession
 
     exposes:
         config.enable_internal_signin
@@ -2609,7 +2627,7 @@ surface AccountActivation {
 
 -- Security settings of the signed-in user.
 surface SecuritySettings {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
 
     let login = UserLogin{user: user}
 
@@ -2663,7 +2681,7 @@ surface SecuritySettings {
 
 -- Applications settings: tokens, own OAuth2 apps, granted apps.
 surface ApplicationSettings {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
 
     exposes:
         for token in AccessTokens where owner = user:
@@ -2720,7 +2738,7 @@ surface ApplicationSettings {
 }
 
 surface OrganizationOAuth2Applications {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
 
     context org: organizations/Organization
 
@@ -2733,13 +2751,13 @@ surface OrganizationOAuth2Applications {
 
     provides:
         OwnerRegistersOAuth2Application(user, owner_user, org, name, redirect_uris, confidential)
-            when is_org_owner(user, org) and config.oauth2_enabled
+            when is_org_owner(org, user) and config.oauth2_enabled
         OwnerUpdatesOAuth2Application(user, app, name, redirect_uris, confidential)
-            when is_org_owner(user, org)
+            when is_org_owner(org, user)
         OwnerRegeneratesClientSecret(user, app)
-            when is_org_owner(user, org)
+            when is_org_owner(org, user)
         OwnerDeletesOAuth2Application(user, app)
-            when is_org_owner(user, org)
+            when is_org_owner(org, user)
 
     @guidance
         -- Web: /org/{org}/settings/applications(/oauth2/{id}...). Org owners only.
@@ -2747,7 +2765,7 @@ surface OrganizationOAuth2Applications {
 
 -- The consent screen of the OAuth2 provider.
 surface OAuth2Consent {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
 
     context app: OAuth2Application
 
@@ -2858,7 +2876,7 @@ surface IdentityProviderCallback {
 }
 
 surface AuthSourceAdministration {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
 
     exposes:
         for source in AuthSources:
@@ -2893,6 +2911,7 @@ surface AuthSourceAdministration {
 -- Deferred Specifications
 ------------------------------------------------------------
 
+-- Local black box: can_read_code(user, repository) is access/can_read(user, repository, code).
 deferred AccessToken.enforcement           -- see: access.allium (scope/public-only/repository reducers per endpoint)
 deferred ExternalGroupsAsserted.team_mapping -- see: organizations.allium (group_team_map, dynamic maps, removal)
 deferred ExternalGroupsAsserted.quota_mapping -- see: quota.allium (quota_group_map)
@@ -2916,20 +2935,16 @@ open question "Disabling TOTP is blocked when 2FA is required, but removing the 
 -- Requests to other modules
 ------------------------------------------------------------
 -- REQUEST accounts/User.kind: individual | bot | ... — used to refuse password sign-in for non-individuals.
--- REQUEST accounts/User.primary_email is writable (InactiveUserReplacesUnconfirmedEmail).
 -- REQUEST accounts/username_available(name): black-box check covering syntax, reserved names, cooldown, uniqueness.
 -- REQUEST accounts/email_available(email): black-box uniqueness check across all addresses.
 -- REQUEST accounts/user_count(): number of user accounts (first account becomes admin).
 -- REQUEST accounts/user_by_name_or_email(name, email): lookup for account-link auto mode.
--- REQUEST accounts: react to EmailConfirmationLinkFollowed(user, email), AccountActivated(user), ExternalAvatarAsserted(user, url), ExternalAdminFlagsAsserted(user, is_admin, is_restricted).
--- REQUEST accounts: your CreateAccountBySelfRegistration(AccountRegistrationAccepted) duplicates VisitorRegisters / ProviderIdentityAutoRegisters / ExternalPasswordSourceProvisionsUser / TrustedProxyRegistersUser / LdapSourceSynchronised, which create accounts/User directly because the same act must bind the session and UserLogin to the new account; integration should keep one creation path (account defaults such as visibility and keep_email_private can stay in accounts as a reaction to UserSignedUp). Both modules currently declare UserSignedUp(user).
+-- REQUEST accounts: react to ExternalAvatarAsserted(user, url), ExternalAdminFlagsAsserted(user, is_admin, is_restricted).
 -- REQUEST accounts: User.login_source duplicates authentication/UserLogin.source; keep one (UserLogin also carries login_name and must_change_password).
--- REQUEST accounts/EmailActivationRequested(user, address): authentication issues the EmailVerificationCode the mail links to (IssueEmailConfirmationCode); notifications reacts to the accounts trigger, so EmailConfirmationRequested(user, email, code) carries the code it needs.
 -- REQUEST accounts: UserLogin is created by authentication for self-registration; administration's "admin creates user" must create a UserLogin (with must_change_password) too.
 -- REQUEST organizations: react to ExternalGroupsAsserted(user, source, groups) per the source's group_team_map / dynamic maps; react to AuthSourceDeleted(source) by clearing membership provenance.
--- REQUEST organizations/is_owner(user, org) — used here as is_org_owner(user, org).
 -- REQUEST quota: react to ExternalGroupsAsserted for quota-group mapping.
 -- REQUEST keys/SshKey.owner: accounts/User — the key an HTTP signature is verified against; react to ExternalSshKeysAsserted(user, source, keys) (source-managed keys).
 -- REQUEST access: consume RequestAuthenticated(user, method) and the token's scopes / public_only / repositories to reduce permissions; access/can_read(user, repository, unit).
 -- REQUEST notifications: send mail for ActivationEmailRequested, EmailConfirmationRequested, PasswordResetRequested, PasswordChanged, TotpEnrolled, TotpDisabled, SecurityKeyRemoved; push "logout" on UserSignedOut.
--- REQUEST administration: InstanceStarted() trigger; the sync_external_users cron task maps to ExternalUserSyncJob.
+-- REQUEST administration: the sync_external_users cron task and ExternalUserSyncJob describe one schedule; a rebuild keeps one.

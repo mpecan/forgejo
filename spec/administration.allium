@@ -72,17 +72,17 @@
 --   CronTaskRunFinished(task, outcome)
 --   per-task work requests (one per registered cron task, see "Cron dispatch"):
 --     MirrorUpdateDue(pull_limit, push_limit)                       -> repositories
---     RepositoryHealthCheckDue(timeout, git_args)                   -> repositories
+--     RepositoryHealthCheckDue(timeout, args)                       -> repositories
 --     RepositoryStatsCheckDue()                                     -> repositories
 --     RepositoryArchiveCleanupDue(older_than)                       -> repositories
 --     ExternalUserSyncDue(update_existing)                          -> authentication
 --     DeletedBranchCleanupDue(older_than)                           -> code
 --     MigrationPosterIdUpdateDue()                                  -> migrations
---     HookDeliveryCleanupDue(cleanup_kind, older_than, number_to_keep) -> webhooks
+--     HookDeliveryCleanupDue(cleanup_type, older_than, number_to_keep) -> webhooks
 --     PackageCleanupDue(older_than)                                 -> packages
 --     InactiveAccountCleanupDue(older_than)                         -> accounts
 --     AllRepositoryArchivesDeletionDue()                            -> repositories
---     RepositoryGarbageCollectionDue(timeout, git_args)             -> repositories
+--     RepositoryGarbageCollectionDue(timeout, args)                 -> repositories
 --     AuthorizedKeysRewriteDue()                                    -> keys
 --     AuthorizedPrincipalsRewriteDue()                              -> keys
 --     MissingRepositoryReinitDue()                                  -> repositories
@@ -91,7 +91,7 @@
 --     OldActivityDeletionDue(older_than)                            -> notifications
 --     UpdateCheckDue(http_endpoint, domain_endpoint)                -> administration
 --     OldSystemNoticeDeletionDue(older_than)                        -> administration
---     LfsGarbageCollectionDue(older_than, last_updated_more_than_ago, number_per_repo, proportion_per_repo) -> code
+--     LfsGarbageCollectionDue(older_than, last_updated_more_than_ago, number_to_check_per_repo, proportion_to_check_per_repo) -> code
 --     IssueIndexRebuildDue()                                        -> discovery
 --     ResolvedReportRemovalDue(keep_for)                            -> moderation
 --     ZombieActionsTaskStopDue()                                    -> actions
@@ -115,8 +115,7 @@
 --   UserPasswordSetByAdmin(admin, user, password) / UserPasswordSetByOperator(operator, user, password) -> authentication (hash + store)
 --   UserAvatarChangedByAdmin(admin, user) / UserAvatarRemovedByAdmin(admin, user)
 --   RepositoryDeletedByAdmin(admin, repository)         -> repositories cascade
---   UnadoptedRepositoryAdopted(admin, owner, name)      -> repositories
---   OrganizationCreatedForUserByAdmin(admin, user, name, visibility)  -> organizations
+--   OrganizationCreatedForUserByAdmin(admin, user, name, visibility)  -> organizations (creates it)
 --   RepositoryCreatedForUserByAdmin(admin, user, name)  -> repositories
 --   SshKeyAddedForUserByAdmin / SshKeyRemovedForUserByAdmin -> keys
 --   AccessTokenRequestedForUser(requester, user, token_name, scopes) -> authentication
@@ -141,6 +140,7 @@
 --   InstanceStarted(instance)                 -- process start (run-at-start tasks)
 
 use "./accounts.allium" as accounts
+use "./access.allium" as access
 use "./organizations.allium" as organizations
 use "./authentication.allium" as authentication
 use "./repositories.allium" as repositories
@@ -167,14 +167,6 @@ use "./migrations.allium" as migrations
 ------------------------------------------------------------
 -- External Entities
 ------------------------------------------------------------
-
--- Somebody reaching the instance over HTTP without (necessarily) being signed in:
--- the person running the install wizard, a load-balancer health probe, an API
--- client reading the version. access.allium owns the general anonymous actor.
--- from: routers/install/routes.go:27
-external entity Visitor {
-    is_signed_in: Boolean
-}
 
 -- A person with a shell on the server host, running the `forgejo` binary against
 -- the instance's configuration and database. Not a Forgejo account.
@@ -505,15 +497,6 @@ entity AnnouncementAcknowledgement {
     acknowledged_at: Timestamp
 }
 
--- A repository directory found in the repository root that has no repository
--- record (e.g. copied in by hand, or left behind). Only administrators see the
--- instance-wide list.
--- from: routers/web/admin/repos.go:64
-entity UnadoptedRepository {
-    owner: accounts/User    -- the user or organization whose directory it sits in
-    name: String
-}
-
 -- One line of the read-only configuration view. Secrets (passwords, URIs with
 -- credentials, connection strings) are shown masked.
 -- from: routers/web/admin/config.go:117
@@ -537,7 +520,8 @@ config {
 
     -- [admin]
     -- from: modules/setting/admin.go:20
-    disable_regular_org_creation: Boolean = false      -- only admins may create organizations (organizations reads it)
+    -- DISABLE_REGULAR_ORG_CREATION lives in organizations' config
+    -- (organizations/config.disable_regular_org_creation).
     default_email_notifications: String = "enabled"    -- enabled | onmention | disabled; new accounts' default (notifications)
     notify_admins_on_new_user: Boolean = false         -- SEND_NOTIFICATION_EMAIL_ON_NEW_USER (notifications)
     user_disabled_features: Set<String> = {}           -- deletion, manage_ssh_keys, manage_gpg_keys, manage_password
@@ -693,8 +677,8 @@ rule VisitorInstallsInstance {
     ensures: SystemSetting.created(key: enable_federated_avatar, value: settings.enable_federated_avatar, version: 1, updated_at: now)
     ensures:
         if settings.admin_name != null:
-            InstallerCreatesFirstAdmin(settings)
-    ensures: InstallationCompleted(instance)
+            InstallerCreatesFirstAdmin(settings: settings)
+    ensures: InstallationCompleted(instance: instance)
     @guidance
         -- Also written to configuration: database, repository root, domain,
         -- SSH (disabled when port 0), LFS (enabled with a fresh signing secret
@@ -722,7 +706,7 @@ rule InstallerCreatesFirstAdmin {
         is_restricted: false,
         prohibit_login: false
     )
-    ensures: FirstAdminSignedIn(settings.admin_name)
+    ensures: FirstAdminSignedIn(name: settings.admin_name)
     @guidance
         -- The admin checks happen before anything is written, so a rejected
         -- admin leaves the instance uninstalled. If an account of that name
@@ -743,7 +727,7 @@ rule ScheduleTasksAtStart {
         for task in CronTasks where enabled = true:
             task.next_run_at = now + time_until_next(task.schedule)
             if task.run_at_start:
-                CronTaskRunRequested(task, null)
+                CronTaskRunRequested(task: task, doer: null)
     @guidance
         -- Disabled tasks are registered (listed, runnable by hand) but never
         -- scheduled.
@@ -777,7 +761,7 @@ rule AdminChangesSetting {
             existing.updated_at = now
         else:
             SystemSetting.created(key: key, value: normalised, version: 1, updated_at: now)
-    ensures: RuntimeSettingChanged(key)
+    ensures: RuntimeSettingChanged(key: key)
     @guidance
         -- Flags accept any truthy spelling and store "true"/"false". Editor apps
         -- are one "Display Name = URL template" per line; malformed lines are
@@ -794,7 +778,7 @@ rule AdminChangesSetting {
 rule RecordSystemNotice {
     when: SystemFailureReported(kind, description)
     ensures: SystemNotice.created(kind: kind, description: description, created_at: now)
-    ensures: SystemNoticeRecorded(kind)
+    ensures: SystemNoticeRecorded(kind: kind)
 }
 
 -- A failed or flagged repository migration leaves a repository notice.
@@ -832,7 +816,7 @@ rule CronTaskFallsDue {
     when: task: CronTask.next_run_at <= now
     requires: task.enabled = true
     ensures: task.next_run_at = now + time_until_next(task.schedule)
-    ensures: CronTaskRunRequested(task, null)
+    ensures: CronTaskRunRequested(task: task, doer: null)
 }
 
 -- An administrator runs a task now — from the dashboard, the cron monitor page,
@@ -841,7 +825,7 @@ rule CronTaskFallsDue {
 rule AdminRunsCronTask {
     when: AdminRunsCronTask(admin, task)
     requires: admin.is_admin = true
-    ensures: CronTaskRunRequested(task, admin)
+    ensures: CronTaskRunRequested(task: task, doer: admin)
 }
 
 -- A run starts only if the same task is not already running; a request while
@@ -853,7 +837,7 @@ rule StartCronTaskRun {
     ensures: task.run_state = running
     ensures: task.exec_times = task.exec_times + 1
     ensures: task.last_run_at = now
-    ensures: CronTaskExecutes(task, doer)
+    ensures: CronTaskExecutes(task: task, doer: doer)
 }
 
 -- The owning module reports how the work went.
@@ -869,7 +853,7 @@ rule FinishCronTaskRun {
             SystemNotice.created(kind: task, description: cron_notice_text(job, outcome, message), created_at: now)
         else if job.notice_on_success:
             SystemNotice.created(kind: task, description: cron_notice_text(job, outcome, message), created_at: now)
-    ensures: CronTaskRunFinished(job, outcome)
+    ensures: CronTaskRunFinished(task: job, outcome: outcome)
     @guidance
         -- A panic/crash inside the work is caught and logged; the task returns
         -- to idle so the next schedule still fires.
@@ -884,14 +868,14 @@ rule FinishCronTaskRun {
 rule DispatchUpdateMirrors {
     when: CronTaskExecutes(task, doer)
     requires: task.name = update_mirrors
-    ensures: MirrorUpdateDue(config.update_mirrors_pull_limit, config.update_mirrors_push_limit)
+    ensures: MirrorUpdateDue(pull_limit: config.update_mirrors_pull_limit, push_limit: config.update_mirrors_push_limit)
 }
 
 -- from: services/cron/tasks_basic.go:47
 rule DispatchRepoHealthCheck {
     when: CronTaskExecutes(task, doer)
     requires: task.name = repo_health_check
-    ensures: RepositoryHealthCheckDue(config.repo_health_check_timeout, config.repo_health_check_args)
+    ensures: RepositoryHealthCheckDue(timeout: config.repo_health_check_timeout, args: config.repo_health_check_args)
 }
 
 -- from: services/cron/tasks_basic.go:67
@@ -905,21 +889,21 @@ rule DispatchCheckRepoStats {
 rule DispatchArchiveCleanup {
     when: CronTaskExecutes(task, doer)
     requires: task.name = archive_cleanup
-    ensures: RepositoryArchiveCleanupDue(config.archive_cleanup_older_than)
+    ensures: RepositoryArchiveCleanupDue(older_than: config.archive_cleanup_older_than)
 }
 
 -- from: services/cron/tasks_basic.go:91
 rule DispatchSyncExternalUsers {
     when: CronTaskExecutes(task, doer)
     requires: task.name = sync_external_users
-    ensures: ExternalUserSyncDue(config.sync_external_users_update_existing)
+    ensures: ExternalUserSyncDue(update_existing: config.sync_external_users_update_existing)
 }
 
 -- from: services/cron/tasks_basic.go:105
 rule DispatchDeletedBranchesCleanup {
     when: CronTaskExecutes(task, doer)
     requires: task.name = deleted_branches_cleanup
-    ensures: DeletedBranchCleanupDue(config.deleted_branches_cleanup_older_than)
+    ensures: DeletedBranchCleanupDue(older_than: config.deleted_branches_cleanup_older_than)
 }
 
 -- from: services/cron/tasks_basic.go:120
@@ -933,21 +917,21 @@ rule DispatchUpdateMigrationPosterId {
 rule DispatchCleanupHookTaskTable {
     when: CronTaskExecutes(task, doer)
     requires: task.name = cleanup_hook_task_table
-    ensures: HookDeliveryCleanupDue(config.cleanup_hook_task_table_cleanup_type, config.cleanup_hook_task_table_older_than, config.cleanup_hook_task_table_number_to_keep)
+    ensures: HookDeliveryCleanupDue(cleanup_type: config.cleanup_hook_task_table_cleanup_type, older_than: config.cleanup_hook_task_table_older_than, number_to_keep: config.cleanup_hook_task_table_number_to_keep)
 }
 
 -- from: services/cron/tasks_basic.go:145
 rule DispatchCleanupPackages {
     when: CronTaskExecutes(task, doer)
     requires: task.name = cleanup_packages
-    ensures: PackageCleanupDue(config.cleanup_packages_older_than)
+    ensures: PackageCleanupDue(older_than: config.cleanup_packages_older_than)
 }
 
 -- from: services/cron/tasks_extended.go:26
 rule DispatchDeleteInactiveAccounts {
     when: CronTaskExecutes(task, doer)
     requires: task.name = delete_inactive_accounts
-    ensures: InactiveAccountCleanupDue(config.delete_inactive_accounts_older_than)
+    ensures: InactiveAccountCleanupDue(older_than: config.delete_inactive_accounts_older_than)
 }
 
 -- from: services/cron/tasks_extended.go:39
@@ -961,7 +945,7 @@ rule DispatchDeleteRepoArchives {
 rule DispatchGitGcRepos {
     when: CronTaskExecutes(task, doer)
     requires: task.name = git_gc_repos
-    ensures: RepositoryGarbageCollectionDue(config.git_gc_repos_timeout, config.git_gc_repos_args)
+    ensures: RepositoryGarbageCollectionDue(timeout: config.git_gc_repos_timeout, args: config.git_gc_repos_args)
 }
 
 -- from: services/cron/tasks_extended.go:70
@@ -1003,28 +987,28 @@ rule DispatchDeleteGeneratedRepositoryAvatars {
 rule DispatchDeleteOldActions {
     when: CronTaskExecutes(task, doer)
     requires: task.name = delete_old_actions
-    ensures: OldActivityDeletionDue(config.delete_old_actions_older_than)
+    ensures: OldActivityDeletionDue(older_than: config.delete_old_actions_older_than)
 }
 
 -- from: services/cron/tasks_extended.go:139
 rule DispatchUpdateChecker {
     when: CronTaskExecutes(task, doer)
     requires: task.name = update_checker
-    ensures: UpdateCheckDue(config.update_checker_http_endpoint, config.update_checker_domain_endpoint)
+    ensures: UpdateCheckDue(http_endpoint: config.update_checker_http_endpoint, domain_endpoint: config.update_checker_domain_endpoint)
 }
 
 -- from: services/cron/tasks_extended.go:153
 rule DispatchDeleteOldSystemNotices {
     when: CronTaskExecutes(task, doer)
     requires: task.name = delete_old_system_notices
-    ensures: OldSystemNoticeDeletionDue(config.delete_old_system_notices_older_than)
+    ensures: OldSystemNoticeDeletionDue(older_than: config.delete_old_system_notices_older_than)
 }
 
 -- from: services/cron/tasks_extended.go:175
 rule DispatchGcLfs {
     when: CronTaskExecutes(task, doer)
     requires: task.name = gc_lfs
-    ensures: LfsGarbageCollectionDue(config.gc_lfs_older_than, config.gc_lfs_last_updated_more_than_ago, config.gc_lfs_number_to_check_per_repo, config.gc_lfs_proportion_to_check_per_repo)
+    ensures: LfsGarbageCollectionDue(older_than: config.gc_lfs_older_than, last_updated_more_than_ago: config.gc_lfs_last_updated_more_than_ago, number_to_check_per_repo: config.gc_lfs_number_to_check_per_repo, proportion_to_check_per_repo: config.gc_lfs_proportion_to_check_per_repo)
 }
 
 -- from: services/cron/tasks_extended.go:206
@@ -1038,7 +1022,7 @@ rule DispatchRebuildIssueIndexer {
 rule DispatchRemoveResolvedReports {
     when: CronTaskExecutes(task, doer)
     requires: task.name = remove_resolved_reports
-    ensures: ResolvedReportRemovalDue(config.remove_resolved_reports_keep_for)
+    ensures: ResolvedReportRemovalDue(keep_for: config.remove_resolved_reports_keep_for)
 }
 
 -- from: services/cron/tasks_actions.go:30
@@ -1087,7 +1071,7 @@ rule DispatchCleanupActions {
 rule DispatchCleanupOfflineRunners {
     when: CronTaskExecutes(task, doer)
     requires: task.name = cleanup_offline_runners
-    ensures: OfflineRunnerCleanupDue(config.cleanup_offline_runners_older_than, config.cleanup_offline_runners_global_scope_only)
+    ensures: OfflineRunnerCleanupDue(older_than: config.cleanup_offline_runners_older_than, global_scope_only: config.cleanup_offline_runners_global_scope_only)
 }
 
 -- from: services/cron/tasks_actions.go:111
@@ -1114,7 +1098,7 @@ rule DeleteOldSystemNotices {
 -- from: modules/updatechecker/update_checker.go:37
 rule QueryReleaseFeed {
     when: UpdateCheckDue(http_endpoint, domain_endpoint)
-    ensures: ReleaseFeedQueried(http_endpoint, domain_endpoint)
+    ensures: ReleaseFeedQueried(http_endpoint: http_endpoint, domain_endpoint: domain_endpoint)
 }
 
 ------------------------------------------------------------
@@ -1125,21 +1109,21 @@ rule QueryReleaseFeed {
 rule AdminStartsBranchResync {
     when: AdminResyncsAllBranches(admin)
     requires: admin.is_admin = true
-    ensures: AllRepositoryBranchesResyncRequested(admin)
+    ensures: AllRepositoryBranchesResyncRequested(admin: admin)
 }
 
 -- from: routers/web/admin/admin.go:198
 rule AdminStartsTagResync {
     when: AdminResyncsAllTags(admin)
     requires: admin.is_admin = true
-    ensures: AllRepositoryTagsResyncRequested(admin)
+    ensures: AllRepositoryTagsResyncRequested(admin: admin)
 }
 
 -- from: routers/web/admin/config.go:35
 rule AdminSendsTestMail {
     when: AdminSendsTestMail(admin, address)
     requires: admin.is_admin = true
-    ensures: TestMailRequested(admin, address)
+    ensures: TestMailRequested(admin: admin, address: address)
 }
 
 ------------------------------------------------------------
@@ -1161,7 +1145,7 @@ rule AdminPublishesAnnouncement {
             existing.updated_at = now
         else:
             Announcement.created(kind: kind, title: stored_title, text: text, created_at: now, updated_at: now)
-    ensures: AnnouncementPublished(kind)
+    ensures: AnnouncementPublished(kind: kind)
     @guidance
         -- The admin page also offers a preview of the rendered modal, which
         -- changes nothing.
@@ -1172,7 +1156,7 @@ rule AdminWithdrawsAnnouncement {
     when: AdminWithdrawsAnnouncement(admin, announcement)
     requires: admin.is_admin = true
     ensures: not exists announcement
-    ensures: AnnouncementWithdrawn(announcement.kind)
+    ensures: AnnouncementWithdrawn(kind: announcement.kind)
 }
 
 -- from: routers/web/user/service_message.go:15
@@ -1225,7 +1209,7 @@ rule AdminCreatesUser {
             password_changed_at: now,
             last_sign_in_at: null
         )
-        UserCreatedByAdmin(admin, user, send_notification)
+        UserCreatedByAdmin(admin: admin, user: user, send_notification: send_notification)
     @guidance
         -- must_change_password: web form checkbox (default unchecked); API
         -- defaults to true; CLI defaults to true except for the very first
@@ -1245,7 +1229,7 @@ rule AdminSetsUserAdmin {
     -- the last administrator cannot be demoted
     requires: value = true or not user.is_admin or has_other_admin(user)
     ensures: user.is_admin = value
-    ensures: UserEditedByAdmin(admin, user)
+    ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
 -- from: routers/web/admin/users.go:451
@@ -1253,7 +1237,7 @@ rule AdminSetsUserRestricted {
     when: AdminSetsUserRestricted(admin, user, value)
     requires: admin.is_admin = true
     ensures: user.is_restricted = value
-    ensures: UserEditedByAdmin(admin, user)
+    ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
 -- Block (or unblock) sign-in. An administrator can never block themselves —
@@ -1267,7 +1251,7 @@ rule AdminSetsProhibitLogin {
             user.prohibit_login = false
         else:
             user.prohibit_login = value
-    ensures: UserEditedByAdmin(admin, user)
+    ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
 -- from: routers/web/admin/users.go:447
@@ -1275,7 +1259,7 @@ rule AdminSetsUserActive {
     when: AdminSetsUserActive(admin, user, value)
     requires: admin.is_admin = true
     ensures: user.is_active = value
-    ensures: UserEditedByAdmin(admin, user)
+    ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
 -- null = instance default, 0 = may not create repositories, n = at most n.
@@ -1286,7 +1270,7 @@ rule AdminSetsMaxRepoCreation {
     requires: admin.is_admin = true
     requires: limit = null or limit >= 0
     ensures: user.max_repo_creation = limit
-    ensures: UserEditedByAdmin(admin, user)
+    ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
 -- Admins may set any visibility the instance allows for users.
@@ -1295,7 +1279,7 @@ rule AdminSetsUserVisibility {
     when: AdminSetsUserVisibility(admin, user, visibility)
     requires: admin.is_admin = true
     ensures: user.visibility = visibility
-    ensures: UserEditedByAdmin(admin, user)
+    ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
 -- Per-account capabilities only an admin can grant.
@@ -1306,7 +1290,7 @@ rule AdminSetsUserPermissions {
     ensures: user.allow_git_hook = allow_git_hook
     ensures: user.allow_import_local = allow_import_local
     ensures: user.allow_create_organization = allow_create_organization
-    ensures: UserEditedByAdmin(admin, user)
+    ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
 -- Profile fields an admin may overwrite (full name, website, location,
@@ -1321,7 +1305,7 @@ rule AdminEditsUserProfile {
     ensures: user.pronouns = pronouns
     ensures: user.description = description
     ensures: user.keep_email_private = keep_email_private
-    ensures: UserEditedByAdmin(admin, user)
+    ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
 -- Set a new password (subject to the password policy), optionally forcing a
@@ -1335,7 +1319,7 @@ rule AdminSetsUserPassword {
     ensures: login.has_password = true
     ensures: login.must_change_password = must_change_password
     ensures: login.password_changed_at = now
-    ensures: UserPasswordSetByAdmin(admin, user, password)
+    ensures: UserPasswordSetByAdmin(admin: admin, user: user, password: password)
 }
 
 -- Rebind an account to a login source and login name (source and name
@@ -1349,7 +1333,7 @@ rule AdminSetsUserLoginSource {
     ensures: user.login_source = login_source
     ensures: login.source = login_source
     ensures: login.login_name = login_name
-    ensures: UserEditedByAdmin(admin, user)
+    ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
 -- Replace the primary email. Existing address of the same user is promoted;
@@ -1361,7 +1345,7 @@ rule AdminSetsUserPrimaryEmail {
     requires: is_valid_email(address)
     requires: not email_used_by_other(address, user)
     ensures: user.primary_email = address
-    ensures: UserEditedByAdmin(admin, user)
+    ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
 -- Rename. Unlike self-service rename, works for accounts from external sources
@@ -1372,8 +1356,9 @@ rule AdminRenamesUser {
     requires: admin.is_admin = true
     requires: is_usable_username(new_name)
     requires: not username_taken(new_name) or lower(new_name) = lower(user.name)
+    let old_name = user.name
     ensures: user.name = new_name
-    ensures: UserRenamedByAdmin(admin, user, user.name, new_name)
+    ensures: UserRenamedByAdmin(admin: admin, user: user, old_name: old_name, new_name: new_name)
 }
 
 -- Remove every second factor (TOTP and security keys) of an account.
@@ -1381,21 +1366,21 @@ rule AdminRenamesUser {
 rule AdminResetsUserTwoFactor {
     when: AdminResetsUserTwoFactor(admin, user)
     requires: admin.is_admin = true
-    ensures: UserTwoFactorResetByAdmin(admin, user)
+    ensures: UserTwoFactorResetByAdmin(admin: admin, user: user)
 }
 
 -- from: routers/web/admin/users.go:542
 rule AdminChangesUserAvatar {
     when: AdminChangesUserAvatar(admin, user, image)
     requires: admin.is_admin = true
-    ensures: UserAvatarChangedByAdmin(admin, user)
+    ensures: UserAvatarChangedByAdmin(admin: admin, user: user)
 }
 
 -- from: routers/web/admin/users.go:559
 rule AdminRemovesUserAvatar {
     when: AdminRemovesUserAvatar(admin, user)
     requires: admin.is_admin = true
-    ensures: UserAvatarRemovedByAdmin(admin, user)
+    ensures: UserAvatarRemovedByAdmin(admin: admin, user: user)
 }
 
 -- Delete an account. Without purge the account must own nothing (no
@@ -1412,7 +1397,7 @@ rule AdminDeletesUser {
     requires: not user.is_admin or has_other_admin(user)
     requires: purge or not owns_content(user)
     ensures: not exists user
-    ensures: UserDeletedByAdmin(admin, user, purge)
+    ensures: UserDeletedByAdmin(admin: admin, user: user, purge: purge)
 }
 
 -- The instance-wide email directory: (de)activate an address. Activating is
@@ -1445,7 +1430,7 @@ rule AdminCreatesOrganizationForUser {
     requires: admin.is_admin = true
     requires: is_usable_username(name)
     requires: not username_taken(name)
-    ensures: OrganizationCreatedForUserByAdmin(admin, user, name, visibility)
+    ensures: OrganizationCreatedForUserByAdmin(admin: admin, user: user, name: name, visibility: visibility)
 }
 
 -- Create a repository owned by a user (API).
@@ -1453,7 +1438,7 @@ rule AdminCreatesOrganizationForUser {
 rule AdminCreatesRepositoryForUser {
     when: AdminCreatesRepositoryForUser(admin, user, name)
     requires: admin.is_admin = true
-    ensures: RepositoryCreatedForUserByAdmin(admin, user, name)
+    ensures: RepositoryCreatedForUserByAdmin(admin: admin, user: user, name: name)
 }
 
 -- Add / remove an SSH key on a user's account (API).
@@ -1461,14 +1446,14 @@ rule AdminCreatesRepositoryForUser {
 rule AdminAddsSshKeyForUser {
     when: AdminAddsSshKeyForUser(admin, user, key_content, title)
     requires: admin.is_admin = true
-    ensures: SshKeyAddedForUserByAdmin(admin, user, key_content, title)
+    ensures: SshKeyAddedForUserByAdmin(admin: admin, user: user, key_content: key_content, title: title)
 }
 
 -- from: routers/api/v1/admin/user.go:361
 rule AdminRemovesSshKeyOfUser {
     when: AdminRemovesSshKeyOfUser(admin, user, key)
     requires: admin.is_admin = true
-    ensures: SshKeyRemovedForUserByAdmin(admin, user, key)
+    ensures: SshKeyRemovedForUserByAdmin(admin: admin, user: user, key: key)
 }
 
 -- Manage a user's access tokens (API: list / create / delete).
@@ -1476,7 +1461,7 @@ rule AdminRemovesSshKeyOfUser {
 rule AdminCreatesAccessTokenForUser {
     when: AdminCreatesAccessTokenForUser(admin, user, token_name, scopes)
     requires: admin.is_admin = true
-    ensures: AccessTokenRequestedForUser(admin, user, token_name, scopes)
+    ensures: AccessTokenRequestedForUser(requester: admin, user: user, token_name: token_name, scopes: scopes)
 }
 
 ------------------------------------------------------------
@@ -1489,29 +1474,13 @@ rule AdminDeletesRepository {
     when: AdminDeletesRepository(admin, repository)
     requires: admin.is_admin = true
     ensures: not exists repository
-    ensures: RepositoryDeletedByAdmin(admin, repository)
+    ensures: RepositoryDeletedByAdmin(admin: admin, repository: repository)
 }
 
--- Adopt a directory as a repository of its owner. The adopted repository is
--- private. Refused if a repository record of that name already exists.
--- from: routers/web/admin/repos.go:108
-rule AdminAdoptsRepository {
-    when: AdminAdoptsRepository(admin, dir)
-    requires: admin.is_admin = true
-    requires: not repository_exists(dir.owner, dir.name)
-    ensures: repositories/Repository.created(name: dir.name, owner_user: dir.owner, is_private: true)
-    ensures: not exists dir
-    ensures: UnadoptedRepositoryAdopted(admin, dir.owner, dir.name)
-}
-
--- Delete the files of an unadopted directory.
--- from: routers/api/v1/admin/adopt.go:123
-rule AdminDeletesUnadoptedRepository {
-    when: AdminDeletesUnadoptedRepository(admin, dir)
-    requires: admin.is_admin = true
-    requires: not repository_exists(dir.owner, dir.name)
-    ensures: not exists dir
-}
+-- Adopting an unadopted directory, or deleting its files, is repositories'
+-- UserAdoptsRepository / UserDeletesUnadoptedRepository (site admins always
+-- pass their checks); administration only lists the directories (surface
+-- UnadoptedRepositories below).
 
 ------------------------------------------------------------
 -- Monitoring (infrastructure capability)
@@ -1523,7 +1492,7 @@ rule AdminCancelsProcess {
     requires: admin.is_admin = true
     requires: not process.is_system
     ensures: process.cancelled = true
-    ensures: ProcessCancellationRequested(admin, process)
+    ensures: ProcessCancellationRequested(admin: admin, process: process)
 }
 
 -- from: routers/web/admin/queue.go:40
@@ -1578,7 +1547,7 @@ rule OperatorCreatesUser {
             last_sign_in_at: null
         )
         if access_token_name != null:
-            AccessTokenRequestedForUser(operator, user, access_token_name, access_token_scopes)
+            AccessTokenRequestedForUser(requester: operator, user: user, token_name: access_token_name, scopes: access_token_scopes)
 }
 
 -- `forgejo admin user change-password`
@@ -1590,7 +1559,7 @@ rule OperatorChangesPassword {
     ensures: login.has_password = true
     ensures: login.must_change_password = must_change_password
     ensures: login.password_changed_at = now
-    ensures: UserPasswordSetByOperator(operator, user, password)
+    ensures: UserPasswordSetByOperator(operator: operator, user: user, password: password)
 }
 
 -- `forgejo admin user must-change-password [--all] [--exclude u] [--unset] users…`
@@ -1606,7 +1575,7 @@ rule OperatorSetsMustChangePassword {
 -- from: cmd/admin_user_reset_mfa.go:33
 rule OperatorResetsTwoFactor {
     when: OperatorResetsTwoFactor(operator, user)
-    ensures: UserTwoFactorResetByAdmin(operator, user)
+    ensures: UserTwoFactorResetByAdmin(admin: operator, user: user)
 }
 
 -- `forgejo admin user delete --id|--username|--email [--purge]`
@@ -1616,35 +1585,35 @@ rule OperatorDeletesUser {
     requires: not user.is_admin or has_other_admin(user)
     requires: purge or not owns_content(user)
     ensures: not exists user
-    ensures: UserDeletedByAdmin(operator, user, purge)
+    ensures: UserDeletedByAdmin(admin: operator, user: user, purge: purge)
 }
 
 -- `forgejo admin user generate-access-token`
 -- from: cmd/admin_user_generate_access_token.go:48
 rule OperatorGeneratesAccessToken {
     when: OperatorGeneratesAccessToken(operator, user, token_name, scopes)
-    ensures: AccessTokenRequestedForUser(operator, user, token_name, scopes)
+    ensures: AccessTokenRequestedForUser(requester: operator, user: user, token_name: token_name, scopes: scopes)
 }
 
 -- `forgejo admin user create-authorized-integration` (JWT-trusting token)
 -- from: cmd/admin_user_generate_authorized_integration.go:102
 rule OperatorCreatesAuthorizedIntegration {
     when: OperatorCreatesAuthorizedIntegration(operator, user, name)
-    ensures: AuthorizedIntegrationRequested(operator, user, name)
+    ensures: AuthorizedIntegrationRequested(operator: operator, user: user, name: name)
 }
 
 -- `forgejo admin regenerate keys`
 -- from: cmd/admin_regenerate.go:20
 rule OperatorRegeneratesAuthorizedKeys {
     when: OperatorRegeneratesAuthorizedKeys(operator)
-    ensures: AuthorizedKeysRegenerationRequested(operator)
+    ensures: AuthorizedKeysRegenerationRequested(operator: operator)
 }
 
 -- `forgejo admin repo-sync-releases`
 -- from: cmd/admin.go:109
 rule OperatorSyncsReleases {
     when: OperatorSyncsReleases(operator)
-    ensures: ReleasesSyncWithTagsRequested(operator)
+    ensures: ReleasesSyncWithTagsRequested(operator: operator)
 }
 
 -- `forgejo admin auth add-oauth|update-oauth|add-ldap|update-ldap|
@@ -1653,7 +1622,7 @@ rule OperatorSyncsReleases {
 -- from: cmd/admin.go:55
 rule OperatorConfiguresAuthSource {
     when: OperatorConfiguresAuthSource(operator, kind, action)
-    ensures: AuthSourceConfiguredFromCli(operator, kind, action)
+    ensures: AuthSourceConfiguredFromCli(operator: operator, kind: kind, action: action)
 }
 
 -- `forgejo admin sendmail --title --content [--force]`: mail every active
@@ -1664,14 +1633,14 @@ rule OperatorMailsAllUsers {
     requires: instance.install_status = installed
     requires: subject != ""
     requires: mail_enabled()
-    ensures: MassMailRequested(subject, body, active_accounts_with_email())
+    ensures: MassMailRequested(subject: subject, body: body, recipients: active_accounts_with_email())
 }
 
 -- `forgejo doctor check [--list|--default|--run c…|--all] [--fix]`
 -- from: cmd/doctor.go:270
 rule OperatorRunsDoctor {
     when: OperatorRunsDoctor(operator, checks, fix)
-    ensures: DoctorRunRequested(operator, checks, fix)
+    ensures: DoctorRunRequested(operator: operator, checks: checks, fix: fix)
 }
 
 -- `forgejo dump`: one archive with the configuration file, a database dump
@@ -1682,14 +1651,14 @@ rule OperatorRunsDoctor {
 rule OperatorDumpsInstance {
     when: OperatorDumpsInstance(operator, instance, format, contents)
     requires: instance.install_status = installed
-    ensures: InstanceDumpProduced(operator, format, contents)
+    ensures: InstanceDumpProduced(operator: operator, format: format, contents: contents)
 }
 
 -- `forgejo manager shutdown|restart|reload-templates|flush-queues|processes|logging`
 -- from: cmd/manager.go:17
 rule OperatorCommandsRunningInstance {
     when: OperatorCommandsRunningInstance(operator, command)
-    ensures: RunningInstanceCommanded(operator, command)
+    ensures: RunningInstanceCommanded(operator: operator, command: command)
 }
 
 ------------------------------------------------------------
@@ -1738,21 +1707,9 @@ invariant OneAcknowledgementPerUserAndKind {
 -- Actor Declarations
 ------------------------------------------------------------
 
-actor SiteAdmin {
-    identified_by: accounts/User where is_admin = true
-}
-
-actor SignedInUser {
-    identified_by: accounts/User where prohibit_login = false
-}
-
-actor InstallingVisitor {
-    identified_by: Visitor where is_signed_in = false
-}
-
-actor HealthProbe {
-    identified_by: Visitor where is_signed_in = false
-}
+-- Administrators, signed-in users and anonymous visitors (the install wizard,
+-- a load-balancer health probe, an API client reading the version) are the
+-- shared actors access/SiteAdmin, access/SignedInUser and access/Visitor.
 
 actor ServerOperator {
     identified_by: Operator where has_host_access = true
@@ -1770,7 +1727,7 @@ actor BackgroundWork {
 
 -- The first-run install wizard.
 surface InstallWizard {
-    facing visitor: InstallingVisitor
+    facing visitor: access/Visitor
     context instance: Instance
 
     exposes:
@@ -1789,7 +1746,7 @@ surface InstallWizard {
 
 -- Health endpoint for load balancers and orchestrators.
 surface HealthEndpoint {
-    facing probe: HealthProbe
+    facing probe: access/Visitor
     context instance: Instance
 
     exposes:
@@ -1810,7 +1767,7 @@ surface HealthEndpoint {
 
 -- Public instance information.
 surface InstanceInfo {
-    facing visitor: Visitor
+    facing visitor: access/Visitor
     context instance: Instance
 
     exposes:
@@ -1824,7 +1781,7 @@ surface InstanceInfo {
 
 -- The admin dashboard.
 surface AdminDashboard {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context instance: Instance
 
     exposes:
@@ -1855,7 +1812,7 @@ surface AdminDashboard {
 
 -- The cron monitor: one row per registered task.
 surface CronTaskMonitor {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context task: CronTask
 
     exposes:
@@ -1884,7 +1841,7 @@ surface CronTaskMonitor {
 
 -- The system notice log.
 surface SystemNoticeLog {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context notice: SystemNotice
 
     exposes:
@@ -1903,7 +1860,7 @@ surface SystemNoticeLog {
 
 -- Read-only configuration with secrets masked; test mail.
 surface InstanceConfiguration {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context entry: ConfigEntry
 
     exposes:
@@ -1925,7 +1882,7 @@ surface InstanceConfiguration {
 
 -- Runtime-changeable settings.
 surface RuntimeSettings {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context setting: SystemSetting
 
     exposes:
@@ -1941,7 +1898,7 @@ surface RuntimeSettings {
 
 -- Managing the site announcement.
 surface AnnouncementAdministration {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context announcement: Announcement
 
     exposes:
@@ -1960,7 +1917,7 @@ surface AnnouncementAdministration {
 
 -- The announcement modal every signed-in user sees until they dismiss it.
 surface AnnouncementBanner {
-    facing viewer: SignedInUser
+    facing viewer: access/SignedInUser
     context announcement: Announcement
 
     exposes:
@@ -1977,7 +1934,7 @@ surface AnnouncementBanner {
 
 -- User administration: one account.
 surface AdminUserAccount {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context subject: accounts/User
 
     exposes:
@@ -2038,7 +1995,7 @@ surface AdminUserAccount {
 
 -- User administration: the directory.
 surface AdminUserDirectory {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
 
     exposes:
         accounts/User.name
@@ -2062,7 +2019,7 @@ surface AdminUserDirectory {
 
 -- The instance-wide email directory.
 surface AdminEmailDirectory {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context email: accounts/EmailAddress
 
     exposes:
@@ -2085,7 +2042,7 @@ surface AdminEmailDirectory {
 
 -- Repository administration.
 surface AdminRepositoryDirectory {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context repository: repositories/Repository
 
     exposes:
@@ -2103,18 +2060,16 @@ surface AdminRepositoryDirectory {
 
 -- Directories without repositories.
 surface UnadoptedRepositories {
-    facing admin: SiteAdmin
-    context dir: UnadoptedRepository
+    facing admin: access/SiteAdmin
+    context dir: repositories/UnadoptedRepository
 
     exposes:
-        dir.owner
+        dir.owner_name
         dir.name
 
-    provides:
-        AdminAdoptsRepository(admin, dir)
-        AdminDeletesUnadoptedRepository(admin, dir)
-
     @guidance
+        -- Adopt and delete are repositories' actions (UserAdoptsRepository,
+        -- UserDeletesUnadoptedRepository), offered on repositories/RepositoryAdministration.
         -- Web: GET /admin/repos/unadopted?search=true&q=, POST /admin/repos/unadopted
         -- (id=owner/name, action=adopt|delete).
         -- API: GET /api/v1/admin/unadopted, POST/DELETE /api/v1/admin/unadopted/{owner}/{repo}.
@@ -2122,7 +2077,7 @@ surface UnadoptedRepositories {
 
 -- Runtime monitoring (infrastructure capability).
 surface RuntimeMonitor {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context process: MonitoredProcess
 
     exposes:
@@ -2146,7 +2101,7 @@ surface RuntimeMonitor {
 -- Delegated admin consoles whose behaviour other modules own. Listed so the
 -- endpoint inventory is complete.
 surface DelegatedAdminConsoles {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context instance: Instance
 
     exposes:
@@ -2255,16 +2210,14 @@ open question "migrations asks for a repository notice on ImportedContentFlagged
 ------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
--- REQUEST accounts/User: fields used here already exist (max_repo_creation with null = default, allow_git_hook, allow_import_local, allow_create_organization, login_source, profile fields); config.disable_regular_org_creation is duplicated in accounts' config — integration should keep one ([admin] section, here).
+-- REQUEST accounts/User: fields used here already exist (max_repo_creation with null = default, allow_git_hook, allow_import_local, allow_create_organization, login_source, profile fields); config.disable_regular_org_creation now lives in organizations' config.
 -- REQUEST authentication/UserLogin { user, source, login_name, has_password, must_change_password, password_changed_at }: administration creates it on admin/CLI account creation and sets must_change_password / source / login_name on admin edit and CLI.
--- REQUEST authentication: InstanceStarted takes the instance here (InstanceStarted(instance)); authentication declared InstanceStarted() — reconcile arity.
 -- REQUEST accounts: react to UserDeletedByAdmin(admin, user, purge) with the cascade (purge: disable first, delete repos, leave orgs and delete sole-owned orgs, delete packages and federated identity; remove user dir and avatar, record SystemFailureReported on file-removal failure).
 -- REQUEST accounts: react to UserRenamedByAdmin with the same redirect/ownership handling as a self rename; react to UserAvatarChangedByAdmin / UserAvatarRemovedByAdmin.
 -- REQUEST accounts: own InactiveAccountCleanupDue(older_than) — delete never-activated accounts older than that and report CronWorkCompleted.
 -- REQUEST authentication: react to UserTwoFactorResetByAdmin (delete TOTP + WebAuthn), AccessTokenRequestedForUser, AuthorizedIntegrationRequested, AuthSourceConfiguredFromCli, ExternalUserSyncDue(update_existing), UserPasswordSetByAdmin / UserPasswordSetByOperator (hash + store).
 -- REQUEST authentication: expose the password policy as password_acceptable(password) (MIN_PASSWORD_LENGTH default 8, PASSWORD_COMPLEXITY, PASSWORD_CHECK_PWN) and password_long_enough(password).
--- REQUEST access: the anonymous actor; administration declares a local external Visitor until access provides one.
--- REQUEST repositories: react to MirrorUpdateDue, RepositoryHealthCheckDue, RepositoryStatsCheckDue, RepositoryArchiveCleanupDue, AllRepositoryArchivesDeletionDue, RepositoryGarbageCollectionDue, MissingRepositoryReinitDue, MissingRepositoryDeletionDue, GeneratedRepositoryAvatarDeletionDue, RepositoryDeletedByAdmin, UnadoptedRepositoryAdopted, RepositoryCreatedForUserByAdmin; provide repository_exists(owner, name).
+-- REQUEST repositories: react to MirrorUpdateDue, RepositoryHealthCheckDue, RepositoryStatsCheckDue, RepositoryArchiveCleanupDue, AllRepositoryArchivesDeletionDue, RepositoryGarbageCollectionDue, MissingRepositoryReinitDue, MissingRepositoryDeletionDue, GeneratedRepositoryAvatarDeletionDue, RepositoryDeletedByAdmin, RepositoryCreatedForUserByAdmin.
 -- REQUEST code: react to DeletedBranchCleanupDue, LfsGarbageCollectionDue, AllRepositoryBranchesResyncRequested.
 -- REQUEST releases: react to AllRepositoryTagsResyncRequested and ReleasesSyncWithTagsRequested.
 -- REQUEST keys: react to AuthorizedKeysRewriteDue, AuthorizedPrincipalsRewriteDue, AuthorizedKeysRegenerationRequested, SshKeyAddedForUserByAdmin, SshKeyRemovedForUserByAdmin.

@@ -45,12 +45,15 @@
 --       -- raised by accounts, organizations, repositories and issues
 --          immediately BEFORE a moderation-relevant edit or a deletion of a
 --          user/org profile, repository, issue/PR or comment.
+--   administration/ResolvedReportRemovalDue(keep_for)
+--       -- the remove_resolved_reports cron task ran (on schedule or "run now").
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
 use "./repositories.allium" as repositories
 use "./issues.allium" as issues
 use "./access.allium" as access
+use "./administration.allium" as administration
 
 ------------------------------------------------------------
 -- Value Types
@@ -471,6 +474,23 @@ rule PurgeResolvedReport {
     when: report: AbuseReport.resolved_at + config.keep_resolved_reports_for <= now
     requires: config.keep_resolved_reports_for > 0.days
     requires: report.status = handled or report.status = ignored
+    ensures: ResolvedReportRemoved(report: report)
+}
+
+-- administration's remove_resolved_reports cron task (KEEP_RESOLVED_REPORTS_FOR
+-- passed as keep_for) sweeps the same reports; "run now" works through it.
+-- from: services/cron/tasks_extended.go (remove_resolved_reports)
+rule ScheduledResolvedReportRemoval {
+    when: administration/ResolvedReportRemovalDue(keep_for)
+    requires: keep_for > 0.days
+    ensures:
+        for report in AbuseReports where status in {handled, ignored} and resolved_at + keep_for <= now:
+            ResolvedReportRemoved(report: report)
+}
+
+-- The one place a resolved report is removed, from either path above.
+rule RemoveResolvedReport {
+    when: ResolvedReportRemoved(report)
     ensures: not exists report
 }
 
@@ -509,14 +529,7 @@ invariant ShadowCopyMatchesContent {
 -- Actor Declarations
 ------------------------------------------------------------
 
--- Any signed-in user who may sign in.
-actor Reporter {
-    identified_by: accounts/User where prohibit_login = false
-}
-
-actor SiteAdmin {
-    identified_by: accounts/User where is_admin = true
-}
+-- Reporters are access/SignedInUser; moderators are access/SiteAdmin.
 
 ------------------------------------------------------------
 -- Surfaces
@@ -525,7 +538,7 @@ actor SiteAdmin {
 -- The "Report abuse" entry on a profile, repository header, issue/PR or
 -- comment menu, and the report form behind it.
 surface ReportAbuse {
-    facing reporter: Reporter
+    facing reporter: access/SignedInUser
     context content: ReportableContent
 
     exposes:
@@ -556,7 +569,7 @@ surface ReportAbuse {
 
 -- The admin moderation queue and the per-item detail page.
 surface ModerationQueue {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context content: ReportableContent where is_in_queue
 
     exposes:
