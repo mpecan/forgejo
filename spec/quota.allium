@@ -1,0 +1,719 @@
+-- allium: 3
+-- quota.allium — storage quotas: rules, groups, who they govern, and which storage-consuming operations they refuse.
+--
+-- Feature switch: [quota] ENABLED (config.enabled, default off) removes every
+--   quota surface (admin API, user/org usage API and storage overview pages)
+--   and makes quota_allows always true; the management rules below are only
+--   reachable through those surfaces.
+-- Scope: Instance-wide storage quota for users and organizations ("quota holders").
+--   An administrator defines quota rules (a byte limit over a set of storage
+--   subjects), bundles them into quota groups, and assigns holders to groups
+--   (explicitly, via configured default groups, or via OAuth2 group claims at
+--   sign-in). Before any operation that would grow a holder's storage, the
+--   holder's current usage is evaluated against their effective groups and the
+--   operation is refused when the holder is over quota for that subject.
+-- Includes:
+--   QuotaSubject hierarchy, QuotaRule, QuotaGroup, QuotaGroupRule (group<->rule
+--   link), QuotaAccount (the quota view of a user or organization),
+--   QuotaGroupMembership, QuotaUsage (measured storage), the evaluation
+--   algorithm, the enforcement table (which operation checks which subject and
+--   charges whom), admin management (API), holder self-service usage
+--   reporting (web storage overview + API), OAuth2 group-claim sync into
+--   quota groups.
+-- Excludes:
+--   - Per-package-type size/count limits ([packages].LIMIT_*): owned by
+--     packages.allium; they are a separate mechanism from quota groups.
+--   - How each storage figure is measured on disk (git object size, LFS size,
+--     blob dedup): the measuring belongs to code/packages/actions; quota only
+--     consumes the figures (see QuotaUsage).
+--   - The 413 response format / HTML "Quota exceeded" page: transport detail.
+--   - The legacy `Rule.Acceptable` (<=) helper: unused by any caller.
+--   - Wiki usage measurement: Forgejo always reports 0 for size:wiki (see open
+--     question); a rule on size:wiki is still enforced through its ancestors.
+-- Emits:
+--   StorageConsumptionAdmitted(account, subject, operation)
+--       -- the quota gate let a storage-growing operation through.
+--   QuotaGroupsChanged(account)
+--       -- a holder's explicit group set changed (admin or login sync).
+-- Reacts to:
+--   StorageConsumptionRequested(requester, account, subject, operation)
+--       -- raised by repositories, code, releases, issues, wiki, pulls,
+--          packages, actions before a storage-growing operation.
+--   LoginSourceGroupsClaimed(user, source, claimed_groups)
+--       -- raised by authentication after an OAuth2 sign-in / registration /
+--          account link whose source has a quota group mapping.
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./authentication.allium" as authentication
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- (none: users, organizations and login sources are imported)
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- What a holder currently uses, in bytes. Every figure is charged to the
+-- OWNER of the thing, never to whoever uploaded it: attachments, artifacts and
+-- LFS objects in a repository count against the repository's owner; packages
+-- count against the package owner.
+-- from: models/quota/used.go:17
+value QuotaUsage {
+    -- git size of the holder's public repositories
+    repos_public: Integer
+    -- git size of the holder's private repositories
+    repos_private: Integer
+    -- LFS size of all the holder's repositories
+    git_lfs: Integer
+    -- attachments on issues/PRs/comments in the holder's repositories
+    attachments_issues: Integer
+    -- attachments on releases in the holder's repositories
+    attachments_releases: Integer
+    -- compressed size of live (not expired / pending deletion / deleted)
+    -- Actions artifacts in the holder's repositories
+    artifacts: Integer
+    -- distinct package blobs referenced by packages the holder owns (directly
+    -- or via a repository the holder owns); a blob shared by many versions
+    -- counts once
+    packages: Integer
+    -- wiki storage; Forgejo does not measure it (always 0)
+    wiki: Integer
+
+    repos_all: repos_public + repos_private
+    git_all: repos_all + git_lfs
+    attachments_all: attachments_issues + attachments_releases
+    assets_all: attachments_all + artifacts + packages
+    all: git_all + assets_all
+}
+
+-- One line of the enforcement table: which subject an operation is checked
+-- against and whose quota is charged.
+-- from: routers/api/v1/api.go:761
+value QuotaGate {
+    operation: QuotaGatedOperation
+    subject: QuotaSubject
+    charged: ChargedParty
+}
+
+-- One entry of a "create group with rules" request.
+-- from: modules/structs/quota.go:91
+value QuotaRuleSpec {
+    name: String
+    limit: Integer?
+    subjects: Set<QuotaSubject>
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Storage subjects. Wire names in comments. They form a tree; a rule that
+-- names a subject also governs every descendant of it:
+--
+--   size:all                                   all
+--   ├─ size:git:all                            git_all
+--   │  ├─ size:git:lfs                         git_lfs
+--   │  └─ size:repos:all                       repos_all
+--   │     ├─ size:repos:public                 repos_public
+--   │     └─ size:repos:private                repos_private
+--   └─ size:assets:all                         assets_all
+--      ├─ size:assets:attachments:all          attachments_all
+--      │  ├─ size:assets:attachments:issues    attachments_issues
+--      │  └─ size:assets:attachments:releases  attachments_releases
+--      ├─ size:assets:artifacts                artifacts
+--      ├─ size:assets:packages:all             packages
+--      └─ size:assets:wiki                     wiki
+--
+-- from: models/quota/limit_subject.go:13
+enum QuotaSubject {
+    size_all
+    | size_repos_all | size_repos_public | size_repos_private
+    | size_git_all | size_git_lfs
+    | size_assets_all
+    | size_assets_attachments_all | size_assets_attachments_issues | size_assets_attachments_releases
+    | size_assets_artifacts | size_assets_packages_all
+    | size_wiki
+}
+
+-- Every operation that consults the quota gate before it runs.
+-- from: services/context/quota.go:110
+enum QuotaGatedOperation {
+    create_repository | generate_repository_from_template | fork_repository
+    | migrate_repository | retry_migration
+    | transfer_repository | accept_repository_transfer
+    | git_push | lfs_upload
+    | edit_files | upload_files | apply_diff_patch | cherry_pick
+    | create_branch | create_tag
+    | create_release | edit_release | upload_release_attachment
+    | upload_issue_attachment
+    | edit_wiki_page
+    | merge_pull_request | update_pull_request_branch | apply_review_suggestion
+    | sync_mirror_manually | sync_mirror_scheduled
+    | upload_package | upload_actions_artifact
+}
+
+-- Whose quota an operation is charged to.
+enum ChargedParty {
+    repository_owner          -- owner of the repository being written to
+    target_owner              -- the user/org that will own the new repository
+    transfer_recipient        -- the user/org receiving the repository
+    head_repository_owner     -- owner of a PR's head (fork) repository
+    package_owner             -- owner of the package (uploader when none yet)
+}
+
+enum MembershipOrigin {
+    admin_assigned | login_source_sync
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A byte limit over a set of subjects. The limit applies to the SUM of the
+-- usage of every listed subject (overlapping subjects are summed twice).
+-- from: models/quota/rule.go:13
+entity QuotaRule {
+    name: String                      -- unique, immutable identity
+    limit: Integer                    -- bytes; -1 means unlimited; 0 forbids any growth
+    subjects: Set<QuotaSubject>
+
+    group_links: QuotaGroupRule with rule = this
+
+    is_unlimited: limit = -1
+
+    -- The rule governs `subject` when it names the subject or any ancestor of it.
+    covers(s): subjects.any(x => x in subject_lineage(s))
+
+    -- Strictly below the limit: a holder exactly AT the limit is over quota.
+    permits(u): limit = -1 or usage_sum(u, subjects) < limit
+}
+
+-- A named bundle of rules.
+-- from: models/quota/group.go:16
+entity QuotaGroup {
+    name: String                      -- unique, immutable identity
+
+    rule_links: QuotaGroupRule with group = this
+    memberships: QuotaGroupMembership with group = this
+
+    -- The group has an opinion on `s` when any of its rules covers it.
+    matches(s): rule_links.any(l => l.rule.covers(s))
+
+    -- Every covering rule must permit; the first covering rule that does not
+    -- permit decides "deny" for this group.
+    permits(s, u): rule_links.all(l => not l.rule.covers(s) or l.rule.permits(u))
+}
+
+-- A rule belongs to any number of groups.
+-- from: models/quota/group.go:25
+entity QuotaGroupRule {
+    group: QuotaGroup
+    rule: QuotaRule
+}
+
+-- The quota view of one user or organization. Exists implicitly for every
+-- holder; exactly one of user / organization is set.
+-- from: models/quota/group.go:37
+entity QuotaAccount {
+    user: accounts/User?
+    organization: organizations/Organization?
+
+    -- measured by the owning modules (see QuotaUsage)
+    usage: QuotaUsage
+
+    memberships: QuotaGroupMembership with account = this
+    has_explicit_groups: memberships.count > 0
+}
+
+-- Assignment of a holder to a group.
+-- from: models/quota/group.go:37
+entity QuotaGroupMembership {
+    group: QuotaGroup
+    account: QuotaAccount
+    origin: MembershipOrigin
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [quota] ENABLED: when false nothing is gated, and every quota API/web
+    -- page (admin, user, org) is absent.
+    enabled: Boolean = false
+    -- [quota] DEFAULT_GROUPS: names of groups governing every holder that has
+    -- no explicit group. Names that do not exist are ignored.
+    default_groups: Set<String> = {}
+    -- [quota.default] TOTAL: limit of the built-in fallback rule (subject
+    -- size:all) used when a holder has neither explicit nor default groups.
+    -- -1 = unlimited. Accepts byte-size notation ("1 GiB").
+    default_total: Integer = -1
+}
+
+------------------------------------------------------------
+-- Defaults
+------------------------------------------------------------
+
+-- The enforcement table. A rebuild must consult the gate at each of these
+-- points; the subject and the charged party are part of the contract.
+-- from: routers/api/v1/api.go:761 / routers/web/web.go:1480 / routers/private/hook_pre_receive.go:184
+
+default QuotaGate gate_create_repository = { operation: create_repository, subject: size_repos_all, charged: target_owner }
+default QuotaGate gate_generate_repository = { operation: generate_repository_from_template, subject: size_repos_all, charged: target_owner }
+default QuotaGate gate_fork_repository = { operation: fork_repository, subject: size_repos_all, charged: target_owner }
+default QuotaGate gate_migrate_repository = { operation: migrate_repository, subject: size_repos_all, charged: target_owner }
+default QuotaGate gate_retry_migration = { operation: retry_migration, subject: size_repos_all, charged: repository_owner }
+default QuotaGate gate_transfer_repository = { operation: transfer_repository, subject: size_repos_all, charged: transfer_recipient }
+default QuotaGate gate_accept_transfer = { operation: accept_repository_transfer, subject: size_repos_all, charged: transfer_recipient }
+default QuotaGate gate_git_push = { operation: git_push, subject: size_repos_all, charged: repository_owner }
+default QuotaGate gate_lfs_upload = { operation: lfs_upload, subject: size_git_lfs, charged: repository_owner }
+default QuotaGate gate_edit_files = { operation: edit_files, subject: size_repos_all, charged: repository_owner }
+default QuotaGate gate_upload_files = { operation: upload_files, subject: size_repos_all, charged: repository_owner }
+default QuotaGate gate_apply_diff_patch = { operation: apply_diff_patch, subject: size_repos_all, charged: repository_owner }
+default QuotaGate gate_cherry_pick = { operation: cherry_pick, subject: size_repos_all, charged: repository_owner }
+default QuotaGate gate_create_branch = { operation: create_branch, subject: size_repos_all, charged: repository_owner }
+default QuotaGate gate_create_tag = { operation: create_tag, subject: size_repos_all, charged: repository_owner }
+default QuotaGate gate_create_release = { operation: create_release, subject: size_repos_all, charged: repository_owner }
+default QuotaGate gate_edit_release = { operation: edit_release, subject: size_repos_all, charged: repository_owner }
+default QuotaGate gate_release_attachment = { operation: upload_release_attachment, subject: size_assets_attachments_releases, charged: repository_owner }
+default QuotaGate gate_issue_attachment = { operation: upload_issue_attachment, subject: size_assets_attachments_issues, charged: repository_owner }
+default QuotaGate gate_wiki = { operation: edit_wiki_page, subject: size_wiki, charged: repository_owner }
+default QuotaGate gate_merge_pull = { operation: merge_pull_request, subject: size_git_all, charged: repository_owner }
+default QuotaGate gate_update_pull = { operation: update_pull_request_branch, subject: size_git_all, charged: repository_owner }
+default QuotaGate gate_apply_suggestion = { operation: apply_review_suggestion, subject: size_git_all, charged: head_repository_owner }
+default QuotaGate gate_mirror_manual = { operation: sync_mirror_manually, subject: size_repos_all, charged: repository_owner }
+default QuotaGate gate_mirror_scheduled = { operation: sync_mirror_scheduled, subject: size_repos_all, charged: repository_owner }
+default QuotaGate gate_package_upload = { operation: upload_package, subject: size_assets_packages_all, charged: package_owner }
+default QuotaGate gate_artifact_upload = { operation: upload_actions_artifact, subject: size_assets_artifacts, charged: repository_owner }
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ---- The gate ----------------------------------------------------------
+
+-- The single decision every gated operation defers to. The check is made
+-- against CURRENT usage before the operation, not against usage plus the
+-- incoming size: a holder just under a limit may make one upload that takes
+-- them over it, after which further growth is refused.
+--
+-- quota_allows(account, subject), precisely:
+--   0. when config.enabled is false: always true (nothing is gated).
+--   1. groups := account's explicit groups; if none, the existing groups
+--      named in config.default_groups; if still none, a built-in group with a
+--      single rule { limit: config.default_total, subjects: {size_all} }.
+--   2. allowed iff SOME group in groups both matches(subject) and
+--      permits(subject, account.usage).
+--   Consequence: a holder whose groups contain no rule covering the subject
+--   is DENIED (see open question), and one permissive group overrides any
+--   number of restrictive ones.
+-- from: models/quota/quota.go:20
+rule StorageConsumptionGated {
+    when: StorageConsumptionRequested(requester, account, subject, operation)
+    requires: quota_allows(account, subject)
+    ensures: StorageConsumptionAdmitted(account: account, subject: subject, operation: operation)
+    @guidance
+        -- Enforcement points (web, API, git, LFS, package registry, Actions
+        -- artifact endpoint) are listed as QuotaGate defaults. Notable details:
+        -- * git push (pre-receive): only ref updates that are not deletions are
+        --   refused; deleting branches/tags is always allowed so a holder can
+        --   free space. AGit refs (refs/for/*) and refs/pull/* are not gated.
+        -- * LFS: the batch "upload" operation and the object PUT are gated only
+        --   when the object is not already stored.
+        -- * scheduled pull-mirror sync is silently skipped (not failed) while
+        --   the owner is over quota; a manual sync reports an error.
+        -- * package upload is charged to the package owner, so members
+        --   uploading into an organization consume the organization's quota.
+        -- * apply-suggestion is charged to the PR head repository owner.
+}
+
+-- ---- Rule management (site admin) ------------------------------------
+
+-- from: routers/api/v1/admin/quota_rule.go:78
+rule AdminCreatesQuotaRule {
+    when: AdminCreatesQuotaRule(admin, name, limit, subjects)
+    requires: admin.is_admin
+    requires: name != ""
+    requires: limit != null
+    requires: limit >= -1
+    requires: not exists QuotaRule{name: name}
+    ensures: QuotaRule.created(name: name, limit: limit, subjects: subjects)
+}
+
+-- Name is immutable; only limit and/or subjects change. Unknown subject names
+-- are refused before anything changes.
+-- from: routers/api/v1/admin/quota_rule.go:150
+rule AdminEditsQuotaRule {
+    when: AdminEditsQuotaRule(admin, rule, new_limit, new_subjects)
+    requires: admin.is_admin
+    requires: new_limit = null or new_limit >= -1
+    ensures:
+        if new_limit != null:
+            rule.limit = new_limit
+        if new_subjects != null:
+            rule.subjects = new_subjects
+}
+
+-- Deleting a rule detaches it from every group.
+-- from: models/quota/rule.go:142
+rule AdminDeletesQuotaRule {
+    when: AdminDeletesQuotaRule(admin, rule)
+    requires: admin.is_admin
+    let links = rule.group_links
+    ensures:
+        for l in links:
+            not exists l
+    ensures: not exists rule
+}
+
+-- ---- Group management (site admin) -----------------------------------
+
+-- Creates the group and, atomically, its rules: a spec naming an EXISTING
+-- rule attaches that rule as it is (the spec's limit/subjects are ignored); a
+-- spec naming a new rule creates it (missing limit = 0). Any failure (duplicate
+-- group name, unknown subject) creates nothing.
+-- from: routers/api/v1/admin/quota_group.go:33
+rule AdminCreatesQuotaGroup {
+    when: AdminCreatesQuotaGroup(admin, name, rule_specs)
+    requires: admin.is_admin
+    requires: name != ""
+    requires: not exists QuotaGroup{name: name}
+    ensures:
+        let group = QuotaGroup.created(name: name)
+        for spec in rule_specs:
+            if exists QuotaRule{name: spec.name}:
+                QuotaGroupRule.created(group: group, rule: QuotaRule{name: spec.name})
+            else:
+                let fresh = QuotaRule.created(name: spec.name, limit: spec.limit ?? 0, subjects: spec.subjects)
+                QuotaGroupRule.created(group: group, rule: fresh)
+}
+
+-- Deleting a group removes its rule links and memberships; the rules survive.
+-- from: models/quota/group.go:276
+rule AdminDeletesQuotaGroup {
+    when: AdminDeletesQuotaGroup(admin, group)
+    requires: admin.is_admin
+    let links = group.rule_links
+    let members = group.memberships
+    ensures:
+        for l in links:
+            not exists l
+    ensures:
+        for m in members:
+            not exists m
+            QuotaGroupsChanged(account: m.account)
+    ensures: not exists group
+}
+
+-- from: models/quota/group.go:126
+rule AdminAddsRuleToQuotaGroup {
+    when: AdminAddsRuleToQuotaGroup(admin, group, rule)
+    requires: admin.is_admin
+    requires: not exists QuotaGroupRule{group: group, rule: rule}
+    ensures: QuotaGroupRule.created(group: group, rule: rule)
+}
+
+-- from: models/quota/group.go:157
+rule AdminRemovesRuleFromQuotaGroup {
+    when: AdminRemovesRuleFromQuotaGroup(admin, group, rule)
+    requires: admin.is_admin
+    requires: exists QuotaGroupRule{group: group, rule: rule}
+    ensures: not exists QuotaGroupRule{group: group, rule: rule}
+}
+
+-- ---- Holder assignment (site admin) ----------------------------------
+
+-- from: models/quota/group.go:70
+rule AdminAddsHolderToQuotaGroup {
+    when: AdminAddsHolderToQuotaGroup(admin, group, account)
+    requires: admin.is_admin
+    requires: not exists QuotaGroupMembership{group: group, account: account}
+    ensures: QuotaGroupMembership.created(group: group, account: account, origin: admin_assigned)
+    ensures: QuotaGroupsChanged(account: account)
+}
+
+-- from: models/quota/group.go:95
+rule AdminRemovesHolderFromQuotaGroup {
+    when: AdminRemovesHolderFromQuotaGroup(admin, group, account)
+    requires: admin.is_admin
+    requires: exists QuotaGroupMembership{group: group, account: account}
+    ensures: not exists QuotaGroupMembership{group: group, account: account}
+    ensures: QuotaGroupsChanged(account: account)
+}
+
+-- Replaces the holder's whole explicit group set (an empty set returns the
+-- holder to the default groups). All named groups must exist, or nothing changes.
+-- from: models/quota/group.go:303
+rule AdminSetsHolderQuotaGroups {
+    when: AdminSetsHolderQuotaGroups(admin, account, groups)
+    requires: admin.is_admin
+    let previous = account.memberships
+    ensures:
+        for m in previous:
+            not exists m
+    ensures:
+        for g in groups:
+            QuotaGroupMembership.created(group: g, account: account, origin: admin_assigned)
+    ensures: QuotaGroupsChanged(account: account)
+}
+
+-- ---- Login-source sync ------------------------------------------------
+
+-- An OAuth2 login source may map claimed identity-provider groups to quota
+-- groups. On each sign-in / auto-registration / account link through that
+-- source: for every mapped source group the user IS in, the user is added to
+-- each mapped quota group (if not already); when the source has "remove
+-- unmapped" enabled, the user is removed from each quota group mapped from a
+-- source group they are NOT in. Quota groups named by the mapping that do not
+-- exist are skipped. LDAP sources do not sync quota groups.
+-- from: services/auth/source/source_quota_group_sync.go:15
+rule LoginSourceSyncsQuotaGroups {
+    when: LoginSourceGroupsClaimed(user, source, claimed_groups)
+    let account = QuotaAccount{user: user}
+    let to_add = quota_groups_mapped_from(source, claimed_groups)
+    let to_remove = quota_groups_mapped_from_unclaimed(source, claimed_groups)
+    requires: exists account
+    ensures:
+        if source.quota_group_map_removal:
+            for g in to_remove:
+                not exists QuotaGroupMembership{group: g, account: account}
+    ensures:
+        for g in to_add:
+            if not exists QuotaGroupMembership{group: g, account: account}:
+                QuotaGroupMembership.created(group: g, account: account, origin: login_source_sync)
+    ensures: QuotaGroupsChanged(account: account)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant UniqueRuleName {
+    for a in QuotaRules:
+        for b in QuotaRules:
+            a.name = b.name implies a = b
+}
+
+invariant UniqueGroupName {
+    for a in QuotaGroups:
+        for b in QuotaGroups:
+            a.name = b.name implies a = b
+}
+
+invariant LimitIsUnlimitedOrNonNegative {
+    for r in QuotaRules:
+        r.limit >= -1
+}
+
+invariant AccountHasExactlyOneHolder {
+    for a in QuotaAccounts:
+        (a.user = null) != (a.organization = null)
+}
+
+invariant RuleAtMostOnceInGroup {
+    for a in QuotaGroupRules:
+        for b in QuotaGroupRules:
+            (a.group = b.group and a.rule = b.rule) implies a = b
+}
+
+invariant HolderAtMostOnceInGroup {
+    for a in QuotaGroupMemberships:
+        for b in QuotaGroupMemberships:
+            (a.group = b.group and a.account = b.account) implies a = b
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor SiteAdmin {
+    identified_by: accounts/User where is_admin = true
+}
+
+-- An organization owner looking at their organization's storage.
+actor OrganizationOwner {
+    within: QuotaAccount
+    identified_by: accounts/User where is_org_owner(this, within.organization)
+}
+
+-- Any part of the system about to grow someone's storage.
+actor StorageConsumer {
+    identified_by: accounts/User where is_active = true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- Site-admin quota management. Present only when quota is enabled.
+surface QuotaAdministration {
+    facing admin: SiteAdmin
+
+    exposes:
+        for r in QuotaRules:
+            r.name
+            r.limit
+            r.subjects
+        for g in QuotaGroups:
+            g.name
+            for l in g.rule_links:
+                l.rule.name
+            for m in g.memberships:
+                m.account.user.name
+                m.account.organization.name
+        for a in QuotaAccounts:
+            a.usage
+            a.memberships
+
+    provides:
+        AdminCreatesQuotaRule(admin, name, limit, subjects) when config.enabled
+        AdminEditsQuotaRule(admin, rule, new_limit, new_subjects) when config.enabled
+        AdminDeletesQuotaRule(admin, rule) when config.enabled
+        AdminCreatesQuotaGroup(admin, name, rule_specs) when config.enabled
+        AdminDeletesQuotaGroup(admin, group) when config.enabled
+        AdminAddsRuleToQuotaGroup(admin, group, rule) when config.enabled
+        AdminRemovesRuleFromQuotaGroup(admin, group, rule) when config.enabled
+        AdminAddsHolderToQuotaGroup(admin, group, account) when config.enabled
+        AdminRemovesHolderFromQuotaGroup(admin, group, account) when config.enabled
+        AdminSetsHolderQuotaGroups(admin, account, groups) when config.enabled
+
+    @guidance
+        -- API only (no admin web UI). Endpoints:
+        --   GET/POST          /admin/quota/rules
+        --   GET/PATCH/DELETE  /admin/quota/rules/{rule}
+        --   GET/POST          /admin/quota/groups
+        --   GET/DELETE        /admin/quota/groups/{group}
+        --   PUT/DELETE        /admin/quota/groups/{group}/rules/{rule}
+        --   GET               /admin/quota/groups/{group}/users
+        --   PUT/DELETE        /admin/quota/groups/{group}/users/{username}
+        --   GET               /admin/users/{username}/quota          (usage + effective groups, with names)
+        --   POST              /admin/users/{username}/quota/groups   (replace explicit set)
+        -- {username} may name an organization.
+}
+
+-- A user looking at their own storage.
+surface OwnStorageOverview {
+    facing viewer: accounts/User
+    context account: QuotaAccount where user = viewer
+
+    exposes:
+        account.usage.repos_public
+        account.usage.repos_private
+        account.usage.git_lfs
+        account.usage.attachments_issues
+        account.usage.attachments_releases
+        account.usage.artifacts
+        account.usage.packages
+        account.usage.all
+        quota_allows(account, subject)
+        for m in account.memberships:
+            for l in m.group.rule_links:
+                l.rule.limit
+                l.rule.subjects
+
+    @guarantee EffectiveGroupsShown
+        -- The overview shows the groups that actually govern the holder: the
+        -- explicit ones, else the default groups, else a synthetic "global
+        -- quota" with the [quota.default] TOTAL limit on size:all.
+
+    @guidance
+        -- Web: /user/settings/storage_overview (per-subject bars).
+        -- API: GET /user/quota (usage + groups; group and rule NAMES are
+        --      withheld from non-admins), GET /user/quota/check?subject=…
+        --      (boolean quota_allows; unknown subject is refused),
+        --      GET /user/quota/{attachments|packages|artifacts} (paginated
+        --      list of what consumes storage, largest first).
+        -- All absent when quota is disabled.
+}
+
+-- An organization owner looking at the organization's storage.
+surface OrganizationStorageOverview {
+    facing owner: OrganizationOwner
+    context account: QuotaAccount where organization != null
+
+    exposes:
+        account.usage.repos_public
+        account.usage.repos_private
+        account.usage.git_lfs
+        account.usage.attachments_issues
+        account.usage.attachments_releases
+        account.usage.artifacts
+        account.usage.packages
+        account.usage.all
+        quota_allows(account, subject)
+
+    @guidance
+        -- Web: /org/{org}/settings/storage_overview.
+        -- API: GET /orgs/{org}/quota, /orgs/{org}/quota/check,
+        --      /orgs/{org}/quota/{attachments|packages|artifacts}
+        --      (token + organization ownership required).
+}
+
+-- The integration boundary every storage-growing operation crosses.
+surface QuotaGate {
+    facing consumer: StorageConsumer
+    context account: QuotaAccount
+
+    provides:
+        StorageConsumptionRequested(consumer, account, subject, operation)
+
+    @guarantee OverQuotaIsRefusedBeforeWork
+        -- When the gate refuses, the operation has no effect at all and the
+        -- caller is told the quota was exceeded and whose quota it was.
+
+    @guarantee DisabledMeansUngated
+        -- With quota disabled every request is admitted.
+}
+
+-- The hand-off from authentication after an OAuth2 sign-in.
+surface LoginSourceQuotaSync {
+    facing user: accounts/User
+
+    provides:
+        LoginSourceGroupsClaimed(user, source, claimed_groups)
+
+    @guidance
+        -- Raised by authentication (routers/web/auth/oauth.go) on sign-in,
+        -- auto-registration and account linking through an OAuth2 source
+        -- whose quota group map is set or whose removal flag is on. The
+        -- claimed groups come from the source's quota group claim.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred quota_allows             -- see: models/quota/quota.go:20 (prose on StorageConsumptionGated)
+deferred subject_lineage          -- see: models/quota/rule.go:19 (the subject plus its ancestors in the QuotaSubject tree)
+deferred quota_groups_mapped_from          -- see: services/auth/source/source_quota_group_sync.go:26 (quota groups mapped from source groups the user is in; unknown group names dropped)
+deferred quota_groups_mapped_from_unclaimed -- see: services/auth/source/source_quota_group_sync.go:36 (quota groups mapped from source groups the user is NOT in)
+deferred usage_sum                -- see: models/quota/rule.go:46 (sum over subjects of the QuotaUsage figure each names)
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Deny when uncovered: a holder whose (explicit or default) groups contain no rule covering the checked subject is denied, while a holder with no groups at all falls back to an unlimited size:all rule. Intentional deny-by-default, or should an uncovered subject be allowed?"
+open question "Forgejo exempts pushes to PROTECTED branches from the quota check (only unprotected branches, tags and other refs are gated). This looks accidental; the spec gates every non-deleting push. Confirm."
+open question "The check uses current usage only (strictly below the limit), so a single upload can overshoot a limit arbitrarily. Should the incoming size be counted (usage + size <= limit)?"
+open question "Wiki storage is never measured (always 0); size:wiki rules can never deny by themselves. Should wiki git size be measured, and should it then also count under size:git:all rather than size:assets:all?"
+open question "Overlapping subjects in one rule (e.g. size:all and size:git:all) are summed twice. Should a rule's usage be the union instead?"
+open question "Web 'accept transfer' charges the accepting user (doer) while the API charges the recipient (which may be an organization). The spec charges the recipient."
+open question "Manual mirror sync is gated on size:repos:all in the web UI but on size:git:all in the API. The spec uses size:repos:all for both."
+open question "Several gated API file operations include DELETE of a file, which can only shrink a repository. Should deletions be exempt as they are for git push?"
+open question "Quota group sync from login sources exists only for OAuth2 sources; should LDAP group membership also map to quota groups?"
+
+-- Requests to other modules
+-- REQUEST accounts/User: a QuotaAccount must exist for every user (or accounts exposes user.quota_account).
+-- REQUEST organizations/Organization: a QuotaAccount must exist for every organization; is_org_owner(user, org) predicate.
+-- REQUEST authentication/AuthSource.quota_group_claim_name: OAuth2 claim carrying the groups used for quota sync.
+-- REQUEST authentication/AuthSource.quota_group_map: mapping source-group -> set of quota group names (validated JSON).
+-- REQUEST authentication/AuthSource.quota_group_map_removal: Boolean, remove memberships for unclaimed mapped groups.
+-- REQUEST authentication: emit quota/LoginSourceGroupsClaimed(user, source, claimed_groups) after OAuth2 sign-in, auto-registration and account linking when the source has a quota group map or removal enabled.
+-- REQUEST repositories, code, releases, issues, wiki, pulls, packages, actions: guard each operation listed in the QuotaGate defaults with `requires: quota/quota_allows(<charged account>, <subject>)` (or raise quota/StorageConsumptionRequested and proceed on StorageConsumptionAdmitted).
+-- REQUEST repositories/Repository.git_size, lfs_size; issues/Attachment.size (+ whether it belongs to a release); actions/Artifact.compressed_size and status; packages/PackageBlob.size: the figures QuotaUsage is computed from.
+-- REQUEST repositories (mirror scheduler): skip a scheduled pull-mirror sync, without error, while the owner's quota does not allow size_repos_all.

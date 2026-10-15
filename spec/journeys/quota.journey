@@ -1,0 +1,159 @@
+-- Journeys through storage quota: administration, the gate, self-service.
+
+world {
+    cast:
+        root:  accounts/User
+        ada:   accounts/User
+        bob:   accounts/User
+        acct:  QuotaAccount
+    given:
+        root.is_admin = true
+        ada.is_admin = false
+        ada.is_active = true
+        bob.is_admin = false
+        acct.user = ada
+        acct.organization = null
+}
+
+journey AnAdminSetsUpAFreeTier {
+    goal: The site admin defines a 1 GiB limit on repository size, bundles it
+          into a "free" group and puts Ada in it.
+
+    1. she defines the rule
+        root does AdminCreatesQuotaRule(root, "repos-1g", 1_073_741_824, {size_repos_all}) on QuotaAdministration
+            creating rule: QuotaRule
+        then AdminCreatesQuotaRule fires
+        then rule.limit = 1_073_741_824
+
+    2. she creates an empty group
+        root does AdminCreatesQuotaGroup(root, "free", {}) on QuotaAdministration
+            creating group: QuotaGroup
+        then AdminCreatesQuotaGroup fires
+
+    3. she attaches the rule to the group
+        root does AdminAddsRuleToQuotaGroup(root, group, rule) on QuotaAdministration
+            creating link: QuotaGroupRule
+        then link.rule = rule
+
+    4. she assigns Ada to the group
+        root does AdminAddsHolderToQuotaGroup(root, group, acct) on QuotaAdministration
+            creating membership: QuotaGroupMembership
+        then membership.origin = admin_assigned
+        then membership.account = acct
+
+    ends: Ada's repositories are now limited to 1 GiB in total.
+}
+
+journey RuleNamesAreUnique {
+    goal: A second rule with an existing name is refused.
+
+    after: AnAdminSetsUpAFreeTier
+
+    1. she tries to reuse the name
+        root cannot do AdminCreatesQuotaRule(root, "repos-1g", 5, {size_all}) on QuotaAdministration
+
+    ends: The original rule is unchanged.
+}
+
+journey OnlySiteAdminsManageQuota {
+    goal: Ada, an ordinary user, cannot create quota rules or move herself into
+          a more generous group.
+
+    1. she tries to create a rule
+        ada cannot do AdminCreatesQuotaRule(ada, "unlimited", -1, {size_all}) on QuotaAdministration
+
+    ends: Quota is an administrator's decision.
+}
+
+journey APushOverQuotaIsRefused {
+    goal: Ada's repositories already use more than her limit allows. Her next
+          push is refused before anything is written.
+
+    1. the push asks the gate
+        stipulate quota_allows(acct, size_repos_all) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, size_repos_all, git_push) on QuotaGate
+
+    ends: Nothing was stored; she is told her quota is exceeded.
+}
+
+journey AnUploadUnderQuotaGoesThrough {
+    goal: Under her limit, an attachment upload in her repository is admitted.
+
+    1. the upload asks the gate
+        stipulate quota_allows(acct, size_assets_attachments_issues) = true
+        ada does StorageConsumptionRequested(ada, acct, size_assets_attachments_issues, upload_issue_attachment) on QuotaGate
+        then StorageConsumptionGated fires
+
+    ends: The attachment is stored and charged to the repository owner.
+}
+
+journey AdaChecksHerOwnStorage {
+    goal: Ada opens her storage overview and sees what she uses; Bob cannot see
+          Ada's figures.
+
+    1. she looks at her usage
+        ada sees acct.usage.all on OwnStorageOverview in acct
+
+    2. bob cannot look at hers
+        bob cannot see acct.usage.all on OwnStorageOverview in acct
+
+    ends: Storage figures are private to their holder (and admins).
+}
+
+journey DeletingARuleDetachesIt {
+    goal: The admin deletes the rule; the group survives without it.
+
+    after: AnAdminSetsUpAFreeTier
+
+    1. she deletes the rule
+        stipulate rule.group_links = {link}
+        root does AdminDeletesQuotaRule(root, rule) on QuotaAdministration
+        then AdminDeletesQuotaRule fires
+        then link does not exist
+        then rule does not exist
+        then group exists
+
+    ends: Ada's group no longer limits anything (and so denies uncovered subjects).
+}
+
+journey AnAdminReplacesAdasGroups {
+    goal: The admin moves Ada from "free" to "supporter" in one step.
+
+    after: AnAdminSetsUpAFreeTier
+
+    1. she creates the supporter group
+        root does AdminCreatesQuotaGroup(root, "supporter", {}) on QuotaAdministration
+            creating supporter: QuotaGroup
+
+    2. she replaces Ada's groups
+        stipulate acct.memberships = {membership}
+        root does AdminSetsHolderQuotaGroups(root, acct, {supporter}) on QuotaAdministration
+        then AdminSetsHolderQuotaGroups fires
+        then membership does not exist
+
+    ends: Ada is governed by the supporter group only.
+}
+
+journey SignInGrantsAQuotaGroup {
+    goal: Ada signs in through an OAuth2 provider that says she is in the
+          "sponsors" group, which the source maps to the "supporter" quota group.
+
+    cast:
+        source:    authentication/AuthSource
+        supporter: QuotaGroup
+
+    given:
+        supporter.name = "supporter"
+        source.quota_group_map_removal = false
+
+    1. authentication hands over her claimed groups
+        stipulate quota_groups_mapped_from(source, {"sponsors"}) = {supporter}
+        stipulate quota_groups_mapped_from_unclaimed(source, {"sponsors"}) = {}
+        ada does LoginSourceGroupsClaimed(ada, source, {"sponsors"}) on LoginSourceQuotaSync
+            creating granted: QuotaGroupMembership
+        then LoginSourceSyncsQuotaGroups fires
+        then granted.origin = login_source_sync
+        then granted.group = supporter
+
+    ends: Ada is in the supporter group because her identity provider says so.
+}

@@ -1,0 +1,662 @@
+-- allium: 3
+-- moderation.allium — abuse reports, the evidence preserved for them, and what site admins do about them.
+--
+-- Feature switch: [moderation] ENABLED (config.enabled, default off) removes
+--   every surface of this module (report entries and form, admin queue) and
+--   the purge task; the rules below are reachable only through those surfaces.
+-- Scope: Signed-in users report abusive content (a user or organization
+--   profile, a repository, an issue or pull request, a comment) under a
+--   category with remarks. Reports on the same item are grouped; the item's
+--   state at the moment it is first edited or deleted after being reported is
+--   preserved as a shadow copy so the evidence survives. Site admins review
+--   the queue of open reports and resolve them (handled / ignored), optionally
+--   acting on the content (suspend or delete the account, delete the
+--   repository, issue or comment). Resolved reports are purged after a
+--   retention period by a cron task.
+-- Includes: ReportableContent (the reported item, a tombstone that outlives
+--   it), AbuseReport, ShadowCopy and its per-kind snapshots, AbuseCategory,
+--   moderation actions, retention purge, the moderation feature switch.
+-- Excludes:
+--   - User-to-user blocking (UserBlock): owned by accounts.allium; a block is
+--     a personal action, not moderation.
+--   - The admin actions themselves (suspend = prohibit login, delete user /
+--     org / repository / issue / comment): their effects are owned by
+--     accounts, organizations, repositories and issues; this module asks for
+--     them via emitted triggers and records the report outcome.
+--   - Anti-spam registration measures (captcha, email domain block/allow
+--     lists, new users restricted by default, manual activation): owned by
+--     authentication/accounts. Forgejo has no automatic spam detection; "spam"
+--     exists only as a report category.
+--   - No REST API: reporting and moderation are web-only in Forgejo.
+--   - htmx partial-swap and flash wording of the admin page: presentation.
+-- Emits:
+--   AbuseReported(content, reporter, category)         -- a new report entered the queue
+--   ReportsResolved(content, resolution, admin)        -- open reports on an item were closed
+--   ReportClosed(report, resolution)                   -- (internal chain) one report closed
+--   ShadowCopyPreserved(copy)                          -- evidence was snapshotted
+--   ModeratorSuspendsAccount(admin, user)              -- accounts: set prohibit_login
+--   ModeratorDeletesAccount(admin, user)               -- accounts: delete user, purging their content
+--   ModeratorDeletesOrganization(admin, organization)  -- organizations: delete org, purging its content
+--   ModeratorDeletesRepository(admin, repository)      -- repositories: delete repository
+--   ModeratorDeletesIssue(admin, issue)                -- issues: delete issue / pull request
+--   ModeratorDeletesComment(admin, comment)            -- issues: delete comment
+-- Reacts to:
+--   ReportableContentChanging(content, change)
+--       -- raised by accounts, organizations, repositories and issues
+--          immediately BEFORE a moderation-relevant edit or a deletion of a
+--          user/org profile, repository, issue/PR or comment.
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./repositories.allium" as repositories
+use "./issues.allium" as issues
+use "./access.allium" as access
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The moderation-relevant fields of a user or organization profile.
+-- (Last-login time is preserved but its change alone never triggers a copy.)
+-- from: models/user/moderation.go:20
+value UserSnapshot {
+    name: String
+    full_name: String
+    email: String
+    login_name: String
+    location: String
+    website: String
+    pronouns: String
+    description: String
+    avatar: String
+    avatar_email: String
+    created_at: Timestamp
+    updated_at: Timestamp
+    last_login_at: Timestamp
+}
+
+-- from: models/repo/moderation.go:18
+value RepositorySnapshot {
+    owner: accounts/User
+    owner_name: String
+    name: String
+    description: String
+    website: String
+    topics: Set<String>
+    avatar: String
+    created_at: Timestamp
+    updated_at: Timestamp
+}
+
+-- from: models/issues/moderation.go:17
+value IssueSnapshot {
+    repository: repositories/Repository
+    index: Integer
+    poster: accounts/User
+    title: String
+    content: String
+    content_version: Integer
+    created_at: Timestamp
+    updated_at: Timestamp
+}
+
+-- from: models/issues/moderation.go:65
+value CommentSnapshot {
+    poster: accounts/User
+    issue: issues/Issue
+    content: String
+    content_version: Integer
+    created_at: Timestamp
+    updated_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- from: models/moderation/abuse_report.go:74
+enum ReportedContentKind {
+    user | organization | repository | issue | comment
+}
+
+-- Offered to the reporter in this order.
+-- from: models/moderation/abuse_report.go:44
+enum AbuseCategory {
+    spam | malware | illegal_content | other_violations
+}
+
+-- What the admin does to the reports themselves.
+-- from: services/moderation/moderating.go:18
+enum ReportResolution {
+    none | handled | ignored
+}
+
+enum ContentChange {
+    update | deletion
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The thing a report points at. One exists (implicitly) for every user,
+-- organization, repository, issue/pull request and comment; it outlives the
+-- item so reports, their grouping and their evidence survive its deletion.
+-- Exactly the field matching `kind` is set while the item exists.
+-- from: models/moderation/abuse_report.go:105
+entity ReportableContent {
+    kind: ReportedContentKind
+    reported_user: accounts/User?
+    reported_organization: organizations/Organization?
+    reported_repository: repositories/Repository?
+    reported_issue: issues/Issue?
+    reported_comment: issues/Comment?
+    is_deleted: Boolean
+
+    -- Human reference shown to admins: "@name", "owner/repo",
+    -- "owner/repo#index", or the comment's permalink. Falls back to
+    -- "deleted <kind> #id" once the item is gone.
+    reference: String
+
+    -- For issues and comments: who wrote it. Taken from the latest shadow
+    -- copy when the item has been deleted.
+    poster: accounts/User?
+
+    -- Comments that are pure timeline events (label changed, assigned, …)
+    -- carry no user content and are not reportable.
+    has_user_content: Boolean
+
+    reports: AbuseReport with content = this
+    open_reports: reports where status = open
+    reports_without_copy: reports where shadow_copy = null
+    shadow_copies: ShadowCopy with content = this
+
+    times_reported: open_reports.count
+    is_in_queue: open_reports.count > 0
+    has_open_report_from(u): open_reports.any(r => r.reporter = u)
+}
+
+-- One user's complaint about one item.
+-- from: models/moderation/abuse_report.go:100
+entity AbuseReport {
+    content: ReportableContent
+    reporter: accounts/User
+    category: AbuseCategory
+    remarks: String                     -- 20..500 characters, trimmed
+    created_at: Timestamp
+    status: open | handled | ignored
+    shadow_copy: ShadowCopy?
+    resolved_at: Timestamp when status = handled | ignored
+
+    transitions status {
+        open -> handled
+        open -> ignored
+        terminal: handled, ignored
+    }
+
+    is_resolved: status != open
+}
+
+-- The state of a reported item captured just before it was first edited or
+-- deleted after being reported. Shared by every report that was waiting for
+-- evidence at that moment; reports filed later get the next copy.
+-- from: models/moderation/shadow_copy.go:175
+entity ShadowCopy {
+    content: ReportableContent
+    captured_at: Timestamp
+    user_snapshot: UserSnapshot?
+    repository_snapshot: RepositorySnapshot?
+    issue_snapshot: IssueSnapshot?
+    comment_snapshot: CommentSnapshot?
+
+    reports: AbuseReport with shadow_copy = this
+    is_orphaned: reports.count = 0
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [moderation] ENABLED: the whole feature (report links and form, admin
+    -- queue, retention cron task) exists only when true.
+    enabled: Boolean = false
+    -- [moderation] KEEP_RESOLVED_REPORTS_FOR: how long handled/ignored reports
+    -- are kept before the purge task deletes them. 0 or less keeps them forever.
+    keep_resolved_reports_for: Duration = 7.days
+    -- [cron.remove_resolved_reports] ENABLED: the purge task is registered when
+    -- moderation is enabled but is itself OFF by default.
+    purge_task_enabled: Boolean = false
+    -- [cron.remove_resolved_reports] SCHEDULE
+    purge_task_interval: Duration = 24.hours
+    remarks_min_length: Integer = 20
+    remarks_max_length: Integer = 500
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ---- Reporting --------------------------------------------------------
+
+-- A signed-in user files a report. Server-side checks:
+--   * reporting your own user profile is refused;
+--   * the reporter must be able to see the item: a user/org profile visible
+--     to them; any readable unit of a repository; read access to the issues
+--     unit (pull requests unit for a PR) of the repository holding an issue,
+--     PR or comment;
+--   * a comment must carry user content;
+--   * the item must still exist;
+--   * a reporter with an OPEN report on the same item cannot file another
+--     (Forgejo silently accepts and drops the duplicate; the form already
+--     says "you have already reported this").
+-- from: routers/web/moderation/report.go:76
+rule UserReportsContent {
+    when: UserReportsContent(reporter, content, category, remarks)
+    requires: not reporter.prohibit_login
+    requires: not content.is_deleted
+    requires: remarks_length(remarks) >= config.remarks_min_length
+    requires: remarks_length(remarks) <= config.remarks_max_length
+    requires: content.kind = user implies content.reported_user != reporter
+    requires: content.kind = user implies profile_visible_to(content.reported_user, reporter)
+    requires: content.kind = organization implies organization_visible_to(content.reported_organization, reporter)
+    requires: content.kind = repository implies can_read_any_unit(reporter, content.reported_repository)
+    requires: content.kind = issue implies can_read_conversation(reporter, content.reported_issue)
+    requires: content.kind = comment implies (content.has_user_content and can_read_conversation(reporter, content.reported_comment.issue))
+    requires: not exists AbuseReport{content: content, reporter: reporter, status: open}
+    ensures: AbuseReport.created(
+        content: content,
+        reporter: reporter,
+        category: category,
+        remarks: remarks,                 -- stored trimmed
+        created_at: now,
+        status: open
+    )
+    ensures: AbuseReported(content: content, reporter: reporter, category: category)
+}
+
+
+-- ---- Evidence ---------------------------------------------------------
+
+-- Before a reported item is edited (moderation-relevant fields only) or
+-- deleted, its current state is captured once and linked to every report on
+-- it that has no copy yet — open or already resolved. Later edits do not
+-- overwrite this evidence; a newer report waits for the next edit.
+-- Moderation-relevant changes:
+--   user/org: name, full name, email (incl. primary email change), login
+--     name, location, website, pronouns, description, avatar, avatar email;
+--     account deletion.
+--   repository: any settings update (owner/name/description/website/topics/
+--     avatar), deletion.
+--   issue/PR: title change, content change, deletion.
+--   comment: content change, deletion.
+-- from: models/moderation/shadow_copy.go:232
+rule PreserveEvidenceBeforeChange {
+    when: ReportableContentChanging(content, change)
+    let waiting = content.reports_without_copy
+    requires: waiting.count > 0
+    ensures:
+        let copy = ShadowCopy.created(
+            content: content,
+            captured_at: now,
+            user_snapshot: snapshot_user(content),
+            repository_snapshot: snapshot_repository(content),
+            issue_snapshot: snapshot_issue(content),
+            comment_snapshot: snapshot_comment(content)
+        )
+        for r in waiting:
+            r.shadow_copy = copy
+        ShadowCopyPreserved(copy: copy)
+}
+
+-- The item is gone; reports and evidence stay, keyed by the tombstone.
+-- from: routers/web/admin/reports.go:94
+rule ReportedContentDeleted {
+    when: ReportableContentChanging(content, change)
+    requires: change = deletion
+    requires: not content.is_deleted
+    ensures: content.is_deleted = true
+}
+
+-- ---- Moderation (site admin) ------------------------------------------
+
+-- Close every open report on the item without touching the item.
+-- from: routers/web/admin/reports.go:237
+rule AdminResolvesReports {
+    when: AdminResolvesReports(admin, content, resolution)
+    let pending = content.open_reports
+    requires: admin.is_admin
+    requires: resolution != none
+    requires: pending.count > 0
+    ensures:
+        for r in pending:
+            ReportClosed(report: r, resolution: resolution)
+    ensures: ReportsResolved(content: content, resolution: resolution, admin: admin)
+}
+
+-- Each open report on an item is closed individually with the admin's
+-- resolution and the time of resolution.
+-- from: models/moderation/abuse_report.go:197
+rule CloseReportAsHandled {
+    when: ReportClosed(report, resolution)
+    requires: report.status = open
+    requires: resolution = handled
+    ensures: report.status = handled
+    ensures: report.resolved_at = now
+}
+
+-- from: models/moderation/abuse_report.go:192
+rule CloseReportAsIgnored {
+    when: ReportClosed(report, resolution)
+    requires: report.status = open
+    requires: resolution = ignored
+    ensures: report.status = ignored
+    ensures: report.resolved_at = now
+}
+
+-- Suspend (prohibit sign-in for) a reported individual. Never the admin
+-- themself, another admin, an organization, or someone already suspended.
+-- from: routers/web/admin/reports.go:259
+rule AdminSuspendsReportedAccount {
+    when: AdminSuspendsReportedAccount(admin, content, resolution)
+    let target = content.reported_user
+    let pending = content.open_reports
+    requires: admin.is_admin
+    requires: content.kind = user
+    requires: not content.is_deleted
+    requires: target != admin
+    requires: not target.is_admin
+    requires: not target.prohibit_login
+    ensures: target.prohibit_login = true
+    ensures: ModeratorSuspendsAccount(admin: admin, user: target)
+    ensures:
+        if resolution != none:
+            for r in pending:
+                ReportClosed(report: r, resolution: resolution)
+            ReportsResolved(content: content, resolution: resolution, admin: admin)
+}
+
+-- Delete a reported individual account, purging everything it owns.
+-- from: routers/web/admin/reports.go:306
+rule AdminDeletesReportedAccount {
+    when: AdminDeletesReportedAccount(admin, content, resolution)
+    let target = content.reported_user
+    let pending = content.open_reports
+    requires: admin.is_admin
+    requires: content.kind = user
+    requires: not content.is_deleted
+    requires: target != admin
+    requires: not target.is_admin
+    ensures: ModeratorDeletesAccount(admin: admin, user: target)
+    ensures:
+        if resolution != none:
+            for r in pending:
+                ReportClosed(report: r, resolution: resolution)
+            ReportsResolved(content: content, resolution: resolution, admin: admin)
+}
+
+-- Delete a reported organization, purging its repositories and packages.
+-- from: routers/web/admin/reports.go:327
+rule AdminDeletesReportedOrganization {
+    when: AdminDeletesReportedOrganization(admin, content, resolution)
+    let target = content.reported_organization
+    let pending = content.open_reports
+    requires: admin.is_admin
+    requires: content.kind = organization
+    requires: not content.is_deleted
+    ensures: ModeratorDeletesOrganization(admin: admin, organization: target)
+    ensures:
+        if resolution != none:
+            for r in pending:
+                ReportClosed(report: r, resolution: resolution)
+            ReportsResolved(content: content, resolution: resolution, admin: admin)
+}
+
+-- from: routers/web/admin/reports.go:349
+rule AdminDeletesReportedRepository {
+    when: AdminDeletesReportedRepository(admin, content, resolution)
+    let target = content.reported_repository
+    let pending = content.open_reports
+    requires: admin.is_admin
+    requires: content.kind = repository
+    requires: not content.is_deleted
+    ensures: ModeratorDeletesRepository(admin: admin, repository: target)
+    ensures:
+        if resolution != none:
+            for r in pending:
+                ReportClosed(report: r, resolution: resolution)
+            ReportsResolved(content: content, resolution: resolution, admin: admin)
+}
+
+-- from: routers/web/admin/reports.go:368
+rule AdminDeletesReportedIssue {
+    when: AdminDeletesReportedIssue(admin, content, resolution)
+    let target = content.reported_issue
+    let pending = content.open_reports
+    requires: admin.is_admin
+    requires: content.kind = issue
+    requires: not content.is_deleted
+    ensures: ModeratorDeletesIssue(admin: admin, issue: target)
+    ensures:
+        if resolution != none:
+            for r in pending:
+                ReportClosed(report: r, resolution: resolution)
+            ReportsResolved(content: content, resolution: resolution, admin: admin)
+}
+
+-- from: routers/web/admin/reports.go:386
+rule AdminDeletesReportedComment {
+    when: AdminDeletesReportedComment(admin, content, resolution)
+    let target = content.reported_comment
+    let pending = content.open_reports
+    requires: admin.is_admin
+    requires: content.kind = comment
+    requires: not content.is_deleted
+    ensures: ModeratorDeletesComment(admin: admin, comment: target)
+    ensures:
+        if resolution != none:
+            for r in pending:
+                ReportClosed(report: r, resolution: resolution)
+            ReportsResolved(content: content, resolution: resolution, admin: admin)
+}
+
+-- ---- Retention ----------------------------------------------------------
+
+-- Daily (by default) purge of reports resolved longer ago than the retention
+-- period; a retention of zero or less keeps resolved reports forever. In
+-- Forgejo the cron task carrying this is registered only when moderation is
+-- enabled and is itself disabled by default (see open question).
+-- from: services/moderation/reporting.go:135
+rule PurgeResolvedReport {
+    when: report: AbuseReport.resolved_at + config.keep_resolved_reports_for <= now
+    requires: config.keep_resolved_reports_for > 0.days
+    requires: report.status = handled or report.status = ignored
+    ensures: not exists report
+}
+
+-- Evidence no longer referenced by any report is discarded with it.
+-- from: services/moderation/reporting.go:154
+rule DiscardOrphanedShadowCopy {
+    when: copy: ShadowCopy.is_orphaned
+    requires: copy.is_orphaned
+    ensures: not exists copy
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A reporter has at most one open report per item.
+invariant OneOpenReportPerReporterAndItem {
+    for a in AbuseReports:
+        for b in AbuseReports:
+            (a.status = open and b.status = open and a.content = b.content and a.reporter = b.reporter) implies a = b
+}
+
+-- Nobody reports their own profile.
+invariant NoSelfReport {
+    for r in AbuseReports:
+        r.content.kind = user implies r.content.reported_user != r.reporter
+}
+
+-- A shadow copy belongs to the item its reports point at.
+invariant ShadowCopyMatchesContent {
+    for r in AbuseReports:
+        r.shadow_copy != null implies r.shadow_copy.content = r.content
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Any signed-in user who may sign in.
+actor Reporter {
+    identified_by: accounts/User where prohibit_login = false
+}
+
+actor SiteAdmin {
+    identified_by: accounts/User where is_admin = true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The "Report abuse" entry on a profile, repository header, issue/PR or
+-- comment menu, and the report form behind it.
+surface ReportAbuse {
+    facing reporter: Reporter
+    context content: ReportableContent
+
+    exposes:
+        content.kind
+        content.reference
+        content.has_open_report_from(reporter)
+
+    provides:
+        UserReportsContent(reporter, content, category, remarks)
+            when config.enabled and not content.has_open_report_from(reporter)
+
+    @guarantee ReportersSeeNoOneElsesReports
+        -- A reporter learns only whether they themself already have an open
+        -- report on the item; other reports, reporters, remarks and the
+        -- moderation outcome are never shown to them.
+
+    @guarantee EntryHiddenWhereMeaningless
+        -- The entry is not offered on the reporter's own profile, on comments
+        -- or issues they posted, or on a repository they administer.
+
+    @guidance
+        -- Web only: GET /report_abuse?type={user|org|repo|issue|pull|comment}&id=N
+        -- renders the form (categories in the order spam, malware, illegal
+        -- content, other violations; remarks 20–500 chars); POST /report_abuse
+        -- submits; success and failure both return to the reporter's dashboard
+        -- with a flash. Unknown type or non-positive id: "invalid" form.
+}
+
+-- The admin moderation queue and the per-item detail page.
+surface ModerationQueue {
+    facing admin: SiteAdmin
+    context content: ReportableContent where is_in_queue
+
+    exposes:
+        content.kind
+        content.reference
+        content.is_deleted
+        content.poster
+        content.times_reported
+        for r in content.open_reports:
+            r.reporter.name
+            r.category
+            r.remarks
+            r.created_at
+            r.shadow_copy.captured_at
+            r.shadow_copy.user_snapshot
+            r.shadow_copy.repository_snapshot
+            r.shadow_copy.issue_snapshot
+            r.shadow_copy.comment_snapshot
+
+    provides:
+        AdminResolvesReports(admin, content, resolution) when config.enabled
+        AdminSuspendsReportedAccount(admin, content, resolution)
+            when config.enabled and content.kind = user and not content.is_deleted
+        AdminDeletesReportedAccount(admin, content, resolution)
+            when config.enabled and content.kind = user and not content.is_deleted
+        AdminDeletesReportedOrganization(admin, content, resolution)
+            when config.enabled and content.kind = organization and not content.is_deleted
+        AdminDeletesReportedRepository(admin, content, resolution)
+            when config.enabled and content.kind = repository and not content.is_deleted
+        AdminDeletesReportedIssue(admin, content, resolution)
+            when config.enabled and content.kind = issue and not content.is_deleted
+        AdminDeletesReportedComment(admin, content, resolution)
+            when config.enabled and content.kind = comment and not content.is_deleted
+
+    @guarantee OneRowPerItem
+        -- The queue lists each item with open reports once, oldest first,
+        -- showing the first report's reporter, category and date plus how many
+        -- open reports the item has.
+
+    @guarantee EvidenceSurvivesDeletion
+        -- When the item has been deleted the detail page still shows every
+        -- open report with its shadow copy, and for issues/comments the poster
+        -- recovered from the copy.
+
+    @guidance
+        -- Web only, site admins:
+        --   GET  /-/admin/moderation/reports                         (queue)
+        --   GET  /-/admin/moderation/reports/type/{1-4}/id/{id}      (detail)
+        --   POST /-/admin/abuse_reports/act  content_type, content_id,
+        --        report_action {0 none,1 handled,2 ignored},
+        --        content_action {0 none,1 suspend,2 delete account,
+        --        3 delete repo,4 delete issue,5 delete comment}
+        --        (both none is rejected).
+        -- Account deletion from moderation always purges.
+}
+
+-- The hook the owning modules call just before they edit or delete an item.
+surface ReportedContentLifecycle {
+    facing editor: accounts/User
+    context content: ReportableContent
+
+    provides:
+        ReportableContentChanging(content, change)
+
+    @guarantee CopyBeforeChange
+        -- The snapshot is taken from the item's state BEFORE the edit or
+        -- deletion is applied, in the same atomic step as the change.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred remarks_length         -- see: services/forms/report_abuse.go:21 (character count after trimming surrounding whitespace; remarks are stored trimmed)
+deferred snapshot_user          -- see: models/user/moderation.go:66 (UserSnapshot of content.reported_user / organization, else null)
+deferred snapshot_repository    -- see: models/repo/moderation.go:50
+deferred snapshot_issue         -- see: models/issues/moderation.go:45
+deferred snapshot_comment       -- see: models/issues/moderation.go:90
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Forgejo does not check that the admin's content action matches the reported kind (e.g. 'delete repository' on a user report deletes the repository with the same numeric id). The spec requires the kind to match; confirm."
+open question "Resolving marks ALL reports on the item (including already-resolved ones, re-stamping resolved_at). The spec resolves only open reports; confirm."
+open question "The purge deletes a shadow copy together with any resolved report linked to it, even when open reports still share that copy. The spec keeps a copy while any report references it; confirm."
+open question "Reporting is allowed server-side for one's own repository, issue or comment (only the UI hides the entry). Should the server refuse these too?"
+open question "Duplicate reports by the same reporter on the same open item are silently dropped with a 'thank you' message. Should the reporter be told instead?"
+open question "Organizations get no shadow copy before deletion (only user deletion snapshots). Should org deletion preserve evidence too?"
+open question "There is no notification to admins when a report arrives and no API. Should a rebuild add either?"
+open question "Should reporters be told when their report is resolved?"
+open question "Forgejo ships the purge task disabled ([cron.remove_resolved_reports] ENABLED=false), so resolved reports and their evidence are kept forever unless an admin turns it on. The spec purges after keep_resolved_reports_for; should a rebuild keep the separate task switch?"
+
+-- Requests to other modules
+-- REQUEST accounts/User: raise moderation/ReportableContentChanging(content, update) before changing any of name, full_name, email (incl. primary-email switch), login_name, location, website, pronouns, description, avatar, avatar_email; and (content, deletion) before deleting a user.
+-- REQUEST accounts: react to moderation/ModeratorSuspendsAccount (prohibit login) and moderation/ModeratorDeletesAccount (delete with purge).
+-- REQUEST accounts: profile_visible_to(user, viewer) predicate (visibility public/limited/private + blocks).
+-- REQUEST organizations: organization_visible_to(org, viewer); react to moderation/ModeratorDeletesOrganization (delete with purge); raise ReportableContentChanging on org profile edits.
+-- REQUEST repositories/Repository: raise ReportableContentChanging before settings updates and deletion; react to moderation/ModeratorDeletesRepository.
+-- REQUEST access: can_read_any_unit(user, repository); can_read_conversation(user, issue) = can_read(user, issue.repository, pull_requests if issue.is_pull else issues).
+-- REQUEST issues/Issue: raise ReportableContentChanging before title change, content change, deletion; react to moderation/ModeratorDeletesIssue.
+-- REQUEST issues/Comment: has_user_content (comment kinds that carry text/attachments); raise ReportableContentChanging before content change and deletion; react to moderation/ModeratorDeletesComment.
+-- REQUEST administration/CronTask: register "remove_resolved_reports" (default disabled, @every 24h) only when moderation is enabled.

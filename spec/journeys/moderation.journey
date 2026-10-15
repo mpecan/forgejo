@@ -1,0 +1,240 @@
+-- Journeys through abuse reporting and moderation.
+
+world {
+    cast:
+        ada:     accounts/User
+        bruno:   accounts/User
+        root:    accounts/User
+        thread:  issues/Issue
+        remark:  issues/Comment
+        item:    ReportableContent
+    given:
+        ada.prohibit_login = false
+        ada.is_admin = false
+        bruno.prohibit_login = false
+        bruno.is_admin = false
+        root.is_admin = true
+        root.prohibit_login = false
+        remark.issue = thread
+        item.kind = comment
+        item.reported_comment = remark
+        item.reported_user = null
+        item.reported_organization = null
+        item.reported_repository = null
+        item.reported_issue = null
+        item.is_deleted = false
+        item.has_user_content = true
+}
+
+journey AUserReportsAnAbusiveComment {
+    goal: Ada sees a spam comment on an issue she can read and reports it. The
+          report enters the moderation queue as open.
+
+    1. Ada can read the conversation and has not reported it yet
+        stipulate can_read_conversation(ada, thread) = true
+        stipulate remarks_length("This comment links to a phishing site twice.") = 45
+
+    2. she files the report
+        ada does UserReportsContent(ada, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
+            creating report: AbuseReport
+        then UserReportsContent fires
+        then report.status = open
+        then report.category = spam
+        then report.reporter = ada
+
+    ends: One open report from Ada sits in the queue for the comment.
+}
+
+journey NobodyReportsWhatTheyCannotSee {
+    goal: Bruno cannot read the issue the comment sits in (a private
+          repository he has no access to) so he cannot report it.
+
+    1. he tries to report the comment
+        stipulate can_read_conversation(bruno, thread) = false
+        stipulate remarks_length("This comment links to a phishing site twice.") = 45
+        bruno cannot do UserReportsContent(bruno, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
+
+    ends: Reporting never reveals or touches content the reporter cannot see.
+}
+
+journey NobodyReportsTheirOwnProfile {
+    goal: Ada tries to report her own profile and is refused.
+
+    given:
+        item.kind = user
+        item.reported_user = ada
+
+    1. she reports herself
+        stipulate profile_visible_to(ada, ada) = true
+        stipulate remarks_length("I would like to see what happens here.") = 38
+        ada cannot do UserReportsContent(ada, item, other_violations, "I would like to see what happens here.") on ReportAbuse
+
+    ends: Self-reports never enter the queue.
+}
+
+journey AReportCannotBeFiledTwice {
+    goal: Having already reported the comment, Ada cannot pile on a second open
+          report of her own.
+
+    1. she reports the comment
+        stipulate can_read_conversation(ada, thread) = true
+        stipulate remarks_length("This comment links to a phishing site twice.") = 45
+        ada does UserReportsContent(ada, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
+            creating first: AbuseReport
+        then first.status = open
+
+    2. she tries again
+        ada cannot do UserReportsContent(ada, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
+
+    ends: Still exactly one open report from Ada.
+}
+
+journey ReportersDoNotSeeOtherReports {
+    goal: Bruno opens the report form for the same comment; he can see whether
+          he himself already reported it, never what Ada wrote.
+
+    after: AUserReportsAnAbusiveComment
+
+    1. bruno looks at the item
+        bruno sees item.kind on ReportAbuse in item
+        bruno cannot see report.remarks on ReportAbuse in item
+
+    ends: Reports stay between the reporter and the admins.
+}
+
+journey EvidenceSurvivesTheEdit {
+    goal: The comment's author quietly rewrites it after being reported. The
+          original text is captured before the edit, linked to Ada's report,
+          and shown to the admin reviewing it.
+
+    after: AUserReportsAnAbusiveComment
+
+    1. the author edits the reported comment
+        stipulate item.reports_without_copy = {report}
+        bruno does ReportableContentChanging(item, update) on ReportedContentLifecycle
+        then PreserveEvidenceBeforeChange fires
+        then ReportedContentDeleted does not fire
+
+    2. the admin reviews the queue
+        stipulate item.is_in_queue = true
+        stipulate item.open_reports = {report}
+        root sees report.remarks on ModerationQueue in item
+
+    ends: The admin judges the comment as it was when reported.
+}
+
+journey DeletionLeavesATombstone {
+    goal: The author deletes the reported comment. Reports and evidence remain,
+          keyed to the deleted item.
+
+    after: AUserReportsAnAbusiveComment
+
+    1. the author deletes it
+        stipulate item.reports_without_copy = {report}
+        bruno does ReportableContentChanging(item, deletion) on ReportedContentLifecycle
+        then PreserveEvidenceBeforeChange fires
+        then ReportedContentDeleted fires
+        then item.is_deleted = true
+
+    ends: The comment is gone; the queue still lists it with its evidence.
+}
+
+journey AnAdminDismissesTheReport {
+    goal: The admin decides the comment is fine and marks every open report on
+          it as ignored, without touching the comment.
+
+    after: AUserReportsAnAbusiveComment
+
+    1. she ignores the reports
+        stipulate item.open_reports = {report}
+        root does AdminResolvesReports(root, item, ignored) on ModerationQueue
+        then AdminResolvesReports fires
+        then CloseReportAsIgnored fires
+        then report.status = ignored
+
+    ends: The item leaves the queue; the comment is untouched.
+}
+
+journey AnAdminDeletesTheCommentAndClosesTheReport {
+    goal: The admin deletes the spam comment and marks the report handled in
+          one action.
+
+    after: AUserReportsAnAbusiveComment
+
+    1. she deletes the comment
+        stipulate item.open_reports = {report}
+        root does AdminDeletesReportedComment(root, item, handled) on ModerationQueue
+        then AdminDeletesReportedComment fires
+        then CloseReportAsHandled fires
+        then report.status = handled
+
+    ends: Deletion is requested from the issues module; the report is handled.
+}
+
+journey OnlyAdminsModerate {
+    goal: Bruno, an ordinary user, cannot resolve reports.
+
+    after: AUserReportsAnAbusiveComment
+
+    1. bruno tries to close the report
+        bruno cannot do AdminResolvesReports(bruno, item, handled) on ModerationQueue
+
+    ends: Nothing changes.
+}
+
+journey AdminsCannotSuspendAdmins {
+    goal: A report against another site admin cannot be acted on by
+          suspending that admin.
+
+    cast:
+        boss:    accounts/User
+        profile: ReportableContent
+
+    given:
+        boss.is_admin = true
+        boss.prohibit_login = false
+        profile.kind = user
+        profile.reported_user = boss
+        profile.is_deleted = false
+
+    1. the admin tries to suspend
+        root cannot do AdminSuspendsReportedAccount(root, profile, handled) on ModerationQueue
+
+    ends: Admins are never suspended through moderation.
+}
+
+journey AnAdminSuspendsASpammer {
+    goal: A report against an ordinary account is acted on by suspending it.
+
+    cast:
+        spammer: accounts/User
+        profile: ReportableContent
+
+    given:
+        spammer.is_admin = false
+        spammer.prohibit_login = false
+        profile.kind = user
+        profile.reported_user = spammer
+        profile.is_deleted = false
+
+    1. the admin suspends the account, leaving the report open
+        root does AdminSuspendsReportedAccount(root, profile, none) on ModerationQueue
+        then AdminSuspendsReportedAccount fires
+        then spammer.prohibit_login = true
+
+    ends: The spammer can no longer sign in.
+}
+
+journey ResolvedReportsArePurged {
+    goal: With the purge task enabled, a report ignored more than the retention
+          period ago is deleted.
+
+    after: AnAdminDismissesTheReport
+
+    1. a week and a day pass
+        after 8.days
+        then PurgeResolvedReport fires
+        then report does not exist
+
+    ends: Only recent resolutions remain on record.
+}
