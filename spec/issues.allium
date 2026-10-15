@@ -1,0 +1,2360 @@
+-- allium: 3
+-- issues.allium — issue tracking: issues, the conversation timeline, labels, milestones, and everything attached to an issue
+--
+-- Scope: the per-repository issue tracker and the conversation half of every
+--   pull request. An `Issue` with `is_pull = true` is the conversation of a
+--   `pulls/PullRequest`; every rule here applies to it unless it says otherwise.
+-- Includes:
+--   - Issue lifecycle: open (create), edit title / body / branch ref, close /
+--     reopen, delete (repo admin), per-repository index shared by issues and
+--     pull requests, due dates, lock / unlock with a reason, pin / unpin /
+--     reorder with a per-repository limit (separately for issues and PRs).
+--   - The Comment timeline: every comment kind (see `CommentKind`), including
+--     the kinds created by `pulls` and `projects` rules (listed so the
+--     timeline is one closed vocabulary); edit / delete of comments; content
+--     history of issue bodies and comments (edits retained, at most
+--     `content_history_limit` revisions; revisions can be hidden).
+--   - Reactions on issues and comments, from an instance-configured set.
+--   - Labels: repository labels, organization labels, exclusive scoped labels
+--     (`scope/name`), archived labels, label templates and initialisation.
+--   - Milestones: open / closed, due date, progress.
+--   - Assignees and who may be assigned.
+--   - Issue dependencies (blocked-by / blocking), optional cross-repository,
+--     and the refusal to close an issue with open blockers.
+--   - Time tracking: stopwatches, manual time, deleting time, who may track.
+--   - Per-issue subscriptions (watch / unwatch; participants are subscribed
+--     implicitly).
+--   - Attachments: upload, allowed types, size / count limits, linking to an
+--     issue or comment (release attachments are linked by `releases`).
+--   - Issue templates (Markdown and YAML forms) and the template config
+--     (`blank_issues_enabled`, contact links).
+--   - Cross references (`#123`, `owner/repo#123`, `!123`) from issues,
+--     comments and pull requests; keyword references in pushed commit
+--     messages that close / reopen issues and log time.
+--   - Mentions (`@user`, `@org/team`) resolved for notification.
+--   - Blocked users (`accounts/UserBlock`) cannot open, comment, react or
+--     change status; anonymous and read-only visitors.
+--   - Per-repository issue / PR list filtering (state, labels, milestone,
+--     project, assignee, poster, keyword) as surface exposure.
+-- Excludes:
+--   - Cross-repository / instance-wide issue search and indexers — `discovery`.
+--   - Review, code comments, review requests, merge — `pulls` (their comment
+--     kinds are enumerated here only).
+--   - Project boards and card moves — `projects` (the `project` /
+--     `project_column` comment kinds are enumerated here only).
+--   - In-app notifications, mails, activity feed, RSS/Atom issue feeds,
+--     reply-by-email — `notifications` (they react to the triggers below).
+--   - Webhook deliveries — `webhooks`; workflow triggers — `actions`.
+--   - Shadow copies of reported content before edit / delete — `moderation`
+--     (it reacts to the edit / delete triggers, which carry the old content).
+--   - Migrated "original author" fields, overriding `updated_at` on API
+--     writes, and comment-type repair doctors — data-import concerns, owned by
+--     the `migrations` addon.
+--   - Timeline aggregation of consecutive label / review-request / status
+--     events into one entry — presentation only.
+--   - Rendering (Markdown, task-list checkbox counting, custom emoji images,
+--     summary cards) — presentation; task counts are exposed as black boxes.
+--   - Issue transfer between repositories and confidential issues — Forgejo
+--     has neither.
+--   - The legacy single `assignee` API field and the deprecated
+--     `/issues/{index}/comments/{id}` API paths — Gitea API compatibility.
+--
+-- Emits:
+--   IssueOpened(issue, mentions)                       -- issue or PR conversation created (PR variant is emitted by pulls)
+--   IssueClosed(issue, doer, comment)
+--   IssueReopened(issue, doer, comment)
+--   IssueDeleted(issue, doer)
+--   IssueTitleChanged(issue, doer, old_title)
+--   IssueContentChanged(issue, doer, old_content)
+--   IssueRefChanged(issue, doer, old_ref)
+--   IssueLabelsChanged(issue, doer, added, removed)
+--   IssueLabelsCleared(issue, doer)
+--   IssueMilestoneChanged(issue, doer, old_milestone)
+--   IssueAssigneeChanged(issue, doer, assignee, removed, comment)
+--   IssueCommentCreated(issue, comment, doer, mentions)
+--   IssueCommentEdited(comment, doer, old_content)
+--   IssueCommentDeleted(comment, doer)
+--   ReactionAdded(reaction)
+--   ReactionRemoved(reaction)
+--   IssueReferencedByCommit(issue, commit_sha, pusher)
+--   IssueCreatedWithProject(issue, poster, project)    -- projects puts the new issue on the board
+--   UserViewsIssue(viewer, issue)                      -- external stimulus; notifications marks the thread read
+-- Reacts to:
+--   code/PushReceived(push)                            -- keyword references in commit messages
+--   pulls/PullRequestMerged(pr, merger, style)         -- merger's stopwatch on the conversation stops
+--   pulls/IssueClosedByPullRequest(issue, pull_request, doer)    -- apply closing references
+--   pulls/IssueReopenedByPullRequest(issue, pull_request, doer)  -- apply reopening references
+--   repositories/RepositoryDeleted(repository, doer)   -- the tracker goes with the repository
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./repositories.allium" as repositories
+use "./access.allium" as access
+use "./code.allium" as code
+use "./pulls.allium" as pulls
+use "./projects.allium" as projects
+use "./releases.allium" as releases
+
+------------------------------------------------------------
+-- Black-box predicates and functions used below
+------------------------------------------------------------
+
+-- Permission predicates are thin local names for `access` semantics so that
+-- rules read in tracker terms. "The issue's unit" is `pull_requests` when
+-- `issue.is_pull`, else `issues`.
+--
+--   can_read_issue(user, issue)        = access/can_read(user, issue.repository, the issue's unit)
+--   can_triage(user, issue)            = access/can_write(user, issue.repository, the issue's unit)
+--   can_read_tracker(user, repository) = can read the issues unit or the pull_requests unit
+--   can_manage_tracker(user, repository) = can write the issues unit or the pull_requests unit
+--   is_repo_admin(user, repository)    = access/is_repo_admin(user, repository)
+--   is_org_owner(user, organization)   = user is in organization.owners_team
+--   can_be_assigned(user, repository)  = user is not an organization and has write
+--                                        on any unit, or read on pull_requests
+--   is_blocked(blocker, user)          = an accounts/UserBlock from blocker to user exists
+--   is_blocked_by_owner(repository, user) = the repository's owner (user or org) blocks user
+--
+-- Repository issue-unit settings (REQUEST below):
+--   timetracker_enabled(repository), only_contributors_track_time(repository),
+--   dependencies_enabled(repository), closes_via_commit_in_any_branch(repository)
+--
+-- Text analysis:
+--   resolve_mentions(issue, doer, text) -> Set<accounts/User>
+--       `@name` and `@org/team` mentions; teams expand to active, non-blocked
+--       members when the team has access to the issue's unit (or admin);
+--       organizations are ignored; users who cannot read the issue, inactive
+--       or login-prohibited users, users who blocked the doer and the doer
+--       are dropped.
+--   cross_references(issue, comment, doer, text) -> Set<CrossReference>
+--       `#N`, `!N`, `owner/repo#N` references (plus a preceding close /
+--       reopen keyword) that point at an existing issue the doer can read;
+--       see `CrossReference`.
+--   commit_references(push) -> Set<CommitReference>
+--   exclusive_scope(label) -> String     -- "" when not exclusive or no scope
+--   is_allowed_file(name, head_bytes) -> Boolean   -- against config.attachment_allowed_types
+--   template_is_valid(template) -> Boolean
+--   task_count(text), tasks_done(text) -> Integer   -- `- [ ]` / `- [x]` items
+--   is_lock_reason(reason)      = reason in config.lock_reasons
+--   is_allowed_reaction(emoji)  = emoji in config.allowed_reactions
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A reference found in the text of an issue, PR or comment and verified
+-- against the referenced issue and the doer's permission.
+-- from: models/issues/issue_xref.go:161
+value CrossReference {
+    target: Issue
+    action: XRefAction    -- `closes` / `reopens` only when the source is a PR, the
+                          -- target is an issue, and the doer could close the
+                          -- target manually (or is its poster / it is a new PR
+                          -- in the same repository); otherwise `none`
+}
+
+-- A keyword reference in a pushed commit message.
+-- from: services/issue/commit.go:106
+value CommitReference {
+    target: Issue
+    action: XRefAction          -- closes | reopens | none
+    commit_sha: String
+    commit_message: String
+    committed_at: Timestamp
+    time_log: Duration?         -- `Fixes #1 @1h30m` logs time when closing
+    branch: String
+}
+
+-- from: modules/structs/issue.go:234
+value ContactLink {
+    name: String
+    url: String
+    about: String
+}
+
+-- One field of a YAML issue form.
+-- from: modules/issue/template/template.go:44
+value IssueFormField {
+    id: String?                 -- unique, alphanumeric / - / _ ; required except for markdown
+    type: IssueFormFieldType
+    label: String?
+    required: Boolean           -- a hidden field cannot be required
+    visible_in_form: Boolean
+    visible_in_content: Boolean
+    options: List<String>       -- dropdown / checkboxes
+}
+
+-- One label in a label template file.
+-- from: modules/label/label.go:16
+value LabelSpec {
+    name: String
+    color: String
+    description: String?
+    is_exclusive: Boolean
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Every kind of timeline entry. Kinds marked (pulls) / (projects) are created
+-- by those modules' rules; everything else by rules in this file.
+-- from: models/issues/comment.go:67
+enum CommentKind {
+    comment                       -- plain comment (Markdown, attachments)
+    | reopen | close
+    | issue_ref                   -- referenced from an issue
+    | commit_ref                  -- referenced from a commit message
+    | comment_ref                 -- referenced from a comment
+    | pull_ref                    -- referenced from a pull request
+    | label                       -- label added / removed
+    | milestone                   -- milestone changed
+    | assignees                   -- assignee added / removed
+    | change_title
+    | delete_branch               -- (pulls) head branch deleted
+    | start_tracking | stop_tracking | cancel_tracking
+    | add_time_manual | delete_time_manual
+    | added_deadline | modified_deadline | removed_deadline
+    | add_dependency | remove_dependency
+    | code                        -- (pulls) code comment
+    | review                      -- (pulls) review summary
+    | lock | unlock
+    | change_target_branch        -- (pulls)
+    | review_request              -- (pulls) reviewer requested
+    | review_request_removed      -- (pulls) review request withdrawn
+    | merge_pull                  -- (pulls) conversation closed by merge
+    | pull_push                   -- (pulls) commits pushed to head
+    | project | project_column    -- (projects)
+    | dismiss_review              -- (pulls)
+    | change_issue_ref            -- issue branch/tag reference changed
+    | pr_scheduled_to_auto_merge | pr_unscheduled_to_auto_merge   -- (pulls) auto-merge
+    | pin | unpin
+}
+
+-- from: modules/references/references.go:62
+enum XRefAction { none | closes | reopens | neutered }
+
+-- Badge shown next to a poster in the timeline.
+-- from: models/issues/comment.go:226
+enum RoleInRepo { owner | member | collaborator | first_time_contributor | contributor | no_role }
+
+-- from: modules/structs/issue.go:147
+enum IssueFormFieldType { markdown | textarea | input | dropdown | checkboxes }
+
+enum TemplateFormat { markdown | yaml }
+
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- An issue, or the conversation of a pull request.
+-- from: models/issues/issue.go:90
+entity Issue {
+    repository: repositories/Repository
+    index: Integer                       -- per repository, shared by issues and PRs, never reused
+    poster: accounts/User
+    title: String                        -- trimmed, at most config.max_title_length
+    content: String                      -- Markdown body
+    content_version: Integer             -- optimistic concurrency for body edits
+    is_pull: Boolean
+    status: open | closed
+    closed_at: Timestamp when status = closed
+    is_locked: Boolean
+    ref: String?                         -- branch or tag the issue is about (issues only)
+    deadline: Timestamp?                 -- due date, end of the chosen day
+    milestone: Milestone?
+    labels: Set<Label>
+    assignees: Set<accounts/User>
+    mentioned_users: Set<accounts/User>
+    read_by: Set<accounts/User>          -- users who have opened the issue page
+    created_at: Timestamp
+    updated_at: Timestamp
+
+    -- Relationships
+    comments: Comment with issue = this
+    reactions: Reaction with issue = this
+    attachments: Attachment with issue = this
+    blocked_by: IssueDependency with issue = this
+    blocking: IssueDependency with blocker = this
+    tracked_times: TrackedTime with issue = this
+    stopwatches: Stopwatch with issue = this
+    watches: IssueWatch with issue = this
+    pin: IssuePin with issue = this
+    history: ContentHistory with issue = this
+
+    -- Projections
+    conversation: comments where kind = comment or kind = review
+    issue_reactions: reactions where comment = null
+    open_blockers: blocked_by where blocker.status = open
+    active_times: tracked_times where is_deleted = false
+    explicit_watchers: watches where is_watching = true
+    explicit_unwatchers: watches where is_watching = false
+
+    -- Derived
+    num_comments: conversation.count
+    is_pinned: pin.count > 0
+    has_open_blockers: open_blockers.count > 0
+    is_overdue: deadline != null and status = open and deadline <= now
+    participants: comments.poster + { poster }
+    num_tasks: task_count(content)
+    num_tasks_done: tasks_done(content)
+
+    transitions status {
+        open -> closed
+        closed -> open
+        terminal: closed
+    }
+}
+
+-- One entry of an issue's timeline. The payload fields that apply depend on
+-- `kind`; all others are absent.
+-- from: models/issues/comment.go:244
+entity Comment {
+    issue: Issue
+    poster: accounts/User
+    kind: CommentKind
+    content: String                      -- Markdown for comment/code/review/dismiss_review;
+                                         -- the lock reason for lock; the duration for time kinds;
+                                         -- the date(s) for deadline kinds
+    content_version: Integer
+    created_at: Timestamp
+    updated_at: Timestamp
+
+    -- kind = label
+    label: Label?
+    label_added: Boolean?
+    -- kind = milestone
+    old_milestone: Milestone?
+    new_milestone: Milestone?
+    -- kind = assignees / review_request
+    assignee: accounts/User?
+    assignee_team: organizations/Team?
+    assignee_removed: Boolean?
+    -- kind = change_title
+    old_title: String?
+    new_title: String?
+    -- kind = change_issue_ref / change_target_branch
+    old_ref: String?
+    new_ref: String?
+    -- kind = add_dependency / remove_dependency
+    dependent_issue: Issue?
+    -- kind = add_time_manual / stop_tracking
+    tracked_time: TrackedTime?
+    -- kind = commit_ref
+    commit_sha: String?
+    -- kind = issue_ref / comment_ref / pull_ref: the origin of the reference
+    ref_issue: Issue?
+    ref_comment: Comment?
+    ref_action: XRefAction?
+    -- kind = project / project_column
+    project: projects/Project?
+    old_project: projects/Project?
+    -- kind = code / review / dismiss_review
+    review: pulls/Review?
+
+    -- Relationships
+    reactions: Reaction with comment = this
+    attachments: Attachment with comment = this
+    history: ContentHistory with comment = this
+
+    -- Derived
+    has_content: kind = comment or kind = code or kind = review or kind = dismiss_review
+    accepts_attachments: kind = comment or kind = code or kind = review
+    counts_as_conversation: kind = comment or kind = review
+    is_edited: history.count > 1
+}
+
+-- A repository label or an organization label (usable in all the
+-- organization's repositories). Exactly one of repository / organization.
+-- from: models/issues/label.go:87
+entity Label {
+    repository: repositories/Repository?
+    organization: organizations/Organization?
+    name: String                         -- at most config.max_label_name_length
+    description: String                  -- at most config.max_label_description_length
+    color: String                        -- normalised to #rrggbb
+    is_exclusive: Boolean                -- `scope/name` labels in one scope are mutually exclusive on an issue
+    archived_at: Timestamp?
+    created_at: Timestamp
+
+    -- Derived
+    is_archived: archived_at != null
+    scope: exclusive_scope(this)
+}
+
+-- from: models/issues/milestone.go:48
+entity Milestone {
+    repository: repositories/Repository
+    name: String                         -- trimmed, at most config.max_milestone_name_length
+    description: String
+    status: open | closed
+    closed_at: Timestamp when status = closed
+    deadline: Timestamp?                 -- absent means "no due date"
+    created_at: Timestamp
+    updated_at: Timestamp
+
+    issues: Issue with milestone = this
+    closed_issues: issues where status = closed
+    open_issues: issues where status = open
+
+    num_issues: issues.count
+    num_closed_issues: closed_issues.count
+    num_open_issues: open_issues.count
+    completeness: percent(num_closed_issues, num_issues)    -- 0 when empty
+    is_overdue: deadline != null and status = open and deadline <= now
+
+    transitions status {
+        open -> closed
+        closed -> open
+        terminal: closed
+    }
+}
+
+-- A user's reaction on an issue (comment absent) or on a comment.
+-- from: models/issues/reaction.go:62
+entity Reaction {
+    user: accounts/User
+    issue: Issue
+    comment: Comment?
+    emoji: String                        -- one of config.allowed_reactions
+    created_at: Timestamp
+}
+
+-- `issue` is blocked by `blocker` (and `blocker` is blocking `issue`).
+-- from: models/issues/dependency.go:107
+entity IssueDependency {
+    issue: Issue
+    blocker: Issue
+    created_by: accounts/User
+    created_at: Timestamp
+}
+
+-- Time a user spent on an issue. Deleting time hides it but keeps the record.
+-- from: models/issues/tracked_time.go:23
+entity TrackedTime {
+    issue: Issue
+    user: accounts/User
+    amount: Duration
+    created_at: Timestamp
+    is_deleted: Boolean
+}
+
+-- A running timer. A user has at most one running stopwatch at a time.
+-- from: models/issues/stopwatch.go:33
+entity Stopwatch {
+    user: accounts/User
+    issue: Issue
+    started_at: Timestamp
+
+    elapsed: now - started_at
+}
+
+-- An explicit subscription choice for one user on one issue. Absent a
+-- choice, a user is subscribed when they watch the repository's issues or
+-- participated (posted or commented).
+-- from: models/issues/issue_watch.go:16
+entity IssueWatch {
+    user: accounts/User
+    issue: Issue
+    is_watching: Boolean
+    updated_at: Timestamp
+}
+
+-- A pinned issue or PR; positions run 1..n per (repository, is_pull).
+-- from: models/issues/issue.go:773
+entity IssuePin {
+    repository: repositories/Repository
+    issue: Issue
+    is_pull: Boolean
+    position: Integer
+}
+
+-- A file attached to an issue, a comment or a release. An uploaded file
+-- that is not linked yet is visible only to its uploader.
+-- from: models/repo/attachment.go:23
+entity Attachment {
+    repository: repositories/Repository
+    uploader: accounts/User
+    name: String
+    size: Integer                        -- bytes
+    issue: Issue?
+    comment: Comment?
+    release: releases/Release?
+    external_url: String?                -- release assets only (owned by releases)
+    download_count: Integer              -- counted for release attachments only
+    created_at: Timestamp
+
+    is_linked: issue != null or release != null
+}
+
+-- One retained revision of an issue body (comment absent) or a comment.
+-- from: models/issues/content_history.go:17
+entity ContentHistory {
+    issue: Issue
+    comment: Comment?
+    editor: accounts/User
+    edited_at: Timestamp
+    content: String
+    is_first_created: Boolean
+    is_deleted: Boolean                  -- soft-deleted revisions have their text erased
+}
+
+-- An issue template found on the repository's default branch.
+-- from: modules/structs/issue.go:190
+entity IssueTemplate {
+    repository: repositories/Repository
+    file_name: String
+    format: TemplateFormat
+    name: String                         -- required
+    about: String                        -- required
+    title: String?                       -- prefilled issue title
+    labels: Set<String>                  -- label names applied when the issue is opened
+    ref: String?
+    body: String?                        -- markdown templates
+    fields: List<IssueFormField>         -- yaml forms, at least one
+
+    is_valid: template_is_valid(this)
+}
+
+-- The template chooser configuration on the default branch.
+-- from: services/issue/template.go:58
+entity IssueTemplateConfig {
+    repository: repositories/Repository
+    blank_issues_enabled: Boolean
+    contact_links: List<ContactLink>
+}
+
+-- A named set of labels an instance offers for initialising a repository or
+-- organization's labels.
+-- from: modules/repository/init.go:146
+entity LabelTemplate {
+    name: String
+    description: String
+    labels: List<LabelSpec>
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [attachment]
+    attachments_enabled: Boolean = true
+    attachment_allowed_types: String = ".avif,.cpuprofile,.csv,.dmp,.docx,.fodg,.fodp,.fods,.fodt,.gif,.gz,.jpeg,.jpg,.json,.jsonc,.log,.md,.mov,.mp4,.odf,.odg,.odp,.ods,.odt,.patch,.pdf,.png,.pptx,.svg,.tgz,.txt,.webm,.webp,.xls,.xlsx,.zip"
+    attachment_max_size_mb: Integer = 2048
+    attachment_max_files: Integer = 5
+
+    -- [repository.issue]
+    lock_reasons: Set<String> = { "Too heated", "Off-topic", "Spam", "Resolved" }
+    max_pinned: Integer = 3                       -- 0 disables pinning
+
+    -- [repository.pull-request] (keywords also apply to commit messages)
+    close_keywords: Set<String> = { "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved" }
+    reopen_keywords: Set<String> = { "reopen", "reopens", "reopened" }
+
+    -- [ui]
+    allowed_reactions: Set<String> = { "+1", "-1", "laugh", "hooray", "confused", "heart", "rocket", "eyes" }
+    reaction_max_user_num: Integer = 10           -- names listed per reaction before "and N more"
+
+    -- [service]
+    timetracking_enabled: Boolean = true          -- instance switch; off hides all time tracking
+    default_enable_timetracking: Boolean = true
+    default_allow_only_contributors_to_track_time: Boolean = true
+    default_enable_dependencies: Boolean = true
+    allow_cross_repository_dependencies: Boolean = true
+
+    -- Domain limits (not configurable in Forgejo)
+    max_title_length: Integer = 255
+    max_label_name_length: Integer = 50
+    max_label_description_length: Integer = 200
+    max_milestone_name_length: Integer = 50
+    content_history_limit: Integer = 20
+    max_manual_time: Duration = 1000.hours
+}
+
+------------------------------------------------------------
+-- Defaults
+------------------------------------------------------------
+
+-- from: options/label/Default
+default LabelTemplate default_labels = {
+    name: "Default",
+    description: "Bug, enhancement, duplicate, invalid, question, wontfix and friends",
+    labels: []
+}
+
+-- from: options/label/Advanced.yaml
+default LabelTemplate advanced_labels = {
+    name: "Advanced",
+    description: "Scoped labels (Kind/, Priority/, Reviewed/, Status/) with exclusive scopes",
+    labels: []
+}
+
+------------------------------------------------------------
+-- Rules: opening and editing issues
+------------------------------------------------------------
+
+-- Metadata (labels, milestone, assignees, due date) is only applied when the
+-- poster can manage the tracker; for anyone else it is silently dropped.
+-- Labels outside the repository / its organization are dropped; of several
+-- labels in one exclusive scope only the last is kept.
+-- from: services/issue/issue.go:31
+rule UserOpensIssue {
+    when: UserOpensIssue(user, repository, title, content, labels, milestone, assignees, deadline, project, attachments)
+    requires: can_read_tracker(user, repository)
+    requires: not repository.is_archived
+    requires: not is_blocked_by_owner(repository, user)
+    requires: trim(title) != ""
+    requires: length(title) <= config.max_title_length
+    requires: milestone = null or milestone in (Milestones where repository = repository)
+    requires: all_assignable(assignees, repository)        -- every one satisfies can_be_assigned
+    let is_manager = can_manage_tracker(user, repository)
+    let mentions = resolve_mentions_in(repository, user, content)
+    ensures:
+        let issue = Issue.created(
+            repository: repository,
+            index: next_issue_index(repository),
+            poster: user,
+            title: trim(title),
+            content: content,
+            content_version: 0,
+            is_pull: false,
+            status: open,
+            is_locked: false,
+            labels: if is_manager: without_scope_duplicates(labels_usable_in(labels, repository)) else: {},
+            milestone: if is_manager: milestone else: null,
+            assignees: if is_manager: assignees else: {},
+            deadline: if is_manager: deadline else: null,
+            mentioned_users: mentions,
+            created_at: now,
+            updated_at: now
+        )
+        IssueOpened(issue: issue, mentions: mentions)
+        TextPosted(issue: issue, comment: null, doer: user, text: title + " " + content)
+        AttachmentsLinked(issue: issue, comment: null, doer: user, attachments: attachments)
+        if is_manager:
+            IssueMetadataInitialised(issue: issue, doer: user)
+        if is_manager and project != null:
+            IssueCreatedWithProject(issue: issue, poster: user, project: project)
+}
+
+-- The timeline records the metadata chosen at creation as ordinary events.
+-- from: models/issues/issue_update.go:357
+rule RecordInitialMetadata {
+    when: IssueMetadataInitialised(issue, doer)
+    ensures:
+        for l in issue.labels:
+            Comment.created(issue: issue, poster: doer, kind: label, label: l, label_added: true,
+                            content: "", content_version: 0, created_at: now, updated_at: now)
+        if issue.milestone != null:
+            Comment.created(issue: issue, poster: doer, kind: milestone, new_milestone: issue.milestone,
+                            content: "", content_version: 0, created_at: now, updated_at: now)
+        for a in issue.assignees:
+            Comment.created(issue: issue, poster: doer, kind: assignees, assignee: a, assignee_removed: false,
+                            content: "", content_version: 0, created_at: now, updated_at: now)
+        IssueLabelsChanged(issue: issue, doer: doer, added: issue.labels, removed: {})
+}
+
+-- Web form only: the poster or a triager may change the title, also while
+-- the issue is locked. Via the API the poster may not while it is locked
+-- (see open questions).
+-- from: services/issue/issue.go:64
+rule UserChangesIssueTitle {
+    when: UserChangesIssueTitle(user, issue, title)
+    requires: can_read_issue(user, issue)
+    requires: user = issue.poster or can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: not is_blocked(issue.poster, user)
+    requires: not is_blocked_by_owner(issue.repository, user)
+    requires: trim(title) != ""
+    requires: length(title) <= config.max_title_length
+    requires: trim(title) != issue.title
+    ensures: issue.title = trim(title)
+    ensures: issue.updated_at = now
+    ensures: Comment.created(issue: issue, poster: user, kind: change_title,
+                             old_title: issue.title, new_title: trim(title),
+                             content: "", content_version: 0, created_at: now, updated_at: now)
+    ensures: IssueTitleChanged(issue: issue, doer: user, old_title: issue.title)
+    ensures: TextPosted(issue: issue, comment: null, doer: user, text: trim(title) + " " + issue.content)
+}
+
+-- Body edits are optimistic: the editor states the version they edited.
+-- The first edit also records the original body as the first revision.
+-- from: models/issues/issue_update.go:257
+rule UserEditsIssueBody {
+    when: UserEditsIssueBody(user, issue, content, seen_version)
+    requires: can_read_issue(user, issue)
+    requires: user = issue.poster or can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: seen_version = issue.content_version
+    ensures: issue.content = content
+    ensures: issue.content_version = issue.content_version + 1
+    ensures: issue.updated_at = now
+    ensures: ContentRevised(issue: issue, comment: null, editor: user, old_content: issue.content, new_content: content)
+    ensures: IssueContentChanged(issue: issue, doer: user, old_content: issue.content)
+    ensures: TextPosted(issue: issue, comment: null, doer: user, text: issue.title + " " + content)
+}
+
+-- Issues only: the branch or tag an issue is about. A set ref limits which
+-- branch's commits may close the issue by keyword.
+-- from: services/issue/issue.go:105
+rule UserChangesIssueRef {
+    when: UserChangesIssueRef(user, issue, ref)
+    requires: not issue.is_pull
+    requires: can_read_issue(user, issue)
+    requires: user = issue.poster or can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    ensures: issue.ref = ref
+    ensures: Comment.created(issue: issue, poster: user, kind: change_issue_ref,
+                             old_ref: issue.ref, new_ref: ref,
+                             content: "", content_version: 0, created_at: now, updated_at: now)
+    ensures: IssueRefChanged(issue: issue, doer: user, old_ref: issue.ref)
+}
+
+-- The due date is a calendar day; it ends at the end of that day.
+-- from: models/issues/issue_update.go:459
+rule TriagerSetsDueDate {
+    when: TriagerSetsDueDate(user, issue, deadline)
+    requires: can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: deadline != issue.deadline
+    ensures: issue.deadline = end_of_day(deadline)
+    ensures:
+        if issue.deadline = null:
+            Comment.created(issue: issue, poster: user, kind: added_deadline, content: format_date(deadline),
+                            content_version: 0, created_at: now, updated_at: now)
+        else:
+            Comment.created(issue: issue, poster: user, kind: modified_deadline, content: format_date(deadline),
+                            content_version: 0, created_at: now, updated_at: now)
+}
+
+-- from: models/issues/issue_update.go:459
+rule TriagerRemovesDueDate {
+    when: TriagerRemovesDueDate(user, issue)
+    requires: can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: issue.deadline != null
+    ensures: issue.deadline = null
+    ensures: Comment.created(issue: issue, poster: user, kind: removed_deadline, content: "",
+                             content_version: 0, created_at: now, updated_at: now)
+}
+
+------------------------------------------------------------
+-- Rules: closing, reopening, deleting
+------------------------------------------------------------
+
+-- The poster or a triager closes. With dependencies enabled, an issue with
+-- open blockers cannot be closed (and the closer's stopwatch keeps running).
+-- Closing stops the closer's own stopwatch on the issue. Pull requests are
+-- closed and reopened through pulls, with the same permission and blocker
+-- checks plus their own.
+-- from: models/issues/issue_update.go:69
+rule UserClosesIssue {
+    when: UserClosesIssue(user, issue)
+    requires: not issue.is_pull                 -- PRs: pulls/UserClosesPullRequest
+    requires: issue.status = open
+    requires: can_read_issue(user, issue)
+    requires: user = issue.poster or can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: not is_blocked(issue.poster, user)
+    requires: not is_blocked_by_owner(issue.repository, user)
+    requires: not (dependencies_enabled(issue.repository) and issue.has_open_blockers)
+    ensures: issue.status = closed
+    ensures: issue.closed_at = now
+    ensures: issue.updated_at = now
+    ensures:
+        let c = Comment.created(issue: issue, poster: user, kind: close, content: "",
+                                content_version: 0, created_at: now, updated_at: now)
+        IssueClosed(issue: issue, doer: user, comment: c)
+    ensures:
+        for sw in issue.stopwatches where user = user:
+            StopwatchFinished(stopwatch: sw)
+}
+
+-- Reopening is never blocked by dependencies.
+-- from: models/issues/issue_update.go:46
+rule UserReopensIssue {
+    when: UserReopensIssue(user, issue)
+    requires: not issue.is_pull                 -- PRs: pulls/UserReopensPullRequest
+    requires: issue.status = closed
+    requires: can_read_issue(user, issue)
+    requires: user = issue.poster or can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: not is_blocked(issue.poster, user)
+    requires: not is_blocked_by_owner(issue.repository, user)
+    ensures: issue.status = open
+    ensures: issue.closed_at = null
+    ensures: issue.updated_at = now
+    ensures:
+        let c = Comment.created(issue: issue, poster: user, kind: reopen, content: "",
+                                content_version: 0, created_at: now, updated_at: now)
+        IssueReopened(issue: issue, doer: user, comment: c)
+}
+
+-- Deleting removes the issue with its whole timeline, labels links,
+-- dependencies (both directions), times, stopwatches, watches, reactions,
+-- pin, attachments (files too), and references pointing from it.
+-- from: services/issue/issue.go:171
+rule RepoAdminDeletesIssue {
+    when: RepoAdminDeletesIssue(user, issue)
+    requires: is_repo_admin(user, issue.repository)
+    requires: not issue.repository.is_archived
+    ensures:
+        for c in issue.comments:
+            not exists c
+        for r in issue.reactions:
+            not exists r
+        for d in issue.blocked_by:
+            not exists d
+        for d in issue.blocking:
+            not exists d
+        for t in issue.tracked_times:
+            not exists t
+        for sw in issue.stopwatches:
+            not exists sw
+        for w in issue.watches:
+            not exists w
+        for a in issue.attachments:
+            not exists a
+        for h in issue.history:
+            not exists h
+        for p in issue.pin:
+            PinRemoved(pin: p)
+        for c in Comments where ref_issue = issue:
+            not exists c
+        for c in Comments where dependent_issue = issue:
+            not exists c
+        not exists issue
+        IssueDeleted(issue: issue, doer: user)
+}
+
+------------------------------------------------------------
+-- Rules: the comment timeline
+------------------------------------------------------------
+
+-- An empty comment is allowed when it carries attachments. A comment may
+-- carry a close / reopen request, which is processed as UserClosesIssue /
+-- UserReopensIssue after the comment is posted.
+-- from: services/issue/comments.go:49
+rule UserComments {
+    when: UserComments(user, issue, content, attachments)
+    requires: can_read_issue(user, issue)
+    requires: not issue.repository.is_archived
+    requires: not issue.is_locked or can_triage(user, issue) or user.is_admin
+    requires: not is_blocked(issue.poster, user)
+    requires: not is_blocked_by_owner(issue.repository, user)
+    requires: content != "" or attachments.count > 0
+    let mentions = resolve_mentions(issue, user, content)
+    ensures:
+        let c = Comment.created(issue: issue, poster: user, kind: comment, content: content,
+                                content_version: 0, created_at: now, updated_at: now)
+        AttachmentsLinked(issue: issue, comment: c, doer: user, attachments: attachments)
+        TextPosted(issue: issue, comment: c, doer: user, text: content)
+        IssueCommentCreated(issue: issue, comment: c, doer: user, mentions: mentions)
+    ensures: issue.updated_at = now
+}
+
+-- Only content-bearing kinds can be edited; edits are optimistic and keep
+-- history (pending-review comments keep no history and notify nobody).
+-- from: services/issue/comments.go:78
+rule UserEditsComment {
+    when: UserEditsComment(user, comment, content, seen_version)
+    requires: comment.has_content
+    requires: can_read_issue(user, comment.issue)
+    requires: user = comment.poster or can_triage(user, comment.issue)
+    requires: not comment.issue.repository.is_archived
+    requires: seen_version = comment.content_version
+    ensures: comment.content = content
+    ensures: comment.content_version = comment.content_version + 1
+    ensures: comment.updated_at = now
+    ensures: ContentRevised(issue: comment.issue, comment: comment, editor: user, old_content: comment.content, new_content: content)
+    ensures: TextPosted(issue: comment.issue, comment: comment, doer: user, text: content)
+    ensures: IssueCommentEdited(comment: comment, doer: user, old_content: comment.content)
+}
+
+-- Deleting a comment removes its reactions and history and neuters the
+-- references it made.
+-- from: models/issues/comment.go:1394
+rule UserDeletesComment {
+    when: UserDeletesComment(user, comment)
+    requires: comment.has_content
+    requires: can_read_issue(user, comment.issue)
+    requires: user = comment.poster or can_triage(user, comment.issue)
+    requires: not comment.issue.repository.is_archived
+    ensures:
+        for r in comment.reactions:
+            not exists r
+        for h in comment.history:
+            not exists h
+        for x in Comments where ref_comment = comment and ref_action != neutered:
+            x.ref_action = neutered
+        not exists comment
+        IssueCommentDeleted(comment: comment, doer: user)
+}
+
+-- Content history: the first edit records the original text as the first
+-- revision, every edit records the new text. Only `content_history_limit`
+-- revisions are kept; when over, the revision closest in time to its
+-- predecessor is dropped (never the first or the latest).
+-- from: models/issues/content_history.go:41
+rule RecordContentRevision {
+    when: ContentRevised(issue, comment, editor, old_content, new_content)
+    let existing = ContentHistories where issue = issue and comment = comment
+    ensures:
+        if existing.count = 0:
+            ContentHistory.created(issue: issue, comment: comment, editor: original_author(issue, comment),
+                                   edited_at: original_time(issue, comment), content: old_content,
+                                   is_first_created: true, is_deleted: false)
+        ContentHistory.created(issue: issue, comment: comment, editor: editor, edited_at: now,
+                               content: new_content, is_first_created: false, is_deleted: false)
+        if existing.count + 2 > config.content_history_limit:
+            not exists closest_spaced_revision(existing)
+}
+
+-- Triagers and the repository owner can hide any revision; the issue /
+-- comment author and the revision's author can hide their own.
+-- from: routers/web/repo/issue_content_history.go:95
+rule UserHidesContentRevision {
+    when: UserHidesContentRevision(user, revision)
+    requires: can_read_issue(user, revision.issue)
+    requires: not revision.issue.repository.is_archived
+    requires:
+        can_triage(user, revision.issue)
+        or user = revision.editor
+        or (revision.comment = null and user = revision.issue.poster)
+        or (revision.comment != null and user = revision.comment.poster)
+    ensures: revision.is_deleted = true
+    ensures: revision.content = ""
+}
+
+-- Mentions in posted text are recorded for the issue.
+-- from: models/issues/issue_update.go:484
+rule RecordMentions {
+    when: TextPosted(issue, comment, doer, text)
+    ensures: issue.mentioned_users = issue.mentioned_users + resolve_mentions(issue, doer, text)
+}
+
+-- Opening the issue page records that the viewer has read it (notifications
+-- marks the matching inbox thread read).
+-- from: models/issues/issue_user.go:60
+rule UserViewsIssue {
+    when: UserViewsIssue(viewer, issue)
+    requires: can_read_issue(viewer, issue)
+    ensures: issue.read_by = issue.read_by + { viewer }
+}
+
+------------------------------------------------------------
+-- Rules: cross references
+------------------------------------------------------------
+
+-- Text of an issue / PR (title + body) or of a comment that references other
+-- issues leaves a reference entry on each target's timeline. Re-posting
+-- (an edit) neuters references that disappeared and adds new ones; an
+-- unchanged reference is left as it is. Self references are ignored.
+-- from: models/issues/issue_xref.go:71
+rule RecordCrossReferences {
+    when: TextPosted(issue, comment, doer, text)
+    let found = cross_references(issue, comment, doer, text)
+    let previous = Comments where ref_issue = issue and ref_comment = comment and ref_action != neutered
+    ensures:
+        for old in previous:
+            if not still_referenced(old, found):
+                old.ref_action = neutered
+        for x in found:
+            if not already_recorded(x, previous):
+                Comment.created(
+                    issue: x.target,
+                    poster: doer,
+                    kind: if comment != null: comment_ref else if issue.is_pull: pull_ref else: issue_ref,
+                    ref_issue: issue,
+                    ref_comment: comment,
+                    ref_action: x.action,
+                    content: "",
+                    content_version: 0,
+                    created_at: now,
+                    updated_at: now
+                )
+}
+
+-- Merging closes the PR's conversation (pulls); the merger's own stopwatch on
+-- it stops like on any close.
+-- from: services/issue/status.go:31
+rule MergerStopwatchStops {
+    when: pulls/PullRequestMerged(pr, merger, style)
+    ensures:
+        for sw in Stopwatches where user = merger and issue = pr.issue:
+            StopwatchFinished(stopwatch: sw)
+}
+
+-- A merged PR applies the latest closing / reopening reference it made to
+-- each issue (pulls decides which issues; see pulls/MergeClosesReferencedIssues).
+-- from: services/pull/merge.go:288
+rule MergeClosesReferencedIssue {
+    when: pulls/IssueClosedByPullRequest(issue, pull_request, doer)
+    ensures: ReferenceResolved(issue: issue, doer: doer, closing: true)
+}
+
+-- from: services/pull/merge.go:288
+rule MergeReopensReferencedIssue {
+    when: pulls/IssueReopenedByPullRequest(issue, pull_request, doer)
+    ensures: ReferenceResolved(issue: issue, doer: doer, closing: false)
+}
+
+
+-- Applying a resolved close / reopen reference (from a merged PR or a pushed
+-- commit). An issue with open blockers is left open: the failure is
+-- swallowed, not reported.
+-- from: services/pull/merge.go:299
+rule ApplyResolvedReference {
+    when: ReferenceResolved(issue, doer, closing)
+    requires: (closing and issue.status = open) or (not closing and issue.status = closed)
+    requires: not (closing and dependencies_enabled(issue.repository) and issue.has_open_blockers)
+    ensures:
+        if closing:
+            issue.status = closed
+            issue.closed_at = now
+            let c = Comment.created(issue: issue, poster: doer, kind: close, content: "",
+                                    content_version: 0, created_at: now, updated_at: now)
+            IssueClosed(issue: issue, doer: doer, comment: c)
+            for sw in issue.stopwatches where user = doer:
+                StopwatchFinished(stopwatch: sw)
+        else:
+            issue.status = open
+            issue.closed_at = null
+            let r = Comment.created(issue: issue, poster: doer, kind: reopen, content: "",
+                                    content_version: 0, created_at: now, updated_at: now)
+            IssueReopened(issue: issue, doer: doer, comment: r)
+}
+
+
+-- Commit messages pushed to a repository reference issues (same repository
+-- or `owner/repo#N`). Every reference the pusher can read leaves one
+-- `commit_ref` entry per commit; a close / reopen keyword acts on an issue
+-- (never a PR) when the pusher could close it manually and the commit is on
+-- the issue's ref branch, else on the default branch, unless the repository
+-- closes via commits in any branch. `Fixes #1 @1h30m` also logs the time.
+-- from: services/issue/commit.go:106
+rule PushedCommitReferencesIssue {
+    when: code/PushReceived(push)
+    for ref in commit_references(push):
+        let target = ref.target
+        let pusher = push.pusher
+        requires: can_read_issue(pusher, target)
+        ensures:
+            if not exists Comment{issue: target, kind: commit_ref, commit_sha: ref.commit_sha}:
+                Comment.created(issue: target, poster: pusher, kind: commit_ref, commit_sha: ref.commit_sha,
+                                content: ref.commit_message, content_version: 0,
+                                created_at: now, updated_at: now)
+                IssueReferencedByCommit(issue: target, commit_sha: ref.commit_sha, pusher: pusher)
+            if ref.action != none
+               and not target.is_pull
+               and (pusher = target.poster or can_triage(pusher, target))
+               and branch_may_close(target, push.repository, ref.branch):
+                if ref.action = closes and ref.time_log != null:
+                    TimeLogged(user: pusher, issue: target, amount: ref.time_log, at: ref.committed_at)
+                ReferenceResolved(issue: target, doer: pusher, closing: ref.action = closes)
+}
+
+------------------------------------------------------------
+-- Rules: locking and pinning
+------------------------------------------------------------
+
+-- A locked conversation accepts comments and reactions only from triagers
+-- (and site admins for comments). The reason must be empty or one of the
+-- configured lock reasons.
+-- from: models/issues/issue_lock.go:22
+rule TriagerLocksIssue {
+    when: TriagerLocksIssue(user, issue, reason)
+    requires: can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: not issue.is_locked
+    requires: reason = "" or is_lock_reason(reason)      -- reason in config.lock_reasons
+    ensures: issue.is_locked = true
+    ensures: Comment.created(issue: issue, poster: user, kind: lock, content: reason,
+                             content_version: 0, created_at: now, updated_at: now)
+}
+
+-- from: models/issues/issue_lock.go:27
+rule TriagerUnlocksIssue {
+    when: TriagerUnlocksIssue(user, issue)
+    requires: can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: issue.is_locked
+    ensures: issue.is_locked = false
+    ensures: Comment.created(issue: issue, poster: user, kind: unlock, content: "",
+                             content_version: 0, created_at: now, updated_at: now)
+}
+
+-- Issues and PRs have separate pin lists of at most `max_pinned` each.
+-- from: models/issues/issue.go:773
+rule RepoAdminPinsIssue {
+    when: RepoAdminPinsIssue(user, issue)
+    requires: is_repo_admin(user, issue.repository)
+    requires: not issue.repository.is_archived
+    requires: issue.pin.count = 0
+    let pins = IssuePins where repository = issue.repository and is_pull = issue.is_pull
+    requires: pins.count < config.max_pinned
+    ensures: IssuePin.created(repository: issue.repository, issue: issue, is_pull: issue.is_pull, position: pins.count + 1)
+    ensures: Comment.created(issue: issue, poster: user, kind: pin, content: "",
+                             content_version: 0, created_at: now, updated_at: now)
+}
+
+-- from: models/issues/issue.go:814
+rule RepoAdminUnpinsIssue {
+    when: RepoAdminUnpinsIssue(user, issue)
+    requires: is_repo_admin(user, issue.repository)
+    requires: not issue.repository.is_archived
+    requires: issue.pin.count > 0
+    ensures:
+        for p in issue.pin:
+            PinRemoved(pin: p)
+    ensures: Comment.created(issue: issue, poster: user, kind: unpin, content: "",
+                             content_version: 0, created_at: now, updated_at: now)
+}
+
+-- Later pins move up to close the gap.
+-- from: models/issues/issue.go:821
+rule ClosePinGap {
+    when: PinRemoved(pin)
+    let later = IssuePins where repository = pin.repository and is_pull = pin.is_pull and position > pin.position
+    ensures:
+        for p in later:
+            p.position = p.position - 1
+        not exists pin
+}
+
+-- Positions beyond the end are clamped to the end.
+-- from: models/issues/issue.go:859
+rule RepoAdminMovesPin {
+    when: RepoAdminMovesPin(user, pin, position)
+    requires: is_repo_admin(user, pin.repository)
+    requires: not pin.repository.is_archived
+    requires: position >= 1
+    let siblings = IssuePins where repository = pin.repository and is_pull = pin.is_pull
+    ensures: pin.position = min_of(position, siblings.count)
+    ensures:
+        for p in siblings:
+            if p != pin:
+                p.position = shifted_position(p.position, pin.position, min_of(position, siblings.count))
+}
+
+------------------------------------------------------------
+-- Rules: labels
+------------------------------------------------------------
+
+-- from: models/issues/label.go:207
+rule TrackerManagerCreatesLabel {
+    when: TrackerManagerCreatesLabel(user, repository, name, description, color, is_exclusive)
+    requires: can_manage_tracker(user, repository)
+    requires: not repository.is_archived
+    requires: trim(name) != "" and length(name) <= config.max_label_name_length
+    requires: length(description) <= config.max_label_description_length
+    requires: is_valid_color(color)
+    ensures: Label.created(repository: repository, name: name, description: description,
+                           color: normalize_color(color), is_exclusive: is_exclusive, created_at: now)
+}
+
+-- Archiving keeps the label on its issues but hides it from the label filter
+-- and marks it in pickers.
+-- from: models/issues/label.go:240
+rule TrackerManagerEditsLabel {
+    when: TrackerManagerEditsLabel(user, label, name, description, color, is_exclusive, is_archived)
+    requires: label.repository != null
+    requires: can_manage_tracker(user, label.repository)
+    requires: not label.repository.is_archived
+    requires: trim(name) != "" and length(name) <= config.max_label_name_length
+    requires: length(description) <= config.max_label_description_length
+    requires: is_valid_color(color)
+    ensures: label.name = name
+    ensures: label.description = description
+    ensures: label.color = normalize_color(color)
+    ensures: label.is_exclusive = is_exclusive
+    ensures:
+        if is_archived and label.archived_at = null:
+            label.archived_at = now
+        if not is_archived:
+            label.archived_at = null
+}
+
+-- Deleting a label removes it from all issues and erases its timeline events.
+-- from: models/issues/label.go:292
+rule TrackerManagerDeletesLabel {
+    when: TrackerManagerDeletesLabel(user, label)
+    requires: label.repository != null
+    requires: can_manage_tracker(user, label.repository)
+    requires: not label.repository.is_archived
+    ensures: LabelRemovedEverywhere(doomed: label)
+}
+
+-- from: models/issues/label.go:207
+rule OrgOwnerCreatesLabel {
+    when: OrgOwnerCreatesLabel(user, organization, name, description, color, is_exclusive)
+    requires: is_org_owner(user, organization)
+    requires: trim(name) != "" and length(name) <= config.max_label_name_length
+    requires: length(description) <= config.max_label_description_length
+    requires: is_valid_color(color)
+    ensures: Label.created(organization: organization, name: name, description: description,
+                           color: normalize_color(color), is_exclusive: is_exclusive, created_at: now)
+}
+
+-- from: models/issues/label.go:240
+rule OrgOwnerEditsLabel {
+    when: OrgOwnerEditsLabel(user, label, name, description, color, is_exclusive, is_archived)
+    requires: label.organization != null
+    requires: is_org_owner(user, label.organization)
+    requires: trim(name) != "" and length(name) <= config.max_label_name_length
+    requires: is_valid_color(color)
+    ensures: label.name = name
+    ensures: label.description = description
+    ensures: label.color = normalize_color(color)
+    ensures: label.is_exclusive = is_exclusive
+    ensures:
+        if is_archived and label.archived_at = null:
+            label.archived_at = now
+        if not is_archived:
+            label.archived_at = null
+}
+
+-- from: models/issues/label.go:258
+rule OrgOwnerDeletesLabel {
+    when: OrgOwnerDeletesLabel(user, label)
+    requires: label.organization != null
+    requires: is_org_owner(user, label.organization)
+    ensures: LabelRemovedEverywhere(doomed: label)
+}
+
+-- from: models/issues/label.go:292
+rule RemoveLabelEverywhere {
+    when: LabelRemovedEverywhere(doomed)
+    ensures:
+        for i in Issues where doomed in labels:
+            i.labels = i.labels - { doomed }
+        for c in Comments where label = doomed:
+            not exists c
+        not exists doomed
+}
+
+-- Adds every label of the chosen template to the repository (or, from the
+-- organization settings, to the organization).
+-- from: modules/repository/init.go:146
+rule TrackerManagerInitialisesLabels {
+    when: TrackerManagerInitialisesLabels(user, repository, template)
+    requires: can_manage_tracker(user, repository)
+    requires: not repository.is_archived
+    ensures:
+        for spec in template.labels:
+            Label.created(repository: repository, name: spec.name, description: spec.description ?? "",
+                          color: normalize_color(spec.color), is_exclusive: spec.is_exclusive, created_at: now)
+}
+
+-- from: routers/web/org/org_labels.go:1
+rule OrgOwnerInitialisesLabels {
+    when: OrgOwnerInitialisesLabels(user, organization, template)
+    requires: is_org_owner(user, organization)
+    ensures:
+        for spec in template.labels:
+            Label.created(organization: organization, name: spec.name, description: spec.description ?? "",
+                          color: normalize_color(spec.color), is_exclusive: spec.is_exclusive, created_at: now)
+}
+
+-- Adding a label in an exclusive scope removes the issue's other labels in
+-- that scope. Labels from outside the repository / its organization are
+-- ignored.
+-- from: models/issues/issue_label.go:89
+rule TriagerAddsLabel {
+    when: TriagerAddsLabel(user, issue, added)
+    requires: can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: added not in issue.labels
+    requires: added.repository = issue.repository or added.organization = issue.repository.owner_org
+    let displaced = issue.labels where scope = added.scope and scope != "" and is_exclusive
+    ensures: issue.labels = issue.labels - displaced + { added }
+    ensures:
+        for d in displaced:
+            Comment.created(issue: issue, poster: user, kind: label, label: d, label_added: false,
+                            content: "", content_version: 0, created_at: now, updated_at: now)
+        Comment.created(issue: issue, poster: user, kind: label, label: added, label_added: true,
+                        content: "", content_version: 0, created_at: now, updated_at: now)
+        IssueLabelsChanged(issue: issue, doer: user, added: { added }, removed: displaced)
+}
+
+-- from: services/issue/label.go:47
+rule TriagerRemovesLabel {
+    when: TriagerRemovesLabel(user, issue, removed)
+    requires: can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: removed in issue.labels
+    ensures: issue.labels = issue.labels - { removed }
+    ensures: Comment.created(issue: issue, poster: user, kind: label, label: removed, label_added: false,
+                             content: "", content_version: 0, created_at: now, updated_at: now)
+    ensures: IssueLabelsChanged(issue: issue, doer: user, added: {}, removed: { removed })
+}
+
+-- Replace the whole label set (API PUT / web multi-select).
+-- from: models/issues/issue_label.go:447
+rule TriagerReplacesLabels {
+    when: TriagerReplacesLabels(user, issue, labels)
+    requires: can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    let wanted = without_scope_duplicates(labels_usable_in(labels, issue.repository))
+    ensures: issue.labels = wanted
+    ensures:
+        for l in wanted - issue.labels:
+            Comment.created(issue: issue, poster: user, kind: label, label: l, label_added: true,
+                            content: "", content_version: 0, created_at: now, updated_at: now)
+        for l in issue.labels - wanted:
+            Comment.created(issue: issue, poster: user, kind: label, label: l, label_added: false,
+                            content: "", content_version: 0, created_at: now, updated_at: now)
+        IssueLabelsChanged(issue: issue, doer: user, added: wanted - issue.labels, removed: issue.labels - wanted)
+}
+
+-- from: models/issues/issue_label.go:374
+rule TriagerClearsLabels {
+    when: TriagerClearsLabels(user, issue)
+    requires: can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    ensures: issue.labels = {}
+    ensures:
+        for l in issue.labels:
+            Comment.created(issue: issue, poster: user, kind: label, label: l, label_added: false,
+                            content: "", content_version: 0, created_at: now, updated_at: now)
+        IssueLabelsCleared(issue: issue, doer: user)
+}
+
+------------------------------------------------------------
+-- Rules: milestones
+------------------------------------------------------------
+
+-- An empty due date means none.
+-- from: models/issues/milestone.go:116
+rule TrackerManagerCreatesMilestone {
+    when: TrackerManagerCreatesMilestone(user, repository, name, description, deadline)
+    requires: can_manage_tracker(user, repository)
+    requires: not repository.is_archived
+    requires: trim(name) != "" and length(trim(name)) <= config.max_milestone_name_length
+    ensures: Milestone.created(repository: repository, name: trim(name), description: description,
+                               status: open, deadline: deadline, created_at: now, updated_at: now)
+}
+
+-- from: models/issues/milestone.go:166
+rule TrackerManagerEditsMilestone {
+    when: TrackerManagerEditsMilestone(user, milestone, name, description, deadline)
+    requires: can_manage_tracker(user, milestone.repository)
+    requires: not milestone.repository.is_archived
+    requires: trim(name) != "" and length(trim(name)) <= config.max_milestone_name_length
+    ensures: milestone.name = trim(name)
+    ensures: milestone.description = description
+    ensures: milestone.deadline = deadline
+    ensures: milestone.updated_at = now
+}
+
+-- from: models/issues/milestone.go:228
+rule TrackerManagerClosesMilestone {
+    when: TrackerManagerClosesMilestone(user, milestone)
+    requires: can_manage_tracker(user, milestone.repository)
+    requires: not milestone.repository.is_archived
+    requires: milestone.status = open
+    ensures: milestone.status = closed
+    ensures: milestone.closed_at = now
+}
+
+-- from: models/issues/milestone.go:228
+rule TrackerManagerReopensMilestone {
+    when: TrackerManagerReopensMilestone(user, milestone)
+    requires: can_manage_tracker(user, milestone.repository)
+    requires: not milestone.repository.is_archived
+    requires: milestone.status = closed
+    ensures: milestone.status = open
+    ensures: milestone.closed_at = null
+}
+
+-- Issues of a deleted milestone keep no milestone; their timeline shows a
+-- "deleted milestone" placeholder.
+-- from: models/issues/milestone.go:245
+rule TrackerManagerDeletesMilestone {
+    when: TrackerManagerDeletesMilestone(user, milestone)
+    requires: can_manage_tracker(user, milestone.repository)
+    requires: not milestone.repository.is_archived
+    ensures:
+        for i in milestone.issues:
+            i.milestone = null
+        not exists milestone
+}
+
+-- Setting none (null) removes the milestone. Applies to a batch of issues
+-- in the web UI.
+-- from: services/issue/milestone.go:91
+rule TriagerSetsMilestone {
+    when: TriagerSetsMilestone(user, issue, target)
+    requires: can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: target = null or target in (Milestones where repository = issue.repository)
+    requires: target != issue.milestone
+    ensures: issue.milestone = target
+    ensures: Comment.created(issue: issue, poster: user, kind: milestone,
+                             old_milestone: issue.milestone, new_milestone: target,
+                             content: "", content_version: 0, created_at: now, updated_at: now)
+    ensures: IssueMilestoneChanged(issue: issue, doer: user, old_milestone: issue.milestone)
+}
+
+------------------------------------------------------------
+-- Rules: assignees
+------------------------------------------------------------
+
+-- Toggling: assigning an assigned user unassigns them.
+-- from: services/issue/assignee.go:47
+rule TriagerTogglesAssignee {
+    when: TriagerTogglesAssignee(user, issue, assignee)
+    requires: can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: can_be_assigned(assignee, issue.repository)
+    let removing = assignee in issue.assignees
+    ensures:
+        if removing:
+            issue.assignees = issue.assignees - { assignee }
+        else:
+            issue.assignees = issue.assignees + { assignee }
+    ensures:
+        let c = Comment.created(issue: issue, poster: user, kind: assignees, assignee: assignee,
+                                assignee_removed: removing, content: "", content_version: 0,
+                                created_at: now, updated_at: now)
+        IssueAssigneeChanged(issue: issue, doer: user, assignee: assignee, removed: removing, comment: c)
+}
+
+-- API semantics: the given set replaces the current assignees ([] clears).
+-- from: services/issue/issue.go:124
+rule TriagerReplacesAssignees {
+    when: TriagerReplacesAssignees(user, issue, wanted)
+    requires: can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: all_assignable(wanted, issue.repository)  -- every one satisfies can_be_assigned
+    ensures: issue.assignees = wanted
+    ensures:
+        for a in issue.assignees - wanted:
+            let c = Comment.created(issue: issue, poster: user, kind: assignees, assignee: a,
+                                    assignee_removed: true, content: "", content_version: 0,
+                                    created_at: now, updated_at: now)
+            IssueAssigneeChanged(issue: issue, doer: user, assignee: a, removed: true, comment: c)
+        for a in wanted - issue.assignees:
+            let c2 = Comment.created(issue: issue, poster: user, kind: assignees, assignee: a,
+                                     assignee_removed: false, content: "", content_version: 0,
+                                     created_at: now, updated_at: now)
+            IssueAssigneeChanged(issue: issue, doer: user, assignee: a, removed: false, comment: c2)
+}
+
+------------------------------------------------------------
+-- Rules: dependencies
+------------------------------------------------------------
+
+-- `issue` becomes blocked by `blocker`. Both issues' timelines record it.
+-- from: models/issues/dependency.go:130
+rule TriagerAddsDependency {
+    when: TriagerAddsDependency(user, issue, blocker)
+    requires: dependencies_enabled(issue.repository)
+    requires: can_triage(user, issue)
+    requires: not issue.repository.is_archived
+    requires: can_read_issue(user, blocker)
+    requires: blocker != issue
+    requires: blocker.repository = issue.repository or config.allow_cross_repository_dependencies
+    requires: not exists IssueDependency{issue: issue, blocker: blocker}
+    requires: not exists IssueDependency{issue: blocker, blocker: issue}
+    ensures: IssueDependency.created(issue: issue, blocker: blocker, created_by: user, created_at: now)
+    ensures: Comment.created(issue: issue, poster: user, kind: add_dependency, dependent_issue: blocker,
+                             content: "", content_version: 0, created_at: now, updated_at: now)
+    ensures: Comment.created(issue: blocker, poster: user, kind: add_dependency, dependent_issue: issue,
+                             content: "", content_version: 0, created_at: now, updated_at: now)
+}
+
+-- from: models/issues/dependency.go:171
+rule TriagerRemovesDependency {
+    when: TriagerRemovesDependency(user, dependency)
+    requires: dependencies_enabled(dependency.issue.repository)
+    requires: can_triage(user, dependency.issue)
+    requires: not dependency.issue.repository.is_archived
+    ensures: Comment.created(issue: dependency.issue, poster: user, kind: remove_dependency,
+                             dependent_issue: dependency.blocker, content: "", content_version: 0,
+                             created_at: now, updated_at: now)
+    ensures: Comment.created(issue: dependency.blocker, poster: user, kind: remove_dependency,
+                             dependent_issue: dependency.issue, content: "", content_version: 0,
+                             created_at: now, updated_at: now)
+    ensures: not exists dependency
+}
+
+------------------------------------------------------------
+-- Rules: time tracking
+------------------------------------------------------------
+
+-- Starting a stopwatch finishes any other stopwatch the user has running.
+-- from: models/issues/stopwatch.go:200
+rule UserStartsStopwatch {
+    when: UserStartsStopwatch(user, issue)
+    requires: may_track_time(user, issue)
+    requires: not exists Stopwatch{user: user, issue: issue}
+    ensures:
+        for other in Stopwatches where user = user:
+            StopwatchFinished(stopwatch: other)
+        Stopwatch.created(user: user, issue: issue, started_at: now)
+        Comment.created(issue: issue, poster: user, kind: start_tracking, content: "",
+                        content_version: 0, created_at: now, updated_at: now)
+}
+
+-- from: models/issues/stopwatch.go:154
+rule UserStopsStopwatch {
+    when: UserStopsStopwatch(user, stopwatch)
+    requires: stopwatch.user = user
+    requires: may_track_time(user, stopwatch.issue)
+    ensures: StopwatchFinished(stopwatch: stopwatch)
+}
+
+-- The elapsed time becomes tracked time.
+-- from: models/issues/stopwatch.go:154
+rule FinishStopwatch {
+    when: StopwatchFinished(stopwatch)
+    ensures:
+        let t = TrackedTime.created(issue: stopwatch.issue, user: stopwatch.user,
+                                    amount: now - stopwatch.started_at, created_at: now, is_deleted: false)
+        Comment.created(issue: stopwatch.issue, poster: stopwatch.user, kind: stop_tracking, tracked_time: t,
+                        content: format_duration(now - stopwatch.started_at), content_version: 0,
+                        created_at: now, updated_at: now)
+        not exists stopwatch
+}
+
+-- from: models/issues/stopwatch.go:255
+rule UserCancelsStopwatch {
+    when: UserCancelsStopwatch(user, stopwatch)
+    requires: stopwatch.user = user
+    requires: may_track_time(user, stopwatch.issue)
+    ensures: Comment.created(issue: stopwatch.issue, poster: user, kind: cancel_tracking, content: "",
+                             content_version: 0, created_at: now, updated_at: now)
+    ensures: not exists stopwatch
+}
+
+-- Manual time: positive and at most `max_manual_time` per entry (web form:
+-- hours and minutes each 0..1000). Via the API a repository admin or site
+-- admin may log time for another user and back-date it.
+-- from: models/issues/tracked_time.go:170
+rule UserAddsTime {
+    when: UserAddsTime(user, issue, amount)
+    requires: may_track_time(user, issue)
+    requires: amount > 0.seconds
+    requires: amount <= config.max_manual_time
+    ensures: TimeLogged(user: user, issue: issue, amount: amount, at: now)
+}
+
+-- from: routers/api/v1/repo/issue_tracked_time.go:201
+rule AdminAddsTimeForUser {
+    when: AdminAddsTimeForUser(admin, issue, user, amount, at)
+    requires: may_track_time(admin, issue)
+    requires: is_repo_admin(admin, issue.repository) or admin.is_admin
+    requires: amount > 0.seconds
+    ensures: TimeLogged(user: user, issue: issue, amount: amount, at: at)
+}
+
+-- from: models/issues/tracked_time.go:170
+rule LogTime {
+    when: TimeLogged(user, issue, amount, at)
+    ensures:
+        let t = TrackedTime.created(issue: issue, user: user, amount: amount, created_at: at, is_deleted: false)
+        Comment.created(issue: issue, poster: user, kind: add_time_manual, tracked_time: t,
+                        content: format_duration(amount), content_version: 0,
+                        created_at: now, updated_at: now)
+}
+
+-- Only the user who tracked the time or a site admin deletes it.
+-- from: models/issues/tracked_time.go:282
+rule UserDeletesTime {
+    when: UserDeletesTime(user, time)
+    requires: may_track_time(user, time.issue)
+    requires: time.user = user or user.is_admin
+    requires: not time.is_deleted
+    ensures: time.is_deleted = true
+    ensures: Comment.created(issue: time.issue, poster: time.user, kind: delete_time_manual,
+                             content: format_duration(time.amount), content_version: 0,
+                             created_at: now, updated_at: now)
+}
+
+-- API: delete all of one's own time on an issue.
+-- from: models/issues/tracked_time.go:243
+rule UserResetsOwnTime {
+    when: UserResetsOwnTime(user, issue)
+    requires: may_track_time(user, issue)
+    let mine = issue.tracked_times where user = user and is_deleted = false
+    requires: mine.count > 0
+    ensures:
+        for t in mine:
+            t.is_deleted = true
+        Comment.created(issue: issue, poster: user, kind: delete_time_manual, content: "",
+                        content_version: 0, created_at: now, updated_at: now)
+}
+
+------------------------------------------------------------
+-- Rules: reactions
+------------------------------------------------------------
+
+-- A user reacts at most once per emoji per target. On a locked issue only
+-- triagers react.
+-- from: services/issue/reaction.go:14
+rule UserReactsToIssue {
+    when: UserReactsToIssue(user, issue, emoji)
+    requires: can_read_issue(user, issue)
+    requires: not issue.repository.is_archived
+    requires: not issue.is_locked or can_triage(user, issue)
+    requires: is_allowed_reaction(emoji)               -- emoji in config.allowed_reactions
+    requires: not is_blocked(issue.poster, user)
+    requires: not is_blocked_by_owner(issue.repository, user)
+    requires: not exists Reaction{user: user, issue: issue, comment: null, emoji: emoji}
+    ensures:
+        let r = Reaction.created(user: user, issue: issue, comment: null, emoji: emoji, created_at: now)
+        ReactionAdded(reaction: r)
+}
+
+-- from: services/issue/reaction.go:46
+rule UserReactsToComment {
+    when: UserReactsToComment(user, comment, emoji)
+    requires: comment.has_content
+    requires: can_read_issue(user, comment.issue)
+    requires: not comment.issue.repository.is_archived
+    requires: not comment.issue.is_locked or can_triage(user, comment.issue)
+    requires: is_allowed_reaction(emoji)               -- emoji in config.allowed_reactions
+    requires: not is_blocked(comment.poster, user)
+    requires: not is_blocked(comment.issue.poster, user)
+    requires: not is_blocked_by_owner(comment.issue.repository, user)
+    requires: not exists Reaction{user: user, issue: comment.issue, comment: comment, emoji: emoji}
+    ensures:
+        let r = Reaction.created(user: user, issue: comment.issue, comment: comment, emoji: emoji, created_at: now)
+        ReactionAdded(reaction: r)
+}
+
+-- from: services/issue/reaction.go:36
+rule UserRemovesReaction {
+    when: UserRemovesReaction(user, reaction)
+    requires: reaction.user = user
+    requires: not reaction.issue.repository.is_archived
+    ensures: ReactionRemoved(reaction: reaction)
+    ensures: not exists reaction
+}
+
+------------------------------------------------------------
+-- Rules: subscriptions
+------------------------------------------------------------
+
+-- A user sets their own subscription; site admins may set anyone's (API).
+-- from: models/issues/issue_watch.go:33
+rule UserSetsIssueSubscription {
+    when: UserSetsIssueSubscription(user, issue, subscriber, watching)
+    requires: can_read_issue(user, issue)
+    requires: subscriber = user or user.is_admin
+    ensures:
+        if exists IssueWatch{user: subscriber, issue: issue}:
+            IssueWatch{user: subscriber, issue: issue}.is_watching = watching
+        else:
+            IssueWatch.created(user: subscriber, issue: issue, is_watching: watching, updated_at: now)
+}
+
+------------------------------------------------------------
+-- Rules: attachments
+------------------------------------------------------------
+
+-- Upload first, link later: the file belongs to the repository and its
+-- uploader until it is linked to an issue or comment by posting / editing.
+-- The type is checked against the file name and its leading bytes.
+-- from: services/attachment/attachment.go:78
+rule UserUploadsAttachment {
+    when: UserUploadsAttachment(user, repository, name, size, head_bytes)
+    requires: config.attachments_enabled
+    requires: can_read_tracker(user, repository)
+    requires: not repository.is_archived
+    requires: is_allowed_file(name, head_bytes)   -- against config.attachment_allowed_types
+    requires: size <= config.attachment_max_size_mb * 1048576
+    ensures: Attachment.created(repository: repository, uploader: user, name: name, size: size,
+                                issue: null, comment: null, release: null, external_url: null,
+                                download_count: 0, created_at: now)
+}
+
+-- Posting or editing text links the listed uploads (same repository) to the
+-- issue or comment; on edit, previously linked files not listed are removed.
+-- At most `attachment_max_files` per upload batch.
+-- from: models/issues/issue_update.go:237
+rule LinkAttachments {
+    when: AttachmentsLinked(issue, comment, doer, attachments)
+    requires: attachments.count <= config.attachment_max_files
+    ensures:
+        for a in attachments:
+            if a.repository = issue.repository and not a.is_linked:
+                a.issue = issue
+                a.comment = comment
+}
+
+-- The uploader removes their own upload (web); via the API whoever may edit
+-- the issue / comment may remove or rename its attachments.
+-- from: routers/web/repo/attachment.go:63
+rule UserDeletesAttachment {
+    when: UserDeletesAttachment(user, attachment)
+    requires: not attachment.repository.is_archived
+    requires:
+        user = attachment.uploader
+        or (attachment.issue != null and attachment.comment = null
+            and (user = attachment.issue.poster or can_triage(user, attachment.issue)))
+        or (attachment.comment != null
+            and (user = attachment.comment.poster or can_triage(user, attachment.issue)))
+    ensures: not exists attachment
+}
+
+-- from: routers/api/v1/repo/issue_attachment.go:234
+rule UserRenamesAttachment {
+    when: UserRenamesAttachment(user, attachment, name)
+    requires: attachment.issue != null
+    requires: not attachment.repository.is_archived
+    requires: user = attachment.uploader or user = attachment.issue.poster or can_triage(user, attachment.issue)
+    requires: is_allowed_file(name, "")
+    ensures: attachment.name = name
+}
+
+------------------------------------------------------------
+-- Rules: repository lifecycle
+------------------------------------------------------------
+
+-- from: models/issues/issue_update.go:661
+rule TrackerDeletedWithRepository {
+    when: repositories/RepositoryDeleted(repository, doer)
+    ensures:
+        for i in Issues where repository = repository:
+            not exists i
+        for l in Labels where repository = repository:
+            not exists l
+        for m in Milestones where repository = repository:
+            not exists m
+        for a in Attachments where repository = repository:
+            not exists a
+        for p in IssuePins where repository = repository:
+            not exists p
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- from: models/issues/issue.go:92
+invariant IndexUniquePerRepository {
+    for a in Issues:
+        for b in Issues:
+            (a != b and a.repository = b.repository) implies a.index != b.index
+}
+
+invariant IndexIsPositive {
+    for i in Issues:
+        i.index >= 1
+}
+
+invariant ClosedIssuesHaveCloseTime {
+    for i in Issues:
+        i.status = closed implies i.closed_at != null
+}
+
+invariant LabelHasExactlyOneOwner {
+    for l in Labels:
+        (l.repository = null) != (l.organization = null)
+}
+
+-- Labels on an issue come from its repository or that repository's organization.
+invariant IssueLabelsInScope {
+    for i in Issues:
+        i.labels.all(l => l.repository = i.repository or l.organization = i.repository.owner_org)
+}
+
+-- At most one label per exclusive scope on an issue.
+invariant ExclusiveScopeHoldsOneLabel {
+    for i in Issues:
+        i.labels.all(a => i.labels.all(b => (a != b and a.is_exclusive and b.is_exclusive and a.scope != "") implies a.scope != b.scope))
+}
+
+invariant MilestoneInSameRepository {
+    for i in Issues:
+        i.milestone != null implies i.milestone.repository = i.repository
+}
+
+invariant PinLimit {
+    for p in IssuePins:
+        p.position >= 1 and p.position <= config.max_pinned
+}
+
+invariant OneStopwatchPerUser {
+    for a in Stopwatches:
+        for b in Stopwatches:
+            (a != b) implies a.user != b.user
+}
+
+invariant NoSelfDependency {
+    for d in IssueDependencies:
+        d.issue != d.blocker
+}
+
+invariant NoMutualDependency {
+    for a in IssueDependencies:
+        for b in IssueDependencies:
+            not (a.issue = b.blocker and a.blocker = b.issue)
+}
+
+invariant OneReactionPerUserEmojiTarget {
+    for a in Reactions:
+        for b in Reactions:
+            (a != b and a.user = b.user and a.issue = b.issue and a.comment = b.comment) implies a.emoji != b.emoji
+}
+
+invariant ReactionsFromAllowedSet {
+    for r in Reactions:
+        r.emoji in config.allowed_reactions
+}
+
+invariant AttachmentsStayInRepository {
+    for a in Attachments:
+        a.issue != null implies a.issue.repository = a.repository
+}
+
+invariant CommentAttachmentsBelongToItsIssue {
+    for a in Attachments:
+        a.comment != null implies a.issue = a.comment.issue
+}
+
+invariant TrackedTimeIsPositive {
+    for t in TrackedTimes:
+        t.amount >= 0.seconds
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Anyone who can read the repository's issues or pull requests. Anonymous
+-- visitors of public repositories are included through `access` (see REQUEST).
+actor TrackerReader {
+    within: repositories/Repository
+    identified_by: accounts/User where can_read_tracker(this, within)
+}
+
+-- Anyone who can read this issue (or PR conversation).
+actor IssueReader {
+    within: Issue
+    identified_by: accounts/User where can_read_issue(this, within)
+}
+
+-- A user with write access to the issue's unit: closes, labels, assigns,
+-- locks, sets milestones, due dates and dependencies.
+actor IssueTriager {
+    within: Issue
+    identified_by: accounts/User where can_triage(this, within)
+}
+
+-- A repository admin (pins, deletes).
+actor IssueAdmin {
+    within: Issue
+    identified_by: accounts/User where is_repo_admin(this, within.repository)
+}
+
+-- A user who can write issues or pull requests: manages labels and milestones.
+actor TrackerManager {
+    within: repositories/Repository
+    identified_by: accounts/User where can_manage_tracker(this, within)
+}
+
+actor RepoAdmin {
+    within: repositories/Repository
+    identified_by: accounts/User where is_repo_admin(this, within)
+}
+
+actor OrgOwner {
+    within: organizations/Organization
+    identified_by: accounts/User where is_org_owner(this, within)
+}
+
+actor SiteAdmin {
+    identified_by: accounts/User where is_admin = true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The repository's issue / PR list and the "new issue" form.
+surface IssueTracker {
+    facing reader: TrackerReader
+    context repository: repositories/Repository
+
+    let issues = Issues where repository = repository
+    let pins = IssuePins where repository = repository
+    let repo_labels = Labels where repository = repository and archived_at = null
+    let repo_milestones = Milestones where repository = repository
+    let templates = IssueTemplates where repository = repository and is_valid
+
+    exposes:
+        for i in issues:
+            i.index
+            i.title
+            i.status
+            i.is_pull
+            i.poster.name
+            i.labels
+            i.milestone.name
+            i.assignees
+            i.num_comments
+            i.deadline
+            i.is_overdue
+            i.num_tasks
+            i.num_tasks_done
+            i.created_at
+            i.updated_at
+        for p in pins:
+            p.issue.title
+            p.position
+        for l in repo_labels:
+            l.name
+            l.color
+            l.description
+            l.is_exclusive
+        for m in repo_milestones:
+            m.name
+            m.status
+            m.deadline
+            m.num_open_issues
+            m.num_closed_issues
+            m.completeness
+            m.is_overdue
+        for t in templates:
+            t.name
+            t.about
+            t.title
+            t.labels
+            t.fields
+        IssueTemplateConfig.blank_issues_enabled
+        IssueTemplateConfig.contact_links
+        config.max_pinned
+
+    provides:
+        UserOpensIssue(reader, repository, title, content, labels, milestone, assignees, deadline, project, attachments)
+            when not repository.is_archived
+        UserUploadsAttachment(reader, repository, name, size, head_bytes)
+            when config.attachments_enabled and not repository.is_archived
+
+    @guarantee FilteringIsLocalToTheRepository
+        -- The list filters by state (open / closed / all), labels (include and
+        -- exclude, exclusive scopes collapse), milestone, project, assignee,
+        -- poster, mentioned / created / assigned-to-me / review-requested, and
+        -- keyword; archived labels' issues are hidden from the label filter
+        -- unless asked for. Search across repositories is `discovery`.
+
+    @guarantee TemplateChooser
+        -- When the default branch has valid templates or contact links, "new
+        -- issue" offers a chooser; when `blank_issues_enabled` is false a blank
+        -- form is not offered. Invalid template files are reported to the
+        -- reader instead of silently ignored. Templates are looked up in
+        -- ISSUE_TEMPLATE / issue_template under the repository root,
+        -- .forgejo/, .gitea/, .github/, .gitlab/ and docs/.
+
+    @guidance
+        -- Web: GET /{owner}/{repo}/issues, /pulls, /issues/new, /issues/new/choose,
+        --   /issues/search, /issues/posters, /issues/suggestions, /labels, /milestones,
+        --   /milestone/{id}, POST /issues/new, POST /issues/attachments,
+        --   POST /issues/attachments/remove; badges /badges/issues*.svg.
+        -- API: GET/POST /repos/{owner}/{repo}/issues, GET /issues/pinned,
+        --   /pulls/pinned, /new_pin_allowed, /issue_templates, /issue_config,
+        --   /issue_config/validate, /labels, /labels/{id}, /milestones,
+        --   /milestones/{id}, GET /issues/comments (repo-wide comment list).
+}
+
+-- One issue's page for anyone who can read it.
+surface IssueConversation {
+    facing reader: IssueReader
+    context issue: Issue
+
+    let visible_times = issue.tracked_times where is_deleted = false and user = reader
+
+    exposes:
+        issue.index
+        issue.title
+        issue.content
+        issue.status
+        issue.closed_at
+        issue.is_locked
+        issue.is_pull
+        issue.ref
+        issue.poster.name
+        issue.labels
+        issue.milestone.name
+        issue.assignees
+        issue.deadline
+        issue.is_overdue
+        issue.is_pinned
+        issue.participants
+        issue.created_at
+        issue.updated_at
+        issue.num_tasks
+        issue.num_tasks_done
+        for c in issue.comments:
+            c.kind
+            c.poster.name
+            c.content
+            c.created_at
+            c.updated_at
+            c.is_edited
+            c.label.name
+            c.label_added
+            c.old_milestone.name
+            c.new_milestone.name
+            c.assignee.name
+            c.assignee_removed
+            c.old_title
+            c.new_title
+            c.old_ref
+            c.new_ref
+            c.dependent_issue.title
+            c.commit_sha
+            c.ref_issue.title
+            c.ref_action
+            role_in_repo(c.poster, issue)
+            for r in c.reactions:
+                r.emoji
+                r.user.name
+            for a in c.attachments:
+                a.name
+                a.size
+        for r in issue.issue_reactions:
+            r.emoji
+            r.user.name
+        for a in issue.attachments:
+            a.name
+            a.size
+        for d in issue.blocked_by:
+            d.blocker.title
+            d.blocker.status
+        for d in issue.blocking:
+            d.issue.title
+            d.issue.status
+        for t in visible_times:
+            t.amount
+            t.created_at
+        for h in issue.history:
+            h.editor.name
+            h.edited_at
+            h.content
+            h.is_deleted
+
+    provides:
+        UserViewsIssue(reader, issue)
+        UserComments(reader, issue, content, attachments)
+            when not issue.is_locked and not issue.repository.is_archived
+        UserReactsToIssue(reader, issue, emoji)
+            when not issue.is_locked and not issue.repository.is_archived
+        UserReactsToComment(reader, comment, emoji)
+            when not issue.is_locked and not issue.repository.is_archived
+        UserRemovesReaction(reader, reaction)
+        UserSetsIssueSubscription(reader, issue, subscriber, watching)
+        UserChangesIssueTitle(reader, issue, title)
+            when reader = issue.poster
+        UserEditsIssueBody(reader, issue, content, seen_version)
+            when reader = issue.poster
+        UserChangesIssueRef(reader, issue, ref)
+            when reader = issue.poster and not issue.is_pull
+        UserClosesIssue(reader, issue)
+            when reader = issue.poster and issue.status = open
+        UserReopensIssue(reader, issue)
+            when reader = issue.poster and issue.status = closed
+        UserEditsComment(reader, comment, content, seen_version)
+        UserDeletesComment(reader, comment)
+        UserHidesContentRevision(reader, revision)
+        UserStartsStopwatch(reader, issue)
+            when may_track_time(reader, issue)
+        UserStopsStopwatch(reader, stopwatch)
+        UserCancelsStopwatch(reader, stopwatch)
+        UserAddsTime(reader, issue, amount)
+            when may_track_time(reader, issue)
+        UserDeletesTime(reader, time)
+        UserResetsOwnTime(reader, issue)
+        UserDeletesAttachment(reader, attachment)
+        UserRenamesAttachment(reader, attachment, name)
+
+    @guarantee ReferencesRespectVisibility
+        -- Cross-reference entries whose origin the reader cannot read are not
+        -- shown, and a blocker the reader cannot read is shown only as
+        -- "an issue you cannot see".
+
+    @guarantee OwnTimeOnly
+        -- Readers who cannot triage see only their own tracked time in time
+        -- listings; triagers and site admins see everyone's.
+
+    @guarantee LockedConversationExplained
+        -- On a locked issue a reader without write access is told the
+        -- conversation is locked (with the reason) instead of a comment box.
+
+    @guarantee RoleBadges
+        -- Each poster is badged poster / owner / member / collaborator /
+        -- contributor (has a merged PR) / first-time contributor.
+
+    @guidance
+        -- Web: GET /{owner}/{repo}/issues/{index} (also /pulls/{index}),
+        --   /issues/{index}/content-history/{overview,list,detail},
+        --   /issues/{index}/attachments, /attachments/{uuid}, /comments/{id}/attachments,
+        --   POST /issues/{index}/{title,content,ref,comments,watch,reactions/{react|unreact},
+        --   times/add,times/{id}/delete,times/stopwatch/{toggle,cancel},
+        --   content-history/soft-delete}, POST /comments/{id}, /comments/{id}/delete,
+        --   /comments/{id}/reactions/{action}.
+        -- API: GET/PATCH /repos/{o}/{r}/issues/{index}, GET/POST /issues/{index}/comments,
+        --   GET /issues/{index}/timeline, GET/PATCH/DELETE /issues/comments/{id},
+        --   GET/POST/DELETE /issues/{index}/reactions, /issues/comments/{id}/reactions,
+        --   /issues/{index}/assets[/{id}], /issues/comments/{id}/assets[/{id}],
+        --   /issues/{index}/times[/{id}], /issues/{index}/stopwatch/{start,stop,delete},
+        --   /issues/{index}/subscriptions[/check|/{user}], GET /issues/{index}/dependencies,
+        --   GET /issues/{index}/blocks, GET /issues/{index}/labels.
+}
+
+-- What a triager can additionally do on an issue.
+surface IssueTriage {
+    facing triager: IssueTriager
+    context issue: Issue
+
+    exposes:
+        issue.labels
+        issue.milestone
+        issue.assignees
+        issue.deadline
+        issue.is_locked
+        for t in issue.active_times:
+            t.user.name
+            t.amount
+        for w in issue.watches:
+            w.user.name
+            w.is_watching
+
+    provides:
+        UserClosesIssue(triager, issue) when issue.status = open
+        UserReopensIssue(triager, issue) when issue.status = closed
+        UserChangesIssueTitle(triager, issue, title)
+        UserEditsIssueBody(triager, issue, content, seen_version)
+        UserComments(triager, issue, content, attachments)
+            when not issue.repository.is_archived
+        TriagerAddsLabel(triager, issue, added)
+        TriagerRemovesLabel(triager, issue, removed)
+        TriagerReplacesLabels(triager, issue, labels)
+        TriagerClearsLabels(triager, issue)
+        TriagerSetsMilestone(triager, issue, target)
+        TriagerTogglesAssignee(triager, issue, assignee)
+        TriagerReplacesAssignees(triager, issue, wanted)
+        TriagerSetsDueDate(triager, issue, deadline)
+        TriagerRemovesDueDate(triager, issue)
+        TriagerLocksIssue(triager, issue, reason) when not issue.is_locked
+        TriagerUnlocksIssue(triager, issue) when issue.is_locked
+        TriagerAddsDependency(triager, issue, blocker)
+            when dependencies_enabled(issue.repository)
+        TriagerRemovesDependency(triager, dependency)
+            when dependencies_enabled(issue.repository)
+
+    @guarantee ClosingBlockedIssueExplained
+        -- Closing an issue with open blockers is refused with a message naming
+        -- the blocking issues; batch close stops at the first such issue.
+
+    @guidance
+        -- Web: POST /{owner}/{repo}/issues/{labels,milestone,assignee,status} (batch,
+        --   `issue_ids`), /issues/{index}/{deadline,lock,unlock,dependency/add,dependency/delete}.
+        -- API: PATCH /issues/{index} (state, milestone, assignees, due_date, unset_due_date),
+        --   POST /issues/{index}/deadline, POST/PUT/DELETE /issues/{index}/labels,
+        --   DELETE /issues/{index}/labels/{id}, PUT/DELETE /issues/{index}/lock,
+        --   POST/DELETE /issues/{index}/dependencies, POST/DELETE /issues/{index}/blocks.
+}
+
+-- Repository admins: pinning and deleting.
+surface IssueAdministration {
+    facing admin: IssueAdmin
+    context issue: Issue
+
+    exposes:
+        issue.is_pinned
+        config.max_pinned
+
+    provides:
+        RepoAdminPinsIssue(admin, issue) when not issue.is_pinned
+        RepoAdminUnpinsIssue(admin, issue) when issue.is_pinned
+        RepoAdminDeletesIssue(admin, issue)
+
+    @guidance
+        -- Web: POST /issues/{index}/pin, DELETE /issues/unpin/{index}, POST /issues/move_pin,
+        --   POST /issues/{index}/delete, POST /issues/delete (batch).
+        -- API: POST/DELETE /issues/{index}/pin, PATCH /issues/{index}/pin/{position},
+        --   DELETE /issues/{index}.
+}
+
+surface PinOrdering {
+    facing admin: RepoAdmin
+    context repository: repositories/Repository
+
+    let pins = IssuePins where repository = repository
+
+    exposes:
+        for p in pins:
+            p.issue.title
+            p.position
+            p.is_pull
+
+    provides:
+        RepoAdminMovesPin(admin, pin, position)
+}
+
+-- Labels and milestones of a repository.
+surface TrackerSettings {
+    facing manager: TrackerManager
+    context repository: repositories/Repository
+
+    let all_labels = Labels where repository = repository
+    let org_labels = Labels where organization = repository.owner_org
+    let all_milestones = Milestones where repository = repository
+
+    exposes:
+        for l in all_labels:
+            l.name
+            l.description
+            l.color
+            l.is_exclusive
+            l.is_archived
+        for l in org_labels:
+            l.name
+            l.color
+        for m in all_milestones:
+            m.name
+            m.description
+            m.status
+            m.deadline
+            m.completeness
+        for t in LabelTemplates:
+            t.name
+            t.description
+
+    provides:
+        TrackerManagerCreatesLabel(manager, repository, name, description, color, is_exclusive)
+            when not repository.is_archived
+        TrackerManagerEditsLabel(manager, label, name, description, color, is_exclusive, is_archived)
+        TrackerManagerDeletesLabel(manager, label)
+        TrackerManagerInitialisesLabels(manager, repository, template)
+            when not repository.is_archived
+        TrackerManagerCreatesMilestone(manager, repository, name, description, deadline)
+            when not repository.is_archived
+        TrackerManagerEditsMilestone(manager, milestone, name, description, deadline)
+        TrackerManagerClosesMilestone(manager, milestone)
+        TrackerManagerReopensMilestone(manager, milestone)
+        TrackerManagerDeletesMilestone(manager, milestone)
+
+    @guidance
+        -- Web: POST /{owner}/{repo}/labels/{new,edit,delete,initialize},
+        --   /milestones/new, /milestones/{id}/edit, /milestones/{id}/{open|close},
+        --   /milestones/delete.
+        -- API: POST /repos/{o}/{r}/labels, PATCH/DELETE /labels/{id},
+        --   POST /milestones, PATCH/DELETE /milestones/{id} (state in PATCH).
+}
+
+surface OrganizationLabels {
+    facing owner: OrgOwner
+    context organization: organizations/Organization
+
+    let labels = Labels where organization = organization
+
+    exposes:
+        for l in labels:
+            l.name
+            l.description
+            l.color
+            l.is_exclusive
+            l.is_archived
+
+    provides:
+        OrgOwnerCreatesLabel(owner, organization, name, description, color, is_exclusive)
+        OrgOwnerEditsLabel(owner, label, name, description, color, is_exclusive, is_archived)
+        OrgOwnerDeletesLabel(owner, label)
+        OrgOwnerInitialisesLabels(owner, organization, template)
+
+    @guidance
+        -- Web: /org/{org}/settings/labels{,/new,/edit,/delete,/initialize}.
+        -- API: GET /orgs/{org}/labels (members), POST, GET/PATCH/DELETE /orgs/{org}/labels/{id}.
+}
+
+-- A signed-in user's own time tracking across repositories.
+surface MyTimeTracking {
+    facing user: accounts/User
+
+    let running = Stopwatches where user = user
+    let mine = TrackedTimes where user = user and is_deleted = false
+
+    exposes:
+        for sw in running:
+            sw.issue.title
+            sw.elapsed
+        for t in mine:
+            t.issue.title
+            t.amount
+            t.created_at
+
+    provides:
+        UserStopsStopwatch(user, stopwatch)
+        UserCancelsStopwatch(user, stopwatch)
+
+    @guidance
+        -- Web: navbar stopwatch, /user/stopwatches.
+        -- API: GET /user/stopwatches, GET /user/times.
+}
+
+surface SiteTimeAdministration {
+    facing admin: SiteAdmin
+
+    exposes:
+        for t in TrackedTimes:
+            t.user.name
+            t.issue.title
+            t.amount
+
+    provides:
+        UserDeletesTime(admin, time)
+        AdminAddsTimeForUser(admin, issue, user, amount, at)
+        UserSetsIssueSubscription(admin, issue, subscriber, watching)
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred resolve_mentions                 -- see: modules/references/references.go mention grammar
+deferred cross_references                 -- see: models/issues/issue_xref.go verifyReferencedIssue
+deferred commit_references                -- see: modules/references/references.go keyword grammar
+deferred template_is_valid                -- see: modules/issue/template/template.go Validate
+deferred is_allowed_file                  -- see: modules/upload (extensions, MIME types, wildcards)
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Web lets an issue's poster change the title of a locked issue; the API refuses poster edits (title, body, ref, state) while locked. Which should the rebuild adopt? The spec follows the web for title/body and requires write for nothing else."
+open question "Web reactions ignore the lock; API reactions on a locked issue require write access. The spec follows the API (locked means only triagers react)."
+open question "Web lock form validates the reason against LOCK_REASONS; the API accepts any reason. The spec validates."
+open question "When `blank_issues_enabled` is false the web form only redirects to the chooser; posting a blank issue (or via API) is still accepted. Should blank issues be refused?"
+open question "Uploaded attachments never linked to an issue or comment are kept indefinitely (only a doctor command removes orphans). Should unlinked uploads expire?"
+open question "Non-writers creating an issue through the web form can still set a milestone and assignees (only labels are dropped); the API drops all metadata. The spec drops all metadata for non-managers."
+open question "Deleting a label erases its label timeline events, while deleting a milestone keeps its events with a 'deleted milestone' placeholder. Should both behave alike?"
+open question "Repository admins may log time for another user and back-date it via the API but not in the web UI; keep it?"
+open question "Issue `priority` exists in storage but nothing sets or shows it; dropped from the spec."
+
+------------------------------------------------------------
+-- Requests to other modules
+------------------------------------------------------------
+-- REQUEST repositories/Repository.owner_org: used to scope organization labels (fixed name, listed for completeness)
+-- REQUEST repositories/RepoUnit (issues) config: enable_timetracker, allow_only_contributors_to_track_time, enable_dependencies — read here as timetracker_enabled / only_contributors_track_time / dependencies_enabled; defaults come from this module's default_* config
+-- REQUEST repositories/Repository.close_issues_via_commit_in_any_branch: keyword closing on non-default branches (default DEFAULT_CLOSE_ISSUES_VIA_COMMITS_IN_ANY_BRANCH = false)
+-- REQUEST repositories/RepositoryDeleted(repository): trigger this module reacts to
+-- REQUEST repositories/Watch.watches_issues: per-repository custom watch selection (issues / PRs) used for implicit issue subscription
+-- REQUEST code/PushReceived(push) with push.repository, push.pusher, push.branch and push.commits (sha, message, timestamp)
+-- REQUEST pulls/PullRequestMerged(pr, merger, style) with pr.issue
+-- REQUEST pulls/MergeClosesReferencedIssues guidance: Forgejo does NOT ignore open dependencies when a merge closes a referenced issue — the close fails and the error is swallowed (services/pull/merge.go:303), so the issue stays open; issues/ApplyResolvedReference models that
+-- REQUEST pulls: issues_closed_by(pr) / issues_reopened_by(pr) should be the latest closes/reopens Comment (ref_issue = pr.issue, ref_action) per target issue, from issues' cross-reference entries
+-- REQUEST pulls: PR conversations are created as issues/Issue (is_pull = true) and must set index: next_issue_index(repository), content_version: 0, labels/assignees/mentioned_users/read_by, created_at/updated_at; pulls' Comment.created calls should also set content_version / created_at / updated_at
+-- REQUEST webhooks / actions: subscribe to this module's trigger names and arities as listed in the header (e.g. IssueCommentCreated(issue, comment, doer, mentions), IssueAssigneeChanged(issue, doer, assignee, removed, comment), IssueClosed(issue, doer, comment)); there is no IssueAssigneeAdded / CommentCreated / IssueEdited trigger
+-- REQUEST projects: issues/IssueDeleted has two parameters (issue, doer)
+-- REQUEST access: an anonymous-visitor actor usable in TrackerReader / IssueReader surfaces for public repositories
+-- REQUEST accounts/UserBlock: is_blocked(blocker, user), including organizations blocking users
+-- REQUEST releases/Release: links Attachments via Attachment.release; release attachment type list is releases' config
+-- REQUEST projects: creates project / project_column Comment entries when an issue's project or column changes
+-- REQUEST moderation: reacts to IssueContentChanged / IssueCommentEdited / IssueCommentDeleted / IssueDeleted to keep shadow copies of reported content
+-- REQUEST quota: attachment uploads are subject to the `size:assets:attachments:issues` quota subject
