@@ -69,23 +69,22 @@
 --   NotificationCountPushed(user, unread_count)        -- the web client refreshes its badge
 --   SignOutPushed(connection, session)                 -- the web client signs that tab out
 --
--- Reacts to (names taken from the sibling modules; ASSUMED marks a trigger the
--- producing module does not emit yet — see Requests):
+-- Reacts to (names and parameters as the integration's canonical table gives them):
 --   issues/IssueOpened(issue, mentions)                 -- issues only (PRs: pulls/PullRequestOpened)
 --   issues/IssueClosed(issue, doer, comment)            -- issues and pull requests
 --   issues/IssueReopened(issue, doer, comment)          -- issues and pull requests
 --   issues/IssueCommentCreated(issue, comment, doer, mentions)
 --   issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)
 --   issues/IssueDeleted(issue, doer)
---   issues/UserViewsIssue(viewer, issue)                -- ASSUMED
---   pulls/PullRequestOpened(pull_request, poster)
---   pulls/PullRequestReadyForReview(pull_request, actor)
---   pulls/PullRequestMerged(pull_request, merger, style)
---   pulls/PullRequestAutoMerged(pull_request, merger, style)
+--   issues/UserViewsIssue(viewer, issue)                -- issues' external stimulus
+--   pulls/PullRequestOpened(pull_request)               -- poster is pull_request.issue.poster
+--   pulls/PullRequestReadyForReview(pull_request, doer)
+--   pulls/PullRequestMerged(pull_request, merger)       -- style is pull_request.merge_style
+--   pulls/PullRequestAutoMerged(pull_request, merger)
 --   pulls/PullRequestHeadUpdated(pull_request, pusher, old_commit_sha, new_commit_sha, is_force_push)
---   pulls/PullRequestReviewSubmitted(pull_request, review)
+--   pulls/ReviewSubmitted(review)                       -- the PR is review.pull_request
 --   pulls/PullRequestCodeCommented(pull_request, comment)
---   pulls/ReviewDismissed(review, actor, message)
+--   pulls/ReviewDismissed(review, dismisser, message)
 --   pulls/ReviewRequested(pull_request, requester, reviewer)
 --   repositories/RepositoryCreated(repository, doer)
 --   repositories/RepositoryForked(source, fork, doer)
@@ -95,28 +94,28 @@
 --   repositories/RepositoryDeleted(repository, doer)
 --   repositories/CollaboratorAdded(repository, user, doer)
 --   repositories/RepositoryVisibilityChanged(repository, doer)
---   repositories/UserViewsRepository(viewer, repository)           -- ASSUMED
---   repositories/MirrorSyncPushed(repository, ref_name, commits)   -- ASSUMED
---   repositories/MirrorRefCreated(repository, ref_name)            -- ASSUMED
---   repositories/MirrorRefDeleted(repository, ref_name)            -- ASSUMED
+--   repositories/RepositoryViewed(viewer, repository)
+--   repositories/MirrorSyncPushed(repository, ref_name, commits)
+--   repositories/MirrorRefCreated(repository, ref_name)
+--   repositories/MirrorRefDeleted(repository, ref_name)
 --   code/PushReceived(push)
 --   code/BranchCreated(branch, by)
 --   code/BranchDeleted(branch, by)
---   releases/ReleasePublished(release, publisher)
+--   releases/ReleasePublished(release)                  -- publisher is release.publisher
 --   accounts/UserAccountDeleted(user, purge, delete_contributions)
---   accounts/EmailActivationRequested(user, address)
 --   accounts/PrimaryEmailChanged(user, old_address, new_address)
 --   authentication/UserSignedUp(user)
 --   authentication/UserSignedOut(user, session)
 --   authentication/ActivationEmailRequested(user, code)
+--   authentication/EmailConfirmationRequested(user, email, code)
 --   authentication/PasswordResetRequested(user, code)
 --   authentication/PasswordChanged(user)
 --   authentication/TotpEnrolled(user)
 --   authentication/TotpDisabled(user)
 --   authentication/SecurityKeyRemoved(user, name)
---   organizations/TeamInviteCreated(invite)
+--   organizations/TeamInviteCreated(invite, inviter)
 --   actions/WorkflowJobCompleted(job, prior_status)
---   administration/UserCreatedByAdmin(admin, name, send_notification)
+--   administration/UserCreatedByAdmin(admin, user, send_notification)
 --   administration/TestMailRequested(admin, address)
 --   administration/MassMailRequested(subject, body, recipients)
 --   administration/OldActivityDeletionDue(older_than)
@@ -190,6 +189,8 @@ use "./administration.allium" as administration
 --
 --   can_read_issue(user, issue)      = access/can_read(user, issue.repository,
 --                                      pull_requests if issue.is_pull else issues)
+--   can_read_code(user, repo)        = access/can_read(user, repo, code)
+--   can_read_releases(user, repo)    = access/can_read(user, repo, releases)
 --   can_comment_on_issue(user, issue)= not issue.is_locked, or the user can write
 --                                      that unit, or the user is a site admin
 --   repository_watchers(repo, category) = users whose repositories/Watch on repo
@@ -528,7 +529,7 @@ rule InboxOnIssueOpened {
 -- the poster, plus mentions — all as named receivers.
 -- from: services/uinotification/notify.go:131
 rule InboxOnPullRequestOpened {
-    when: pulls/PullRequestOpened(pull_request, poster)
+    when: pulls/PullRequestOpened(pull_request)
     let issue = pull_request.issue
     let mentions = issue_mentions(issue)
     let receivers = (repository_watchers(issue.repository, pull_requests) + issue_participants(issue) - {issue.poster}) + mentions
@@ -562,26 +563,26 @@ rule InboxOnIssueReopened {
 -- audience it is ready for review.
 -- from: services/uinotification/notify.go:113
 rule InboxOnReadyForReview {
-    when: pulls/PullRequestReadyForReview(pull_request, actor)
-    ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: actor)
+    when: pulls/PullRequestReadyForReview(pull_request, doer)
+    ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: doer)
 }
 
 -- from: services/uinotification/notify.go:124
 rule InboxOnPullRequestMerged {
-    when: pulls/PullRequestMerged(pull_request, merger, style)
+    when: pulls/PullRequestMerged(pull_request, merger)
     ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: merger)
 }
 
 -- from: services/uinotification/notify.go:128
 rule InboxOnPullRequestAutoMerged {
-    when: pulls/PullRequestAutoMerged(pull_request, merger, style)
+    when: pulls/PullRequestAutoMerged(pull_request, merger)
     ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: merger)
 }
 
 -- from: services/uinotification/notify.go:166
 rule InboxOnReviewSubmitted {
-    when: pulls/PullRequestReviewSubmitted(pull_request, review)
-    let issue = pull_request.issue
+    when: pulls/ReviewSubmitted(review)
+    let issue = review.pull_request.issue
     let mentions = review_mentions(review)
     ensures: IssueThreadActivity(issue: issue, comment: null, author: review.reviewer)
     ensures:
@@ -607,8 +608,8 @@ rule InboxOnPullRequestCommitsPushed {
 
 -- from: services/uinotification/notify.go:208
 rule InboxOnReviewDismissed {
-    when: pulls/ReviewDismissed(review, actor, message)
-    ensures: IssueThreadActivity(issue: review.pull_request.issue, comment: null, author: actor)
+    when: pulls/ReviewDismissed(review, dismisser, message)
+    ensures: IssueThreadActivity(issue: review.pull_request.issue, comment: null, author: dismisser)
 }
 
 -- Being assigned by somebody else notifies the assignee. Unassignment and
@@ -724,7 +725,7 @@ rule ViewingIssueMarksItRead {
 -- threads for it read.
 -- from: models/activities/notification.go:296
 rule ViewingRepositoryMarksTransferOfferRead {
-    when: repositories/UserViewsRepository(viewer, repository)
+    when: repositories/RepositoryViewed(viewer, repository)
     ensures:
         for n in Notifications where recipient = viewer and repository = repository and source = repository and status = unread:
             n.status = read
@@ -775,7 +776,7 @@ rule UserMarksNotificationsInBulk {
 -- from: routers/api/v1/notify/repo.go:134
 rule UserMarksRepoNotificationsInBulk {
     when: UserMarksRepoNotificationsInBulk(user, repository, from_statuses, to_status, updated_before)
-    requires: access/can_read(user, repository, code)
+    requires: can_read_code(user, repository)
     ensures:
         for n in Notifications where recipient = user and repository = repository and status in from_statuses and updated_at <= updated_before:
             n.status = to_status
@@ -886,9 +887,9 @@ rule MailOnIssueOpened {
 
 -- from: services/mailer/notify.go:89
 rule MailOnPullRequestOpened {
-    when: pulls/PullRequestOpened(pull_request, poster)
+    when: pulls/PullRequestOpened(pull_request)
     let mentions = issue_mentions(pull_request.issue)
-    ensures: IssueMailDue(issue: pull_request.issue, doer: poster, category: pull_new, comment: null, code_comment: null, mentions: mentions, force_doer: false)
+    ensures: IssueMailDue(issue: pull_request.issue, doer: pull_request.issue.poster, category: pull_new, comment: null, code_comment: null, mentions: mentions, force_doer: false)
 }
 
 -- The mail category follows the comment kind: plain comment, close, reopen,
@@ -918,29 +919,29 @@ rule MailOnIssueReopened {
 
 -- from: services/mailer/notify.go:78
 rule MailOnReadyForReview {
-    when: pulls/PullRequestReadyForReview(pull_request, actor)
-    ensures: IssueMailDue(issue: pull_request.issue, doer: actor, category: pull_ready_for_review, comment: null, code_comment: null, mentions: {}, force_doer: false)
+    when: pulls/PullRequestReadyForReview(pull_request, doer)
+    ensures: IssueMailDue(issue: pull_request.issue, doer: doer, category: pull_ready_for_review, comment: null, code_comment: null, mentions: {}, force_doer: false)
 }
 
 -- from: services/mailer/notify.go:132
 rule MailOnPullRequestMerged {
-    when: pulls/PullRequestMerged(pull_request, merger, style)
+    when: pulls/PullRequestMerged(pull_request, merger)
     ensures: IssueMailDue(issue: pull_request.issue, doer: merger, category: pull_merge, comment: null, code_comment: null, mentions: {}, force_doer: false)
 }
 
 -- An automatic merge also mails the person who scheduled it.
 -- from: services/mailer/notify.go:142
 rule MailOnPullRequestAutoMerged {
-    when: pulls/PullRequestAutoMerged(pull_request, merger, style)
+    when: pulls/PullRequestAutoMerged(pull_request, merger)
     ensures: IssueMailDue(issue: pull_request.issue, doer: merger, category: pull_merge, comment: null, code_comment: null, mentions: {}, force_doer: true)
 }
 
 -- from: services/mailer/notify.go:94
 rule MailOnReviewSubmitted {
-    when: pulls/PullRequestReviewSubmitted(pull_request, review)
+    when: pulls/ReviewSubmitted(review)
     let category = review_mail_category(review)
     let mentions = review_mentions(review)
-    ensures: IssueMailDue(issue: pull_request.issue, doer: review.reviewer, category: category, comment: null, code_comment: null, mentions: mentions, force_doer: false)
+    ensures: IssueMailDue(issue: review.pull_request.issue, doer: review.reviewer, category: category, comment: null, code_comment: null, mentions: mentions, force_doer: false)
     @guidance
         -- review_mail_category: approve -> pull_review_approve,
         -- request_changes -> pull_review_reject, comment -> pull_review_comment.
@@ -966,8 +967,8 @@ rule MailOnPullRequestCommitsPushed {
 
 -- from: services/mailer/notify.go:176
 rule MailOnReviewDismissed {
-    when: pulls/ReviewDismissed(review, actor, message)
-    ensures: IssueMailDue(issue: review.pull_request.issue, doer: actor, category: pull_review_dismissed, comment: null, code_comment: null, mentions: {}, force_doer: false)
+    when: pulls/ReviewDismissed(review, dismisser, message)
+    ensures: IssueMailDue(issue: review.pull_request.issue, doer: dismisser, category: pull_review_dismissed, comment: null, code_comment: null, mentions: {}, force_doer: false)
 }
 
 -- Assignment mail goes to the assignee only, when assigned by somebody else
@@ -1059,14 +1060,15 @@ rule ComposeIssueMail {
 -- watchers who can read releases, except the publisher.
 -- from: services/mailer/mail_release.go:30
 rule MailOnReleasePublished {
-    when: releases/ReleasePublished(release, publisher)
+    when: releases/ReleasePublished(release)
     requires: config.mailer_enabled
     requires: config.enable_notify_mail
     requires: not release.is_prerelease
+    let publisher = release.publisher
     let recipients = repository_watchers(release.repository, releases) - {publisher}
     ensures:
         for r in recipients:
-            if mail_eligible(r, false) and access/can_read(r, release.repository, releases):
+            if mail_eligible(r, false) and can_read_releases(r, release.repository):
                 MailMessage.created(
                     to_address: r.primary_email,
                     recipient: r,
@@ -1141,10 +1143,9 @@ rule MailOnCollaboratorAdded {
 -- account or self-registration is closed.
 -- from: services/mailer/mail_team_invite.go:23
 rule MailOnTeamInvite {
-    when: organizations/TeamInviteCreated(invite)
+    when: organizations/TeamInviteCreated(invite, inviter)
     requires: config.mailer_enabled
     requires: not address_belongs_to_login_prohibited_user(invite.email)
-    let inviter = invite.inviter
     ensures: MailMessage.created(
         to_address: invite.email,
         recipient: null,
@@ -1228,12 +1229,14 @@ rule MailAccountActivation {
     ensures: AccountMailQueued(user: user, address: user.primary_email, category: account_activation)
 }
 
--- Sent to the address being confirmed, not the primary address.
+-- Sent to the address being confirmed, not the primary address. Authentication
+-- issues the code the mail links to (accounts/EmailActivationRequested is
+-- consumed by authentication only, to issue that code).
 -- from: services/mailer/mail.go:130
 rule MailEmailConfirmation {
-    when: accounts/EmailActivationRequested(user, address)
+    when: authentication/EmailConfirmationRequested(user, email, code)
     requires: config.mailer_enabled
-    ensures: AccountMailQueued(user: user, address: address, category: email_confirmation)
+    ensures: AccountMailQueued(user: user, address: email, category: email_confirmation)
 }
 
 -- from: services/mailer/mail.go:114
@@ -1246,11 +1249,9 @@ rule MailPasswordReset {
 -- An administrator who creates an account may have the new user told about it.
 -- from: services/mailer/mail.go:165
 rule MailRegistrationNotice {
-    when: administration/UserCreatedByAdmin(admin, name, send_notification)
+    when: administration/UserCreatedByAdmin(admin, user, send_notification)
     requires: config.mailer_enabled
     requires: send_notification
-    let user = accounts/User{name: name}
-    requires: exists user
     requires: user.is_active
     ensures: AccountMailQueued(user: user, address: user.primary_email, category: registration_notice)
 }
@@ -1448,9 +1449,9 @@ rule RecordIssueOpened {
 
 -- from: services/feed/action.go:246
 rule RecordPullRequestOpened {
-    when: pulls/PullRequestOpened(pull_request, poster)
+    when: pulls/PullRequestOpened(pull_request)
     ensures: Activity.created(
-        kind: create_pull_request, actor: poster, repository: pull_request.issue.repository,
+        kind: create_pull_request, actor: pull_request.issue.poster, repository: pull_request.issue.repository,
         issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: pull_request.issue.title,
         is_private: pull_request.issue.repository.is_private, watch_category: pull_requests, created_at: now
     )
@@ -1500,7 +1501,7 @@ rule RecordIssueReopened {
 
 -- from: services/feed/action.go:378
 rule RecordPullRequestMerged {
-    when: pulls/PullRequestMerged(pull_request, merger, style)
+    when: pulls/PullRequestMerged(pull_request, merger)
     ensures: Activity.created(
         kind: merge_pull_request, actor: merger, repository: pull_request.issue.repository,
         issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: pull_request.issue.title,
@@ -1510,7 +1511,7 @@ rule RecordPullRequestMerged {
 
 -- from: services/feed/action.go:388
 rule RecordPullRequestAutoMerged {
-    when: pulls/PullRequestAutoMerged(pull_request, merger, style)
+    when: pulls/PullRequestAutoMerged(pull_request, merger)
     ensures: Activity.created(
         kind: auto_merge_pull_request, actor: merger, repository: pull_request.issue.repository,
         issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: pull_request.issue.title,
@@ -1523,8 +1524,8 @@ rule RecordPullRequestAutoMerged {
 -- plain comment review with an empty body.
 -- from: services/feed/action.go:322
 rule RecordReviewSubmitted {
-    when: pulls/PullRequestReviewSubmitted(pull_request, review)
-    let issue = pull_request.issue
+    when: pulls/ReviewSubmitted(review)
+    let issue = review.pull_request.issue
     requires: review.status = submitted
     ensures:
         for cc in review.comments:
@@ -1547,10 +1548,10 @@ rule RecordReviewSubmitted {
 
 -- from: services/feed/action.go:398
 rule RecordReviewDismissed {
-    when: pulls/ReviewDismissed(review, actor, message)
+    when: pulls/ReviewDismissed(review, dismisser, message)
     let issue = review.pull_request.issue
     ensures: Activity.created(
-        kind: pull_review_dismissed, actor: actor, repository: issue.repository,
+        kind: pull_review_dismissed, actor: dismisser, repository: issue.repository,
         issue: issue, comment: null, code_comment: null, ref_name: null, content: feed_excerpt(message),
         is_private: issue.repository.is_private, watch_category: pull_requests, created_at: now
     )
@@ -1605,11 +1606,11 @@ rule RecordPush {
     when: code/PushReceived(push)
     ensures:
         for u in push.ref_updates:
-            if u.ref_kind in {branch, tag}:
+            if u.ref_kind in {branch_ref, tag_ref}:
                 Activity.created(
                     kind:
-                        if u.ref_kind = tag and u.is_deletion: delete_tag
-                        else if u.ref_kind = tag: push_tag
+                        if u.ref_kind = tag_ref and u.is_deletion: delete_tag
+                        else if u.ref_kind = tag_ref: push_tag
                         else if u.is_deletion: delete_branch
                         else: commit_repo,
                     actor: push.pusher, repository: push.repository,
@@ -1674,9 +1675,9 @@ rule RecordMirrorRefDeleted {
 
 -- from: services/feed/action.go:509
 rule RecordReleasePublished {
-    when: releases/ReleasePublished(release, publisher)
+    when: releases/ReleasePublished(release)
     ensures: Activity.created(
-        kind: publish_release, actor: publisher, repository: release.repository,
+        kind: publish_release, actor: release.publisher, repository: release.repository,
         issue: null, comment: null, code_comment: null, ref_name: release.tag_name, content: release.title,
         is_private: release.repository.is_private, watch_category: releases, created_at: now
     )
@@ -1823,14 +1824,9 @@ invariant MailSubjectBounded {
 -- Actor Declarations
 ------------------------------------------------------------
 
--- Anyone signed in. Inbox, dashboard and preferences are personal.
-actor SignedInUser {
-    identified_by: accounts/User where prohibit_login = false
-}
-
-actor SiteAdmin {
-    identified_by: accounts/User where is_admin = true
-}
+-- People are the shared actors access/SignedInUser (inbox, dashboard and
+-- preferences are personal) and access/SiteAdmin. The two mail endpoints
+-- below are this module's own.
 
 -- The outgoing mail transport (SMTP / sendmail).
 actor OutgoingMailTransport {
@@ -1848,7 +1844,7 @@ actor IncomingMailbox {
 
 -- One inbox thread, as its recipient sees it.
 surface NotificationThread {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
     context notification: Notification where recipient = user
 
     exposes:
@@ -1879,7 +1875,7 @@ surface NotificationThread {
 
 -- The inbox as a whole: the badge count and the bulk operations.
 surface NotificationInbox {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
     let unread = Notifications where recipient = user and status = unread
     let pinned = Notifications where recipient = user and status = pinned
 
@@ -1914,7 +1910,7 @@ surface NotificationInbox {
 
 -- The live stream a browser keeps open.
 surface NotificationEventStream {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
     context connection: EventStreamConnection where user = user
 
     exposes:
@@ -1929,7 +1925,7 @@ surface NotificationEventStream {
 
 -- What a person receives in their own mailbox.
 surface PersonalMailbox {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
     context message: MailMessage where recipient = user
 
     exposes:
@@ -1950,7 +1946,7 @@ surface PersonalMailbox {
 
 -- A site administrator's view of mail and threads.
 surface AdminNotificationTools {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
     context notification: Notification
 
     exposes:
@@ -2007,7 +2003,7 @@ surface IncomingMailGateway {
 -- The signed-in user's dashboard: their feed (including private activity
 -- they can still see), filterable by day, with their heatmap.
 surface UserDashboard {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
 
     exposes:
         for e in FeedEntries where owner_user = user and activity_visible_to(activity, user, true):
@@ -2030,7 +2026,7 @@ surface UserDashboard {
 -- An organization's dashboard for one of its members, optionally narrowed to
 -- one team's repositories.
 surface OrganizationDashboard {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
     context organization: organizations/Organization
 
     exposes:
@@ -2089,7 +2085,7 @@ surface RepositoryActivityFeed {
     context repository: repositories/Repository
 
     exposes:
-        for a in Activities where repository = repository and access/can_read(viewer, repository, code):
+        for a in Activities where repository = repository and can_read_code(viewer, repository):
             a.kind when activity_visible_to(a, viewer, true)
             a.actor when activity_visible_to(a, viewer, true)
             a.issue when activity_visible_to(a, viewer, true)
@@ -2108,7 +2104,7 @@ surface SyndicationFeeds {
     context repository: repositories/Repository
 
     exposes:
-        for a in Activities where repository = repository and config.enable_feed and access/can_read(reader, repository, code):
+        for a in Activities where repository = repository and config.enable_feed and can_read_code(reader, repository):
             a.kind
             a.content
             a.created_at
@@ -2172,21 +2168,20 @@ open question "Failed mail is dropped without retry. Should a rebuild retry tran
 -- (Used as provided: accounts/User.email_notifications, keep_activity_private,
 --  language, can_receive_mail, activity_readable_by(viewer); accounts/config.
 --  default_email_notifications; administration/config.notify_admins_on_new_user;
---  releases/ReleasePublished(release, publisher); pulls/Review.{pull_request,
+--  releases/Release.publisher; pulls/Review.{pull_request,
 --  reviewer, kind, body, comments, status}; code/Push.ref_updates and
 --  RefUpdate.{ref_kind, ref_name, is_deletion}; organizations/TeamInvite.
 --  {email, inviter}.)
 -- REQUEST accounts/UserBlock lookup has_blocked(blocker, blocked): blocked authors never reach the blocker's inbox or feed.
--- REQUEST accounts+authentication: accounts/EmailActivationRequested(user, address) and authentication/EmailConfirmationRequested(user, email, code) describe the same mail; this module reacts to the accounts one only — integration should keep exactly one.
 -- REQUEST organizations: transfer_recipients needs "members allowed to create repositories in an organization".
--- REQUEST repositories: emit UserViewsRepository(viewer, repository) when a signed-in user opens a repository home page.
 -- REQUEST repositories: a pull-mirror sync should emit per-ref MirrorSyncPushed(repository, ref_name, commits), MirrorRefCreated(repository, ref_name), MirrorRefDeleted(repository, ref_name) (distinct from code/PushReceived, attributed to the owner) — Forgejo keeps separate mirror_sync_* feed kinds.
 -- REQUEST repositories: RepositoryStarred is listed as feeding the activity feed, but Forgejo records no star activity (star_repo is never produced); this module does not react to it.
 -- REQUEST repositories: Watch.watch_issues / watch_pull_requests / watch_releases are used through repository_watchers(repo, category).
 -- REQUEST issues: emit UserViewsIssue(viewer, issue) when a signed-in user opens an issue or pull request (web and API); provide Issue.subscribers / explicitly_unsubscribed, Comment.kind (comment | close | reopen | code | pull_push | review) for comment_mail_category; react to notifications/MailReplyReceived (create the comment as author, with the attachments) and notifications/MailUnsubscribeReceived (record an explicit unsubscribe).
 -- REQUEST issues: IssueOpened is consumed for issues only (requires not is_pull); please confirm pulls never emits issues/IssueOpened for a PR, or the feed/inbox/mail would double up with pulls/PullRequestOpened.
 -- REQUEST issues/pulls: IssueClosed / IssueReopened are consumed for both issues and PRs; pulls/PullRequestClosed / PullRequestReopened are therefore NOT consumed here — integration must ensure a PR close emits issues/IssueClosed (or switch this module to the pulls triggers).
--- REQUEST pulls: react to notifications/MailReplyReceived with replied_to_code set (reply in that code conversation); expose the mentions of a PR description, a review body and a code comment (issue_mentions / review_mentions / code_comment_mentions) or pass them in PullRequestOpened / PullRequestReviewSubmitted / PullRequestCodeCommented.
+-- REQUEST pulls: react to notifications/MailReplyReceived with replied_to_code set (reply in that code conversation); expose the mentions of a PR description, a review body and a code comment (issue_mentions / review_mentions / code_comment_mentions).
+-- REQUEST pulls: an automatic merge should emit PullRequestAutoMerged INSTEAD of PullRequestMerged for this module (Forgejo calls one notifier or the other); pulls currently emits both, which would record two activities, two inbox updates and two merge mails.
 -- REQUEST pulls: TeamReviewRequested(pull_request, requester, team) is not consumed; Forgejo notifies nobody per team member — confirm.
 -- REQUEST actions/Job.{status, run.notify_email, run.trigger_user, run.repository} and is_failure(status); this module mails on WorkflowJobCompleted with a failure status.
 -- REQUEST federation: react to notifications/ActivityRecorded(activity) to publish to ActivityPub followers.

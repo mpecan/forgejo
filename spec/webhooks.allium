@@ -37,33 +37,40 @@
 --   HookDeliveryCompleted(delivery)      -- succeeded, failed or skipped
 --
 -- Reacts to:
---   code/PushReceived(push)                               -> push
---   code/RefCreated(repository, ref_name, ref_kind, pusher)  -> create
---   code/RefDeleted(repository, ref_name, ref_kind, pusher)  -> delete
+--   code/PushReceived(push)                               -> push (one per pushed branch or tag)
+--   code/RefCreated(repository, pusher, ref_kind, ref_name, commit_sha)  -> create
+--   code/RefDeleted(repository, pusher, ref_kind, ref_name)              -> delete
 --   repositories/RepositoryCreated(repository, doer)      -> repository/created
---   repositories/RepositoryMigrated(repository, doer)     -> repository/created
---   repositories/RepositoryForked(fork, source, doer)     -> fork (+ repository/created for org forks)
+--   migrations/RepositoryMigrated(repository)             -> repository/created (sender: the migration's doer)
+--   repositories/RepositoryForked(source, fork, doer)     -> fork (+ repository/created for org forks)
 --   repositories/RepositoryDeleted(repository, doer)      -> repository/deleted; removes repo webhooks
 --   repositories/Repository.created                       -> copy default webhooks
---   repositories/RepositoryGeneratedFromTemplate(repository, template, include_webhooks)
---   issues/IssueOpened(issue)                             -> issues/opened
+--   repositories/RepositoryGeneratedFromTemplate(template, repository, doer, git_content, topics,
+--       git_hooks, webhooks, avatar, labels, protected_branches)  -> copy template webhooks when `webhooks`
+--   issues/IssueOpened(issue, mentions)                   -> issues/opened
 --   issues/IssueTitleChanged(issue, doer, old_title)      -> issues|pull_request/edited
 --   issues/IssueContentChanged(issue, doer, old_content)  -> issues|pull_request/edited
---   issues/IssueClosed(issue, doer), issues/IssueReopened(issue, doer)
---   issues/IssueAssigneeAdded(issue, doer, assignee), issues/IssueAssigneeRemoved(issue, doer, assignee)
---   issues/IssueLabelsChanged(issue, doer), issues/IssueLabelsCleared(issue, doer)
---   issues/IssueMilestoneChanged(issue, doer, old_milestone?)
---   issues/CommentCreated(comment, doer), issues/CommentEdited(comment, doer, old_content),
---   issues/CommentDeleted(comment, doer)
---   pulls/PullRequestOpened(pr), pulls/PullRequestMerged(pr, merger),
---   pulls/PullRequestTargetBranchChanged(pr, doer, old_branch),
---   pulls/PullRequestSynchronized(pr, doer), pulls/ReviewSubmitted(review),
---   pulls/ReviewRequested(pr, doer, reviewer), pulls/ReviewRequestRemoved(pr, doer, reviewer)
+--   issues/IssueClosed(issue, doer, comment), issues/IssueReopened(issue, doer, comment)
+--   issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)  -> assigned / unassigned
+--   issues/IssueLabelsChanged(issue, doer, added, removed), issues/IssueLabelsCleared(issue, doer)
+--   issues/IssueMilestoneChanged(issue, doer, old_milestone)
+--   issues/IssueCommentCreated(issue, comment, doer, mentions), issues/IssueCommentEdited(comment, doer, old_content),
+--   issues/IssueCommentDeleted(comment, doer)
+--   pulls/PullRequestOpened(pull_request), pulls/PullRequestMerged(pull_request, merger) (also emitted for auto-merges),
+--   pulls/PullRequestTargetBranchChanged(pull_request, doer, old_base_branch),
+--   pulls/PullRequestSynchronized(pull_request, doer), pulls/ReviewSubmitted(review),
+--   pulls/ReviewRequested(pull_request, requester, reviewer), pulls/ReviewRequestRemoved(pull_request, doer, reviewer)
 --   wiki/WikiPageCreated(repository, doer, page), wiki/WikiPageEdited(...), wiki/WikiPageDeleted(...)
 --   releases/ReleasePublished(release), releases/ReleaseUpdated(release, doer), releases/ReleaseDeleted(release, doer)
---   packages/PackageVersionCreated(version, doer), packages/PackageVersionDeleted(version, doer)
---   actions/WorkflowRunStatusChanged(run, prior_status), actions/WorkflowJobStatusChanged(job, prior_status)
+--   packages/PackageVersionCreated(version, publisher), packages/PackageVersionDeleted(version, doer)
+--   actions/WorkflowRunStatusChanged(run, prior_status), actions/WorkflowRunCompleted(run, prior_status),
+--   actions/WorkflowJobStatusChanged(job, prior_status), actions/WorkflowJobCompleted(job, prior_status)
 --   accounts/UserAccountDeleted(user, purge, delete_contributions), organizations/OrganizationDeleted(organization)
+--   administration/HookDeliveryCleanupDue(cleanup_type, older_than, number_to_keep)  -> history cleanup "run now"
+--
+-- Black-box predicates (each the local name of another module's contract):
+--   is_repo_admin(user, repository)    = access/is_repo_admin(user, repository)
+--   is_org_owner(organization, user)   = organizations/is_org_owner(organization, user)
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -76,6 +83,7 @@ use "./wiki.allium" as wiki
 use "./releases.allium" as releases
 use "./packages.allium" as packages
 use "./actions.allium" as actions
+use "./migrations.allium" as migrations
 use "./administration.allium" as administration
 
 ------------------------------------------------------------
@@ -414,7 +422,7 @@ config {
     cleanup_enabled: Boolean = true
     cleanup_schedule: String = "@midnight"
     cleanup_run_at_start: Boolean = false
-    cleanup_type: String = "older_than"         -- "older_than" | "per_webhook"
+    cleanup_type: String = "older_than"         -- "older_than" | "per_webhook" (administration/HookCleanupKind)
     cleanup_older_than: Duration = 7.days
     cleanup_keep_count: Integer = 10
 }
@@ -427,11 +435,11 @@ config {
 rule RepoAdminCreatesWebhook {
     when: RepoAdminCreatesWebhook(actor, repo, hook_config, is_active)
     requires: not config.disable_webhooks
-    requires: access/is_repo_admin(actor, repo)
+    requires: is_repo_admin(actor, repo)
     requires: hook_config.is_valid
     ensures: Webhook.created(
         scope: per_repository,
-        repository: repository,
+        repository: repo,
         config: hook_config,
         is_active: is_active,
         last_status: none,
@@ -451,7 +459,7 @@ rule RepoAdminCreatesWebhook {
 rule OrgOwnerCreatesWebhook {
     when: OrgOwnerCreatesWebhook(actor, organization, hook_config, is_active)
     requires: not config.disable_webhooks
-    requires: organization.has_owner(actor) or actor.is_admin
+    requires: is_org_owner(organization, actor) or actor.is_admin
     requires: hook_config.is_valid
     ensures: Webhook.created(
         scope: per_owner,
@@ -535,9 +543,9 @@ rule ManagerEditsWebhook {
     when: ManagerEditsWebhook(actor, webhook, hook_config, is_active)
     requires: not config.disable_webhooks
     let may_manage =
-        if webhook.scope = per_repository: access/is_repo_admin(actor, webhook.repository)
+        if webhook.scope = per_repository: is_repo_admin(actor, webhook.repository)
         else: if webhook.scope = per_owner and webhook.owner_user != null: webhook.owner_user = actor
-        else: if webhook.scope = per_owner and webhook.owner_org != null: webhook.owner_org.has_owner(actor) or actor.is_admin
+        else: if webhook.scope = per_owner and webhook.owner_org != null: is_org_owner(webhook.owner_org, actor) or actor.is_admin
         else: webhook.is_admin_level and actor.is_admin
     requires: may_manage
     requires: hook_config.kind = webhook.config.kind
@@ -558,9 +566,9 @@ rule ManagerDeletesWebhook {
     when: ManagerDeletesWebhook(actor, webhook)
     requires: not config.disable_webhooks
     let may_manage =
-        if webhook.scope = per_repository: access/is_repo_admin(actor, webhook.repository)
+        if webhook.scope = per_repository: is_repo_admin(actor, webhook.repository)
         else: if webhook.scope = per_owner and webhook.owner_user != null: webhook.owner_user = actor
-        else: if webhook.scope = per_owner and webhook.owner_org != null: webhook.owner_org.has_owner(actor) or actor.is_admin
+        else: if webhook.scope = per_owner and webhook.owner_org != null: is_org_owner(webhook.owner_org, actor) or actor.is_admin
         else: webhook.is_admin_level and actor.is_admin
     requires: may_manage
     ensures:
@@ -580,7 +588,7 @@ rule RepoAdminTestsWebhook {
     when: RepoAdminTestsWebhook(actor, webhook)
     requires: not config.disable_webhooks
     requires: webhook.scope = per_repository
-    requires: access/is_repo_admin(actor, webhook.repository)
+    requires: is_repo_admin(actor, webhook.repository)
     ensures:
         let fresh = HookDelivery.created(
             webhook: webhook,
@@ -606,9 +614,9 @@ rule ManagerRedeliversDelivery {
     when: ManagerRedeliversDelivery(actor, delivery)
     requires: not config.disable_webhooks
     let may_manage =
-        if delivery.webhook.scope = per_repository: access/is_repo_admin(actor, delivery.webhook.repository)
+        if delivery.webhook.scope = per_repository: is_repo_admin(actor, delivery.webhook.repository)
         else: if delivery.webhook.scope = per_owner and delivery.webhook.owner_user != null: delivery.webhook.owner_user = actor
-        else: if delivery.webhook.scope = per_owner and delivery.webhook.owner_org != null: delivery.webhook.owner_org.has_owner(actor) or actor.is_admin
+        else: if delivery.webhook.scope = per_owner and delivery.webhook.owner_org != null: is_org_owner(delivery.webhook.owner_org, actor) or actor.is_admin
         else: delivery.webhook.is_admin_level and actor.is_admin
     requires: may_manage
     ensures:
@@ -653,8 +661,8 @@ rule CopyDefaultWebhooksIntoNewRepository {
 -- repository's own webhooks.
 -- from: services/repository/hooks.go:49
 rule CopyTemplateRepositoryWebhooks {
-    when: repositories/RepositoryGeneratedFromTemplate(repository, template, include_webhooks)
-    requires: include_webhooks
+    when: repositories/RepositoryGeneratedFromTemplate(template, repository, doer, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches)
+    requires: webhooks
     for source in Webhooks where scope = per_repository and repository = template:
         ensures: Webhook.created(
             scope: per_repository,
@@ -669,8 +677,8 @@ rule CopyTemplateRepositoryWebhooks {
 
 -- from: services/repository/delete.go:199
 rule RemoveWebhooksOfDeletedRepository {
-    when: repositories/RepositoryDeleted(deleted_repo, doer)
-    for w in Webhooks where scope = per_repository and repository = deleted_repo:
+    when: repositories/RepositoryDeleted(repository, doer)
+    for w in Webhooks where scope = per_repository and w.repository = repository:
         ensures:
             for d in w.deliveries:
                 not exists d
@@ -749,43 +757,58 @@ rule QueueDeliveryForMatchedEvent {
 
 -- Code ------------------------------------------------------------
 
--- Also fired for refs updated by a pull-mirror sync.
+-- One push event per branch or tag the push created or moved (a deleted
+-- ref is announced by RefDeletionRaisesHookEvent instead). Also fired for
+-- refs updated by a pull-mirror sync.
 -- from: services/webhook/notifier.go:603
 rule PushRaisesHookEvent {
     when: code/PushReceived(push)
-    ensures: HookEventRaised(
-        kind: push,
-        action: pushed,
-        source_repo: push.repository,
-        branch: push.branch_name,
-        commit_count: push.commit_count,
-        sender: push.pusher
-    )
+    ensures:
+        for u in push.ref_updates:
+            if u.ref_kind in {branch_ref, tag_ref} and not u.is_deletion:
+                HookEventRaised(
+                    kind: push,
+                    action: pushed,
+                    source_repo: push.repository,
+                    owner_user: null,
+                    owner_org: null,
+                    branch: if u.ref_kind = branch_ref: u.ref_name else: null,
+                    commit_count: pushed_commit_count(u),
+                    sender: push.pusher
+                )
     @guidance
+        -- pushed_commit_count(u) is the number of commits between u.old_sha
+        -- and u.new_sha (all reachable commits for a new ref).
         -- The payload lists at most config.payload_commit_limit commits plus
         -- the head commit, and reports the full total_commits.
 }
 
 -- from: services/webhook/notifier.go:770
 rule RefCreationRaisesHookEvent {
-    when: code/RefCreated(repo, ref_name, ref_kind, pusher)
+    when: code/RefCreated(repository, pusher, ref_kind, ref_name, commit_sha)
     ensures: HookEventRaised(
         kind: create,
         action: created,
-        source_repo: repo,
-        branch: if ref_kind = branch: ref_name else: null,
+        source_repo: repository,
+        owner_user: null,
+        owner_org: null,
+        branch: if ref_kind = branch_ref: ref_name else: null,
+        commit_count: null,
         sender: pusher
     )
 }
 
 -- from: services/webhook/notifier.go:806
 rule RefDeletionRaisesHookEvent {
-    when: code/RefDeleted(repo, ref_name, ref_kind, pusher)
+    when: code/RefDeleted(repository, pusher, ref_kind, ref_name)
     ensures: HookEventRaised(
         kind: delete,
         action: deleted,
-        source_repo: repo,
-        branch: if ref_kind = branch: ref_name else: null,
+        source_repo: repository,
+        owner_user: null,
+        owner_org: null,
+        branch: if ref_kind = branch_ref: ref_name else: null,
+        commit_count: null,
         sender: pusher
     )
 }
@@ -794,37 +817,42 @@ rule RefDeletionRaisesHookEvent {
 
 -- from: services/webhook/notifier.go:110
 rule RepositoryCreationRaisesHookEvent {
-    when: repositories/RepositoryCreated(repo, doer)
-    ensures: HookEventRaised(kind: repository, action: created, source_repo: repo, sender: doer)
+    when: repositories/RepositoryCreated(repository, doer)
+    ensures: HookEventRaised(kind: repository, action: created, source_repo: repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
+-- The sender is the user who ran the migration.
 -- from: services/webhook/notifier.go:133
 rule RepositoryMigrationRaisesHookEvent {
-    when: repositories/RepositoryMigrated(repo, doer)
-    ensures: HookEventRaised(kind: repository, action: created, source_repo: repo, sender: doer)
+    when: migrations/RepositoryMigrated(repository)
+    let migration = migrations/Migration{repository: repository}
+    ensures: HookEventRaised(kind: repository, action: created, source_repo: repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: migration.doer)
 }
 
 -- The fork event goes to the source repository's hooks; a fork into an
 -- organization also announces the new repository to the organization.
 -- from: services/webhook/notifier.go:82
 rule ForkRaisesHookEvents {
-    when: repositories/RepositoryForked(fork, source, doer)
-    ensures: HookEventRaised(kind: fork, action: forked, source_repo: source, sender: doer)
+    when: repositories/RepositoryForked(source, fork, doer)
+    ensures: HookEventRaised(kind: fork, action: forked, source_repo: source, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
     ensures:
         if fork.owner_org != null:
-            HookEventRaised(kind: repository, action: created, source_repo: fork, sender: doer)
+            HookEventRaised(kind: repository, action: created, source_repo: fork, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
 -- Announced before the repository disappears; its own webhooks go with it,
 -- so only owner and system webhooks are told.
 -- from: services/webhook/notifier.go:122
 rule RepositoryDeletionRaisesHookEvent {
-    when: repositories/RepositoryDeleted(deleted_repo, doer)
+    when: repositories/RepositoryDeleted(repository, doer)
     ensures: HookEventRaised(
         kind: repository,
         action: deleted,
-        owner_user: deleted_repo.owner_user,
-        owner_org: deleted_repo.owner_org,
+        source_repo: null,
+        owner_user: repository.owner_user,
+        owner_org: repository.owner_org,
+        branch: null,
+        commit_count: null,
         sender: doer
     )
 }
@@ -833,15 +861,15 @@ rule RepositoryDeletionRaisesHookEvent {
 
 -- from: services/webhook/notifier.go:272
 rule IssueOpenedRaisesHookEvent {
-    when: issues/IssueOpened(issue)
+    when: issues/IssueOpened(issue, mentions)
     requires: not issue.is_pull
-    ensures: HookEventRaised(kind: issues, action: opened, source_repo: issue.repository, sender: issue.poster)
+    ensures: HookEventRaised(kind: issues, action: opened, source_repo: issue.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: issue.poster)
 }
 
 -- from: services/webhook/notifier.go:294
 rule PullRequestOpenedRaisesHookEvent {
-    when: pulls/PullRequestOpened(pr)
-    ensures: HookEventRaised(kind: pull_request, action: opened, source_repo: pr.issue.repository, sender: pr.issue.poster)
+    when: pulls/PullRequestOpened(pull_request)
+    ensures: HookEventRaised(kind: pull_request, action: opened, source_repo: pull_request.issue.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: pull_request.issue.poster)
 }
 
 -- from: services/webhook/notifier.go:190
@@ -849,7 +877,14 @@ rule TitleChangeRaisesHookEvent {
     when: issues/IssueTitleChanged(issue, doer, old_title)
     ensures: HookEventRaised(
         kind: if issue.is_pull: pull_request else: issues,
-        action: edited, source_repo: issue.repository, sender: doer)
+        action: edited,
+        source_repo: issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
 -- from: services/webhook/notifier.go:320
@@ -857,60 +892,105 @@ rule ContentChangeRaisesHookEvent {
     when: issues/IssueContentChanged(issue, doer, old_content)
     ensures: HookEventRaised(
         kind: if issue.is_pull: pull_request else: issues,
-        action: edited, source_repo: issue.repository, sender: doer)
+        action: edited,
+        source_repo: issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
 -- from: services/webhook/notifier.go:230
 rule CloseRaisesHookEvent {
-    when: issues/IssueClosed(issue, doer)
+    when: issues/IssueClosed(issue, doer, comment)
     ensures: HookEventRaised(
         kind: if issue.is_pull: pull_request else: issues,
-        action: closed, source_repo: issue.repository, sender: doer)
+        action: closed,
+        source_repo: issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
 -- from: services/webhook/notifier.go:230
 rule ReopenRaisesHookEvent {
-    when: issues/IssueReopened(issue, doer)
+    when: issues/IssueReopened(issue, doer, comment)
     ensures: HookEventRaised(
         kind: if issue.is_pull: pull_request else: issues,
-        action: reopened, source_repo: issue.repository, sender: doer)
+        action: reopened,
+        source_repo: issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
--- Manual and automatic merges alike; the payload marks the PR merged.
+-- Manual and automatic merges alike (pulls emits PullRequestMerged for
+-- both); the payload marks the PR merged.
 -- from: services/webhook/notifier.go:636
 rule MergeRaisesHookEvent {
-    when: pulls/PullRequestMerged(pr, merger)
-    ensures: HookEventRaised(kind: pull_request, action: closed, source_repo: pr.issue.repository, sender: merger)
+    when: pulls/PullRequestMerged(pull_request, merger)
+    ensures: HookEventRaised(kind: pull_request, action: closed, source_repo: pull_request.issue.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: merger)
 }
 
 -- from: services/webhook/notifier.go:673
 rule TargetBranchChangeRaisesHookEvent {
-    when: pulls/PullRequestTargetBranchChanged(pr, doer, old_branch)
-    ensures: HookEventRaised(kind: pull_request, action: edited, source_repo: pr.issue.repository, sender: doer)
+    when: pulls/PullRequestTargetBranchChanged(pull_request, doer, old_base_branch)
+    ensures: HookEventRaised(kind: pull_request, action: edited, source_repo: pull_request.issue.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
 -- from: services/webhook/notifier.go:145
 rule AssigneeAddedRaisesHookEvent {
-    when: issues/IssueAssigneeAdded(issue, doer, assignee)
+    when: issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)
+    requires: not removed
     ensures: HookEventRaised(
         kind: if issue.is_pull: pull_request_assign else: issue_assign,
-        action: assigned, source_repo: issue.repository, sender: doer)
+        action: assigned,
+        source_repo: issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
 -- from: services/webhook/notifier.go:145
 rule AssigneeRemovedRaisesHookEvent {
-    when: issues/IssueAssigneeRemoved(issue, doer, assignee)
+    when: issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)
+    requires: removed
     ensures: HookEventRaised(
         kind: if issue.is_pull: pull_request_assign else: issue_assign,
-        action: unassigned, source_repo: issue.repository, sender: doer)
+        action: unassigned,
+        source_repo: issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
 -- from: services/webhook/notifier.go:515
 rule LabelsChangedRaisesHookEvent {
-    when: issues/IssueLabelsChanged(issue, doer)
+    when: issues/IssueLabelsChanged(issue, doer, added, removed)
     ensures: HookEventRaised(
         kind: if issue.is_pull: pull_request_label else: issue_label,
-        action: label_updated, source_repo: issue.repository, sender: doer)
+        action: label_updated,
+        source_repo: issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
 -- from: services/webhook/notifier.go:42
@@ -918,42 +998,76 @@ rule LabelsClearedRaisesHookEvent {
     when: issues/IssueLabelsCleared(issue, doer)
     ensures: HookEventRaised(
         kind: if issue.is_pull: pull_request_label else: issue_label,
-        action: label_cleared, source_repo: issue.repository, sender: doer)
+        action: label_cleared,
+        source_repo: issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
 -- from: services/webhook/notifier.go:561
 rule MilestoneChangedRaisesHookEvent {
-    when: issues/IssueMilestoneChanged(issue, doer, old_milestone?)
+    when: issues/IssueMilestoneChanged(issue, doer, old_milestone)
     ensures: HookEventRaised(
         kind: if issue.is_pull: pull_request_milestone else: issue_milestone,
         action: if issue.milestone != null: milestoned else: demilestoned,
-        source_repo: issue.repository, sender: doer)
+        source_repo: issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
 -- Only conversation comments (not timeline events) are announced.
 -- from: services/webhook/notifier.go:407
 rule CommentCreatedRaisesHookEvent {
-    when: issues/CommentCreated(comment, doer)
+    when: issues/IssueCommentCreated(issue, comment, doer, mentions)
     requires: comment.kind = comment
     ensures: HookEventRaised(
-        kind: if comment.issue.is_pull: pull_request_comment else: issue_comment,
-        action: created, source_repo: comment.issue.repository, sender: doer)
+        kind: if issue.is_pull: pull_request_comment else: issue_comment,
+        action: created,
+        source_repo: issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
 -- from: services/webhook/notifier.go:364
 rule CommentEditedRaisesHookEvent {
-    when: issues/CommentEdited(comment, doer, old_content)
+    when: issues/IssueCommentEdited(comment, doer, old_content)
     ensures: HookEventRaised(
         kind: if comment.issue.is_pull: pull_request_comment else: issue_comment,
-        action: edited, source_repo: comment.issue.repository, sender: doer)
+        action: edited,
+        source_repo: comment.issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
 -- from: services/webhook/notifier.go:437
 rule CommentDeletedRaisesHookEvent {
-    when: issues/CommentDeleted(comment, doer)
+    when: issues/IssueCommentDeleted(comment, doer)
     ensures: HookEventRaised(
         kind: if comment.issue.is_pull: pull_request_comment else: issue_comment,
-        action: deleted, source_repo: comment.issue.repository, sender: doer)
+        action: deleted,
+        source_repo: comment.issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
 -- Pull requests ---------------------------------------------------
@@ -962,51 +1076,59 @@ rule CommentDeletedRaisesHookEvent {
 -- from: services/webhook/notifier.go:698
 rule ReviewSubmittedRaisesHookEvent {
     when: pulls/ReviewSubmitted(review)
-    requires: review.kind in {approve, comment, reject}
+    requires: review.status = submitted
+    requires: review.kind in {approve, comment, request_changes}
     ensures: HookEventRaised(
         kind: if review.kind = approve: pull_request_review_approved
-              else: if review.kind = reject: pull_request_review_rejected
+              else: if review.kind = request_changes: pull_request_review_rejected
               else: pull_request_review_comment,
-        action: reviewed, source_repo: review.pull_request.issue.repository, sender: review.reviewer)
+        action: reviewed,
+        source_repo: review.pull_request.issue.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: review.reviewer
+    )
 }
 
 -- from: services/webhook/notifier.go:742
 rule ReviewRequestedRaisesHookEvent {
-    when: pulls/ReviewRequested(pr, doer, reviewer)
-    ensures: HookEventRaised(kind: pull_request_review_request, action: review_requested, source_repo: pr.issue.repository, sender: doer)
+    when: pulls/ReviewRequested(pull_request, requester, reviewer)
+    ensures: HookEventRaised(kind: pull_request_review_request, action: review_requested, source_repo: pull_request.issue.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: requester)
 }
 
 -- from: services/webhook/notifier.go:742
 rule ReviewRequestRemovedRaisesHookEvent {
-    when: pulls/ReviewRequestRemoved(pr, doer, reviewer)
-    ensures: HookEventRaised(kind: pull_request_review_request, action: review_request_removed, source_repo: pr.issue.repository, sender: doer)
+    when: pulls/ReviewRequestRemoved(pull_request, doer, reviewer)
+    ensures: HookEventRaised(kind: pull_request_review_request, action: review_request_removed, source_repo: pull_request.issue.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
 -- New commits on the head branch.
 -- from: services/webhook/notifier.go:785
 rule SynchronizeRaisesHookEvent {
-    when: pulls/PullRequestSynchronized(pr, doer)
-    ensures: HookEventRaised(kind: pull_request_sync, action: synchronized, source_repo: pr.issue.repository, sender: doer)
+    when: pulls/PullRequestSynchronized(pull_request, doer)
+    ensures: HookEventRaised(kind: pull_request_sync, action: synchronized, source_repo: pull_request.issue.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
 -- Wiki ------------------------------------------------------------
 
 -- from: services/webhook/notifier.go:477
 rule WikiPageCreatedRaisesHookEvent {
-    when: wiki/WikiPageCreated(repo, doer, page)
-    ensures: HookEventRaised(kind: wiki, action: created, source_repo: repo, sender: doer)
+    when: wiki/WikiPageCreated(repository, doer, page)
+    ensures: HookEventRaised(kind: wiki, action: created, source_repo: repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
 -- from: services/webhook/notifier.go:490
 rule WikiPageEditedRaisesHookEvent {
-    when: wiki/WikiPageEdited(repo, doer, page)
-    ensures: HookEventRaised(kind: wiki, action: edited, source_repo: repo, sender: doer)
+    when: wiki/WikiPageEdited(repository, doer, page)
+    ensures: HookEventRaised(kind: wiki, action: edited, source_repo: repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
 -- from: services/webhook/notifier.go:503
 rule WikiPageDeletedRaisesHookEvent {
-    when: wiki/WikiPageDeleted(repo, doer, page)
-    ensures: HookEventRaised(kind: wiki, action: deleted, source_repo: repo, sender: doer)
+    when: wiki/WikiPageDeleted(repository, doer, page)
+    ensures: HookEventRaised(kind: wiki, action: deleted, source_repo: repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
 -- Releases --------------------------------------------------------
@@ -1014,19 +1136,19 @@ rule WikiPageDeletedRaisesHookEvent {
 -- from: services/webhook/notifier.go:838
 rule ReleasePublishedRaisesHookEvent {
     when: releases/ReleasePublished(release)
-    ensures: HookEventRaised(kind: release, action: published, source_repo: release.repository, sender: release.publisher)
+    ensures: HookEventRaised(kind: release, action: published, source_repo: release.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: release.publisher)
 }
 
 -- from: services/webhook/notifier.go:842
 rule ReleaseUpdatedRaisesHookEvent {
     when: releases/ReleaseUpdated(release, doer)
-    ensures: HookEventRaised(kind: release, action: updated, source_repo: release.repository, sender: doer)
+    ensures: HookEventRaised(kind: release, action: updated, source_repo: release.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
 -- from: services/webhook/notifier.go:846
 rule ReleaseDeletedRaisesHookEvent {
     when: releases/ReleaseDeleted(release, doer)
-    ensures: HookEventRaised(kind: release, action: deleted, source_repo: release.repository, sender: doer)
+    ensures: HookEventRaised(kind: release, action: deleted, source_repo: release.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
 -- Packages --------------------------------------------------------
@@ -1034,24 +1156,32 @@ rule ReleaseDeletedRaisesHookEvent {
 -- A package linked to a repository reaches that repository's hooks too.
 -- from: services/webhook/notifier.go:1095
 rule PackageVersionCreatedRaisesHookEvent {
-    when: packages/PackageVersionCreated(version, doer)
+    when: packages/PackageVersionCreated(version, publisher)
     ensures: HookEventRaised(
-        kind: package, action: created,
+        kind: package,
+        action: created,
         source_repo: version.package.repository,
         owner_user: version.package.owner_user,
         owner_org: version.package.owner_org,
-        sender: doer)
+        branch: null,
+        commit_count: null,
+        sender: publisher
+    )
 }
 
 -- from: services/webhook/notifier.go:890
 rule PackageVersionDeletedRaisesHookEvent {
     when: packages/PackageVersionDeleted(version, doer)
     ensures: HookEventRaised(
-        kind: package, action: deleted,
+        kind: package,
+        action: deleted,
         source_repo: version.package.repository,
         owner_user: version.package.owner_user,
         owner_org: version.package.owner_org,
-        sender: doer)
+        branch: null,
+        commit_count: null,
+        sender: doer
+    )
 }
 
 -- Actions ---------------------------------------------------------
@@ -1067,7 +1197,12 @@ rule WorkflowRunStatusRaisesHookEvent {
         kind: workflow_run_kind(run.status),
         action: status_changed,
         source_repo: run.repository,
-        sender: run.trigger_user)
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: run.trigger_user
+    )
 }
 
 -- from: services/webhook/notifier.go:1023
@@ -1078,7 +1213,47 @@ rule WorkflowJobStatusRaisesHookEvent {
         kind: workflow_job_kind(job.status),
         action: status_changed,
         source_repo: job.run.repository,
-        sender: job.run.trigger_user)
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: job.run.trigger_user
+    )
+}
+
+-- A run or job reaching its final status (success, failure, cancelled,
+-- skipped) is announced the same way; actions emits completion separately
+-- from non-final status changes.
+-- from: services/webhook/notifier.go:926
+rule WorkflowRunCompletionRaisesHookEvent {
+    when: actions/WorkflowRunCompleted(run, prior_status)
+    requires: run.status in {cancelled, failure, skipped, success}
+    ensures: HookEventRaised(
+        kind: workflow_run_kind(run.status),
+        action: status_changed,
+        source_repo: run.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: run.trigger_user
+    )
+}
+
+-- from: services/webhook/notifier.go:1023
+rule WorkflowJobCompletionRaisesHookEvent {
+    when: actions/WorkflowJobCompleted(job, prior_status)
+    requires: job.status in {cancelled, failure, skipped, success}
+    ensures: HookEventRaised(
+        kind: workflow_job_kind(job.status),
+        action: status_changed,
+        source_repo: job.run.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: job.run.trigger_user
+    )
 }
 
 ------------------------------------------------------------
@@ -1162,8 +1337,13 @@ rule DeliveryTimesOut {
 -- Rules — history cleanup (cron task cleanup_hook_task_table)
 ------------------------------------------------------------
 
--- Runs on config.cleanup_schedule (default nightly); expressed here as the
--- condition it enforces.
+-- The cron task cleanup_hook_task_table is registered and scheduled by
+-- administration (default nightly, also "run now"); each run arrives as
+-- administration/HookDeliveryCleanupDue with the configured settings, and
+-- this module's cleanup_* config mirrors those settings. The two temporal
+-- rules below state the condition every run enforces; the reaction performs
+-- the same sweep with the parameters it is given, so both converge on the
+-- same history.
 -- from: models/webhook/hooktask.go:202
 rule CleanupDeliveriesOlderThan {
     when: delivery: HookDelivery.is_expired
@@ -1181,6 +1361,20 @@ rule CleanupDeliveriesBeyondKeepCount {
     ensures:
         for d in excess:
             not exists d
+}
+
+-- One scheduled (or manually started) run of the cleanup task.
+-- from: services/cron/tasks_basic.go:130
+rule CleanupDeliveryHistoryWhenDue {
+    when: administration/HookDeliveryCleanupDue(cleanup_type, older_than, number_to_keep)
+    ensures:
+        if cleanup_type = older_than:
+            for d in HookDeliveries where is_finished and finished_at + older_than <= now:
+                not exists d
+        else:
+            for w in Webhooks:
+                for d in oldest_beyond(w.finished_deliveries, number_to_keep):
+                    not exists d
 }
 
 ------------------------------------------------------------
@@ -1221,23 +1415,11 @@ invariant ChosenEventsOnlyWhenChoosing {
 -- Actor Declarations
 ------------------------------------------------------------
 
-actor RepoAdmin {
-    within: repositories/Repository
-    identified_by: accounts/User where access/is_repo_admin(this, within)
-}
-
-actor OrgOwner {
-    within: organizations/Organization
-    identified_by: accounts/User where within.has_owner(this) or is_admin = true
-}
-
-actor SignedInUser {
-    identified_by: accounts/User where is_active = true and prohibit_login = false
-}
-
-actor SiteAdmin {
-    identified_by: accounts/User where is_admin = true
-}
+-- Managers are the shared actors: access/RepoAdmin (repository webhooks),
+-- organizations/OrgOwner (organization webhooks), access/SignedInUser (own
+-- webhooks) and access/SiteAdmin (system and default webhooks). Every
+-- permission is also a `requires` on the rule, since surfaces do not enforce
+-- the facing actor.
 
 actor HookReceiver {
     identified_by: ReceivingService where base_url != ""
@@ -1250,7 +1432,7 @@ actor HookReceiver {
 -- Repository settings → Webhooks (web) and /repos/{owner}/{repo}/hooks (API).
 -- from: routers/web/web.go:1329
 surface RepoWebhookSettings {
-    facing admin: RepoAdmin
+    facing admin: access/RepoAdmin
     context repo: repositories/Repository
 
     let hooks = Webhooks where scope = per_repository and repository = repo
@@ -1303,7 +1485,7 @@ surface RepoWebhookSettings {
 -- Organization settings → Webhooks and /orgs/{org}/hooks.
 -- from: routers/web/web.go:1151
 surface OrgWebhookSettings {
-    facing owner: OrgOwner
+    facing owner: organizations/OrgOwner
     context organization: organizations/Organization
 
     let hooks = Webhooks where scope = per_owner and owner_org = organization
@@ -1340,7 +1522,7 @@ surface OrgWebhookSettings {
 -- User settings → Webhooks and /user/hooks.
 -- from: routers/web/web.go:867
 surface UserWebhookSettings {
-    facing user: SignedInUser
+    facing user: access/SignedInUser
 
     let hooks = Webhooks where scope = per_owner and owner_user = user
 
@@ -1376,7 +1558,7 @@ surface UserWebhookSettings {
 -- Site administration → Webhooks (system and default) and /admin/hooks.
 -- from: routers/web/admin/hooks.go:22
 surface AdminWebhookSettings {
-    facing admin: SiteAdmin
+    facing admin: access/SiteAdmin
 
     let hooks = Webhooks where is_admin_level
 
@@ -1465,17 +1647,12 @@ open question "Test deliveries are only offered for repository webhooks; should 
 ------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
--- REQUEST access/is_repo_admin(user, repository): fixed name; used for repo webhook management.
--- REQUEST repositories/Repository.owner_user, owner_org: fixed; used for owner-webhook fan-out.
--- REQUEST repositories/RepositoryCreated(repository, doer), RepositoryMigrated(repository, doer), RepositoryForked(fork, source, doer), RepositoryDeleted(repository, doer): emitted triggers; RepositoryDeleted must be emitted before the repository is removed.
--- REQUEST repositories/RepositoryGeneratedFromTemplate(repository, template, include_webhooks): template generation with the "webhooks" option.
--- REQUEST code/PushReceived(push) with push.repository, push.branch_name (null for tags), push.commit_count, push.pusher; also emitted for refs updated by pull-mirror sync.
--- REQUEST code/RefCreated(repository, ref_name, ref_kind: branch|tag, pusher) and code/RefDeleted(...): also emitted by mirror sync.
--- REQUEST issues/IssueOpened, IssueTitleChanged, IssueContentChanged, IssueClosed, IssueReopened, IssueAssigneeAdded, IssueAssigneeRemoved, IssueLabelsChanged, IssueLabelsCleared, IssueMilestoneChanged, CommentCreated, CommentEdited, CommentDeleted (signatures in header); issues/Issue.milestone; issues/Comment.kind with value `comment` for plain conversation comments; IssueClosed must not be emitted for a merge.
--- REQUEST pulls/PullRequestOpened(pr), PullRequestMerged(pr, merger) (incl. auto-merge), PullRequestTargetBranchChanged(pr, doer, old_branch), PullRequestSynchronized(pr, doer), ReviewSubmitted(review), ReviewRequested/ReviewRequestRemoved(pr, doer, reviewer); pulls/Review.kind (approve|comment|reject|pending|request), Review.reviewer, Review.pull_request.
--- REQUEST wiki/WikiPageCreated, WikiPageEdited, WikiPageDeleted (repository, doer, page).
--- REQUEST releases/ReleasePublished(release), ReleaseUpdated(release, doer), ReleaseDeleted(release, doer); releases/Release.repository, Release.publisher.
--- REQUEST packages/PackageVersionCreated(version, doer), PackageVersionDeleted(version, doer); packages/PackageVersion.package; packages/Package.repository?, owner_user?, owner_org?.
--- REQUEST actions/WorkflowRunStatusChanged(run, prior_status) (incl. new attempts and completion), actions/WorkflowJobStatusChanged(job, prior_status); WorkflowRun.status, repository, trigger_user; Job.status, Job.run.
--- REQUEST accounts/UserAccountDeleted(user, purge, delete_contributions), organizations/OrganizationDeleted(organization).
--- REQUEST administration/CronTask: register "cleanup_hook_task_table" (enabled, @midnight, run_at_start false) whose settings are this module's cleanup_* config.
+-- (Triggers consumed are bound exactly as the integration's canonical table
+--  names them; see the header.)
+-- REQUEST repositories/Repository.owner_user, owner_org: used for owner-webhook fan-out; RepositoryDeleted must be emitted before the repository is removed.
+-- REQUEST code/Push.ref_updates with RefUpdate.{ref_kind, ref_name, is_deletion}; PushReceived also for refs updated by pull-mirror sync, and RefCreated / RefDeleted also emitted by mirror sync.
+-- REQUEST issues/Issue.milestone; issues/Comment.kind with value `comment` for plain conversation comments; IssueClosed must not be emitted for a merge.
+-- REQUEST pulls: PullRequestMerged is emitted for auto-merges as well (webhooks does not react to PullRequestAutoMerged); Review.{status, kind: ReviewVerdict, reviewer, pull_request}.
+-- REQUEST packages/PackageVersion.package; packages/Package.repository?, owner_user?, owner_org?.
+-- REQUEST actions: WorkflowRun.{status, repository, trigger_user}; Job.{status, run}.
+-- REQUEST migrations/Migration{repository}.doer: the sender of the repository/created event for a migration.

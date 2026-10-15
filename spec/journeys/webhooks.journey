@@ -135,7 +135,7 @@ journey RepoAdminAddsACiWebhook {
         repo: repositories/Repository
 
     1. she administers the repository
-        stipulate access/is_repo_admin(ada, repo) = true
+        stipulate is_repo_admin(ada, repo) = true
         stipulate cfg.is_valid = true
 
     2. she adds a repository webhook
@@ -159,7 +159,7 @@ journey RepoWriterCannotAddWebhooks {
         repo: repositories/Repository
 
     1. his attempt is refused
-        stipulate access/is_repo_admin(bob, repo) = false
+        stipulate is_repo_admin(bob, repo) = false
         stipulate cfg.is_valid = true
         bob cannot do RepoAdminCreatesWebhook(bob, repo, cfg, true) on RepoWebhookSettings
 
@@ -174,7 +174,7 @@ journey OrgMemberCannotAddOrgWebhooks {
         org: organizations/Organization
 
     1. his attempt is refused
-        stipulate org.has_owner(bob) = false
+        stipulate is_org_owner(org, bob) = false
         stipulate cfg.is_valid = true
         bob cannot do OrgOwnerCreatesWebhook(bob, org, cfg, true) on OrgWebhookSettings
 
