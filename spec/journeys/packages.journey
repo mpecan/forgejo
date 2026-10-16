@@ -61,7 +61,7 @@ journey AdaPublishesAGenericPackage {
 -- Additive kinds take more files into an existing version.
 journey AdaAddsASecondFileToTheSameVersion {
     given:
-        tool:  Package { registry: reg, kind: generic, name: "tool", is_internal: false, autolink_pending: false }
+        tool:  Package { registry: reg, kind: generic, name: "tool", is_internal: false, repository: null, autolink_pending: false }
         v1:    PackageVersion { package: tool, creator: ada, version: "1.0.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
         blob:  PackageBlob { size: 2048, hash_sha256: "abc123" }
         file:  PackageFile { version: v1, blob: blob, name: "tool.tar.gz", composite_key: null, is_lead: true }
@@ -90,7 +90,7 @@ journey NpmRefusesToRepublishAVersion {
     goal: Ada tries to overwrite an npm version she already published.
 
     given:
-        lib:  Package { registry: reg, kind: npm, name: "left-pad", is_internal: false, autolink_pending: false }
+        lib:  Package { registry: reg, kind: npm, name: "left-pad", is_internal: false, repository: null, autolink_pending: false }
         v1:   PackageVersion { package: lib, creator: ada, version: "1.0.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
 
     1. the same version again is a conflict
@@ -142,7 +142,7 @@ journey BobDownloadsAndEveCannotSee {
           private to her). Bob's download is counted.
 
     given:
-        tool:  Package { registry: reg, kind: generic, name: "tool", is_internal: false, autolink_pending: false }
+        tool:  Package { registry: reg, kind: generic, name: "tool", is_internal: false, repository: null, autolink_pending: false }
         v1:    PackageVersion { package: tool, creator: ada, version: "1.0.0", is_internal: false, download_count: 3, is_tagged: false, is_yanked: false }
         blob:  PackageBlob { size: 2048, hash_sha256: "abc123" }
         file:  PackageFile { version: v1, blob: blob, name: "tool.tar.gz", is_lead: true }
@@ -169,7 +169,7 @@ journey BobDownloadsAndEveCannotSee {
 -- repository index, creating the owner's signing key on first need.
 journey AdaDeletesADebianVersion {
     given:
-        pkg:  Package { registry: reg, kind: debian, name: "hello", is_internal: false, autolink_pending: false }
+        pkg:  Package { registry: reg, kind: debian, name: "hello", is_internal: false, repository: null, autolink_pending: false }
         v2:   PackageVersion { package: pkg, creator: ada, version: "2.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
 
     1. she deletes the version from its settings page
@@ -191,7 +191,7 @@ journey AdaDeletesADebianVersion {
 journey AdaLinksAPackageToHerRepository {
     given:
         repo: repositories/Repository { owner_user: ada, is_private: false }
-        pkg:  Package { registry: reg, kind: generic, name: "tool", is_internal: false, linked_repository: null, autolink_pending: false }
+        pkg:  Package { registry: reg, kind: generic, name: "tool", is_internal: false, repository: null, autolink_pending: false }
 
     1. she links it
         stipulate can_write_packages(ada, reg) = true
@@ -199,7 +199,7 @@ journey AdaLinksAPackageToHerRepository {
         stipulate can_write_repo_packages(ada, repo) = true
         ada does UserLinksPackage(ada, pkg, repo) on PackageVersionSettings
         then UserLinksPackageToRepository fires
-        then pkg.linked_repository = repo
+        then pkg.repository = repo
 
     2. bob, who cannot write packages here, cannot unlink it
         stipulate can_write_packages(bob, reg) = false
@@ -211,7 +211,7 @@ journey AdaLinksAPackageToHerRepository {
 -- A Cargo version can be yanked and unyanked without deleting it.
 journey AdaYanksACrate {
     given:
-        crate: Package { registry: reg, kind: cargo, name: "fastmath", is_internal: false, autolink_pending: false }
+        crate: Package { registry: reg, kind: cargo, name: "fastmath", is_internal: false, repository: null, autolink_pending: false }
         v3:    PackageVersion { package: crate, creator: ada, version: "0.3.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
 
     1. she yanks it
@@ -257,6 +257,7 @@ journey AdaPushesAContainerImage {
     4. she pushes the manifest as "v1"
         stipulate valid_image_reference("web", "v1") = true
         stipulate manifest_references_resolve(reg, "web", "man1") = true
+        stipulate manifest_references_blob("man1", "layer1") = true
         stipulate reg.visible_version_count = 0
         ada does ContainerClientPushesManifest(ada, reg, "web", "v1", true, 512, "man1") on ContainerRegistryProtocol
             creating image: Package
@@ -273,7 +274,7 @@ journey AdaPushesAContainerImage {
 -- download count.
 journey AdaRepointsTheLatestTag {
     given:
-        image: Package { registry: reg, kind: container, name: "web", is_internal: false, autolink_pending: false }
+        image: Package { registry: reg, kind: container, name: "web", is_internal: false, repository: null, autolink_pending: false }
         old:   PackageVersion { package: image, creator: ada, version: "latest", is_internal: false, download_count: 42, is_tagged: true, is_yanked: false }
 
     1. she pushes a new manifest as latest
@@ -300,7 +301,7 @@ journey AdaKeepsOnlyRecentSnapshots {
     given:
         sched.next_run_at = 1.day
         sched.last_run_at = null
-        lib:  Package { registry: reg, kind: maven, name: "com.example:lib", is_internal: false, autolink_pending: false }
+        lib:  Package { registry: reg, kind: maven, name: "com.example:lib", is_internal: false, repository: null, autolink_pending: false }
         snap: PackageVersion { package: lib, creator: ada, version: "1.0-SNAPSHOT", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
 
     1. she adds a rule
@@ -357,7 +358,9 @@ journey AdminPurgesLeftovers {
         root: accounts/User
     given:
         root.is_admin = true
-        empty:  Package { registry: reg, kind: generic, name: "abandoned", is_internal: false, autolink_pending: false }
+        root.is_active = true
+        root.prohibit_login = false
+        empty:  Package { registry: reg, kind: generic, name: "abandoned", is_internal: false, repository: null, autolink_pending: false }
         orphan: PackageBlob { size: 99, hash_sha256: "zzz", created_at: 0.days }
 
     1. an ordinary user cannot run it

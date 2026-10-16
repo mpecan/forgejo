@@ -962,7 +962,7 @@ rule ClientReadsTemplate {
     when: ClientReadsTemplate(client, kind, name)
     let template = TemplateFile{kind: kind, name: name}
     requires: exists template
-    ensures: TemplateRead(client, template)
+    ensures: TemplateRead(client: client, template: template)
     @guidance
         -- API: GET /gitignore/templates, /gitignore/templates/{name},
         --   /licenses, /licenses/{name}, /label/templates,
@@ -1002,7 +1002,7 @@ rule ViewerSearchesAllCode {
         )
         if mode = regexp or (mode = fuzzy and not service.fuzzy_enabled):
             search.effective_mode = union
-        CodeSearchAnswered(search)
+        CodeSearchAnswered(search: search)
     @guidance
         -- Web: GET /explore/code (q, l, path, mode=exact|union|fuzzy, page).
         -- Disabled page or no indexer: redirect to /explore/repos.
@@ -1035,7 +1035,7 @@ rule ViewerSearchesOwnerCode {
         )
         if mode = regexp or (mode = fuzzy and not service.fuzzy_enabled):
             search.effective_mode = union
-        CodeSearchAnswered(search)
+        CodeSearchAnswered(search: search)
     @guidance
         -- Web: GET /{owner}/-/code (q, l, path, mode, page). Without an
         -- indexer this page redirects to the owner's profile.
@@ -1065,7 +1065,7 @@ rule ReaderSearchesRepositoryCodeIndexed {
         )
         if mode = regexp or (mode = fuzzy and not service.fuzzy_enabled):
             search.effective_mode = union
-        CodeSearchAnswered(search)
+        CodeSearchAnswered(search: search)
     @guidance
         -- Web: GET /{owner}/{repo}/search (q, l, path, mode, page). The index
         -- only knows the default branch, so `ref_name` is ignored here.
@@ -1102,7 +1102,7 @@ rule ReaderSearchesRepositoryCodeByGrep {
         )
         if mode = fuzzy:
             search.effective_mode = exact
-        CodeSearchAnswered(search)
+        CodeSearchAnswered(search: search)
     @guidance
         -- Web: GET /{owner}/{repo}/search, /search/branch/{branch},
         --   /search/tag/{tag} (the latter two only exist without an indexer).
@@ -1120,7 +1120,7 @@ rule CodeIndexerStarts {
     ensures:
         if index_was_empty:
             for repository in all_repositories():
-                CodeIndexRefreshRequested(repository)
+                CodeIndexRefreshRequested(repository: repository)
     @guidance
         -- A freshly created index is populated by queueing every existing
         -- repository (newest first), after forgetting any recorded index
@@ -1165,16 +1165,16 @@ rule DefaultBranchPushRefreshesIndexes {
     when: code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
     requires: branch_name = repository.default_branch
     requires: new_sha != null
-    ensures: CodeIndexRefreshRequested(repository)
-    ensures: LanguageStatsRefreshQueued(repository)
+    ensures: CodeIndexRefreshRequested(repository: repository)
+    ensures: LanguageStatsRefreshQueued(repository: repository)
 }
 
 -- from: services/indexer/notify.go:155
 rule DefaultBranchChangeRefreshesIndexes {
     when: code/DefaultBranchChanged(repository, old_name, new_name, by)
     requires: not repository.is_empty
-    ensures: CodeIndexRefreshRequested(repository)
-    ensures: LanguageStatsRefreshQueued(repository)
+    ensures: CodeIndexRefreshRequested(repository: repository)
+    ensures: LanguageStatsRefreshQueued(repository: repository)
 }
 
 -- from: services/indexer/notify.go:93
@@ -1182,9 +1182,9 @@ rule MigratedRepositoryIsIndexed {
     when: migrations/RepositoryMigrated(repository)
     ensures:
         if not repository.is_empty:
-            CodeIndexRefreshRequested(repository)
-    ensures: LanguageStatsRefreshQueued(repository)
-    ensures: RepositoryIssuesReindexRequested(repository)
+            CodeIndexRefreshRequested(repository: repository)
+    ensures: LanguageStatsRefreshQueued(repository: repository)
+    ensures: RepositoryIssuesReindexRequested(repository: repository)
 }
 
 -- Adopting unadopted repositories on disk behaves like a migration.
@@ -1193,9 +1193,9 @@ rule AdoptedRepositoryIsIndexed {
     when: repositories/RepositoryAdopted(repository, doer)
     ensures:
         if not repository.is_empty:
-            CodeIndexRefreshRequested(repository)
-    ensures: LanguageStatsRefreshQueued(repository)
-    ensures: RepositoryIssuesReindexRequested(repository)
+            CodeIndexRefreshRequested(repository: repository)
+    ensures: LanguageStatsRefreshQueued(repository: repository)
+    ensures: RepositoryIssuesReindexRequested(repository: repository)
 }
 
 -- Deleting a repository removes all its code and issue documents.
@@ -1252,7 +1252,7 @@ rule CodeIndexJobRuns {
                     commit_sha: head,
                     indexed_at: now
                 )
-            CodeIndexRefreshed(repository, commit_sha: head)
+            CodeIndexRefreshed(repository: repository, commit_sha: head)
     @guidance
         -- Documents after the job are exactly the files of `head` for which
         -- is_indexable_file(path, size) holds (see invariant
@@ -1295,7 +1295,7 @@ rule LanguageStatsJobRuns {
                 mark.commit_sha = head
             else:
                 LanguageStatsMark.created(repository: repository, commit_sha: head)
-            LanguageStatsComputed(repository, commit_sha: head, sizes: language_sizes(repository, head))
+            LanguageStatsComputed(repository: repository, commit_sha: head, sizes: language_sizes(repository, head))
 }
 
 ------------------------------------------------------------
@@ -1309,7 +1309,7 @@ rule IssueIndexerStarts {
     ensures: service.status = ready
     ensures:
         if index_was_empty:
-            IssueIndexRebuildStarted(service)
+            IssueIndexRebuildStarted(service: service)
 }
 
 -- from: modules/indexer/issues/indexer.go:147
@@ -1341,7 +1341,7 @@ rule IssueIndexRebuildQueuesEverything {
     ensures: service.last_full_rebuild_at = now
     ensures:
         for repository in all_repositories():
-            RepositoryIssuesReindexRequested(repository)
+            RepositoryIssuesReindexRequested(repository: repository)
 }
 
 -- Scheduled full rebuild (cron task `rebuild_issue_indexer`, off by default).
@@ -1350,7 +1350,7 @@ rule ScheduledIssueIndexRebuild {
     when: service: IssueIndexService.last_full_rebuild_at + config.rebuild_issue_indexer_interval <= now
     requires: config.rebuild_issue_indexer_enabled
     requires: service.status = ready
-    ensures: IssueIndexRebuildStarted(service)
+    ensures: IssueIndexRebuildStarted(service: service)
 }
 
 -- The administration cron task `rebuild_issue_indexer` (timer or "run now")
@@ -1367,14 +1367,14 @@ rule IssueIndexRebuildTaskRuns {
 -- from: modules/repository/create.go:305
 rule CreatedRepositoryIssuesIndexed {
     when: repositories/RepositoryCreated(repository, doer)
-    ensures: RepositoryIssuesReindexRequested(repository)
+    ensures: RepositoryIssuesReindexRequested(repository: repository)
 }
 
 -- The public/private flag of every issue document follows its repository.
 -- from: modules/repository/create.go:303
 rule VisibilityChangeReindexesIssues {
     when: repositories/RepositoryVisibilityChanged(repository, doer)
-    ensures: RepositoryIssuesReindexRequested(repository)
+    ensures: RepositoryIssuesReindexRequested(repository: repository)
 }
 
 rule QueueRepositoryIssuesJob {
@@ -1392,7 +1392,7 @@ rule RepositoryIssuesJobRuns {
     ensures:
         if job.action = reindex:
             for issue in issues_of(job.repository):
-                IssueReindexRequested(issue)
+                IssueReindexRequested(issue: issue)
         else:
             for d in issue_documents_of(job.repository):
                 not exists d
@@ -1404,57 +1404,57 @@ rule RepositoryIssuesJobRuns {
 -- from: services/indexer/notify.go:38
 rule IssueOpenedIsIndexed {
     when: issues/IssueOpened(issue, mentions)
-    ensures: IssueReindexRequested(issue)
+    ensures: IssueReindexRequested(issue: issue)
 }
 
 rule IssueClosedIsReindexed {
     when: issues/IssueClosed(issue, doer, comment)
-    ensures: IssueReindexRequested(issue)
+    ensures: IssueReindexRequested(issue: issue)
 }
 
 rule IssueReopenedIsReindexed {
     when: issues/IssueReopened(issue, doer, comment)
-    ensures: IssueReindexRequested(issue)
+    ensures: IssueReindexRequested(issue: issue)
 }
 
 rule IssueTitleChangeIsReindexed {
     when: issues/IssueTitleChanged(issue, doer, old_title)
-    ensures: IssueReindexRequested(issue)
+    ensures: IssueReindexRequested(issue: issue)
 }
 
 rule IssueContentChangeIsReindexed {
     when: issues/IssueContentChanged(issue, doer, old_content)
-    ensures: IssueReindexRequested(issue)
+    ensures: IssueReindexRequested(issue: issue)
 }
 
 rule IssueRefChangeIsReindexed {
     when: issues/IssueRefChanged(issue, doer, old_ref)
-    ensures: IssueReindexRequested(issue)
+    ensures: IssueReindexRequested(issue: issue)
 }
 
 rule IssueLabelsChangeIsReindexed {
     when: issues/IssueLabelsChanged(issue, doer, added, removed)
-    ensures: IssueReindexRequested(issue)
+    ensures: IssueReindexRequested(issue: issue)
 }
 
 rule IssueLabelsClearIsReindexed {
     when: issues/IssueLabelsCleared(issue, doer)
-    ensures: IssueReindexRequested(issue)
+    ensures: IssueReindexRequested(issue: issue)
 }
 
 rule IssueMilestoneChangeIsReindexed {
     when: issues/IssueMilestoneChanged(issue, doer, old_milestone)
-    ensures: IssueReindexRequested(issue)
+    ensures: IssueReindexRequested(issue: issue)
 }
 
 rule IssueAssigneeChangeIsReindexed {
     when: issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)
-    ensures: IssueReindexRequested(issue)
+    ensures: IssueReindexRequested(issue: issue)
 }
 
 rule CommentCreatedReindexesIssue {
     when: issues/IssueCommentCreated(issue, comment, doer, mentions)
-    ensures: IssueReindexRequested(issue)
+    ensures: IssueReindexRequested(issue: issue)
 }
 
 rule CommentEditedReindexesIssue {
@@ -1562,7 +1562,7 @@ rule AdminRequestsCodeReindex {
     requires: admin.is_admin
     requires: kind = code
     requires: code_search_service().enabled
-    ensures: CodeIndexRefreshRequested(repository)
+    ensures: CodeIndexRefreshRequested(repository: repository)
     @guidance
         -- Web: POST /{owner}/{repo}/settings action=admin_index
         --   request_reindex_type=code|stats|issues. Code re-index without an
@@ -1573,14 +1573,14 @@ rule AdminRequestsStatsReindex {
     when: AdminRequestsReindex(admin, repository, kind)
     requires: admin.is_admin
     requires: kind = stats
-    ensures: LanguageStatsRefreshQueued(repository)
+    ensures: LanguageStatsRefreshQueued(repository: repository)
 }
 
 rule AdminRequestsIssuesReindex {
     when: AdminRequestsReindex(admin, repository, kind)
     requires: admin.is_admin
     requires: kind = issues
-    ensures: RepositoryIssuesReindexRequested(repository)
+    ensures: RepositoryIssuesReindexRequested(repository: repository)
 }
 
 ------------------------------------------------------------
@@ -1903,7 +1903,7 @@ rule ReaderRequestsContributorStats {
         status: generating,
         requested_at: now
     )
-    ensures: ContributorStatsGenerationStarted(repository, revision)
+    ensures: ContributorStatsGenerationStarted(repository: repository, revision: revision)
     @guidance
         -- Web: GET /{owner}/{repo}/activity/contributors[/data],
         --   /activity/code-frequency[/data], /activity/recent-commits[/data].

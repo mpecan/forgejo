@@ -258,14 +258,15 @@ rule UserCreatesWikiPage {
 -- Editing a page; a different title renames it in the same commit.
 -- from: services/wiki/wiki.go:290
 rule UserEditsWikiPage {
-    when: UserEditsWikiPage(user, page, title, content, message)
+    when: UserEditsWikiPage(user, wiki, page, title, content, message)
+    requires: page.wiki = wiki
     let new_name = if title = "": page.name else: page_name_for(title)
-    requires: wiki_unit_enabled(page.wiki.repository)
-    requires: can_write_wiki(user, page.wiki.repository)
-    requires: not page.wiki.repository.is_archived
+    requires: wiki_unit_enabled(wiki.repository)
+    requires: can_write_wiki(user, wiki.repository)
+    requires: not wiki.repository.is_archived
     requires: new_name not in {"_pages", "_new", "_edit", "raw"}
-    requires: new_name = page.name or not exists WikiPage{wiki: page.wiki, name: new_name}
-    requires: wiki_quota_allows(page.wiki.repository)
+    requires: new_name = page.name or not exists WikiPage{wiki: wiki, name: new_name}
+    requires: wiki_quota_allows(wiki.repository)
     let commit_message = if message = "": "Update " + page.title else: message
     ensures: page.name = new_name
     ensures:
@@ -276,14 +277,14 @@ rule UserEditsWikiPage {
     ensures: page.last_author = user
     ensures: page.updated_at = now
     ensures: WikiRevision.created(
-        wiki: page.wiki,
+        wiki: wiki,
         page_name: new_name,
         kind: edited,
         author: user,
         message: commit_message,
         created_at: now
     )
-    ensures: WikiPageEdited(repository: page.wiki.repository, doer: user, page: page)
+    ensures: WikiPageEdited(repository: wiki.repository, doer: user, page: page)
     @guidance
         -- Web: GET /{o}/{r}/wiki/{page}?action=_edit, POST /wiki/{page}.
         -- API: PATCH /repos/{o}/{r}/wiki/page/{pageName} (empty title keeps
@@ -293,12 +294,13 @@ rule UserEditsWikiPage {
 
 -- from: services/wiki/wiki.go:296
 rule UserDeletesWikiPage {
-    when: UserDeletesWikiPage(user, page)
-    requires: wiki_unit_enabled(page.wiki.repository)
-    requires: can_write_wiki(user, page.wiki.repository)
-    requires: not page.wiki.repository.is_archived
+    when: UserDeletesWikiPage(user, wiki, page)
+    requires: page.wiki = wiki
+    requires: wiki_unit_enabled(wiki.repository)
+    requires: can_write_wiki(user, wiki.repository)
+    requires: not wiki.repository.is_archived
     let page_name = page.name
-    let the_wiki = page.wiki
+    let the_wiki = wiki
     ensures: not exists page
     ensures: WikiRevision.created(
         wiki: the_wiki,
@@ -447,9 +449,9 @@ surface WikiEditing {
     provides:
         UserCreatesWikiPage(editor, wiki, title, content, message)
             when not wiki.repository.is_archived
-        UserEditsWikiPage(editor, page, title, content, message)
+        UserEditsWikiPage(editor, wiki, page, title, content, message)
             when not wiki.repository.is_archived
-        UserDeletesWikiPage(editor, page)
+        UserDeletesWikiPage(editor, wiki, page)
             when not wiki.repository.is_archived
         UserPushesToWiki(editor, wiki)
             when not wiki.repository.is_archived and not wiki.repository.is_mirror

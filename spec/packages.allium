@@ -194,10 +194,11 @@ entity Package {
     -- Internal packages hold registry machinery (repository index files) and
     -- are never listed, counted or individually addressable by users.
     is_internal: Boolean
-    linked_repository: repositories/Repository?
+    -- the repository the package is linked to (webhooks / actions payloads
+    -- read it as package.repository)
+    repository: repositories/Repository?
     properties: Set<PackageProperty>
     -- convenience views used by webhooks / actions payloads
-    repository: linked_repository
     owner_user: registry.owner_user
     owner_org: registry.owner_org
     -- container only: auto-linking is attempted once, on the first manifest
@@ -527,8 +528,9 @@ default KindPolicy vagrant_policy = { kind: vagrant, display_name: "Vagrant", ve
 -- manifest_references_resolve(registry, image, sha256): every config and
 --   layer blob (or, for an index, every sub-manifest) the manifest names is
 --   known to the image (uploaded, mounted or already part of a version).
--- manifest_references_blob(version, blob), manifest_file_name(sha256):
---   manifest content navigation; files are named after their digest.
+-- manifest_references_blob(manifest_sha256, blob_sha256), manifest_file_name(sha256):
+--   manifest content navigation (the manifest with that digest names the
+--   blob with that digest); files are named after their digest.
 -- autolink_candidate(package): the repository named by the image source
 --   annotation, else label, else by the first image-name segment.
 -- blob_readable_by(blob, user): see ContainerMountsBlob guidance.
@@ -568,7 +570,7 @@ rule PublishFirstVersionOfNewPackage {
             name: name,
             semver_compatible: is_semver_kind(kind),
             is_internal: false,
-            linked_repository: null,
+            repository: null,
             properties: extracted_package_properties(kind, sha256),
             autolink_pending: false
         )
@@ -586,9 +588,9 @@ rule PublishFirstVersionOfNewPackage {
             is_yanked: false,
             dist_tags: initial_dist_tags(kind, sha256)
         )
-        FileStored(version: new_version, file_name, composite_key, is_lead, size, sha256)
-        PackageVersionCreated(version: new_version, publisher)
-        RegistryContentChanged(registry, kind, package)
+        FileStored(version: new_version, file_name: file_name, composite_key: composite_key, is_lead: is_lead, size: size, sha256: sha256)
+        PackageVersionCreated(version: new_version, publisher: publisher)
+        RegistryContentChanged(registry: registry, kind: kind, package: package)
     @guidance
         -- Package names are compared case-insensitively (stored as given)
         -- except Maven, whose group:artifact ids are case-sensitive
@@ -646,9 +648,9 @@ rule PublishNewVersionOfExistingPackage {
             is_yanked: false,
             dist_tags: initial_dist_tags(kind, sha256)
         )
-        FileStored(version: new_version, file_name, composite_key, is_lead, size, sha256)
-        PackageVersionCreated(version: new_version, publisher)
-        RegistryContentChanged(registry, kind, package)
+        FileStored(version: new_version, file_name: file_name, composite_key: composite_key, is_lead: is_lead, size: size, sha256: sha256)
+        PackageVersionCreated(version: new_version, publisher: publisher)
+        RegistryContentChanged(registry: registry, kind: kind, package: package)
     @guidance
         -- npm: dist-tags supplied with the publish are moved onto the new
         -- version (removed from whichever version held them before).
@@ -676,8 +678,8 @@ rule AddFileToExistingVersion {
     requires: publisher.is_admin or policy.size_limit < 0 or size <= policy.size_limit
     requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + size <= config.limit_total_owner_size
     ensures:
-        FileStored(version: target, file_name, composite_key, is_lead, size, sha256)
-        RegistryContentChanged(registry, kind, package)
+        FileStored(version: target, file_name: file_name, composite_key: composite_key, is_lead: is_lead, size: size, sha256: sha256)
+        RegistryContentChanged(registry: registry, kind: kind, package: package)
     @guidance
         -- Maven checksum uploads (.md5/.sha1/.sha256/.sha512) are not stored:
         -- they are verified against the existing file and acknowledged.
@@ -706,8 +708,8 @@ rule ReplaceFileInExistingVersion {
     requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + size <= config.limit_total_owner_size
     ensures: not exists old_file
     ensures:
-        FileStored(version: target, file_name, composite_key, is_lead, size, sha256)
-        RegistryContentChanged(registry, kind, package)
+        FileStored(version: target, file_name: file_name, composite_key: composite_key, is_lead: is_lead, size: size, sha256: sha256)
+        RegistryContentChanged(registry: registry, kind: kind, package: package)
     @guidance
         -- When the new content equals the old (same blob) nothing changes.
 }
@@ -738,9 +740,9 @@ rule RefreshIndexesAfterChange {
     let policy = KindPolicy{kind: kind}
     ensures:
         if policy.has_repository_index:
-            RepositoryIndexStale(registry, kind)
+            RepositoryIndexStale(registry: registry, kind: kind)
         if kind = cargo:
-            CargoIndexEntryStale(registry, package)
+            CargoIndexEntryStale(registry: registry, package: package)
 }
 
 ------------------------------------------------------------
@@ -760,7 +762,7 @@ rule RebuildRepositoryIndex {
                 RepositoryIndex.created(registry: registry, kind: kind, scope: scope, built_at: now)
     ensures:
         if policy.signing != none:
-            SigningKeyNeeded(registry, kind)
+            SigningKeyNeeded(registry: registry, kind: kind)
     @guidance
         -- Debian: Packages(.gz/.xz) per distribution/component/architecture,
         -- Release + InRelease + Release.gpg per distribution, by-hash
@@ -795,7 +797,7 @@ rule ClientFetchesRepositoryKey {
     requires: config.packages_enabled
     requires: can_read_packages(client, registry)
     requires: policy.signing != none
-    ensures: SigningKeyNeeded(registry, kind)
+    ensures: SigningKeyNeeded(registry: registry, kind: kind)
 }
 
 -- from: services/packages/cargo/index.go:109
@@ -868,7 +870,7 @@ rule CargoYanksVersion {
     requires: can_write_packages(publisher, registry)
     requires: version.is_yanked = false
     ensures: version.is_yanked = true
-    ensures: CargoIndexEntryStale(registry, package: version.package)
+    ensures: CargoIndexEntryStale(registry: registry, package: version.package)
 }
 
 -- from: routers/api/packages/cargo/cargo.go:264
@@ -881,7 +883,7 @@ rule CargoUnyanksVersion {
     requires: quota_allows_package_upload(registry)
     requires: version.is_yanked = true
     ensures: version.is_yanked = false
-    ensures: CargoIndexEntryStale(registry, package: version.package)
+    ensures: CargoIndexEntryStale(registry: registry, package: version.package)
 }
 
 -- Point an npm dist-tag at a version; the tag leaves whichever version of the
@@ -1023,12 +1025,12 @@ rule ContainerPushesManifestForNewImage {
     requires: manifest_references_resolve(registry, image, sha256)
     requires: publisher.is_admin or config.limit_total_owner_count < 0 or registry.visible_version_count < config.limit_total_owner_count
     ensures:
-        let package = Package.created(registry: registry, kind: container, name: image, semver_compatible: false, is_internal: false, linked_repository: null, properties: {}, autolink_pending: true)
+        let package = Package.created(registry: registry, kind: container, name: image, semver_compatible: false, is_internal: false, repository: null, properties: {}, autolink_pending: true)
         let new_version = PackageVersion.created(package: package, creator: publisher, version: reference, created_at: now, is_internal: false, metadata: extracted_image_metadata(sha256), properties: extracted_image_properties(sha256), download_count: 0, last_downloaded_at: null, is_tagged: is_tag, is_yanked: false, dist_tags: {})
-        FileStored(version: new_version, file_name: manifest_file_name(sha256), composite_key: null, is_lead: true, size, sha256)
-        ContainerManifestLayersAttached(version: new_version, registry, image)
-        ContainerImageCreated(package, publisher)
-        PackageVersionCreated(version: new_version, publisher)
+        FileStored(version: new_version, file_name: manifest_file_name(sha256), composite_key: null, is_lead: true, size: size, sha256: sha256)
+        ContainerManifestLayersAttached(version: new_version, registry: registry, image: image, manifest_sha256: sha256)
+        ContainerImageCreated(package: package, publisher: publisher)
+        PackageVersionCreated(version: new_version, publisher: publisher)
     @guidance
         -- Schema version must be 2; media type is taken from the request or
         -- the manifest; image index entries must themselves be image
@@ -1053,12 +1055,12 @@ rule ContainerPushesNewReference {
     requires: publisher.is_admin or config.limit_total_owner_count < 0 or registry.visible_version_count < config.limit_total_owner_count
     ensures:
         let new_version = PackageVersion.created(package: package, creator: publisher, version: reference, created_at: now, is_internal: false, metadata: extracted_image_metadata(sha256), properties: extracted_image_properties(sha256), download_count: 0, last_downloaded_at: null, is_tagged: is_tag, is_yanked: false, dist_tags: {})
-        FileStored(version: new_version, file_name: manifest_file_name(sha256), composite_key: null, is_lead: true, size, sha256)
-        ContainerManifestLayersAttached(version: new_version, registry, image)
-        PackageVersionCreated(version: new_version, publisher)
+        FileStored(version: new_version, file_name: manifest_file_name(sha256), composite_key: null, is_lead: true, size: size, sha256: sha256)
+        ContainerManifestLayersAttached(version: new_version, registry: registry, image: image, manifest_sha256: sha256)
+        PackageVersionCreated(version: new_version, publisher: publisher)
     ensures:
         if package.autolink_pending:
-            ContainerImageCreated(package, publisher)
+            ContainerImageCreated(package: package, publisher: publisher)
 }
 
 -- Re-pushing an existing tag (or digest) re-points it: the old version is
@@ -1078,9 +1080,9 @@ rule ContainerRepointsReference {
     ensures: not exists previous
     ensures:
         let new_version = PackageVersion.created(package: package, creator: publisher, version: reference, created_at: now, is_internal: false, metadata: extracted_image_metadata(sha256), properties: extracted_image_properties(sha256), download_count: carried_downloads, last_downloaded_at: carried_last_download, is_tagged: is_tag, is_yanked: false, dist_tags: {})
-        FileStored(version: new_version, file_name: manifest_file_name(sha256), composite_key: null, is_lead: true, size, sha256)
-        ContainerManifestLayersAttached(version: new_version, registry, image)
-        PackageVersionCreated(version: new_version, publisher)
+        FileStored(version: new_version, file_name: manifest_file_name(sha256), composite_key: null, is_lead: true, size: size, sha256: sha256)
+        ContainerManifestLayersAttached(version: new_version, registry: registry, image: image, manifest_sha256: sha256)
+        PackageVersionCreated(version: new_version, publisher: publisher)
     @guidance
         -- The superseded manifest's own digest version (if any) is left in
         -- place; it becomes dangling and is purged by the expired-data
@@ -1091,10 +1093,10 @@ rule ContainerRepointsReference {
 -- manifest's version and leave the image's uploaded-blob staging area.
 -- from: services/packages/container/manifest.go:500
 rule AttachManifestLayers {
-    when: ContainerManifestLayersAttached(version, registry, image)
+    when: ContainerManifestLayersAttached(version, registry, image, manifest_sha256)
     ensures:
         for staged in registry.container_uploads:
-            if staged.image = image and manifest_references_blob(version, staged.blob):
+            if staged.image = image and manifest_references_blob(manifest_sha256, staged.blob.hash_sha256):
                 not exists staged
                 PackageFile.created(version: version, blob: staged.blob, name: manifest_file_name(staged.blob.hash_sha256), composite_key: null, is_lead: false, created_at: now, properties: {})
 }
@@ -1110,8 +1112,8 @@ rule AutolinkContainerImage {
     requires: package.autolink_pending
     ensures: package.autolink_pending = false
     ensures:
-        if candidate != null and package.linked_repository = null and same_owner(package.registry, candidate) and can_write_repo_packages(publisher, candidate):
-            package.linked_repository = candidate
+        if candidate != null and package.repository = null and same_owner(package.registry, candidate) and can_write_repo_packages(publisher, candidate):
+            package.repository = candidate
     @guidance
         -- The source URL must start with this instance's URL and have the
         -- form <instance>/<owner>/<repo>. Failures are silent.
@@ -1128,7 +1130,7 @@ rule ContainerDeletesManifest {
     requires: package.kind = container
     requires: can_write_packages(publisher, package.registry)
     ensures: not exists version
-    ensures: PackageVersionDeleted(version, doer: publisher)
+    ensures: PackageVersionDeleted(version: version, doer: publisher)
 }
 
 -- `docker login` exchange: issue a bearer token for the authenticated user,
@@ -1184,8 +1186,8 @@ rule UserDeletesPackageVersion {
         for f in version.files:
             not exists f
     ensures: not exists version
-    ensures: PackageVersionDeleted(version, doer: actor)
-    ensures: RegistryContentChanged(registry, kind, package)
+    ensures: PackageVersionDeleted(version: version, doer: actor)
+    ensures: RegistryContentChanged(registry: registry, kind: kind, package: package)
     @guidance
         -- RubyGems "yank" and the generic/npm "delete version" endpoints are
         -- deletions. A package left without versions disappears from listings
@@ -1204,7 +1206,7 @@ rule UserDeletesWholePackage {
         for v in package.visible_versions:
             not exists v
             PackageVersionDeleted(version: v, doer: actor)
-    ensures: RegistryContentChanged(registry: package.registry, kind: package.kind, package)
+    ensures: RegistryContentChanged(registry: package.registry, kind: package.kind, package: package)
 }
 
 -- Delete a single file; when it was the last file of its version the version
@@ -1224,8 +1226,8 @@ rule UserDeletesPackageFile {
     ensures:
         if was_last_file:
             not exists version
-            PackageVersionDeleted(version, doer: actor)
-    ensures: RegistryContentChanged(registry, kind: package.kind, package)
+            PackageVersionDeleted(version: version, doer: actor)
+    ensures: RegistryContentChanged(registry: registry, kind: package.kind, package: package)
 }
 
 ------------------------------------------------------------
@@ -1238,31 +1240,31 @@ rule UserLinksPackageToRepository {
     requires: config.packages_enabled
     requires: can_write_packages(actor, package.registry)
     requires: same_owner(package.registry, repository)
-    requires: package.linked_repository = null
+    requires: package.repository = null
     requires: can_write_repo_packages(actor, repository)
-    ensures: package.linked_repository = repository
+    ensures: package.repository = repository
 }
 
 -- from: services/packages/package_update.go:41
 rule UserUnlinksPackageFromRepository {
     when: UserUnlinksPackage(actor, package)
-    let repository = package.linked_repository
+    let repository = package.repository
     let registry = package.registry
     requires: config.packages_enabled
     requires: can_write_packages(actor, registry)
     requires: repository != null
     requires: can_write_repo_packages(actor, repository)
     requires: actor.is_admin or registry.owner_user = actor or (registry.owner_is_org and is_org_owner(registry.owner_org, actor))
-    ensures: package.linked_repository = null
+    ensures: package.repository = null
 }
 
 -- from: services/repository/delete.go:347
 rule RepositoryDeletionUnlinksPackages {
-    when: repositories/RepositoryDeleted(repository, _)
+    when: repositories/RepositoryDeleted(repository, doer)
     ensures:
         for p in Packages:
-            if p.linked_repository = repository:
-                p.linked_repository = null
+            if p.repository = repository:
+                p.repository = null
 }
 
 ------------------------------------------------------------
@@ -1517,7 +1519,7 @@ invariant OneCleanupRulePerOwnerAndKind {
 -- from: services/packages/package_update.go:20
 invariant LinkedRepositoryHasSameOwner {
     for p in Packages:
-        p.linked_repository != null implies same_owner(p.registry, p.linked_repository)
+        p.repository != null implies same_owner(p.registry, p.repository)
 }
 
 -- Every registry belongs to exactly one owner.
@@ -1727,8 +1729,8 @@ surface PackageBrowsing {
             p.kind
             p.properties
             p.latest_version
-        for p in registry.visible_packages where p.linked_repository != null and can_read_packages(viewer, registry) and can_read_repo_code(viewer, p.linked_repository):
-            p.linked_repository
+        for p in registry.visible_packages where p.repository != null and can_read_packages(viewer, registry) and can_read_repo_code(viewer, p.repository):
+            p.repository
         for v in PackageVersions where v.package.registry = registry and v.is_internal = false and can_read_packages(viewer, registry):
             v.version
             v.creator
@@ -1793,7 +1795,7 @@ surface PackageVersionSettings {
 
     exposes:
         for p in registry.visible_packages where can_write_packages(writer, registry):
-            p.linked_repository
+            p.repository
 
     provides:
         UserLinksPackage(writer, package, repository)
@@ -1863,7 +1865,7 @@ surface RepositoryPackages {
     context repository: repositories/Repository
 
     exposes:
-        for p in Packages where p.linked_repository = repository and p.is_internal = false and can_read_repo_code(viewer, repository):
+        for p in Packages where p.repository = repository and p.is_internal = false and can_read_repo_code(viewer, repository):
             p.name
             p.kind
             p.latest_version

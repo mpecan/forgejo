@@ -272,12 +272,13 @@ rule UserCreatesReleaseOnExistingTag {
 -- Editing a draft that stays a draft. Nobody is told.
 -- from: services/release/release.go:248
 rule UserEditsDraftRelease {
-    when: UserEditsRelease(user, release, title, note, is_draft, is_prerelease, hide_archive_links)
-    requires: can_write_releases(user, release.repository)
-    requires: not release.repository.is_archived
+    when: UserEditsRelease(user, repository, release, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: release.repository = repository
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
     requires: release.state = draft
     requires: is_draft
-    requires: release_quota_allows(release.repository)
+    requires: release_quota_allows(repository)
     ensures: release.title = title
     ensures: release.note = note
     ensures: release.is_prerelease = is_prerelease
@@ -287,14 +288,15 @@ rule UserEditsDraftRelease {
 -- Publishing a draft. Its tag is created now if it does not exist yet.
 -- from: services/release/release.go:248
 rule UserPublishesDraftRelease {
-    when: UserEditsRelease(user, release, title, note, is_draft, is_prerelease, hide_archive_links)
-    requires: can_write_releases(user, release.repository)
-    requires: not release.repository.is_archived
+    when: UserEditsRelease(user, repository, release, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: release.repository = repository
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
     requires: release.state = draft
     requires: not is_draft
-    requires: release.has_tag or may_control_tag(user, release.repository, release.tag_name)
-    requires: release.has_tag or target_resolves(release.repository, release.target)
-    requires: release_quota_allows(release.repository)
+    requires: release.has_tag or may_control_tag(user, repository, release.tag_name)
+    requires: release.has_tag or target_resolves(repository, release.target)
+    requires: release_quota_allows(repository)
     let tag_was_missing = not release.has_tag
     ensures: release.title = title
     ensures: release.note = note
@@ -303,8 +305,8 @@ rule UserPublishesDraftRelease {
     ensures: release.state = published
     ensures:
         if tag_was_missing:
-            release.commit_sha = commit_of(release.repository, release.target)
-            release.num_commits = commit_count_of(release.repository, release.target)
+            release.commit_sha = commit_of(repository, release.target)
+            release.num_commits = commit_count_of(repository, release.target)
             release.created_at = now
             ReleaseTagRequested(release: release, doer: user)
     ensures: ReleasePublished(release: release)
@@ -313,12 +315,13 @@ rule UserPublishesDraftRelease {
 -- Editing a published release that stays published.
 -- from: services/release/release.go:368
 rule UserEditsPublishedRelease {
-    when: UserEditsRelease(user, release, title, note, is_draft, is_prerelease, hide_archive_links)
-    requires: can_write_releases(user, release.repository)
-    requires: not release.repository.is_archived
+    when: UserEditsRelease(user, repository, release, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: release.repository = repository
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
     requires: release.state = published
     requires: not is_draft
-    requires: release_quota_allows(release.repository)
+    requires: release_quota_allows(repository)
     ensures: release.title = title
     ensures: release.note = note
     ensures: release.is_prerelease = is_prerelease
@@ -329,9 +332,10 @@ rule UserEditsPublishedRelease {
 -- Turning a published release back into a draft. The tag stays.
 -- from: routers/web/repo/release.go:817
 rule UserUnpublishesRelease {
-    when: UserEditsRelease(user, release, title, note, is_draft, is_prerelease, hide_archive_links)
-    requires: can_write_releases(user, release.repository)
-    requires: not release.repository.is_archived
+    when: UserEditsRelease(user, repository, release, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: release.repository = repository
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
     requires: release.state = published
     requires: is_draft
     ensures: release.title = title
@@ -344,13 +348,14 @@ rule UserUnpublishesRelease {
 -- API only: moving a draft to another tag name and/or target before its tag exists.
 -- from: routers/api/v1/repo/release.go:353
 rule UserRetargetsDraftRelease {
-    when: UserRetargetsRelease(user, release, tag_name, target)
-    requires: can_write_releases(user, release.repository)
-    requires: not release.repository.is_archived
+    when: UserRetargetsRelease(user, repository, release, tag_name, target)
+    requires: release.repository = repository
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
     requires: release.state = draft
     requires: not release.has_tag
     requires: is_valid_tag_name(tag_name)
-    requires: tag_name = release.tag_name or not exists Release{repository: release.repository, tag_name: tag_name}
+    requires: tag_name = release.tag_name or not exists Release{repository: repository, tag_name: tag_name}
     ensures: release.tag_name = tag_name
     ensures: release.target = target
     @guidance
@@ -365,9 +370,10 @@ rule UserRetargetsDraftRelease {
 -- all its assets are removed. A draft whose tag never existed disappears.
 -- from: services/release/release.go:390
 rule UserDeletesRelease {
-    when: UserDeletesRelease(user, release)
-    requires: can_write_releases(user, release.repository)
-    requires: not release.repository.is_archived
+    when: UserDeletesRelease(user, repository, release)
+    requires: release.repository = repository
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
     requires: release.is_release
     let was_published = release.state = published
     ensures:
@@ -398,17 +404,18 @@ rule UserDeletesRelease {
 -- for linking on save (web: the release is chosen when the form is saved).
 -- from: routers/api/v1/repo/release_attachment.go:190
 rule UserUploadsReleaseAsset {
-    when: UserUploadsReleaseAsset(user, release, name, size, head_bytes)
+    when: UserUploadsReleaseAsset(user, repository, release, name, size, head_bytes)
+    requires: release.repository = repository
     requires: config.attachments_enabled
-    requires: can_write_releases(user, release.repository)
-    requires: not release.repository.is_archived
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
     requires: release.is_release
     requires: name != ""
     requires: file_type_allowed(name, head_bytes, config.release_allowed_types)
     requires: size <= config.max_asset_size_mb * 1048576
-    requires: asset_quota_allows(release.repository)
+    requires: asset_quota_allows(repository)
     ensures: issues/Attachment.created(
-        repository: release.repository,
+        repository: repository,
         uploader: user,
         name: name,
         size: size,
@@ -432,11 +439,12 @@ rule UserUploadsReleaseAsset {
 -- Web: the uploads listed in the saved release form become its assets.
 -- from: models/repo/release.go:235
 rule UserLinksUploadToRelease {
-    when: UserLinksUploadToRelease(user, release, file)
-    requires: can_write_releases(user, release.repository)
-    requires: not release.repository.is_archived
+    when: UserLinksUploadToRelease(user, repository, release, file)
+    requires: release.repository = repository
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
     requires: release.is_release
-    requires: file.repository = release.repository
+    requires: file.repository = repository
     requires: file.uploader = user
     requires: not file.is_linked
     ensures: file.release = release
@@ -445,15 +453,16 @@ rule UserLinksUploadToRelease {
 -- Adding a link to a file hosted elsewhere.
 -- from: services/attachment/attachment.go:50
 rule UserAddsExternalAsset {
-    when: UserAddsExternalAsset(user, release, name, url)
+    when: UserAddsExternalAsset(user, repository, release, name, url)
+    requires: release.repository = repository
     requires: config.attachments_enabled
-    requires: can_write_releases(user, release.repository)
-    requires: not release.repository.is_archived
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
     requires: release.is_release
     requires: is_valid_url(url)
     requires: name != ""
     ensures: issues/Attachment.created(
-        repository: release.repository,
+        repository: repository,
         uploader: user,
         name: name,
         size: 0,
@@ -473,10 +482,11 @@ rule UserAddsExternalAsset {
 
 -- from: services/release/release.go:340
 rule UserRenamesReleaseAsset {
-    when: UserRenamesReleaseAsset(user, asset, name)
+    when: UserRenamesReleaseAsset(user, repository, asset, name)
+    requires: asset.repository = repository
     requires: asset.release != null
-    requires: can_write_releases(user, asset.repository)
-    requires: not asset.repository.is_archived
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
     requires: name != ""
     ensures: asset.name = name
     @guidance
@@ -485,10 +495,11 @@ rule UserRenamesReleaseAsset {
 
 -- from: routers/api/v1/repo/release_attachment.go:395
 rule UserChangesExternalAssetUrl {
-    when: UserChangesExternalAssetUrl(user, asset, url)
+    when: UserChangesExternalAssetUrl(user, repository, asset, url)
+    requires: asset.repository = repository
     requires: asset.release != null
-    requires: can_write_releases(user, asset.repository)
-    requires: not asset.repository.is_archived
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
     requires: asset.external_url != null
     requires: is_valid_url(url)
     ensures: asset.external_url = url
@@ -499,10 +510,11 @@ rule UserChangesExternalAssetUrl {
 
 -- from: routers/api/v1/repo/release_attachment.go:460
 rule UserDeletesReleaseAsset {
-    when: UserDeletesReleaseAsset(user, asset)
+    when: UserDeletesReleaseAsset(user, repository, asset)
+    requires: asset.repository = repository
     requires: asset.release != null
-    requires: can_write_releases(user, asset.repository)
-    requires: not asset.repository.is_archived
+    requires: can_write_releases(user, repository)
+    requires: not repository.is_archived
     ensures: not exists asset
     @guidance
         -- Web: "attachment-del-*" on the edit form; API DELETE .../assets/{asset_id}.
@@ -512,10 +524,11 @@ rule UserDeletesReleaseAsset {
 -- Downloading a stored asset counts; following an external link does not.
 -- from: routers/web/repo/attachment.go:83
 rule VisitorDownloadsReleaseAsset {
-    when: VisitorDownloadsReleaseAsset(viewer, asset)
+    when: VisitorDownloadsReleaseAsset(viewer, repository, asset)
+    requires: asset.repository = repository
     requires: asset.release != null
-    requires: can_read_releases(viewer, asset.repository)
-    requires: asset.release.is_visible_to_readers or can_write_releases(viewer, asset.repository)
+    requires: can_read_releases(viewer, repository)
+    requires: asset.release.is_visible_to_readers or can_write_releases(viewer, repository)
     ensures:
         if asset.external_url = null:
             asset.download_count = asset.download_count + 1
@@ -784,7 +797,7 @@ surface ReleaseCatalogue {
         latest_release_of(repository)
 
     provides:
-        VisitorDownloadsReleaseAsset(viewer, asset)
+        VisitorDownloadsReleaseAsset(viewer, repository, asset)
 
     @guarantee DraftsAreInvisibleToReaders
         -- A draft never appears in lists, single views, the latest lookup,
@@ -834,25 +847,25 @@ surface ReleaseManagement {
     provides:
         UserCreatesRelease(writer, repository, tag_name, target, title, note, is_draft, is_prerelease, hide_archive_links)
             when not repository.is_archived and not repository.is_empty
-        UserEditsRelease(writer, release, title, note, is_draft, is_prerelease, hide_archive_links)
+        UserEditsRelease(writer, repository, release, title, note, is_draft, is_prerelease, hide_archive_links)
             when not repository.is_archived
-        UserRetargetsRelease(writer, release, tag_name, target)
+        UserRetargetsRelease(writer, repository, release, tag_name, target)
             when not repository.is_archived
-        UserDeletesRelease(writer, release)
+        UserDeletesRelease(writer, repository, release)
             when not repository.is_archived
-        UserUploadsReleaseAsset(writer, release, name, size, head_bytes)
+        UserUploadsReleaseAsset(writer, repository, release, name, size, head_bytes)
             when not repository.is_archived and config.attachments_enabled
-        UserLinksUploadToRelease(writer, release, file)
+        UserLinksUploadToRelease(writer, repository, release, file)
             when not repository.is_archived
-        UserAddsExternalAsset(writer, release, name, url)
+        UserAddsExternalAsset(writer, repository, release, name, url)
             when not repository.is_archived and config.attachments_enabled
-        UserRenamesReleaseAsset(writer, asset, name)
+        UserRenamesReleaseAsset(writer, repository, asset, name)
             when not repository.is_archived
-        UserChangesExternalAssetUrl(writer, asset, url)
+        UserChangesExternalAssetUrl(writer, repository, asset, url)
             when not repository.is_archived
-        UserDeletesReleaseAsset(writer, asset)
+        UserDeletesReleaseAsset(writer, repository, asset)
             when not repository.is_archived
-        VisitorDownloadsReleaseAsset(writer, asset)
+        VisitorDownloadsReleaseAsset(writer, repository, asset)
 
     @guarantee ArchivedRepositoriesAreFrozen
         -- No release or asset of an archived repository can be created,

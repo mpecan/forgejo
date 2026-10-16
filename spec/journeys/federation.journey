@@ -1,6 +1,9 @@
 -- Journeys through federation: remote servers discovering this instance,
 -- remote people following and starring, local people following out, and
 -- the delivery queue retrying.
+--
+-- Federation is off by default ([federation] ENABLED = false). Every journey
+-- here but the last is about an instance whose operator switched it on.
 
 world {
     cast:
@@ -27,6 +30,7 @@ world {
         bob_doc.host_software = forgejo
         alice.kind = individual
         alice.prohibit_login = false
+        federation/config.enabled = true
 }
 
 journey ARemotePersonIsMetForTheFirstTime {
@@ -247,6 +251,8 @@ journey FederationAdminPagesAreForAdminsOnly {
 
     given:
         root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
         alice.is_admin = false
 
     1. the site admin sees the host list
@@ -276,4 +282,20 @@ journey WebFingerResolvesOnlyPublicAccounts {
         peer cannot see dave.name on WebFingerLookup in dave
 
     ends: Only public accounts are discoverable anonymously.
+}
+
+journey FederationIsOffUntilTheOperatorTurnsItOn {
+    goal: On an instance that has not enabled federation, a remote server
+          gets nowhere and a local user cannot follow anyone elsewhere.
+
+    given:
+        federation/config.enabled = false
+
+    1. a remote server presents bob's signed request
+        peer cannot do RemoteRequestSigned(peer, bob_doc) on PersonActorEndpoint
+
+    2. alice tries to look bob up
+        alice cannot do UserLooksUpRemoteActor(alice, bob_doc) on FederationForLocalUser
+
+    ends: Nothing about bob or his server is stored; federation stays inert.
 }

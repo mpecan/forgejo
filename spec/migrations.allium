@@ -56,8 +56,12 @@
 --       webhooks (repository created), activity feed, notifications; the
 --       doer is migrations/Migration{repository}.doer
 --   - MigrationFailed(migration)                 -- progress page, notifications
---   - administration/SystemFailureReported(kind, description) -- kind: repository; on a
---       failed import and on dropped unsafe source data (SystemNotice)
+--   - MigrationFailureReported(kind, description) -- kind: repository; on a
+--       failed import and on dropped unsafe source data; administration
+--       records it as a SystemNotice
+--   - ImportCompleted(repository, remote_address, has_credentials, interval,
+--       lfs_enabled, lfs_endpoint)            -- repositories finishes the
+--       repository (ready; pull mirror for a mirror import)
 --   - MigratedContentDiscarded(repository)       -- core wipes partially
 --       imported content before a retry
 --   - ExternalAuthorLinked(authorship, user)     -- imported content now
@@ -1009,7 +1013,7 @@ rule GitCloneTimesOut {
     ensures: migration.ended_at = now
     ensures: migration.git_deadline = null
     ensures: MigrationFailed(migration: migration)
-    ensures: administration/SystemFailureReported(kind: repository, description: migration.message)
+    ensures: MigrationFailureReported(kind: repository, description: migration.message)
 }
 
 -- "N issues / pull requests migrated so far".
@@ -1041,7 +1045,7 @@ rule RejectRewrittenCloneAddress {
     ensures: migration.message = "the source redirected to a disallowed address"
     ensures: migration.ended_at = now
     ensures: MigrationFailed(migration: migration)
-    ensures: administration/SystemFailureReported(kind: repository, description: migration.message)
+    ensures: MigrationFailureReported(kind: repository, description: migration.message)
 }
 
 -- ===== What gets imported =====
@@ -1288,7 +1292,7 @@ rule RefuseUnsafePullRequest {
     ensures: migration.message = "pull request was not checked for safety"
     ensures: migration.ended_at = now
     ensures: MigrationFailed(migration: migration)
-    ensures: administration/SystemFailureReported(kind: repository, description: migration.message)
+    ensures: MigrationFailureReported(kind: repository, description: migration.message)
 }
 
 -- Comments attach to an already imported issue / pull request. Close,
@@ -1343,7 +1347,7 @@ rule RefuseOrphanComment {
     ensures: migration.message = "comment belongs to an issue that was not imported"
     ensures: migration.ended_at = now
     ensures: MigrationFailed(migration: migration)
-    ensures: administration/SystemFailureReported(kind: repository, description: migration.message)
+    ensures: MigrationFailureReported(kind: repository, description: migration.message)
 }
 
 -- Reviews attach to an imported pull request. Code comments are kept only
@@ -1424,7 +1428,7 @@ rule FlagDroppedSourceData {
 
     requires: migration.status = running
 
-    ensures: administration/SystemFailureReported(kind: repository, description: detail)
+    ensures: MigrationFailureReported(kind: repository, description: detail)
 }
 
 -- ===== Finishing =====
@@ -1451,7 +1455,7 @@ rule CompleteMigration {
     ensures: migration.source_address = null
     ensures: migration.credentials = null
     ensures: migration.message = null
-    ensures: repositories/ImportCompleted(
+    ensures: ImportCompleted(
         repository: migration.repository,
         remote_address: sanitized_url(address),
         has_credentials: creds.kind != anonymous,
@@ -1481,7 +1485,7 @@ rule FailMigration {
     ensures: migration.message = strip_credentials(detail)
     ensures: migration.ended_at = now
     ensures: MigrationFailed(migration: migration)
-    ensures: administration/SystemFailureReported(
+    ensures: MigrationFailureReported(
         kind: repository,
         description: migration_failure_notice(migration.original_url, strip_credentials(detail))
     )

@@ -10,6 +10,11 @@ world {
         repo.is_archived = false
         repo.is_empty = false
         repo.default_branch = "main"
+        repo.owner_user = ada
+        repo.owner_org = null
+        -- None of these stories is about CI: Actions is off on this instance,
+        -- so a release event starts no workflow.
+        actions/config.actions_enabled = false
 }
 
 -- The happy path: a maintainer cuts v1.0 straight from main.
@@ -62,7 +67,7 @@ journey ADraftStaysHiddenUntilPublished {
         stipulate may_control_tag(ada, repo, "v2.0") = true
         stipulate target_resolves(repo, "main") = true
         stipulate release_quota_allows(repo) = true
-        ada does UserEditsRelease(ada, rel, "Two", "Final notes", false, false, false) on ReleaseManagement
+        ada does UserEditsRelease(ada, repo, rel, "Two", "Final notes", false, false, false) on ReleaseManagement
         then UserPublishesDraftRelease fires
         then rel.state = published
         then rel.note = "Final notes"
@@ -122,7 +127,7 @@ journey AnArchivedRepositoryRefusesReleaseChanges {
     1. she tries to edit the notes
         stipulate can_write_releases(ada, repo) = true
         stipulate release_quota_allows(repo) = true
-        ada cannot do UserEditsRelease(ada, rel, "Title", "New notes", false, false, false) on ReleaseManagement
+        ada cannot do UserEditsRelease(ada, repo, rel, "Title", "New notes", false, false, false) on ReleaseManagement
 
     ends: The release is unchanged.
 }
@@ -195,7 +200,7 @@ journey DeletingAReleaseKeepsItsTag {
 
     1. she deletes the release only
         stipulate can_write_releases(ada, repo) = true
-        ada does UserDeletesRelease(ada, rel) on ReleaseManagement
+        ada does UserDeletesRelease(ada, repo, rel) on ReleaseManagement
         then UserDeletesRelease fires
         then rel.state = tag_only
         then rel.commit_sha = "abc123"
@@ -269,11 +274,11 @@ journey DownloadsAreCountedForStoredAssetsOnly {
     1. he downloads the tarball
         stipulate can_read_releases(bob, repo) = true
         stipulate can_write_releases(bob, repo) = false
-        bob does VisitorDownloadsReleaseAsset(bob, tarball) on ReleaseCatalogue
+        bob does VisitorDownloadsReleaseAsset(bob, repo, tarball) on ReleaseCatalogue
         then tarball.download_count = 4
 
     2. he follows the mirror link
-        bob does VisitorDownloadsReleaseAsset(bob, link) on ReleaseCatalogue
+        bob does VisitorDownloadsReleaseAsset(bob, repo, link) on ReleaseCatalogue
         then link.download_count = 0
 
     3. he sees the counts
@@ -301,13 +306,12 @@ journey ADraftsAssetsAreNotDownloadable {
     1. he tries to download it
         stipulate can_read_releases(bob, repo) = true
         stipulate can_write_releases(bob, repo) = false
-        bob cannot do VisitorDownloadsReleaseAsset(bob, asset) on ReleaseCatalogue
+        bob cannot do VisitorDownloadsReleaseAsset(bob, repo, asset) on ReleaseCatalogue
 
     ends: The counter is still zero and Bob learned nothing.
 }
 
--- Adding an external link to a release. (Step 1 field checks stay undecided: the
--- simulator does not bind entities another module owns when a rule here creates them.)
+-- Adding an external link to a release.
 journey AMaintainerLinksAnExternalAsset {
     goal: Ada's binaries are hosted on a CDN. She adds a link to the release
           instead of uploading.
@@ -322,7 +326,7 @@ journey AMaintainerLinksAnExternalAsset {
     1. she adds the link
         stipulate can_write_releases(ada, repo) = true
         stipulate is_valid_url("https://cdn.example/app.zip") = true
-        ada does UserAddsExternalAsset(ada, rel, "app.zip", "https://cdn.example/app.zip") on ReleaseManagement
+        ada does UserAddsExternalAsset(ada, repo, rel, "app.zip", "https://cdn.example/app.zip") on ReleaseManagement
             creating link: issues/Attachment
         then UserAddsExternalAsset fires
         then link.external_url = "https://cdn.example/app.zip"
@@ -330,7 +334,7 @@ journey AMaintainerLinksAnExternalAsset {
 
     2. an invalid URL is refused
         stipulate is_valid_url("not a url") = false
-        ada cannot do UserAddsExternalAsset(ada, rel, "bad", "not a url") on ReleaseManagement
+        ada cannot do UserAddsExternalAsset(ada, repo, rel, "bad", "not a url") on ReleaseManagement
 
     ends: The release offers app.zip from the CDN.
 }

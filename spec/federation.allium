@@ -48,9 +48,9 @@
 --   ActivityDelivered(delivery) / ActivityDeliveryAbandoned(delivery)
 -- Gating: [federation] ENABLED (config.enabled, default off) decides whether
 --   any of this exists. When off, no federation route is mounted, so none of
---   the inbound or user-initiated triggers below can occur; the surfaces carry
---   the guard. Background reactions (local star, local activity) check it
---   themselves.
+--   the inbound or user-initiated triggers below can occur: every rule they
+--   wake requires config.enabled, and so do the background reactions (local
+--   star, local activity).
 -- Reacts to:
 --   repositories/Star.created                         -- local star -> outbound Like
 --   notifications/ActivityRecorded(activity)          -- public local activity -> Create(Note) to remote followers
@@ -369,6 +369,7 @@ default InstanceActor instance_actor = {
 -- from: services/federation/signature_service.go:24
 rule ResolveSigningActor {
     when: RemoteRequestSigned(peer, signer)
+    requires: config.enabled
     requires: signer.kind in {person, application}
     requires: signer.public_key != null
     requires: signer.key_id = peer.signing_key_id
@@ -398,8 +399,8 @@ rule DiscoverFederationHost {
             created_at: now,
             updated_at: now
         )
-        FederationHostDiscovered(host)
-        RemoteActorOnKnownHost(remote, host)
+        FederationHostDiscovered(host: host)
+        RemoteActorOnKnownHost(remote: remote, host: host)
 }
 
 -- from: services/federation/federation_service.go:30
@@ -407,7 +408,7 @@ rule RecogniseKnownHost {
     when: RemoteActorReferenced(remote)
     let host = FederationHost{host_fqdn: remote.host_fqdn, host_port: remote.host_port}
     requires: exists host
-    ensures: RemoteActorOnKnownHost(remote, host)
+    ensures: RemoteActorOnKnownHost(remote: remote, host: host)
 }
 
 -- A remote Person seen for the first time becomes a local account of kind
@@ -490,6 +491,7 @@ rule CacheHostInstanceActorKey {
 -- from: services/federation/repository_inbox_like.go:33
 rule AcceptFederatedLike {
     when: RemoteActorLikesRepository(peer, actor, repository, object_uri, published_at)
+    requires: config.enabled
     requires: not config.signature_enforced or peer.signature_valid
     requires: object_uri = repository_actor_uri(repository)
     requires: actor.host.latest_activity = null or published_at > actor.host.latest_activity
@@ -498,7 +500,7 @@ rule AcceptFederatedLike {
     ensures:
         if not already_starred:
             repositories/Star.created(user: actor.user, repository: repository)
-            FederatedStarReceived(federated_user: actor, repository)
+            FederatedStarReceived(federated_user: actor, repository: repository)
     ensures: actor.host.latest_activity = published_at
     ensures: actor.host.updated_at = now
     @guidance
@@ -516,6 +518,7 @@ rule AcceptFederatedLike {
 -- from: services/federation/person_inbox_follow.go:18
 rule AcceptRemoteFollow {
     when: RemoteActorFollowsUser(peer, actor, user)
+    requires: config.enabled
     requires: not config.signature_enforced or peer.signature_valid
     requires: not exists FederatedFollower{followed: user, follower: actor}
     ensures:
@@ -530,8 +533,8 @@ rule AcceptRemoteFollow {
             next_attempt_at: now,
             status: queued
         )
-        RemoteUserFollowedUser(follower)
-    ensures: ActorKeyPairNeeded(user)
+        RemoteUserFollowedUser(follower: follower)
+    ensures: ActorKeyPairNeeded(user: user)
 }
 
 -- Undo(Follow): stop delivering to that follower. Undo of anything other
@@ -539,11 +542,12 @@ rule AcceptRemoteFollow {
 -- from: services/federation/person_inbox_undo.go:15
 rule AcceptRemoteUnfollow {
     when: RemoteActorUndoesFollow(peer, actor, user)
+    requires: config.enabled
     requires: not config.signature_enforced or peer.signature_valid
     let existing = FederatedFollower{followed: user, follower: actor}
     requires: exists existing
     ensures: not exists existing
-    ensures: RemoteUserUnfollowedUser(user, federated_user: actor)
+    ensures: RemoteUserUnfollowedUser(user: user, federated_user: actor)
 }
 
 -- Accept(Follow) answering a follow a local user sent: acknowledged and
@@ -551,8 +555,9 @@ rule AcceptRemoteUnfollow {
 -- from: services/federation/person_inbox_accept.go:14
 rule AcknowledgeFollowAccepted {
     when: RemoteActorAcceptsFollow(peer, actor, user)
+    requires: config.enabled
     requires: not config.signature_enforced or peer.signature_valid
-    ensures: RemoteFollowAccepted(user, federated_user: actor)
+    ensures: RemoteFollowAccepted(user: user, federated_user: actor)
 }
 
 -- Create(Note) addressed to a local user: kept in that user's federated
@@ -560,6 +565,7 @@ rule AcknowledgeFollowAccepted {
 -- from: services/federation/person_inbox_create.go:17
 rule RecordFederatedNote {
     when: RemoteActorSendsNote(peer, actor, user, note_content, note_url, original)
+    requires: config.enabled
     requires: not config.signature_enforced or peer.signature_valid
     requires: note_content != ""
     requires: note_url != ""
@@ -614,6 +620,7 @@ rule ProvisionInstanceKeyPair {
 -- from: routers/api/v1/activitypub/actor.go:21
 rule ServeInstanceActor {
     when: RemoteFetchesInstanceActor(peer)
+    requires: config.enabled
     ensures: InstanceActorKeyPairNeeded()
 }
 
@@ -622,8 +629,9 @@ rule ServeInstanceActor {
 -- from: routers/api/v1/activitypub/person.go:23
 rule ServePersonActor {
     when: RemoteFetchesPersonActor(peer, user)
+    requires: config.enabled
     requires: not config.signature_enforced or peer.signature_valid
-    ensures: ActorKeyPairNeeded(user)
+    ensures: ActorKeyPairNeeded(user: user)
 }
 
 ------------------------------------------------------------
@@ -635,8 +643,9 @@ rule ServePersonActor {
 -- from: services/federation/person_service.go:36
 rule UserLooksUpRemoteActor {
     when: UserLooksUpRemoteActor(user, remote)
+    requires: config.enabled
     requires: remote.kind = person
-    ensures: RemoteActorReferenced(remote)
+    ensures: RemoteActorReferenced(remote: remote)
 }
 
 -- A local user follows a remote person: a Follow is queued to the remote
@@ -645,8 +654,9 @@ rule UserLooksUpRemoteActor {
 -- from: services/federation/person_service.go:36
 rule UserFollowsRemoteActor {
     when: UserFollowsRemoteActor(user, target)
+    requires: config.enabled
     requires: user.kind != activitypub
-    ensures: ActorKeyPairNeeded(user)
+    ensures: ActorKeyPairNeeded(user: user)
     ensures: Delivery.created(
         sender: user,
         inbox_uri: inbox_uri_of(target),
@@ -735,11 +745,11 @@ rule AttemptDelivery {
     ensures:
         if accepted:
             delivery.status = delivered
-            ActivityDelivered(delivery)
+            ActivityDelivered(delivery: delivery)
         else:
             if attempt >= delivery.max_attempts:
                 delivery.status = abandoned
-                ActivityDeliveryAbandoned(delivery)
+                ActivityDeliveryAbandoned(delivery: delivery)
             else:
                 delivery.next_attempt_at = now + config.delivery_retry_delay
 }
@@ -756,6 +766,7 @@ rule AttemptDelivery {
 -- from: routers/web/repo/setting/setting.go:397
 rule RepoAdminSetsFollowingRepos {
     when: RepoAdminSetsFollowingRepos(admin, target, remotes)
+    requires: config.enabled
     requires: is_repo_admin(admin, target)
     requires: following_input_length(remotes) <= config.max_following_repos_input_length
     requires: remotes.all(r => r.kind = repository)
@@ -767,7 +778,7 @@ rule RepoAdminSetsFollowingRepos {
     ensures:
         for r in remotes:
             RemoteActorReferenced(remote: r)
-            FollowingRepoResolvable(target, remote: r)
+            FollowingRepoResolvable(target: target, remote: r)
 }
 
 -- from: services/federation/repository_inbox_like.go:86
@@ -932,7 +943,6 @@ surface InstanceActorEndpoint {
 
     provides:
         RemoteFetchesInstanceActor(peer)
-            when config.enabled
 
     @guidance
         -- GET  /api/v1/activitypub/actor           (Application; no signature needed)
@@ -962,17 +972,15 @@ surface PersonActorEndpoint {
 
     provides:
         RemoteFetchesPersonActor(peer, user)
-            when config.enabled
         RemoteRequestSigned(peer, signer)
-            when config.enabled
         RemoteActorFollowsUser(peer, actor, user)
-            when config.enabled and (not config.signature_enforced or peer.signature_valid)
+            when not config.signature_enforced or peer.signature_valid
         RemoteActorUndoesFollow(peer, actor, user)
-            when config.enabled and (not config.signature_enforced or peer.signature_valid)
+            when not config.signature_enforced or peer.signature_valid
         RemoteActorAcceptsFollow(peer, actor, user)
-            when config.enabled and (not config.signature_enforced or peer.signature_valid)
+            when not config.signature_enforced or peer.signature_valid
         RemoteActorSendsNote(peer, actor, user, note_content, note_url, original)
-            when config.enabled and (not config.signature_enforced or peer.signature_valid)
+            when not config.signature_enforced or peer.signature_valid
 
     contracts:
         demands SignedFederationClient
@@ -1007,9 +1015,8 @@ surface RepositoryActorEndpoint {
 
     provides:
         RemoteRequestSigned(peer, signer)
-            when config.enabled
         RemoteActorLikesRepository(peer, actor, repository, object_uri, published_at)
-            when config.enabled and (not config.signature_enforced or peer.signature_valid)
+            when not config.signature_enforced or peer.signature_valid
 
     @guidance
         -- GET  /api/v1/activitypub/repository-id/{id}          Repository (name, inbox, outbox)
@@ -1091,9 +1098,7 @@ surface FederationForLocalUser {
 
     provides:
         UserLooksUpRemoteActor(viewer, remote)
-            when config.enabled
         UserFollowsRemoteActor(viewer, target)
-            when config.enabled
 
     @guidance
         -- POST /api/v1/user/activitypub/follow {target: <actor URI>}
@@ -1117,7 +1122,6 @@ surface RepositoryFederationSettings {
 
     provides:
         RepoAdminSetsFollowingRepos(admin, repository, remotes)
-            when config.enabled
 
     @guidance
         -- POST /{owner}/{repo}/settings action=federation following_repos=<uri;uri;...>
@@ -1130,7 +1134,7 @@ surface FederationAdministration {
     facing admin: access/SiteAdmin
 
     exposes:
-        for h in FederationHosts where admin.is_admin:
+        for h in FederationHosts:
             h.host_fqdn
             h.host_port
             h.host_scheme
@@ -1139,7 +1143,7 @@ surface FederationAdministration {
             h.created_at
             h.updated_at
             h.federated_users.count
-        for f in FederatedUsers where admin.is_admin:
+        for f in FederatedUsers:
             f.user.name
             f.external_id
             f.host.host_fqdn

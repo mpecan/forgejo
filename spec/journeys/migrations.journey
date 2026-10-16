@@ -20,6 +20,7 @@ world {
         item:    ImportedIssue
         sel:     RestoreSelection
         orphan:  ImportedComment
+        indexer: discovery/CodeSearchService
     given:
         alice.is_active = true
         alice.prohibit_login = false
@@ -67,6 +68,10 @@ world {
         orphan.author = who
         orphan.kind = "comment"
         orphan.content = "me too"
+        item.reactions = {}
+        -- The code indexer is off (REPO_INDEXER_ENABLED defaults to false),
+        -- so a finished import queues no code-index job.
+        indexer.enabled = false
 }
 
 -- The main path: a full import from GitHub, from the form to a ready
@@ -106,6 +111,8 @@ journey AliceImportsARepositoryFromGitHub {
         then m.stage = issue_items
 
     4. the adapter finishes and the repository is ready
+        stipulate code_search_service() = indexer
+        stipulate git_tags(m.repository) = {}
         adapter does SourceImportFinished(m) on SourceAdapterBoundary
         then CompleteMigration fires
         then m.status = finished
@@ -173,6 +180,8 @@ journey AliceMirrorsARepository {
     2. it runs and completes
         core does MigrationDequeued(m) on CoreHostBoundary
         adapter does ImportStageReached(m, topics) on SourceAdapterBoundary
+        stipulate code_search_service() = indexer
+        stipulate git_tags(m.repository) = {}
         adapter does SourceImportFinished(m) on SourceAdapterBoundary
         then CompleteMigration fires
         then m.status = finished
@@ -285,6 +294,7 @@ journey AliceCancelsAndRetries {
         m:    Migration
     given:
         repo.status = being_migrated
+        repo.is_mirror = false
         m.repository = repo
         m.doer = alice
         m.source = gh
@@ -324,6 +334,7 @@ journey OnlyRepositoryAdminsControlAMigration {
         m:    Migration
     given:
         repo.status = being_migrated
+        repo.is_mirror = false
         m.repository = repo
         m.doer = alice
         m.status = running
@@ -346,6 +357,7 @@ journey AFailedImportCanBeThrownAway {
         m:    Migration
     given:
         repo.status = being_migrated
+        repo.is_mirror = false
         m.repository = repo
         m.doer = alice
         m.source = gh
@@ -383,6 +395,7 @@ journey OnlyTheRequesterSeesTheTaskMessage {
         m:    Migration
     given:
         repo.status = being_migrated
+        repo.is_mirror = false
         m.repository = repo
         m.doer = alice
         m.status = running
@@ -411,6 +424,7 @@ journey ImportedIssuesKeepTheirAuthor {
         m:       Migration
     given:
         repo.status = being_migrated
+        repo.is_mirror = false
         m.repository = repo
         m.doer = alice
         m.source = gh
@@ -421,7 +435,6 @@ journey ImportedIssuesKeepTheirAuthor {
     1. the adapter yields her issue
         stipulate m.content_scope = {issue_items, comments}
         stipulate m.imported_numbers = {}
-        stipulate item.reactions = []
         stipulate item.label_names = {}
         stipulate resolve_author(m, who) = null
         stipulate ghost_user() = ghost
@@ -446,6 +459,7 @@ journey ACommentForAMissingIssueStopsTheImport {
         m:       Migration
     given:
         repo.status = being_migrated
+        repo.is_mirror = false
         m.repository = repo
         m.doer = alice
         m.source = gh
@@ -474,6 +488,7 @@ journey AHangingCloneTimesOut {
         m:    Migration
     given:
         repo.status = being_migrated
+        repo.is_mirror = false
         m.repository = repo
         m.doer = alice
         m.source = gh
@@ -554,8 +569,12 @@ journey ARestoreHandsCommentsToLinkedAccounts {
         repo: repositories/Repository
         m:    Migration
         ext:  ExternalAuthorship
+        ghost: accounts/User
+        note: issues/Comment
     given:
         repo.status = being_migrated
+        repo.is_mirror = false
+        note.poster = ghost
         m.repository = repo
         m.doer = alice
         m.source = gh
@@ -573,18 +592,21 @@ journey ARestoreHandsCommentsToLinkedAccounts {
         ext.external_id = "77"
         ext.external_name = "dave-gl"
         ext.content = on_comment
-        ext.comment = null
+        ext.comment = note
         ext.status = unlinked
 
     1. the archive import finishes
         stipulate linked_account_for(gitlab, "77") = dave
         stipulate sanitized_url(addr) = "https://github.com/acme/widget"
         stipulate url_of(null) = null
+        stipulate code_search_service() = indexer
+        stipulate git_tags(repo) = {}
         adapter does SourceImportFinished(m) on SourceAdapterBoundary
         then CompleteMigration fires
         then RelinkPass fires
         then ClaimAuthorship fires
         then ext.status = linked
+        then note.poster = dave
         then ext.linked_user = dave
 
     ends: Dave owns his old comments without having done anything.

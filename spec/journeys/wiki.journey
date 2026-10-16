@@ -13,6 +13,9 @@ world {
         wiki.repository = repo
         repo.wiki_branch = "main"
         wiki.status = uninitialised
+        -- None of these stories is about CI: Actions is off on this instance,
+        -- so a wiki change starts no workflow.
+        actions/config.actions_enabled = false
 }
 
 -- The happy path: first page, then an edit, then history.
@@ -35,7 +38,7 @@ journey AMaintainerStartsTheWiki {
         then home.content = "Welcome"
 
     2. she improves it with a commit message
-        ada does UserEditsWikiPage(ada, home, "Home", "Welcome to the project", "Expand intro") on WikiEditing
+        ada does UserEditsWikiPage(ada, wiki, home, "Home", "Welcome to the project", "Expand intro") on WikiEditing
         then UserEditsWikiPage fires
         then home.content = "Welcome to the project"
         then home.last_author = ada
@@ -68,7 +71,7 @@ journey AnEditorRenamesAPage {
         stipulate page_name_for("Getting Started") = "Getting-Started"
         stipulate kind_of_page("Getting-Started") = regular
         stipulate wiki_quota_allows(repo) = true
-        ada does UserEditsWikiPage(ada, page, "Getting Started", "Run make install", "") on WikiEditing
+        ada does UserEditsWikiPage(ada, wiki, page, "Getting Started", "Run make install", "") on WikiEditing
         then page.name = "Getting-Started"
         then page.title = "Getting Started"
 
@@ -132,10 +135,10 @@ journey AReaderCannotEditTheWiki {
     2. he tries to edit it
         stipulate wiki_unit_enabled(repo) = true
         stipulate can_write_wiki(bob, repo) = false
-        bob cannot do UserEditsWikiPage(bob, home, "Home", "vandalised", "") on WikiEditing
+        bob cannot do UserEditsWikiPage(bob, wiki, home, "Home", "vandalised", "") on WikiEditing
 
     3. and to delete it
-        bob cannot do UserDeletesWikiPage(bob, home) on WikiEditing
+        bob cannot do UserDeletesWikiPage(bob, wiki, home) on WikiEditing
 
     ends: The page is unchanged.
 }
@@ -161,8 +164,9 @@ journey AGloballyWriteableWikiAcceptsOutsiders {
         stipulate page_name_for("Home") = "Home"
         stipulate kind_of_page("Home") = regular
         stipulate wiki_quota_allows(repo) = true
+        stipulate can_read_wiki(ada, repo) = true
         ada sees home.content on WikiReading in wiki
-        bob does UserEditsWikiPage(bob, home, "Home", "Welcome", "typo") on WikiEditing
+        bob does UserEditsWikiPage(bob, wiki, home, "Home", "Welcome", "typo") on WikiEditing
         then home.content = "Welcome"
         then home.last_author = bob
 
@@ -184,7 +188,7 @@ journey AnArchivedWikiIsReadOnly {
     1. she tries to delete it
         stipulate wiki_unit_enabled(repo) = true
         stipulate can_write_wiki(ada, repo) = true
-        ada cannot do UserDeletesWikiPage(ada, page) on WikiEditing
+        ada cannot do UserDeletesWikiPage(ada, wiki, page) on WikiEditing
 
     ends: The page remains.
 }
@@ -204,7 +208,7 @@ journey AnEditorDeletesAPage {
     1. she deletes it
         stipulate wiki_unit_enabled(repo) = true
         stipulate can_write_wiki(ada, repo) = true
-        ada does UserDeletesWikiPage(ada, page) on WikiEditing
+        ada does UserDeletesWikiPage(ada, wiki, page) on WikiEditing
         then UserDeletesWikiPage fires
         then page does not exist
 
@@ -255,6 +259,7 @@ journey AnOwnerDeletesAllWikiData {
 
     2. ada confirms with the repository name
         stipulate is_repo_owner(ada, repo) = true
+        stipulate can_admin_repository(ada, repo) = true
         ada does OwnerDeletesWiki(ada, wiki, "ada/project") on WikiAdministration
         then OwnerDeletesWiki fires
         then wiki.status = uninitialised
