@@ -25,12 +25,6 @@ world {
         carol.prohibit_login = false
         carol.is_admin = false
         carol.visibility = public
-        -- The unit lists, restated at their defaults: the walker does not read a
-        -- collection literal default from a config block.
-        repositories/config.default_repo_units = {code, issues, pull_requests, releases, wiki, projects, packages, actions}
-        repositories/config.default_fork_repo_units = {code, pull_requests}
-        repositories/config.default_mirror_repo_units = {code, issues, releases, wiki, projects, packages}
-        repositories/config.disabled_repo_units = {}
 }
 
 -- The ordinary beginning: a new, initialised, public repository under one's own name.
@@ -105,6 +99,7 @@ journey BobForksAlicesRepositoryOnce {
         stipulate src.effective_fork_privacy = false
         bob does UserForksRepository(bob, src, "notes", "Bob's copy") on RepositoryOverview
             creating fork: Repository
+            where git_tags(fork) = {}
         then UserForksRepository fires
         then ForkInheritsLanguageStats fires
         then fork.is_fork = true
@@ -161,6 +156,7 @@ journey TransferAwaitsTheRecipient {
         stipulate can_see_repository(bob, repo) = true
         alice does OwnerTransfersRepositoryToUser(alice, repo, bob) on RepositoryDangerZone
             creating offer: RepoTransfer
+            where transfer_recipients(offer) = {bob}
         then OwnerTransfersRepositoryToUser fires
         then repo.status = pending_transfer
         then offer.recipient_user = bob
@@ -205,6 +201,7 @@ journey RecipientRejectsTheTransfer {
         stipulate can_see_repository(bob, repo) = true
         alice does OwnerTransfersRepositoryToUser(alice, repo, bob) on RepositoryDangerZone
             creating offer: RepoTransfer
+            where transfer_recipients(offer) = {bob}
         then repo.status = pending_transfer
 
     2. a second transfer cannot start while one is pending
@@ -525,6 +522,11 @@ journey PullMirrorKeepsItselfCurrent {
         stipulate m.repository = repo
         -- the remote has no tags yet
         stipulate git_tags(repo) = {}
+        -- a plain git import brings no issues, and the indexers find no
+        -- language they measure at the imported head
+        stipulate issues_of(repo) = {}
+        stipulate default_branch_head(repo) = "c0ffee"
+        stipulate language_sizes(repo, "c0ffee") = {}
         stipulate url_of(null) = null
         adapter does SourceImportFinished(m) on SourceAdapterBoundary
             creating mirror: Mirror
@@ -707,8 +709,6 @@ journey ASiteAdminCreatesAndDeletesForAUser {
         root.is_active = true
         root.prohibit_login = false
         bob.max_repo_creation = 0
-        -- restated at its default: the walker does not read an enum default from a config block
-        repositories/config.default_object_format = sha1
 
     1. root creates it for bob
         stipulate is_valid_repo_name("sandbox") = true

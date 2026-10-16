@@ -887,9 +887,8 @@ rule AgitPushRequestsPullRequest {
         base_branch: base_branch,
         head_branch: head_branch,
         head_sha: update.new_sha,
-        -- written as `if` rather than `??`: allium-journey 0.1.2 does not evaluate `??`
-        title: if update.push.agit_title != null: update.push.agit_title else: commit_summary(repository, update.new_sha),
-        description: if update.push.agit_description != null: update.push.agit_description else: commit_body(repository, update.new_sha)
+        title: update.push.agit_title ?? commit_summary(repository, update.new_sha),
+        description: update.push.agit_description ?? commit_body(repository, update.new_sha)
     )
     @guidance
         -- Rejected per ref (other refs still apply) when: no topic was given; the target

@@ -40,6 +40,7 @@ journey SomebodyReportsABug {
         stipulate cross_references(repo, ada, "Crash on save", "Steps: ...") = {}
         ada does UserOpensIssue(ada, repo, "Crash on save", "Steps: ...", {}, null, {}, null, null, {}) on IssueTracker
             creating issue: Issue
+            where issue_notification_audience(issue, ada) = {}
         then UserOpensIssue fires
         then issue.index = 7
         then issue.status = open
@@ -75,6 +76,8 @@ journey AConversationUnfolds {
         stipulate can_read_issue(tess, bug) = true
         stipulate is_blocked(ada, tess) = false
         stipulate is_blocked_by_owner(repo, tess) = false
+        stipulate can_read_issue(ada, bug) = true
+        stipulate issue_notification_audience(bug, tess) = {ada}
         stipulate resolve_mentions(bug, tess, "Can you share logs?") = {}
         stipulate cross_references(repo, tess, null, "Can you share logs?") = {}
         tess does UserComments(tess, bug, "Can you share logs?", {}) on IssueConversation
@@ -85,7 +88,6 @@ journey AConversationUnfolds {
         then c.issue = bug
 
     2. ada reacts with a heart
-        stipulate can_read_issue(ada, bug) = true
         stipulate is_blocked(tess, ada) = false
         stipulate is_blocked(ada, ada) = false
         stipulate is_blocked_by_owner(repo, ada) = false
@@ -181,6 +183,7 @@ journey LockingAHeatedConversation {
         stipulate can_read_issue(tess, bug) = true
         stipulate is_blocked(ada, tess) = false
         stipulate is_blocked_by_owner(repo, tess) = false
+        stipulate issue_notification_audience(bug, tess) = {ada}
         stipulate resolve_mentions(bug, tess, "Locked until tempers cool.") = {}
         stipulate cross_references(repo, tess, null, "Locked until tempers cool.") = {}
         tess does UserComments(tess, bug, "Locked until tempers cool.", {}) on IssueTriage
@@ -236,11 +239,14 @@ journey ABlockedIssueWaitsForItsBlocker {
         stipulate can_triage(tess, refactor) = true
         stipulate is_blocked(tess, tess) = false
         stipulate refactor.has_open_blockers = false
+        stipulate issue_notification_audience(refactor, tess) = {}
         tess does UserClosesIssue(tess, refactor) on IssueTriage
         then refactor.status = closed
 
     4. and now the bug can be closed
         stipulate bug.has_open_blockers = false
+        stipulate can_read_issue(ada, bug) = true
+        stipulate issue_notification_audience(bug, tess) = {ada}
         tess does UserClosesIssue(tess, bug) on IssueTriage
         then bug.status = closed
         then UserClosesIssue fires

@@ -1,8 +1,8 @@
 -- Journeys through code.allium: branches, pushes, protection, tags, statuses, LFS.
 --
 -- alice can write the code unit of `repo`; bob can only read it; carol is another
--- writer who is not on any allowlist. Permission answers come from access and are
--- stipulated per journey.
+-- writer who is not on any allowlist. Permission answers come from access; alice's
+-- are in `world`, the rest are stipulated per journey.
 
 world {
     cast:
@@ -29,6 +29,10 @@ world {
         repo.is_private = false
         repo.owner_user = alice
         repo.owner_org = null
+        -- alice writes the code, and the repository is within its git quota
+        can_write_code(alice, repo) = true
+        can_read_code(alice, repo) = true
+        exceeds_git_quota(repo) = false
 }
 
 -- The everyday branch life: create from a commit, delete, find it in the deleted list.
@@ -37,12 +41,10 @@ journey AWriterBranchesOffAndCleansUp {
           still find it among the deleted branches to restore.
 
     1. she creates the branch from a commit
-        stipulate can_write_code(alice, repo) = true
         stipulate valid_ref_name("feature") = true
         stipulate length("feature") = 7
         stipulate branch_name_conflicts(repo, "feature") = false
         stipulate commit_exists(repo, "c0ffee") = true
-        stipulate exceeds_git_quota(repo) = false
         alice does UserCreatesBranch(alice, repo, "feature", "c0ffee") on CodeWriting
             creating branch: Branch
         then BranchCreatedByPush fires
@@ -83,7 +85,6 @@ journey ADeletedBranchIsRestoredOrForgotten {
         stale.status = live
 
     1. both branches are deleted
-        stipulate can_write_code(alice, repo) = true
         stipulate protection_for(repo, "oops") = null
         stipulate protection_for(repo, "stale") = null
         alice does UserDeletesBranch(alice, oops) on BranchView
@@ -92,7 +93,6 @@ journey ADeletedBranchIsRestoredOrForgotten {
         then stale.status = deleted
 
     2. she restores the one she needs
-        stipulate exceeds_git_quota(repo) = false
         alice does UserRestoresBranch(alice, oops) on DeletedBranchView
         then oops.status = live
         then oops.head_commit_sha = "0a0a0a"
@@ -126,12 +126,10 @@ journey TheDefaultBranchStays {
         bob cannot do UserDeletesBranch(bob, main) on BranchView
 
     2. alice cannot delete the default branch in the UI
-        stipulate can_write_code(alice, repo) = true
         stipulate protection_for(repo, "main") = null
         alice cannot do UserDeletesBranch(alice, main) on BranchView
 
     3. nor by pushing a deletion
-        stipulate can_read_code(alice, repo) = true
         alice does GitClientPushes(alice, repo, ssh, null, null, null, null, null, null, null, false) on GitTransport
             creating push: Push
         stipulate may_write_branch(alice, push, "main") = true
@@ -178,12 +176,10 @@ journey AProtectedBranchTakesOnlyAllowlistedPushes {
         stipulate is_force_push(repo, "aaa111", "bbb222") = false
         stipulate touches_protected_files(prot, repo, "aaa111", "bbb222") = false
         stipulate touches_only_unprotected_files(prot, repo, "aaa111", "bbb222") = false
-        stipulate exceeds_git_quota(repo) = false
         carol cannot do PusherProposesRefUpdate(carol, carols, branch_ref, "main", "aaa111", "bbb222") on GitTransport
         then main.head_commit_sha = "aaa111"
 
     3. alice pushes the same fast-forward
-        stipulate can_read_code(alice, repo) = true
         alice does GitClientPushes(alice, repo, ssh, null, null, null, null, null, null, null, false) on GitTransport
             creating alices: Push
         stipulate may_write_branch(alice, alices, "main") = true
@@ -228,11 +224,9 @@ journey OnlyTheReleaseManagerTagsReleases {
             creating carols: Push
         stipulate may_write_code(carol, carols) = true
         stipulate tag_pattern_matches("v*", "v1.0") = true
-        stipulate exceeds_git_quota(repo) = false
         carol cannot do PusherProposesRefUpdate(carol, carols, tag_ref, "v1.0", null, "fff000") on GitTransport
 
     2. alice pushes it
-        stipulate can_read_code(alice, repo) = true
         alice does GitClientPushes(alice, repo, ssh, null, null, null, null, null, null, null, false) on GitTransport
             creating alices: Push
         stipulate may_write_code(alice, alices) = true
@@ -260,12 +254,10 @@ journey TheFirstPushFillsAnEmptyRepository {
         repo.is_empty = true
 
     1. she pushes trunk
-        stipulate can_read_code(alice, repo) = true
         alice does GitClientPushes(alice, repo, http, null, null, null, null, null, null, null, false) on GitTransport
             creating push: Push
         stipulate may_write_branch(alice, push, "trunk") = true
         stipulate protection_for(repo, "trunk") = null
-        stipulate exceeds_git_quota(repo) = false
         alice does PusherProposesRefUpdate(alice, push, branch_ref, "trunk", null, "123abc") on GitTransport
             creating trunk: Branch
         then BranchCreatedByPush fires
@@ -291,14 +283,12 @@ journey AnArchiveIsReadOnly {
         repo.is_private = true
 
     1. alice clones it over SSH
-        stipulate can_read_code(alice, repo) = true
         stipulate must_have_two_factor(alice) = false
         stipulate authenticated_by_password(alice) = false
         alice does GitClientFetches(alice, repo, ssh) on GitTransport
         then GitClientFetchesRepository fires
 
     2. nobody can push
-        stipulate can_write_code(alice, repo) = true
         alice cannot do GitClientPushes(alice, repo, ssh, null, null, null, null, null, null, null, false) on GitTransport
 
     3. bob cannot fetch a private repository he cannot read
@@ -346,7 +336,13 @@ journey AReaderProposesAChangeWithAGit {
         stipulate open_pull_request_exists(repo, "bob/fix-typo", repo, "main") = false
         stipulate truncate("Fix typo", 255) = "Fix typo"
         stipulate has_wip_prefix("Fix typo") = false
+        -- alice owns the repository and watches its pull requests
+        stipulate repository_watchers(repo, pull_requests) = {alice}
         bob does PusherProposesRefUpdate(bob, push, for_review, "main/fix-typo", null, "ddd444") on GitTransport
+            creating proposal: pulls/PullRequest
+            where issue_participants(proposal.issue) = {bob}
+            where issue_mentions(proposal.issue) = {}
+            where can_read_issue(alice, proposal.issue) = true
         then AcceptReviewRefPush fires
         then AgitPushRequestsPullRequest fires
         then main.head_commit_sha = "aaa111"
@@ -393,7 +389,6 @@ journey LfsIsOffUntilTheInstanceEnablesIt {
           lock files or upload LFS objects.
 
     1. alice cannot lock a file
-        stipulate can_write_code(alice, repo) = true
         stipulate normalise_path("assets/logo.psd") = "assets/logo.psd"
         alice cannot do UserLocksLfsPath(alice, repo, "assets/logo.psd") on LfsApi
 
@@ -414,7 +409,6 @@ journey LfsLocksOnAnInstanceThatEnabledIt {
         config.lfs_start_server = true
 
     1. alice locks the file
-        stipulate can_write_code(alice, repo) = true
         stipulate normalise_path("assets/logo.psd") = "assets/logo.psd"
         alice does UserLocksLfsPath(alice, repo, "assets/logo.psd") on LfsApi
             creating lock: LfsLock
@@ -457,7 +451,6 @@ journey AnEditGoesToANewBranchWhenMainIsProtected {
         stipulate may_write_branch_as_user(alice, repo, "main") = true
         stipulate all_paths_valid({"README.md"}) = true
         stipulate none_locked_by_other(repo, {"README.md"}, alice) = true
-        stipulate exceeds_git_quota(repo) = false
         stipulate protection_allows_files(main, alice, {"README.md"}) = false
         alice cannot do UserCommitsFileChanges(alice, main, direct, null, {"README.md"}, "Fix README", null, false) on BranchView
 

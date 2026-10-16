@@ -1193,8 +1193,7 @@ rule UserSchedulesAutoMerge {
     requires: not has_open_blocking_dependencies(pr.issue)
     requires: not exists pr.auto_merge
     ensures: AutoMerge.created(pull_request: pr, scheduled_by: user, style: style,
-        -- `if` rather than `??`: allium-journey 0.1.2 does not evaluate `??`
-        message: if message != null: message else: default_merge_message(pr, style),
+        message: message ?? default_merge_message(pr, style),
         delete_branch_after_merge: delete_branch_after_merge, created_at: now)
     ensures: issues/Comment.created(issue: pr.issue, poster: user, kind: pull_scheduled_merge, content: "",
         content_version: 0, created_at: now, updated_at: now)

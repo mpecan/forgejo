@@ -15,6 +15,10 @@ world {
         -- None of these stories is about CI: Actions is off on this instance,
         -- so a release event starts no workflow.
         actions/config.actions_enabled = false
+        -- ada manages releases, bob reads them, and the quota has room
+        can_write_releases(ada, repo) = true
+        can_read_releases(bob, repo) = true
+        release_quota_allows(repo) = true
 }
 
 -- The happy path: a maintainer cuts v1.0 straight from main.
@@ -24,11 +28,9 @@ journey MaintainerPublishesAReleaseOnANewTag {
           the release on the Releases page.
 
     1. she publishes v1.0 from main
-        stipulate can_write_releases(ada, repo) = true
         stipulate is_valid_tag_name("v1.0") = true
         stipulate may_control_tag(ada, repo, "v1.0") = true
         stipulate target_resolves(repo, "main") = true
-        stipulate release_quota_allows(repo) = true
         ada does UserCreatesRelease(ada, repo, "v1.0", "main", "First stable", "Notes", false, false, false) on ReleaseManagement
             creating rel: Release
         then UserCreatesPublishedRelease fires
@@ -36,7 +38,6 @@ journey MaintainerPublishesAReleaseOnANewTag {
         then rel.publisher = ada
 
     2. a reader finds it
-        stipulate can_read_releases(bob, repo) = true
         bob sees rel.tag_name on ReleaseCatalogue in repo
         bob sees rel.note on ReleaseCatalogue in repo
 
@@ -50,7 +51,6 @@ journey ADraftStaysHiddenUntilPublished {
           only read, must not see it; once she publishes it, he does.
 
     1. she saves a draft for a tag that does not exist yet
-        stipulate can_write_releases(ada, repo) = true
         stipulate is_valid_tag_name("v2.0") = true
         ada does UserCreatesRelease(ada, repo, "v2.0", "main", "Two", "WIP", true, false, false) on ReleaseManagement
             creating rel: Release
@@ -59,14 +59,12 @@ journey ADraftStaysHiddenUntilPublished {
         then rel.commit_sha = null
 
     2. bob cannot see it, ada can
-        stipulate can_read_releases(bob, repo) = true
         bob cannot see rel.tag_name on ReleaseCatalogue in repo
         ada sees rel.state on ReleaseManagement in repo
 
     3. she publishes it, which creates the tag
         stipulate may_control_tag(ada, repo, "v2.0") = true
         stipulate target_resolves(repo, "main") = true
-        stipulate release_quota_allows(repo) = true
         ada does UserEditsRelease(ada, repo, rel, "Two", "Final notes", false, false, false) on ReleaseManagement
         then UserPublishesDraftRelease fires
         then rel.state = published
@@ -96,11 +94,9 @@ journey AProtectedTagNameBlocksPublishing {
           Ada can write releases but is not allowed to create such a tag.
 
     1. she tries to publish v3.0
-        stipulate can_write_releases(ada, repo) = true
         stipulate is_valid_tag_name("v3.0") = true
         stipulate may_control_tag(ada, repo, "v3.0") = false
         stipulate target_resolves(repo, "main") = true
-        stipulate release_quota_allows(repo) = true
         ada cannot do UserCreatesRelease(ada, repo, "v3.0", "main", "Three", "", false, false, false) on ReleaseManagement
 
     2. she may still prepare it as a draft
@@ -125,8 +121,6 @@ journey AnArchivedRepositoryRefusesReleaseChanges {
         rel.commit_sha = "abc123"
 
     1. she tries to edit the notes
-        stipulate can_write_releases(ada, repo) = true
-        stipulate release_quota_allows(repo) = true
         ada cannot do UserEditsRelease(ada, repo, rel, "Title", "New notes", false, false, false) on ReleaseManagement
 
     ends: The release is unchanged.
@@ -146,12 +140,9 @@ journey APushedTagGetsReleaseNotesLater {
         then rel.commit_sha = "c0ffee"
 
     2. a reader does not see a release for a bare tag
-        stipulate can_read_releases(bob, repo) = true
         bob cannot see rel.tag_name on ReleaseCatalogue in repo
 
     3. ada writes the release on the existing tag
-        stipulate can_write_releases(ada, repo) = true
-        stipulate release_quota_allows(repo) = true
         ada does UserCreatesRelease(ada, repo, "v4.0", "", "Four", "Notes", false, false, false) on ReleaseManagement
         then UserCreatesReleaseOnExistingTag fires
         then rel.state = published
@@ -174,11 +165,9 @@ journey ATagCarriesOnlyOneRelease {
         rel.commit_sha = "abc123"
 
     1. she tries again
-        stipulate can_write_releases(ada, repo) = true
         stipulate is_valid_tag_name("v1.0") = true
         stipulate may_control_tag(ada, repo, "v1.0") = true
         stipulate target_resolves(repo, "main") = true
-        stipulate release_quota_allows(repo) = true
         ada cannot do UserCreatesRelease(ada, repo, "v1.0", "main", "Again", "", false, false, false) on ReleaseManagement
 
     ends: There is still exactly one record for v1.0.
@@ -199,7 +188,6 @@ journey DeletingAReleaseKeepsItsTag {
         rel.commit_sha = "abc123"
 
     1. she deletes the release only
-        stipulate can_write_releases(ada, repo) = true
         ada does UserDeletesRelease(ada, repo, rel) on ReleaseManagement
         then UserDeletesRelease fires
         then rel.state = tag_only
@@ -237,7 +225,6 @@ journey ATagThatGoesAwayAndComesBack {
         then rel.commit_sha = null
 
     2. readers no longer see it
-        stipulate can_read_releases(bob, repo) = true
         bob cannot see rel.tag_name on ReleaseCatalogue in repo
 
     3. the tag is pushed again on a new commit
@@ -272,7 +259,6 @@ journey DownloadsAreCountedForStoredAssetsOnly {
         link.download_count = 0
 
     1. he downloads the tarball
-        stipulate can_read_releases(bob, repo) = true
         stipulate can_write_releases(bob, repo) = false
         bob does VisitorDownloadsReleaseAsset(bob, repo, tarball) on ReleaseCatalogue
         then tarball.download_count = 4
@@ -304,7 +290,6 @@ journey ADraftsAssetsAreNotDownloadable {
         asset.download_count = 0
 
     1. he tries to download it
-        stipulate can_read_releases(bob, repo) = true
         stipulate can_write_releases(bob, repo) = false
         bob cannot do VisitorDownloadsReleaseAsset(bob, repo, asset) on ReleaseCatalogue
 
@@ -324,7 +309,6 @@ journey AMaintainerLinksAnExternalAsset {
         rel.commit_sha = "abc123"
 
     1. she adds the link
-        stipulate can_write_releases(ada, repo) = true
         stipulate is_valid_url("https://cdn.example/app.zip") = true
         ada does UserAddsExternalAsset(ada, repo, rel, "app.zip", "https://cdn.example/app.zip") on ReleaseManagement
             creating link: issues/Attachment
