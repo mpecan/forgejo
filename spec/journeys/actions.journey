@@ -5,8 +5,9 @@
 -- Notes for readers of the report: permissions are black-box policies
 -- (can_read_actions, can_write_actions, is_repo_admin,
 -- may_manage_actions_scope, may_delegate_actions_trust) and are stated with
--- `stipulate`. Collections given to entities (labels, needs, runs_on) are
--- stipulated too, because the journey `given` block does not take set values.
+-- `stipulate`. Collections (labels, needs, runs_on) are stipulated where a
+-- step needs them. The repository's Actions unit is a cast RepoUnit in the
+-- world, so every journey here runs with Actions enabled.
 
 world {
     cast:
@@ -14,7 +15,11 @@ world {
         repo:       repositories/Repository
         site:       ActionsScope
         repo_scope: ActionsScope
+        actions_unit: repositories/RepoUnit
     given:
+        actions_unit.repository = repo
+        actions_unit.kind = actions
+        actions_unit.enabled = true
         repo.is_archived = false
         repo.is_empty = false
         repo.default_branch = "main"
@@ -54,6 +59,7 @@ journey ADispatchedWorkflowRunsToSuccess {
         runner.token = "runner-secret"
 
     1. she dispatches the workflow on main
+        stipulate can_read_actions(ada, repo) = true
         stipulate can_write_actions(ada, repo) = true
         stipulate ref_exists(repo, "refs/heads/main") = true
         stipulate ref_commit(repo, "refs/heads/main") = "c0ffee"
@@ -71,12 +77,8 @@ journey ADispatchedWorkflowRunsToSuccess {
         then run.jobs_expanded = false
 
     2. its job graph is materialised
-        after 1.second
-        then ExpandRunIntoJobs fires
-        then run.jobs_expanded = true
-
-    3. a runner carrying the docker label takes the run's job
-        stipulate runner.labels = {"docker", "amd64"}
+        -- An `after` cannot name what it creates, so the run's one job is the
+        -- cast `job`, described here rather than parsed from the workflow.
         stipulate job.run = run
         stipulate job.status = waiting
         stipulate job.attempt = 1
@@ -85,7 +87,13 @@ journey ADispatchedWorkflowRunsToSuccess {
         stipulate job.runs_on = {"docker"}
         stipulate job.oidc_requested = false
         stipulate job.is_incomplete = false
-        stipulate actions_unit_enabled(repo) = true
+        stipulate run.aggregated_status = waiting
+        after 1.second
+        then ExpandRunIntoJobs fires
+        then run.jobs_expanded = true
+
+    3. a runner carrying the docker label takes the run's job
+        stipulate runner.labels = {"docker", "amd64"}
         stipulate blocked_by_concurrency_group(run) = false
         runner does RunnerFetchesTask(runner, job, null) on RunnerService
             creating task: Task
@@ -182,6 +190,7 @@ journey ARunningRunCannotBeRerunUntilItFinishes {
 
     1. the re-run is refused while it runs
         stipulate job.needs = {}
+        stipulate can_read_actions(ada, repo) = true
         stipulate can_write_actions(ada, repo) = true
         stipulate workflow_disabled(repo, "build.yml") = false
         ada cannot do UserRerunsWorkflowRun(ada, run) on WorkflowRunPage
@@ -252,7 +261,6 @@ journey ARunnerRegistersAndOnlyGetsJobsItCanRun {
     2. a runner without the gpu label cannot take the gpu job
         stipulate runner.labels = {"docker"}
         stipulate gpu_job.runs_on = {"gpu"}
-        stipulate actions_unit_enabled(repo) = true
         stipulate blocked_by_concurrency_group(run) = false
         runner cannot do RunnerFetchesTask(runner, gpu_job, null) on RunnerService
 
@@ -309,6 +317,7 @@ journey AnEphemeralRunnerRunsOneJob {
         runner.has_taken_task = false
         runner.token = "one-shot"
         run.repository = repo
+        run.started_at = null
         run.jobs_expanded = true
         run.pre_execution_error = null
         run.event = workflow_dispatch
@@ -323,7 +332,6 @@ journey AnEphemeralRunnerRunsOneJob {
     1. it takes the job
         stipulate runner.labels = {"docker"}
         stipulate job.runs_on = {"docker"}
-        stipulate actions_unit_enabled(repo) = true
         stipulate blocked_by_concurrency_group(run) = false
         runner does RunnerFetchesTask(runner, job, null) on RunnerService
             creating task: Task
@@ -373,9 +381,15 @@ journey AMaintainerApprovesAForkPullRequestRun {
 
     2. ada approves it once
         stipulate may_delegate_actions_trust(ada, repo) = true
+        -- The job's waiting status is reported on the pull request's head
+        -- commit, which exists.
+        stipulate status_commit(run) = "f00d"
+        stipulate commit_exists(repo, "f00d") = true
+        stipulate full_sha(repo, "f00d") = "f00d"
         ada does UserApprovesPullRequestRunsOnce(ada, pr) on PullRequestActionsTrust
         then UserApprovesPullRequestRuns fires
         then ApproveRun fires
+        then ReportJobCommitStatusOnChange fires
         then run.needs_approval = false
         then run.approved_by = ada
         then job.status = waiting
@@ -458,6 +472,7 @@ journey ASilentTaskBecomesAZombie {
         run.repository = repo
         run.event = workflow_dispatch
         run.is_fork_pull_request = false
+        run.started_at = null
         run.jobs_expanded = true
         run.pre_execution_error = null
         run.needs_approval = false
@@ -471,7 +486,6 @@ journey ASilentTaskBecomesAZombie {
     1. the runner takes the job
         stipulate runner.labels = {"docker"}
         stipulate job.runs_on = {"docker"}
-        stipulate actions_unit_enabled(repo) = true
         stipulate blocked_by_concurrency_group(run) = false
         stipulate run.status_is_stale = false
         runner does RunnerFetchesTask(runner, job, null) on RunnerService
@@ -559,7 +573,6 @@ journey AScheduleFires {
 
     1. the clock reaches the next occurrence
         stipulate spec.next_run_at = now
-        stipulate actions_unit_enabled(repo) = true
         stipulate workflow_disabled(repo, "nightly.yml") = false
         stipulate schedule_is_broken(spec) = false
         stipulate actions_bot() = bot
@@ -627,6 +640,7 @@ journey LogsExpireAfterTheRetentionPeriod {
         run.repository = repo
         run.event = workflow_dispatch
         run.is_fork_pull_request = false
+        run.started_at = null
         run.jobs_expanded = true
         run.pre_execution_error = null
         run.needs_approval = false
@@ -638,9 +652,9 @@ journey LogsExpireAfterTheRetentionPeriod {
         job.is_incomplete = false
 
     1. the job runs and finishes, uploading its log
+        stipulate can_read_actions(ada, repo) = true
         stipulate runner.labels = {"docker"}
         stipulate job.runs_on = {"docker"}
-        stipulate actions_unit_enabled(repo) = true
         stipulate blocked_by_concurrency_group(run) = false
         stipulate run.status_is_stale = false
         runner does RunnerFetchesTask(runner, job, null) on RunnerService

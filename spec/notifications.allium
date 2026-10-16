@@ -201,7 +201,7 @@ use "./administration.allium" as administration
 --                                    = users @-mentioned (directly or through a
 --                                      team) in that text, who can read the issue
 --   issue_notification_audience, issue_mail_audience, mail_mention_recipients,
---   transfer_recipients, activity_feed_watchers, activity_visible_to,
+--   transfer_recipients, feed_reaches, activity_visible_to,
 --   contribution_heatmap, feed_excerpt: described where they are used.
 
 ------------------------------------------------------------
@@ -1700,7 +1700,6 @@ rule RecordReleasePublished {
 -- from: models/activities/action.go:701
 rule FanOutActivity {
     when: activity: Activity.created
-    let watchers = activity_feed_watchers(activity)
     ensures:
         if activity.actor != null:
             FeedEntry.created(activity: activity, owner_user: activity.actor, owner_org: null)
@@ -1711,13 +1710,14 @@ rule FanOutActivity {
             if activity.actor = null:
                 FeedEntry.created(activity: activity, owner_user: activity.repository.owner_user, owner_org: null)
     ensures:
-        for w in watchers:
-            FeedEntry.created(activity: activity, owner_user: w, owner_org: null)
+        for w in activity.repository.watches where w.is_watching and w.user != activity.actor and feed_reaches(w, activity):
+            FeedEntry.created(activity: activity, owner_user: w.user, owner_org: null)
     ensures: ActivityRecorded(activity: activity)
     @guidance
-        -- activity_feed_watchers(activity) = watchers of activity.repository
-        -- whose watch covers activity.watch_category, minus the actor, minus
-        -- users who have blocked the actor, filtered by unit read access:
+        -- The actor's own watch never adds a second entry. Otherwise
+        -- feed_reaches(watch, activity): the watch covers
+        -- activity.watch_category, the watcher has not blocked the actor,
+        -- and can read the unit the activity is about:
         --   commit_repo, push_tag, delete_tag, delete_branch, publish_release -> code
         --   create/comment/close/reopen issue                                -> issues
         --   create/comment/merge/auto-merge/close/reopen pull request        -> pull_requests

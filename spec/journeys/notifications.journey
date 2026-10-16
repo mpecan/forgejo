@@ -9,10 +9,16 @@ world {
         repo:  repositories/Repository
         issue: issues/Issue
     given:
+        ada.is_active = true
+        bob.is_active = true
         ada.prohibit_login = false
         bob.prohibit_login = false
         ada.is_admin = false
         bob.is_admin = false
+        ada.email_notifications = enabled
+        bob.email_notifications = enabled
+        repo.owner_user = ada
+        repo.owner_org = null
         issue.repository = repo
         issue.is_pull = false
         issue.is_locked = false
@@ -89,6 +95,7 @@ journey AnAdminReadsButDoesNotChangeAThread {
 
     given:
         cora.is_admin = true
+        cora.is_active = true
         cora.prohibit_login = false
         thread.recipient = ada
         thread.repository = repo
@@ -372,6 +379,21 @@ journey AdasBadgeUpdatesWithoutReloading {
         then connection does not exist
 
     ends: The badge followed her inbox without a single reload.
+}
+
+-- Configuration: an instance can switch the live stream off.
+journey TheLiveStreamCanBeSwitchedOff {
+    goal: The administrator set the event-source update time to zero. Ada's
+          inbox no longer offers a live stream; her badge updates only when
+          she reloads.
+
+    given:
+        config.event_source_update_time = 0.seconds
+
+    1. she cannot open the stream
+        ada cannot do UserOpensEventStream(ada) on NotificationInbox
+
+    ends: No stream connection exists for Ada.
 }
 
 -- Fan-out into the activity feed, driven by another module's act.

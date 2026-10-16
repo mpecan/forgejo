@@ -46,8 +46,9 @@
 --   WorkflowJobStatusChanged(job, prior_status)        -- non-final job status change
 --   WorkflowJobCompleted(job, prior_status)            -- job reached a final status;
 --       -- notifications mails the trigger user on failure when run.notify_email
---   code/CommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
---       -- emitted on code's behalf with creator = the Actions bot; code records the CommitStatus
+--   JobCommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
+--       -- creator = the Actions bot; code reacts and records the CommitStatus
+--       -- exactly as the commit-status API does
 --   IdTokenIssued(task, audience, expires_at)
 --
 -- Reacts to:
@@ -408,9 +409,12 @@ entity Job {
 
     tasks: Task with job = this
 
-    needs_done: needs.count = 0 or all_needed_jobs_done(this)
-    needs_succeeded: needs.count = 0 or all_needed_jobs_succeeded_or_skipped(this)
-    all_needs_skipped: needs.count > 0 and all_needed_jobs_skipped(this)
+    -- The jobs this one needs: the run's jobs of the same namespace whose
+    -- key is listed in `needs`.
+    needed_jobs: run.jobs where namespace = this.namespace and key in this.needs
+    needs_done: needed_jobs.all(j => j.is_done)
+    needs_succeeded: needed_jobs.all(j => j.status in {success, skipped})
+    all_needs_skipped: needs.count > 0 and needed_jobs.all(j => j.status = skipped)
     is_done: status in {success, failure, cancelled, skipped}
     ready_to_unblock: status = blocked and needs_done and not run.needs_approval
 
@@ -697,7 +701,7 @@ rule PushStartsWorkflows {
 rule RefCreationStartsWorkflows {
     when: code/RefCreated(repository, pusher, ref_kind, ref_name, commit_sha)
     requires: ref_kind in {branch_ref, tag_ref}
-    ensures: ForgeEventObserved(repository, doer: pusher, event: create, activity: null, ref: qualified_ref(ref_kind, ref_name), commit_sha, pull_request: null)
+    ensures: ForgeEventObserved(repository: repository, doer: pusher, event: create, activity: null, ref: qualified_ref(ref_kind, ref_name), commit_sha: commit_sha, pull_request: null)
 }
 
 -- `delete` runs workflows from the default branch.
@@ -705,7 +709,7 @@ rule RefCreationStartsWorkflows {
 rule RefDeletionStartsWorkflows {
     when: code/RefDeleted(repository, pusher, ref_kind, ref_name)
     requires: ref_kind in {branch_ref, tag_ref}
-    ensures: ForgeEventObserved(repository, doer: pusher, event: delete, activity: null, ref: qualified_ref(ref_kind, ref_name), commit_sha: null, pull_request: null)
+    ensures: ForgeEventObserved(repository: repository, doer: pusher, event: delete, activity: null, ref: qualified_ref(ref_kind, ref_name), commit_sha: null, pull_request: null)
 }
 
 -- Pull-mirror syncs start the same push / create / delete workflows as user
@@ -738,7 +742,7 @@ rule MirrorRefDeletionStartsWorkflows {
 -- from: services/actions/notifier.go:410
 rule ForkStartsWorkflows {
     when: repositories/RepositoryForked(source, fork, doer)
-    ensures: ForgeEventObserved(repository: source, doer, event: fork, activity: null, ref: "refs/heads/" + source.default_branch, commit_sha: null, pull_request: null)
+    ensures: ForgeEventObserved(repository: source, doer: doer, event: fork, activity: null, ref: "refs/heads/" + source.default_branch, commit_sha: null, pull_request: null)
 }
 
 -- Issue events run from the default branch. Pull requests are opened by pulls.
@@ -753,13 +757,13 @@ rule IssueOpenedStartsWorkflows {
 -- from: services/actions/notifier.go:62
 rule IssueTitleChangeStartsWorkflows {
     when: issues/IssueTitleChanged(issue, doer, old_title)
-    ensures: IssueEditedForActions(issue, editor: doer)
+    ensures: IssueEditedForActions(issue: issue, editor: doer)
 }
 
 -- from: services/actions/notifier.go:69
 rule IssueContentChangeStartsWorkflows {
     when: issues/IssueContentChanged(issue, doer, old_content)
-    ensures: IssueEditedForActions(issue, editor: doer)
+    ensures: IssueEditedForActions(issue: issue, editor: doer)
 }
 
 -- from: services/actions/notifier.go:75
@@ -777,10 +781,10 @@ rule IssueClosedStartsWorkflows {
     when: issues/IssueClosed(issue, doer, comment)
     ensures:
         if issue.is_pull:
-            ForgeEventObserved(repository: issue.repository, doer, event: pull_request, activity: "closed", ref: null, commit_sha: null, pull_request: issue.pull_request)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request, activity: "closed", ref: null, commit_sha: null, pull_request: issue.pull_request)
             PullRequestClosedForActions(pull_request: issue.pull_request)
         else:
-            ForgeEventObserved(repository: issue.repository, doer, event: issues, activity: "closed", ref: null, commit_sha: null, pull_request: null)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issues, activity: "closed", ref: null, commit_sha: null, pull_request: null)
 }
 
 -- from: services/actions/notifier.go:114
@@ -788,9 +792,9 @@ rule IssueReopenedStartsWorkflows {
     when: issues/IssueReopened(issue, doer, comment)
     ensures:
         if issue.is_pull:
-            ForgeEventObserved(repository: issue.repository, doer, event: pull_request, activity: "reopened", ref: null, commit_sha: null, pull_request: issue.pull_request)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request, activity: "reopened", ref: null, commit_sha: null, pull_request: issue.pull_request)
         else:
-            ForgeEventObserved(repository: issue.repository, doer, event: issues, activity: "reopened", ref: null, commit_sha: null, pull_request: null)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issues, activity: "reopened", ref: null, commit_sha: null, pull_request: null)
 }
 
 -- from: services/actions/notifier.go:169
@@ -799,9 +803,9 @@ rule AssigneeChangeStartsWorkflows {
     let activity = if removed: "unassigned" else: "assigned"
     ensures:
         if issue.is_pull:
-            ForgeEventObserved(repository: issue.repository, doer, event: pull_request_assign, activity, ref: null, commit_sha: null, pull_request: issue.pull_request)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request_assign, activity: activity, ref: null, commit_sha: null, pull_request: issue.pull_request)
         else:
-            ForgeEventObserved(repository: issue.repository, doer, event: issue_assign, activity, ref: null, commit_sha: null, pull_request: null)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issue_assign, activity: activity, ref: null, commit_sha: null, pull_request: null)
 }
 
 -- from: services/actions/notifier.go:188
@@ -810,9 +814,9 @@ rule MilestoneChangeStartsWorkflows {
     let activity = if issue.milestone = null: "demilestoned" else: "milestoned"
     ensures:
         if issue.is_pull:
-            ForgeEventObserved(repository: issue.repository, doer, event: pull_request_milestone, activity, ref: null, commit_sha: null, pull_request: issue.pull_request)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request_milestone, activity: activity, ref: null, commit_sha: null, pull_request: issue.pull_request)
         else:
-            ForgeEventObserved(repository: issue.repository, doer, event: issue_milestone, activity, ref: null, commit_sha: null, pull_request: null)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issue_milestone, activity: activity, ref: null, commit_sha: null, pull_request: null)
 }
 
 -- Label changes match activity types `labeled` / `unlabeled`.
@@ -822,9 +826,9 @@ rule LabelChangeStartsWorkflows {
     let activity = if added.count > 0: "labeled" else: "unlabeled"
     ensures:
         if issue.is_pull:
-            ForgeEventObserved(repository: issue.repository, doer, event: pull_request_label, activity, ref: null, commit_sha: null, pull_request: issue.pull_request)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request_label, activity: activity, ref: null, commit_sha: null, pull_request: issue.pull_request)
         else:
-            ForgeEventObserved(repository: issue.repository, doer, event: issue_label, activity, ref: null, commit_sha: null, pull_request: null)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issue_label, activity: activity, ref: null, commit_sha: null, pull_request: null)
 }
 
 -- from: services/actions/notifier.go:206
@@ -832,9 +836,9 @@ rule LabelsClearedStartsWorkflows {
     when: issues/IssueLabelsCleared(issue, doer)
     ensures:
         if issue.is_pull:
-            ForgeEventObserved(repository: issue.repository, doer, event: pull_request_label, activity: "unlabeled", ref: null, commit_sha: null, pull_request: issue.pull_request)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request_label, activity: "unlabeled", ref: null, commit_sha: null, pull_request: issue.pull_request)
         else:
-            ForgeEventObserved(repository: issue.repository, doer, event: issue_label, activity: "unlabeled", ref: null, commit_sha: null, pull_request: null)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issue_label, activity: "unlabeled", ref: null, commit_sha: null, pull_request: null)
 }
 
 -- Comments match `issue_comment` (types created/edited/deleted) on issues
@@ -844,9 +848,9 @@ rule CommentCreatedStartsWorkflows {
     when: issues/IssueCommentCreated(issue, comment, doer, mentions)
     ensures:
         if issue.is_pull:
-            ForgeEventObserved(repository: issue.repository, doer, event: pull_request_comment, activity: "created", ref: null, commit_sha: null, pull_request: issue.pull_request)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request_comment, activity: "created", ref: null, commit_sha: null, pull_request: issue.pull_request)
         else:
-            ForgeEventObserved(repository: issue.repository, doer, event: issue_comment, activity: "created", ref: null, commit_sha: null, pull_request: null)
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issue_comment, activity: "created", ref: null, commit_sha: null, pull_request: null)
 }
 
 -- from: services/actions/notifier.go:287
@@ -854,9 +858,9 @@ rule CommentEditedStartsWorkflows {
     when: issues/IssueCommentEdited(comment, doer, old_content)
     ensures:
         if comment.issue.is_pull:
-            ForgeEventObserved(repository: comment.issue.repository, doer, event: pull_request_comment, activity: "edited", ref: null, commit_sha: null, pull_request: comment.issue.pull_request)
+            ForgeEventObserved(repository: comment.issue.repository, doer: doer, event: pull_request_comment, activity: "edited", ref: null, commit_sha: null, pull_request: comment.issue.pull_request)
         else:
-            ForgeEventObserved(repository: comment.issue.repository, doer, event: issue_comment, activity: "edited", ref: null, commit_sha: null, pull_request: null)
+            ForgeEventObserved(repository: comment.issue.repository, doer: doer, event: issue_comment, activity: "edited", ref: null, commit_sha: null, pull_request: null)
 }
 
 -- from: services/actions/notifier.go:302
@@ -864,9 +868,9 @@ rule CommentDeletedStartsWorkflows {
     when: issues/IssueCommentDeleted(comment, doer)
     ensures:
         if comment.issue.is_pull:
-            ForgeEventObserved(repository: comment.issue.repository, doer, event: pull_request_comment, activity: "deleted", ref: null, commit_sha: null, pull_request: comment.issue.pull_request)
+            ForgeEventObserved(repository: comment.issue.repository, doer: doer, event: pull_request_comment, activity: "deleted", ref: null, commit_sha: null, pull_request: comment.issue.pull_request)
         else:
-            ForgeEventObserved(repository: comment.issue.repository, doer, event: issue_comment, activity: "deleted", ref: null, commit_sha: null, pull_request: null)
+            ForgeEventObserved(repository: comment.issue.repository, doer: doer, event: issue_comment, activity: "deleted", ref: null, commit_sha: null, pull_request: null)
 }
 
 -- The pull request's head commit at the time of the event is used, never a
@@ -875,14 +879,14 @@ rule CommentDeletedStartsWorkflows {
 rule PullRequestOpenedStartsWorkflows {
     when: pulls/PullRequestOpened(pull_request)
     ensures: ForgeEventObserved(repository: pull_request.base_repository, doer: pull_request.issue.poster, event: pull_request, activity: "opened",
-        ref: pull_ref(pull_request), commit_sha: pull_request.head_commit_sha, pull_request)
+        ref: pull_ref(pull_request), commit_sha: pull_request.head_commit_sha, pull_request: pull_request)
 }
 
 -- from: services/actions/notifier.go:725
 rule PullRequestSynchronizedStartsWorkflows {
     when: pulls/PullRequestSynchronized(pull_request, doer)
-    ensures: ForgeEventObserved(repository: pull_request.base_repository, doer, event: pull_request_sync, activity: "synchronize",
-        ref: pull_ref(pull_request), commit_sha: pull_request.head_commit_sha, pull_request)
+    ensures: ForgeEventObserved(repository: pull_request.base_repository, doer: doer, event: pull_request_sync, activity: "synchronize",
+        ref: pull_ref(pull_request), commit_sha: pull_request.head_commit_sha, pull_request: pull_request)
 }
 
 -- A merge is a `closed` pull_request event on the merge commit.
@@ -890,7 +894,7 @@ rule PullRequestSynchronizedStartsWorkflows {
 rule PullRequestMergedStartsWorkflows {
     when: pulls/PullRequestMerged(pull_request, merger)
     ensures: ForgeEventObserved(repository: pull_request.base_repository, doer: merger, event: pull_request, activity: "closed",
-        ref: merge_commit_of(pull_request), commit_sha: merge_commit_of(pull_request), pull_request)
+        ref: merge_commit_of(pull_request), commit_sha: merge_commit_of(pull_request), pull_request: pull_request)
 }
 
 -- Approve / request changes / comment reviews; activity `submitted`/`edited`.
@@ -913,21 +917,21 @@ rule ReviewStartsWorkflows {
 rule ReviewRequestStartsWorkflows {
     when: pulls/ReviewRequested(pull_request, requester, reviewer)
     ensures: ForgeEventObserved(repository: pull_request.base_repository, doer: requester, event: pull_request_review_request, activity: "review_requested",
-        ref: pull_ref(pull_request), commit_sha: null, pull_request)
+        ref: pull_ref(pull_request), commit_sha: null, pull_request: pull_request)
 }
 
 -- from: services/actions/notifier.go:486
 rule ReviewRequestRemovalStartsWorkflows {
     when: pulls/ReviewRequestRemoved(pull_request, doer, reviewer)
-    ensures: ForgeEventObserved(repository: pull_request.base_repository, doer, event: pull_request_review_request, activity: "review_request_removed",
-        ref: pull_ref(pull_request), commit_sha: null, pull_request)
+    ensures: ForgeEventObserved(repository: pull_request.base_repository, doer: doer, event: pull_request_review_request, activity: "review_request_removed",
+        ref: pull_ref(pull_request), commit_sha: null, pull_request: pull_request)
 }
 
 -- from: services/actions/notifier.go:754
 rule TargetBranchChangeStartsWorkflows {
     when: pulls/PullRequestTargetBranchChanged(pull_request, doer, old_base_branch)
-    ensures: ForgeEventObserved(repository: pull_request.base_repository, doer, event: pull_request, activity: "edited",
-        ref: pull_ref(pull_request), commit_sha: null, pull_request)
+    ensures: ForgeEventObserved(repository: pull_request.base_repository, doer: doer, event: pull_request, activity: "edited",
+        ref: pull_ref(pull_request), commit_sha: null, pull_request: pull_request)
 }
 
 -- Release events run on the release's tag; `updated` matches type `edited`.
@@ -941,13 +945,13 @@ rule ReleasePublishedStartsWorkflows {
 -- from: services/actions/notifier.go:696
 rule ReleaseUpdatedStartsWorkflows {
     when: releases/ReleaseUpdated(release, doer)
-    ensures: ForgeEventObserved(repository: release.repository, doer, event: release, activity: "edited", ref: "refs/tags/" + release.tag_name, commit_sha: null, pull_request: null)
+    ensures: ForgeEventObserved(repository: release.repository, doer: doer, event: release, activity: "edited", ref: "refs/tags/" + release.tag_name, commit_sha: null, pull_request: null)
 }
 
 -- from: services/actions/notifier.go:701
 rule ReleaseDeletedStartsWorkflows {
     when: releases/ReleaseDeleted(release, doer)
-    ensures: ForgeEventObserved(repository: release.repository, doer, event: release, activity: "deleted", ref: "refs/tags/" + release.tag_name, commit_sha: null, pull_request: null)
+    ensures: ForgeEventObserved(repository: release.repository, doer: doer, event: release, activity: "deleted", ref: "refs/tags/" + release.tag_name, commit_sha: null, pull_request: null)
 }
 
 -- `registry_package` (type `published` / `deleted`), only for packages
@@ -963,26 +967,26 @@ rule PackagePublishedStartsWorkflows {
 rule PackageDeletedStartsWorkflows {
     when: packages/PackageVersionDeleted(version, doer)
     requires: version.package.repository != null
-    ensures: ForgeEventObserved(repository: version.package.repository, doer, event: package, activity: "deleted", ref: null, commit_sha: null, pull_request: null)
+    ensures: ForgeEventObserved(repository: version.package.repository, doer: doer, event: package, activity: "deleted", ref: null, commit_sha: null, pull_request: null)
 }
 
 -- Wiki edits match `gollum` and run from the default branch.
 -- from: services/actions/notifier.go:785
 rule WikiCreatedStartsWorkflows {
     when: wiki/WikiPageCreated(repository, doer, page)
-    ensures: ForgeEventObserved(repository, doer, event: wiki, activity: "created", ref: null, commit_sha: null, pull_request: null)
+    ensures: ForgeEventObserved(repository: repository, doer: doer, event: wiki, activity: "created", ref: null, commit_sha: null, pull_request: null)
 }
 
 -- from: services/actions/notifier.go:797
 rule WikiEditedStartsWorkflows {
     when: wiki/WikiPageEdited(repository, doer, page)
-    ensures: ForgeEventObserved(repository, doer, event: wiki, activity: "edited", ref: null, commit_sha: null, pull_request: null)
+    ensures: ForgeEventObserved(repository: repository, doer: doer, event: wiki, activity: "edited", ref: null, commit_sha: null, pull_request: null)
 }
 
 -- from: services/actions/notifier.go:809
 rule WikiDeletedStartsWorkflows {
     when: wiki/WikiPageDeleted(repository, doer, page)
-    ensures: ForgeEventObserved(repository, doer, event: wiki, activity: "deleted", ref: null, commit_sha: null, pull_request: null)
+    ensures: ForgeEventObserved(repository: repository, doer: doer, event: wiki, activity: "deleted", ref: null, commit_sha: null, pull_request: null)
 }
 
 ------------------------------------------------------------
@@ -996,7 +1000,7 @@ rule WikiDeletedStartsWorkflows {
 rule DetectWorkflowRuns {
     when: ForgeEventObserved(repository, doer, event, activity, ref, commit_sha, pull_request)
     requires: config.actions_enabled
-    requires: actions_unit_enabled(repository)
+    requires: repository.units.any(u => u.kind = actions and u.enabled)
     requires: not repository.is_empty
     requires: not repository.is_archived
     requires: not is_actions_bot(doer)
@@ -1012,7 +1016,7 @@ rule DetectWorkflowRuns {
     ensures:
         for workflow in matching_workflows(repository, event, activity, effective_ref, commit_sha, pull_request)
                 where not is_disabled:
-            WorkflowRunRequested(workflow, doer, event, activity, ref: effective_ref, commit_sha, pull_request,
+            WorkflowRunRequested(workflow: workflow, doer: doer, event: event, activity: activity, ref: effective_ref, commit_sha: commit_sha, pull_request: pull_request,
                 needs_approval: needs_approval and not is_pull_request_target(workflow, event))
     @guidance
         -- runs_from_default_branch: delete, fork, issues (all kinds),
@@ -1097,7 +1101,7 @@ rule ExpandRunIntoJobs {
     ensures:
         run.jobs_expanded = true
         if run.concurrency_mode = cancel_in_progress:
-            ConcurrencyGroupCancellationRequested(run)
+            ConcurrencyGroupCancellationRequested(run: run)
         for definition in job_definitions(run.repository, run.workflow_file, run.commit_sha):
             Job.created(
                 run: run,
@@ -1117,8 +1121,8 @@ rule ExpandRunIntoJobs {
                 oidc_requested: definition.oidc_requested,
                 is_assigned: false
             )
-        WorkflowRunAttemptStarted(run)
-        RunConsistencyCheckRequested(run)
+        WorkflowRunAttemptStarted(run: run)
+        RunConsistencyCheckRequested(run: run)
     @guidance
         -- initial_job_status: blocked when the definition has needs, is
         -- incomplete, or the run needs approval; else skipped when its `if:`
@@ -1142,7 +1146,7 @@ rule RecordPreExecutionFailure {
     ensures:
         run.jobs_expanded = true
         if run.concurrency_mode = cancel_in_progress:
-            ConcurrencyGroupCancellationRequested(run)
+            ConcurrencyGroupCancellationRequested(run: run)
         Job.created(
             run: run,
             key: run.workflow_file,
@@ -1161,7 +1165,7 @@ rule RecordPreExecutionFailure {
             oidc_requested: false,
             is_assigned: false
         )
-        WorkflowRunAttemptStarted(run)
+        WorkflowRunAttemptStarted(run: run)
 }
 
 -- Checks that would otherwise leave a job blocked forever fail the run:
@@ -1172,7 +1176,7 @@ rule CheckRunConsistency {
     when: RunConsistencyCheckRequested(run)
     let problem = consistency_problem(run.repository, run.workflow_file, run.commit_sha)
     requires: problem != null
-    ensures: RunFailedBeforeExecution(run, error: problem)
+    ensures: RunFailedBeforeExecution(run: run, error: problem)
 }
 
 -- from: services/actions/run.go:154
@@ -1181,7 +1185,7 @@ rule FailRunBeforeExecution {
     requires: run.pre_execution_error = null
     ensures:
         run.pre_execution_error = error
-        RunKillRequested(run, as_failure: true)
+        RunKillRequested(run: run, as_failure: true)
 }
 
 -- Every other run of the same repository and concurrency group that still
@@ -1210,9 +1214,9 @@ rule KillRun {
                 job.status = cancelled
             job.stopped_at = now
             job.status_changed_at = now
-            WorkflowJobCompleted(job, prior_status: job.status)
+            WorkflowJobCompleted(job: job, prior_status: job.status)
             for task in job.tasks where status = running:
-                TaskStopRequested(task, as_failure)
+                TaskStopRequested(task: task, as_failure: as_failure)
         run.needs_approval = false
 }
 
@@ -1246,9 +1250,9 @@ rule RunStatusFollowsJobs {
         run.status = run.aggregated_status
         if run.aggregated_status in {success, failure, cancelled, skipped}:
             run.stopped_at = now
-            WorkflowRunCompleted(run, prior_status: prior)
+            WorkflowRunCompleted(run: run, prior_status: prior)
         else:
-            WorkflowRunStatusChanged(run, prior_status: prior)
+            WorkflowRunStatusChanged(run: run, prior_status: prior)
     @guidance
         -- Aggregation: all skipped -> skipped; all success/skipped ->
         -- success; any running -> running; any waiting -> waiting; any
@@ -1271,7 +1275,7 @@ rule BlockedJobBecomesWaiting {
     ensures:
         job.status = waiting
         job.status_changed_at = now
-        WorkflowJobStatusChanged(job, prior_status: blocked)
+        WorkflowJobStatusChanged(job: job, prior_status: blocked)
 }
 
 -- from: services/actions/job_emitter.go:351
@@ -1284,7 +1288,7 @@ rule BlockedJobIsSkipped {
         job.status = skipped
         job.stopped_at = now
         job.status_changed_at = now
-        WorkflowJobCompleted(job, prior_status: blocked)
+        WorkflowJobCompleted(job: job, prior_status: blocked)
 }
 
 -- A job whose matrix / runs-on / `with:` needed outputs of other jobs is
@@ -1301,7 +1305,7 @@ rule IncompleteJobExpands {
             job.status = skipped
             job.stopped_at = now
             job.status_changed_at = now
-            WorkflowJobCompleted(job, prior_status: blocked)
+            WorkflowJobCompleted(job: job, prior_status: blocked)
         else if outcome.error != null:
             RunFailedBeforeExecution(run: job.run, error: outcome.error)
         else:
@@ -1342,7 +1346,7 @@ rule WorkflowCallOuterJobFinishes {
             job.status = success
         job.stopped_at = now
         job.status_changed_at = now
-        WorkflowJobCompleted(job, prior_status: blocked)
+        WorkflowJobCompleted(job: job, prior_status: blocked)
 }
 
 ------------------------------------------------------------
@@ -1358,7 +1362,7 @@ rule ApproveRun {
         for job in run.jobs where status = blocked and needs.count = 0:
             job.status = waiting
             job.status_changed_at = now
-            WorkflowJobStatusChanged(job, prior_status: blocked)
+            WorkflowJobStatusChanged(job: job, prior_status: blocked)
         run.needs_approval = false
         run.approved_by = approver
 }
@@ -1370,7 +1374,7 @@ rule UserApprovesPullRequestRuns {
     requires: may_delegate_actions_trust(user, pull_request.base_repository)
     ensures:
         for run in WorkflowRuns where pull_request = pull_request and needs_approval = true:
-            RunApproved(run, approver: user)
+            RunApproved(run: run, approver: user)
 }
 
 -- "Always trust": remember the poster and approve all their pending runs.
@@ -1388,7 +1392,7 @@ rule UserAlwaysTrustsPoster {
     ensures:
         for run in WorkflowRuns where repository = pull_request.base_repository
                 and pull_request_poster = poster and needs_approval = true:
-            RunApproved(run, approver: user)
+            RunApproved(run: run, approver: user)
 }
 
 -- "Deny": cancel every unfinished run of this pull request.
@@ -1399,7 +1403,7 @@ rule UserDeniesPullRequestRuns {
     ensures:
         for run in WorkflowRuns where pull_request = pull_request
                 and status in {waiting, blocked, running}:
-            RunKillRequested(run, as_failure: false)
+            RunKillRequested(run: run, as_failure: false)
 }
 
 -- "Revoke": forget the poster and cancel all their unfinished runs.
@@ -1413,7 +1417,7 @@ rule UserRevokesPosterTrust {
             not exists tc
         for run in WorkflowRuns where repository = pull_request.base_repository
                 and pull_request_poster = poster and status in {waiting, blocked, running}:
-            RunKillRequested(run, as_failure: false)
+            RunKillRequested(run: run, as_failure: false)
 }
 
 -- Closing a pull request cancels runs still waiting for approval.
@@ -1422,7 +1426,7 @@ rule ClosedPullRequestCancelsUnapprovedRuns {
     when: PullRequestClosedForActions(pull_request)
     ensures:
         for run in WorkflowRuns where pull_request = pull_request and needs_approval = true:
-            RunKillRequested(run, as_failure: false)
+            RunKillRequested(run: run, as_failure: false)
 }
 
 -- Explicit trust lapses when it has not been relied upon for 90 days.
@@ -1557,7 +1561,7 @@ rule UserResetsRegistrationToken {
 rule UsedEphemeralRunnerRemoved {
     when: runner: Runner.has_used_its_single_task
     requires: not runner.is_busy
-    ensures: RunnerRemovalDue(runner)
+    ensures: RunnerRemovalDue(runner: runner)
 }
 
 -- Optional cron: delete runners that have been offline (or never came
@@ -1568,7 +1572,7 @@ rule OfflineRunnerRemoved {
     requires: config.offline_runner_cleanup_enabled
     requires: runner.last_online_at = null or runner.last_online_at + config.offline_runner_cleanup_age <= now
     requires: config.offline_runner_cleanup_global_only implies runner.scope.kind = instance
-    ensures: RunnerRemovalDue(runner)
+    ensures: RunnerRemovalDue(runner: runner)
 }
 
 -- One place where a swept runner (used ephemeral or long offline) goes away.
@@ -1597,7 +1601,7 @@ rule RunnerFetchesTask {
         or (runner.scope.kind = repository and runner.scope.repository = job.run.repository)
         or (runner.scope.kind = user and job.run.repository.owner_user = runner.scope.owner_user)
         or (runner.scope.kind = organization and job.run.repository.owner_org = runner.scope.owner_org)
-    requires: actions_unit_enabled(job.run.repository)
+    requires: job.run.repository.units.any(u => u.kind = actions and u.enabled)
     requires: runner.labels.count > 0 and job.runs_on.count > 0
     requires: (job.runs_on - runner.labels).count = 0
     requires: not (runner.is_ephemeral and runner.has_taken_task)
@@ -1629,7 +1633,7 @@ rule RunnerFetchesTask {
         runner.last_online_at = now
         if job.run.started_at = null:
             job.run.started_at = now
-        WorkflowJobStatusChanged(job, prior_status: waiting)
+        WorkflowJobStatusChanged(job: job, prior_status: waiting)
     @guidance
         -- Order: run priority (highest first), then the job's last update,
         -- then creation order — i.e. FIFO unless a run was prioritised.
@@ -1742,7 +1746,7 @@ rule UserCancelsRun {
     when: UserCancelsWorkflowRun(user, run)
     requires: can_write_actions(user, run.repository)
     requires: run.status in {waiting, blocked, running}
-    ensures: RunKillRequested(run, as_failure: false)
+    ensures: RunKillRequested(run: run, as_failure: false)
 }
 
 -- Re-run all jobs of a finished, valid run whose workflow is not disabled.
@@ -1775,8 +1779,8 @@ rule UserRerunsRun {
                 job.status = blocked
             else:
                 job.status = waiting
-            WorkflowJobAttemptStarted(job)
-        WorkflowRunAttemptStarted(run)
+            WorkflowJobAttemptStarted(job: job)
+        WorkflowRunAttemptStarted(run: run)
 }
 
 -- Re-run one finished job plus every job that (transitively) needs it;
@@ -1794,7 +1798,7 @@ rule UserRerunsJob {
             artifact.status = pending_deletion
         for dependant in dependants_of(job):
             JobRerunRequested(job: dependant, keep_blocked: true)
-        JobRerunRequested(job, keep_blocked: false)
+        JobRerunRequested(job: job, keep_blocked: false)
         if job.run.status in {success, failure, cancelled, skipped}:
             job.run.attempt = job.run.attempt + 1
             WorkflowRunAttemptStarted(run: job.run)
@@ -1805,7 +1809,7 @@ rule RerunSingleJob {
     when: JobRerunRequested(job, keep_blocked)
     ensures:
         for task in job.tasks where status = running:
-            TaskStopRequested(task, as_failure: false)
+            TaskStopRequested(task: task, as_failure: false)
         job.attempt = job.attempt + 1
         job.handle = new_handle()
         job.is_assigned = false
@@ -1816,7 +1820,7 @@ rule RerunSingleJob {
             job.status = blocked
         else:
             job.status = waiting
-        WorkflowJobAttemptStarted(job)
+        WorkflowJobAttemptStarted(job: job)
 }
 
 -- Only finished runs can be deleted; logs, tasks and artifacts go with it.
@@ -1996,7 +2000,7 @@ rule UserDeletesArtifact {
 rule ArtifactExpires {
     when: artifact: Artifact.expires_at <= now
     requires: artifact.status = upload_confirmed
-    ensures: ArtifactExpiryDue(artifact)
+    ensures: ArtifactExpiryDue(artifact: artifact)
 }
 
 -- from: services/actions/cleanup.go:48
@@ -2012,7 +2016,7 @@ rule ExpireArtifact {
 -- from: services/actions/cleanup.go:70
 rule ArtifactPurged {
     when: artifact: Artifact.status becomes pending_deletion
-    ensures: ArtifactPurgeDue(artifact)
+    ensures: ArtifactPurgeDue(artifact: artifact)
 }
 
 -- from: services/actions/cleanup.go:70
@@ -2032,7 +2036,7 @@ rule PurgeArtifact {
 rule TaskLogsExpire {
     when: task: Task.stopped_at + config.log_retention <= now
     requires: not task.log_expired
-    ensures: TaskLogExpiryDue(task)
+    ensures: TaskLogExpiryDue(task: task)
 }
 
 -- from: services/actions/cleanup.go:96
@@ -2048,7 +2052,7 @@ rule LingeringLogArchived {
     when: task: Task.stopped_at + config.lingering_log_age <= now
     requires: not task.log_archived
     requires: not task.log_expired
-    ensures: LingeringLogTransferDue(task)
+    ensures: LingeringLogTransferDue(task: task)
 }
 
 -- from: services/actions/log.go:25
@@ -2070,7 +2074,7 @@ rule ArchiveLingeringLog {
 rule ZombieTaskFails {
     when: task: Task.last_activity_at + config.zombie_task_timeout <= now
     requires: task.status = running
-    ensures: TaskTimedOut(task)
+    ensures: TaskTimedOut(task: task)
 }
 
 -- A running task that has run for too long fails even if it reports.
@@ -2078,7 +2082,7 @@ rule ZombieTaskFails {
 rule EndlessTaskFails {
     when: task: Task.started_at + config.endless_task_timeout <= now
     requires: task.status = running
-    ensures: TaskTimedOut(task)
+    ensures: TaskTimedOut(task: task)
 }
 
 -- from: services/actions/task.go:257
@@ -2105,7 +2109,7 @@ rule AbandonedJobCancelled {
     when: job: Job.status_changed_at + config.abandoned_job_timeout <= now
     requires: job.status in {waiting, blocked}
     requires: not job.run.needs_approval
-    ensures: JobAbandoned(job)
+    ensures: JobAbandoned(job: job)
 }
 
 -- from: services/actions/clear_tasks.go:85
@@ -2117,7 +2121,7 @@ rule CancelAbandonedJob {
         job.status = cancelled
         job.stopped_at = now
         job.status_changed_at = now
-        WorkflowJobCompleted(job, prior_status: waiting)
+        WorkflowJobCompleted(job: job, prior_status: waiting)
 }
 
 ------------------------------------------------------------
@@ -2133,7 +2137,7 @@ rule ReportJobCommitStatusOnChange {
     requires: job.run.event in {push, pull_request, pull_request_sync, pull_request_label,
         pull_request_assign, pull_request_milestone, release}
     requires: not job.is_incomplete
-    ensures: code/CommitStatusReported(repository: job.run.repository, commit_sha: status_commit(job.run),
+    ensures: JobCommitStatusReported(repository: job.run.repository, commit_sha: status_commit(job.run),
         context: commit_status_context(job), state: commit_state(job.status), target_url: job_link(job),
         description: commit_status_description(job), creator: actions_bot())
 }
@@ -2144,7 +2148,7 @@ rule ReportJobCommitStatusOnCompletion {
     requires: job.run.event in {push, pull_request, pull_request_sync, pull_request_label,
         pull_request_assign, pull_request_milestone, release}
     requires: not job.is_incomplete
-    ensures: code/CommitStatusReported(repository: job.run.repository, commit_sha: status_commit(job.run),
+    ensures: JobCommitStatusReported(repository: job.run.repository, commit_sha: status_commit(job.run),
         context: commit_status_context(job), state: commit_state(job.status), target_url: job_link(job),
         description: commit_status_description(job), creator: actions_bot())
     @guidance
@@ -2160,7 +2164,7 @@ rule ReportJobCommitStatusOnAttempt {
     requires: job.run.event in {push, pull_request, pull_request_sync, pull_request_label,
         pull_request_assign, pull_request_milestone, release}
     requires: not job.is_incomplete
-    ensures: code/CommitStatusReported(repository: job.run.repository, commit_sha: status_commit(job.run),
+    ensures: JobCommitStatusReported(repository: job.run.repository, commit_sha: status_commit(job.run),
         context: commit_status_context(job), state: commit_state(job.status), target_url: job_link(job),
         description: commit_status_description(job), creator: actions_bot())
 }
@@ -2178,7 +2182,7 @@ rule TaskRequestsIdToken {
     when: TaskRequestsIdToken(task, audience)
     requires: task.status = running
     requires: task.oidc_enabled
-    ensures: IdTokenIssued(task, audience, expires_at: now + config.id_token_lifetime)
+    ensures: IdTokenIssued(task: task, audience: audience, expires_at: now + config.id_token_lifetime)
     @guidance
         -- An empty audience means the repository owner's URL.
         -- `sub` is "repo:<owner>-<owner_id>/<repo>-<repo_id>:pull_request"
@@ -2260,7 +2264,7 @@ rule UserDeletesVariable {
 rule RefreshSchedules {
     when: SchedulesNeedRefresh(repository)
     requires: config.actions_enabled
-    requires: actions_unit_enabled(repository)
+    requires: repository.units.any(u => u.kind = actions and u.enabled)
     requires: not repository.is_empty
     requires: not repository.is_archived
     ensures:
@@ -2269,7 +2273,7 @@ rule RefreshSchedules {
                 not exists spec
             not exists old
         for workflow in scheduled_workflows(repository):
-            ScheduleRegistrationRequested(workflow)
+            ScheduleRegistrationRequested(workflow: workflow)
 }
 
 -- from: services/actions/notifier_helper.go:600
@@ -2293,7 +2297,7 @@ rule RegisterSchedule {
 -- from: services/actions/notifier.go:600
 rule DefaultBranchChangeRefreshesSchedules {
     when: code/DefaultBranchChanged(repository, old_name, new_name, by)
-    ensures: SchedulesNeedRefresh(repository)
+    ensures: SchedulesNeedRefresh(repository: repository)
 }
 
 -- Renaming the default branch re-registers schedules against the new name.
@@ -2301,33 +2305,33 @@ rule DefaultBranchChangeRefreshesSchedules {
 rule DefaultBranchRenameRefreshesSchedules {
     when: code/BranchRenamed(repository, from_name, to_name, by)
     requires: to_name = repository.default_branch
-    ensures: SchedulesNeedRefresh(repository)
+    ensures: SchedulesNeedRefresh(repository: repository)
 }
 
 -- from: routers/web/repo/setting/setting.go:1088
 rule UnarchiveRefreshesSchedules {
     when: repositories/RepositoryUnarchived(repository, doer)
-    ensures: SchedulesNeedRefresh(repository)
+    ensures: SchedulesNeedRefresh(repository: repository)
 }
 
 -- from: services/repository/setting.go:38
 rule ActionsUnitEnabledRefreshesSchedules {
     when: repositories/RepoUnitEnabled(repository, kind)
     requires: kind = actions
-    ensures: SchedulesNeedRefresh(repository)
+    ensures: SchedulesNeedRefresh(repository: repository)
 }
 
 -- from: routers/web/repo/setting/setting.go:1065
 rule ArchiveDropsSchedules {
     when: repositories/RepositoryArchived(repository, doer)
-    ensures: SchedulesDropped(repository)
+    ensures: SchedulesDropped(repository: repository)
 }
 
 -- from: services/repository/setting.go:31
 rule ActionsUnitDisabledDropsSchedules {
     when: repositories/RepoUnitDisabled(repository, kind)
     requires: kind = actions
-    ensures: SchedulesDropped(repository)
+    ensures: SchedulesDropped(repository: repository)
 }
 
 -- Schedules go away and unfinished scheduled runs are cancelled.
@@ -2341,7 +2345,7 @@ rule DropSchedules {
             not exists old
         for run in WorkflowRuns where repository = repository and trigger_event = schedule
                 and status in {waiting, blocked, running}:
-            RunKillRequested(run, as_failure: false)
+            RunKillRequested(run: run, as_failure: false)
 }
 
 -- A due cron entry starts a run of its schedule's workflow, then moves to
@@ -2349,7 +2353,7 @@ rule DropSchedules {
 -- from: services/actions/schedule_tasks.go:30
 rule ScheduleFires {
     when: spec: ScheduleSpec.next_run_at <= now
-    ensures: ScheduleSpecDue(spec)
+    ensures: ScheduleSpecDue(spec: spec)
 }
 
 -- A due cron entry of a usable schedule starts its run.
@@ -2357,7 +2361,7 @@ rule ScheduleFires {
 rule StartScheduledRun {
     when: ScheduleSpecDue(spec)
     requires: not spec.schedule.repository.is_archived
-    requires: actions_unit_enabled(spec.schedule.repository)
+    requires: spec.schedule.repository.units.any(u => u.kind = actions and u.enabled)
     requires: not workflow_disabled(spec.schedule.repository, spec.schedule.workflow_file)
     requires: not schedule_is_broken(spec)
     ensures: WorkflowRun.created(
@@ -2493,7 +2497,7 @@ rule BlockingRevokesActionsTrust {
             not exists tc
         for run in WorkflowRuns where pull_request_poster = blocked and repository.owner_user = blocker
                 and status in {waiting, blocked, running}:
-            RunKillRequested(run, as_failure: false)
+            RunKillRequested(run: run, as_failure: false)
 }
 
 ------------------------------------------------------------
@@ -2512,7 +2516,7 @@ rule ZombieTaskSweep {
     when: administration/ZombieActionsTaskStopDue()
     ensures:
         for task in Tasks where status = running and last_activity_at + config.zombie_task_timeout <= now:
-            TaskTimedOut(task)
+            TaskTimedOut(task: task)
 }
 
 -- from: services/cron/tasks_actions.go:40
@@ -2520,7 +2524,7 @@ rule EndlessTaskSweep {
     when: administration/EndlessActionsTaskStopDue()
     ensures:
         for task in Tasks where status = running and started_at + config.endless_task_timeout <= now:
-            TaskTimedOut(task)
+            TaskTimedOut(task: task)
 }
 
 -- from: services/cron/tasks_actions.go:50
@@ -2529,7 +2533,7 @@ rule AbandonedJobSweep {
     ensures:
         for job in Jobs where status in {waiting, blocked} and not run.needs_approval
                 and status_changed_at + config.abandoned_job_timeout <= now:
-            JobAbandoned(job)
+            JobAbandoned(job: job)
 }
 
 -- from: services/cron/tasks_actions.go:60
@@ -2538,7 +2542,7 @@ rule LingeringLogSweep {
     ensures:
         for task in Tasks where stopped_at != null and not log_archived and not log_expired
                 and stopped_at + config.lingering_log_age <= now:
-            LingeringLogTransferDue(task)
+            LingeringLogTransferDue(task: task)
 }
 
 -- from: services/cron/tasks_actions.go:72
@@ -2546,7 +2550,7 @@ rule ScheduleSweep {
     when: administration/ActionsScheduleStartDue()
     ensures:
         for spec in ScheduleSpecs where next_run_at <= now:
-            ScheduleSpecDue(spec)
+            ScheduleSpecDue(spec: spec)
 }
 
 -- Expired and deleted artifacts, expired logs and used ephemeral runners.
@@ -2555,14 +2559,14 @@ rule ActionsCleanupSweep {
     when: administration/ActionsCleanupDue()
     ensures:
         for artifact in Artifacts where status = upload_confirmed and expires_at <= now:
-            ArtifactExpiryDue(artifact)
+            ArtifactExpiryDue(artifact: artifact)
         for artifact in Artifacts where status = pending_deletion:
-            ArtifactPurgeDue(artifact)
+            ArtifactPurgeDue(artifact: artifact)
         for task in Tasks where stopped_at != null and not log_expired
                 and stopped_at + config.log_retention <= now:
-            TaskLogExpiryDue(task)
+            TaskLogExpiryDue(task: task)
         for runner in Runners where has_used_its_single_task and not is_busy:
-            RunnerRemovalDue(runner)
+            RunnerRemovalDue(runner: runner)
 }
 
 -- Trust that has not been relied upon within the expiry lapses.
@@ -2583,7 +2587,7 @@ rule OfflineRunnerSweep {
         for runner in Runners where created_at + older_than <= now
                 and (last_online_at = null or last_online_at + older_than <= now)
                 and (global_scope_only implies scope.kind = instance):
-            RunnerRemovalDue(runner)
+            RunnerRemovalDue(runner: runner)
 }
 
 ------------------------------------------------------------
@@ -3050,10 +3054,10 @@ open question "Scheduled workflows are never disabled for inactivity (GitHub dis
 -- Requests to other modules
 ------------------------------------------------------------
 -- REQUEST code/Push.ref_updates with RefUpdate.ref_kind/ref_name/new_sha (present); a black-box full_ref_name(update) / qualified_ref(kind, name) gives refs/heads/<b> or refs/tags/<t>.
--- REQUEST code: accept code/CommitStatusReported from the Actions bot (creator = actions_bot()) for the job's own repository without a write-permission check; target URL = the job page. Scheduled runs report no statuses (Forgejo skips them on runner updates).
+-- REQUEST code: react to actions/JobCommitStatusReported from the Actions bot (creator = actions_bot()) for the job's own repository without a write-permission check; target URL = the job page. Scheduled runs report no statuses (Forgejo skips them on runner updates).
 -- REQUEST accounts: a well-known system user "the Actions bot" (actions_bot(), is_actions_bot(user)); events caused by it start no workflows.
 -- REQUEST repositories/Repository.default_branch, .is_empty, .is_archived, .owner_user, .owner_org — used for scoping and gating.
--- REQUEST repositories: the actions unit's per-repository settings (disabled workflow file names, OIDC subject format) are modelled here as Workflow.is_disabled; repositories may prefer to own them on RepoUnit. actions_unit_enabled(repository) = the actions RepoUnit is enabled and actions is not in DISABLED_REPO_UNITS.
+-- REQUEST repositories: the actions unit's per-repository settings (disabled workflow file names, OIDC subject format) are modelled here as Workflow.is_disabled; repositories may prefer to own them on RepoUnit. the actions unit counts as enabled when the repository has an enabled RepoUnit of kind actions (access's invariant keeps units in DISABLED_REPO_UNITS disabled).
 -- REQUEST access: can_read(user, repo, actions), can_write(user, repo, actions), is_repo_admin(user, repo). This module uses local black-box aliases can_read_actions / can_write_actions / is_repo_admin because qualified black-box calls cannot be stipulated in journeys; integration may substitute the access functions.
 -- REQUEST access: the automatic token as an authentication method (TaskAccessesOwnRepository / TaskReadsOtherPublicRepository already model it) — note Forgejo grants write to every unit of the own repository, read for fork PR runs.
 -- REQUEST issues: Issue.pull_request, Issue.milestone, Comment.issue (used to route issue vs pull-request activity).
