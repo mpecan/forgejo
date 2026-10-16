@@ -9,10 +9,16 @@ world {
         org:   organizations/Organization
     given:
         ada.is_active = true
+        ada.prohibit_login = false
         ada.kind = individual
         bob.is_active = true
+        bob.prohibit_login = false
         bob.kind = individual
         repo.is_archived = false
+        -- The templates' column lists, restated at their defaults: the walker
+        -- does not read a List literal default from a config block.
+        config.basic_kanban_columns = {"To do", "In progress", "Done"}
+        config.bug_triage_columns = {"Needs triage", "High priority", "Low priority", "Closed"}
 }
 
 -- A repository writer starts a kanban board and gets the template's columns.

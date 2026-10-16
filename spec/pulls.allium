@@ -72,6 +72,7 @@
 --   TeamReviewRequestRemoved(pull_request, doer, team)
 --   ReviewDismissed(review, dismisser, message)
 --   PullRequestHeadBranchDeleted(pull_request, doer)
+--   HeadBranchDeletionRequested(user, branch)          -- code deletes the head branch as UserDeletesBranch does
 --   SuggestionsApplied(pull_request, doer, conversations)
 --   IssueClosedByPullRequest(issue, pull_request, doer)   -- per issue the merged PR closes by keyword
 --   IssueReopenedByPullRequest(issue, pull_request, doer) -- per issue the merged PR reopens by keyword
@@ -618,6 +619,8 @@ rule RequestCodeOwnerReviews {
     let pr = pull_request
     requires: pr.base_repository.is_fork = false
     let rules = CodeOwnerRules where repository = pr.base_repository
+    -- No CODEOWNERS file, no rules, nobody to request.
+    requires: rules.count > 0
     let owners = code_owner_users(rules, pr)
     let owner_teams = code_owner_teams(rules, pr)
     let poster = pr.issue.poster
@@ -730,8 +733,8 @@ rule HeadBranchPushUpdatesPullRequests {
     when: code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
     for pr in PullRequests where head_repository = repository and head_branch = branch_name
             and flow = branch and issue.status = open
-            and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error):
-        requires: new_sha != pr.head_commit_sha
+            and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error)
+            and head_commit_sha != new_sha:
         ensures: PullRequestHeadMoved(pull_request: pr, pusher: pusher, old_commit_sha: pr.head_commit_sha, new_commit_sha: new_sha)
     @guidance
         -- Only PRs that existed before the push was received are updated (a PR
@@ -788,7 +791,6 @@ rule BaseBranchPushRechecksPullRequests {
     when: code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
     for pr in PullRequests where base_repository = repository and base_branch = branch_name and issue.status = open
             and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error):
-        requires: (pr.status = checking or pr.status = mergeable or pr.status = conflict or pr.status = empty or pr.status = ancestor or pr.status = error)
         ensures: pr.status = checking
         ensures: pr.check_requested_at = now
         ensures: pr.commits_ahead = commits_ahead_of(pr.head_repository, pr.head_branch, pr.base_repository, pr.base_branch)
@@ -801,9 +803,8 @@ rule BaseBranchPushRechecksPullRequests {
 rule ProtectionChangeRechecksPullRequests {
     when: code/BranchProtectionChanged(rule)
     for pr in PullRequests where base_repository = rule.repository and issue.status = open
-            and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error):
-        requires: rule_matches_branch(rule, pr.base_branch)
-        requires: (pr.status = checking or pr.status = mergeable or pr.status = conflict or pr.status = empty or pr.status = ancestor or pr.status = error)
+            and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error)
+            and rule_matches_branch(rule, base_branch):
         ensures: pr.status = checking
         ensures: pr.check_requested_at = now
 }
@@ -1192,7 +1193,8 @@ rule UserSchedulesAutoMerge {
     requires: not has_open_blocking_dependencies(pr.issue)
     requires: not exists pr.auto_merge
     ensures: AutoMerge.created(pull_request: pr, scheduled_by: user, style: style,
-        message: message ?? default_merge_message(pr, style),
+        -- `if` rather than `??`: allium-journey 0.1.2 does not evaluate `??`
+        message: if message != null: message else: default_merge_message(pr, style),
         delete_branch_after_merge: delete_branch_after_merge, created_at: now)
     ensures: issues/Comment.created(issue: pr.issue, poster: user, kind: pull_scheduled_merge, content: "",
         content_version: 0, created_at: now, updated_at: now)
@@ -1240,12 +1242,13 @@ rule AutoMergeExecutes {
         pr.merged_at = now
         pr.check_requested_at = null
         pr.conflicted_files = {}
-        not exists scheduled
         pr.merged_automatically = true
         PullRequestAutoMerged(pull_request: pr, merger: scheduled.scheduled_by)
         PullRequestMerged(pull_request: pr, merger: scheduled.scheduled_by)
         if scheduled.delete_branch_after_merge:
             PullRequestHeadBranchDeletionRequested(pull_request: pr, doer: scheduled.scheduled_by)
+        -- the schedule is removed last: everything above reads it
+        not exists scheduled
     @guidance
         -- Triggered in Forgejo by: a commit status on the head commit
         -- (code/CommitStatusCreated), an approval, a dismissed review, and a
@@ -1294,7 +1297,7 @@ rule DeletePullRequestHeadBranch {
                         old_ref: pr.head_branch, new_ref: pr.base_branch,
                         content_version: 0, created_at: now, updated_at: now)
                     PullRequestTargetBranchChanged(pull_request: child, doer: user, old_base_branch: pr.head_branch)
-        code/UserDeletesBranch(user: user, branch: head)
+        HeadBranchDeletionRequested(user: user, branch: head)
         issues/Comment.created(issue: pr.issue, poster: user, kind: delete_branch, content: "",
             old_ref: pr.head_branch, content_version: 0, created_at: now, updated_at: now)
         PullRequestHeadBranchDeleted(pull_request: pr, doer: user)
@@ -1388,8 +1391,8 @@ rule UserPostsSingleCodeComment {
 -- review stays pending; any other reply is visible immediately.
 -- from: services/pull/review.go:160
 rule UserRepliesToCodeConversation {
-    when: UserRepliesToCodeConversation(user, thread, body)
-    let pr = thread.pull_request
+    when: UserRepliesToCodeConversation(user, pr, thread, body)
+    requires: thread.pull_request = pr
     requires: pr.base_repository.is_archived = false
     requires: can_read_pulls(user, pr.base_repository)
     requires: not pr.issue.is_locked or can_write_pulls(user, pr.base_repository)
@@ -1404,8 +1407,8 @@ rule UserRepliesToCodeConversation {
 
 -- from: routers/api/v1/repo/pull_review.go:1066
 rule UserEditsReviewComment {
-    when: UserEditsReviewComment(user, comment, body)
-    let pr = comment.conversation.pull_request
+    when: UserEditsReviewComment(user, pr, comment, body)
+    requires: comment.conversation.pull_request = pr
     requires: pr.base_repository.is_archived = false
     requires: user = comment.poster or can_write_pulls(user, pr.base_repository)
     requires: not pr.issue.is_locked or can_write_pulls(user, pr.base_repository)
@@ -1416,8 +1419,8 @@ rule UserEditsReviewComment {
 -- Deleting the last comment of a pending review removes the pending review.
 -- from: services/issue/comments.go:121
 rule UserDeletesReviewComment {
-    when: UserDeletesReviewComment(user, comment)
-    let pr = comment.conversation.pull_request
+    when: UserDeletesReviewComment(user, pr, comment)
+    requires: comment.conversation.pull_request = pr
     requires: pr.base_repository.is_archived = false
     requires: user = comment.poster or can_write_pulls(user, pr.base_repository)
     ensures:
@@ -1531,7 +1534,8 @@ rule ReviewVerdictSupersedesEarlierState {
 -- remaining approve/request_changes review.
 -- from: models/issues/review.go:820
 rule UserDeletesReview {
-    when: UserDeletesReview(user, doomed)
+    when: UserDeletesReview(user, pr, doomed)
+    requires: doomed.pull_request = pr
     requires: user = doomed.reviewer or user.is_admin
     ensures:
         for thread in CodeConversations where review = doomed:
@@ -1560,8 +1564,8 @@ rule RestoreLatestOfficialReview {
 -- reviewer's earlier ones) with a message, while the PR is open and unmerged.
 -- from: services/pull/review.go:499
 rule RepoAdminDismissesReview {
-    when: RepoAdminDismissesReview(admin, review, message)
-    let pr = review.pull_request
+    when: RepoAdminDismissesReview(admin, pr, review, message)
+    requires: review.pull_request = pr
     requires: is_repo_admin(admin, pr.base_repository)
     requires: review.is_blocking_verdict
     requires: pr.is_open
@@ -1581,8 +1585,8 @@ rule RepoAdminDismissesReview {
 
 -- from: routers/api/v1/repo/pull_review.go:1024
 rule RepoAdminUndismissesReview {
-    when: RepoAdminUndismissesReview(admin, review)
-    let pr = review.pull_request
+    when: RepoAdminUndismissesReview(admin, pr, review)
+    requires: review.pull_request = pr
     requires: is_repo_admin(admin, pr.base_repository)
     requires: review.is_blocking_verdict
     requires: pr.is_open
@@ -1629,8 +1633,8 @@ rule UserRequestsReview {
 -- requested reviewer themselves.
 -- from: models/issues/review.go:612
 rule UserWithdrawsReviewRequest {
-    when: UserWithdrawsReviewRequest(user, request)
-    let pr = request.pull_request
+    when: UserWithdrawsReviewRequest(user, pr, request)
+    requires: request.pull_request = pr
     requires: request.reviewer != null
     requires: pr.may_change_review_requests(user) or user = request.reviewer
     ensures:
@@ -1665,8 +1669,8 @@ rule UserRequestsTeamReview {
 
 -- from: models/issues/review.go:705
 rule UserWithdrawsTeamReviewRequest {
-    when: UserWithdrawsTeamReviewRequest(user, request)
-    let pr = request.pull_request
+    when: UserWithdrawsTeamReviewRequest(user, pr, request)
+    requires: request.pull_request = pr
     requires: request.team != null
     requires: pr.may_change_review_requests(user)
     ensures: not exists request
@@ -1681,8 +1685,8 @@ rule UserWithdrawsTeamReviewRequest {
 
 -- from: models/issues/review.go:751
 rule UserResolvesCodeConversation {
-    when: UserResolvesCodeConversation(user, thread)
-    let pr = thread.pull_request
+    when: UserResolvesCodeConversation(user, pr, thread)
+    requires: thread.pull_request = pr
     requires: pr.base_repository.is_archived = false
     requires: pr.may_resolve_conversations(user)
     requires: thread.resolved_by = null
@@ -1693,8 +1697,8 @@ rule UserResolvesCodeConversation {
 
 -- from: models/issues/review.go:751
 rule UserUnresolvesCodeConversation {
-    when: UserUnresolvesCodeConversation(user, thread)
-    let pr = thread.pull_request
+    when: UserUnresolvesCodeConversation(user, pr, thread)
+    requires: thread.pull_request = pr
     requires: pr.base_repository.is_archived = false
     requires: pr.may_resolve_conversations(user)
     requires: thread.resolved_by != null
@@ -1949,17 +1953,17 @@ surface PullRequestPage {
         UserSubmitsReview(viewer, pr, verdict, body, commit_sha)
         UserAddsPendingCodeComment(viewer, pr, path, line, side, extra_lines, body)
         UserPostsSingleCodeComment(viewer, pr, path, line, side, extra_lines, body)
-        UserRepliesToCodeConversation(viewer, thread, body)
+        UserRepliesToCodeConversation(viewer, pr, thread, body)
         UserMarksFilesViewed(viewer, pr, paths, viewed)
         UserRequestsReview(viewer, pr, reviewer) when pr.may_change_review_requests(viewer)
         UserRequestsTeamReview(viewer, pr, team) when pr.may_change_review_requests(viewer)
-        UserWithdrawsReviewRequest(viewer, request)
-        UserWithdrawsTeamReviewRequest(viewer, request) when pr.may_change_review_requests(viewer)
-        UserResolvesCodeConversation(viewer, thread) when pr.may_resolve_conversations(viewer)
-        UserUnresolvesCodeConversation(viewer, thread) when pr.may_resolve_conversations(viewer)
-        UserEditsReviewComment(viewer, comment, body)
-        UserDeletesReviewComment(viewer, comment)
-        UserDeletesReview(viewer, review)
+        UserWithdrawsReviewRequest(viewer, pr, request)
+        UserWithdrawsTeamReviewRequest(viewer, pr, request) when pr.may_change_review_requests(viewer)
+        UserResolvesCodeConversation(viewer, pr, thread) when pr.may_resolve_conversations(viewer)
+        UserUnresolvesCodeConversation(viewer, pr, thread) when pr.may_resolve_conversations(viewer)
+        UserEditsReviewComment(viewer, pr, comment, body)
+        UserDeletesReviewComment(viewer, pr, comment)
+        UserDeletesReview(viewer, pr, review)
         UserAppliesSuggestions(viewer, pr, threads, summary, message) when pr.head_is_editable_by(viewer)
         UserUpdatesPullRequestBranch(viewer, pr, style) when pr.is_open and pr.commits_behind > 0
         UserChangesPullRequestTarget(viewer, pr, new_base_branch) when pr.may_manage(viewer)
@@ -2000,7 +2004,7 @@ surface DraftReviewPanel {
 
     provides:
         UserSubmitsDraftReview(author, draft, verdict, body, commit_sha)
-        UserDeletesReview(author, draft)
+        UserDeletesReview(author, draft.pull_request, draft)
 
     @guarantee OnlyTheAuthorSeesADraft
         -- A pending review exists for nobody but its author (instance admins
@@ -2081,8 +2085,8 @@ surface ReviewModeration {
             review.is_dismissed
 
     provides:
-        RepoAdminDismissesReview(admin, review, message) when pr.is_open and not pr.is_merged
-        RepoAdminUndismissesReview(admin, review) when pr.is_open and not pr.is_merged
+        RepoAdminDismissesReview(admin, pr, review, message) when pr.is_open and not pr.is_merged
+        RepoAdminUndismissesReview(admin, pr, review) when pr.is_open and not pr.is_merged
         UserMergesPullRequest(admin, pr, style, title, message, expected_head_sha, delete_branch_after_merge, force_merge)
             when pr.may_bypass_protection(admin)
 }
@@ -2097,7 +2101,7 @@ surface SiteAdminReviewControls {
         review.status
 
     provides:
-        UserDeletesReview(admin, review)
+        UserDeletesReview(admin, review.pull_request, review)
 }
 
 ------------------------------------------------------------
@@ -2129,7 +2133,7 @@ open question "Should merge-message templates live only in the repository (.forg
 
 -- REQUEST code/ProtectedBranch: pulls reads repository, status_check_enabled, status_check_contexts (globs over CommitStatus.context, evaluated by required_status_checks_pass), required_approvals, block_on_rejected_reviews, block_on_official_review_requests, block_on_outdated_branch, dismiss_stale_approvals, ignore_stale_approvals, apply_to_admins, protected_file_patterns, allows_merge_by(user), counts_approval_of(user) — all present; also needs protection_for(repository, branch) as the shared "first matching rule" function and rule_matches_branch(rule, branch).
 -- REQUEST code: AgitPullRequestRequested should only fire when the pusher can read pull requests (pulls re-checks); AgitPullRequestHeadPushed for refs/pull/<n>/head must require code write or the PR poster (pulls re-checks).
--- REQUEST code/UserDeletesBranch(user, branch) is chained by pulls for head-branch cleanup after merge.
+-- REQUEST code: react to HeadBranchDeletionRequested(user, branch) by deleting the branch as UserDeletesBranch does (done: code/PullRequestHeadBranchIsDeleted).
 -- REQUEST code: the merge push (Push.merging_pull) pre-receive should apply pulls/PullRequest.may_merge and protection_satisfied minus protected files.
 -- REQUEST issues: UserClosesIssue / UserReopensIssue should not apply to pull-request conversations (is_pull) — pulls owns UserClosesPullRequest / UserReopensPullRequest with PR-specific guards (merged, duplicate head/base, deleted branches) — or should defer to them.
 -- REQUEST issues: Comment needs `review` for kinds review/dismiss_review/code and `old_ref`/`new_ref` for change_target_branch/delete_branch (present); review_request comments for removals carry the reviewer/team name.

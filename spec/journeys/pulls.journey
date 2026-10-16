@@ -22,6 +22,7 @@ world {
         ada.is_active = true
         bob.is_admin = false
         bob.is_active = true
+        bob.email_notifications = disabled
         carol.is_admin = false
         carol.is_active = true
         root.is_admin = true
@@ -50,6 +51,12 @@ world {
         pr.commits_ahead = 2
         pr.commits_behind = 0
         pr.allow_maintainer_edit = false
+        repo.owner_user = bob
+        repo.owner_org = null
+        ada.prohibit_login = false
+        bob.prohibit_login = false
+        carol.prohibit_login = false
+        root.prohibit_login = false
 }
 
 -- The happy path of opening: a contributor proposes a branch and the
@@ -160,6 +167,8 @@ journey ReviewThenMerge {
         stipulate within_quota(repo) = true
         stipulate compose_merge_message(pr, merge, "", "") = "Merge pull request 'Add widgets' (#1) from feature into main"
         stipulate merge_result_commit(pr, merge, "Merge pull request 'Add widgets' (#1) from feature into main") = "abc1"
+        stipulate issues_closed_by(pr) = {}
+        stipulate issues_reopened_by(pr) = {}
         bob does UserMergesPullRequest(bob, pr, merge, "", "", null, false, false) on PullRequestMergeBox
         then UserMergesPullRequest fires
         then pr.status = merged
@@ -273,6 +282,8 @@ journey ProtectionBlocksMergeUntilAnAdminOverrides {
         stipulate merge_signing_satisfied(pr, root, squash) = true
         stipulate compose_merge_message(pr, squash, "", "") = "Add widgets (#1)"
         stipulate merge_result_commit(pr, squash, "Add widgets (#1)") = "5a5a"
+        stipulate issues_closed_by(pr) = {}
+        stipulate issues_reopened_by(pr) = {}
         root does UserMergesPullRequest(root, pr, squash, "", "", null, false, true) on PullRequestMergeBox
         then pr.status = merged
         then pr.merge_style = squash
@@ -364,7 +375,8 @@ journey AutoMergeWaitsForRequiredChecks {
         stipulate pr.protection_satisfied = true
         -- quiet the reactions of other modules to the merge
         stipulate issue_index_service() = indexer
-        stipulate actions_unit_enabled(repo) = false
+        stipulate issues_closed_by(pr) = {}
+        stipulate issues_reopened_by(pr) = {}
         stipulate branch_exists(repo, "feature") = true
         stipulate merge_result_commit(pr, rebase, "") = "beef"
         after 1.minute
@@ -420,6 +432,7 @@ journey ReviewRequestsAreAskedAndAnswered {
         stipulate has_submitted_review(pr, bob) = false
         stipulate protection_for(repo, "main") = null
         stipulate can_write_code(bob, repo) = true
+        stipulate can_read_issue(bob, conv) = true
         ada does UserRequestsReview(ada, pr, bob) on PullRequestAuthorControls
             creating request: ReviewRequest
         then request.reviewer = bob
@@ -479,6 +492,7 @@ journey UpdatingTheBranchDismissesStaleApprovals {
     1. bob updates the branch by merging main into it
         stipulate protection_for(repo, "main") = rule
         stipulate may_update_by_merge(bob, pr) = true
+        stipulate can_write_code(bob, repo) = true
         stipulate within_quota(repo) = true
         stipulate updated_head(pr, merge) = "f11e"
         stipulate diff_differs(pr, "f00d", "f11e") = true
@@ -579,11 +593,11 @@ journey AdminDismissesARequestForChanges {
 
     1. bob cannot dismiss it
         stipulate is_repo_admin(bob, repo) = false
-        bob cannot do RepoAdminDismissesReview(bob, objection, "Carol is away") on ReviewModeration
+        bob cannot do RepoAdminDismissesReview(bob, pr, objection, "Carol is away") on ReviewModeration
 
     2. root dismisses it
         stipulate is_repo_admin(root, repo) = true
-        root does RepoAdminDismissesReview(root, objection, "Carol is away") on ReviewModeration
+        root does RepoAdminDismissesReview(root, pr, objection, "Carol is away") on ReviewModeration
         then objection.is_dismissed = true
 
     3. everyone sees it was dismissed
@@ -591,4 +605,38 @@ journey AdminDismissesARequestForChanges {
         ada sees objection.is_dismissed on PullRequestPage in pr
 
     ends: The request for changes no longer blocks the merge.
+}
+
+-- After the merge, the head branch is cleaned up: pulls asks, code deletes it
+-- with the same checks as any branch deletion.
+journey TheMergedHeadBranchIsDeleted {
+    goal: Ada's pull request is merged. Bob presses "Delete branch"; nothing
+          else is open from `feature`, so code deletes it and the timeline
+          records the deletion.
+
+    cast:
+        feature: code/Branch
+    given:
+        pr.status = merged
+        conv.status = closed
+        feature.repository = repo
+        feature.name = "feature"
+        feature.head_commit_sha = "f00d"
+        feature.status = live
+
+    1. bob deletes the head branch
+        stipulate head_commit_of(repo, "feature") = "f00d"
+        stipulate has_other_open_pull_request_from(pr) = false
+        stipulate can_write_code(bob, repo) = true
+        stipulate open_pull_requests_into(repo, "feature") = {}
+        stipulate protection_for(repo, "feature") = null
+        stipulate can_read_pulls(bob, repo) = true
+        bob does UserDeletesPullRequestHeadBranch(bob, pr) on PullRequestPage
+        then DeletePullRequestHeadBranch fires
+        then PullRequestHeadBranchIsDeleted fires
+        then feature.status = deleted
+        then feature.deleted_by = bob
+
+    ends: `feature` is gone (restorable for a day); the merged pull request
+          says who deleted it.
 }

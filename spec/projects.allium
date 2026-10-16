@@ -357,7 +357,7 @@ rule UserDeletesProject {
 -- Deleting a repository deletes its boards with their columns and cards.
 -- from: services/repository/delete.go:275
 rule RepositoryDeletionRemovesProjects {
-    when: repositories/RepositoryDeleted(repository, _)
+    when: repositories/RepositoryDeleted(repository, doer)
     for project in Projects where owner_repository = repository:
         ensures:
             for card in project.cards:
@@ -371,7 +371,7 @@ rule RepositoryDeletionRemovesProjects {
 -- Deleting an issue removes its card.
 -- from: services/issue/issue.go:280
 rule IssueDeletionRemovesCard {
-    when: issues/IssueDeleted(issue, _)
+    when: issues/IssueDeleted(issue, doer)
     ensures:
         for card in ProjectCards where issue = issue:
             not exists card

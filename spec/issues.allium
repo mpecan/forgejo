@@ -125,10 +125,13 @@ use "./releases.allium" as releases
 --       organizations are ignored; users who cannot read the issue, inactive
 --       or login-prohibited users, users who blocked the doer and the doer
 --       are dropped.
---   cross_references(issue, comment, doer, text) -> Set<CrossReference>
+--   cross_references(repository, doer, title, text) -> Set<CrossReference>
 --       `#N`, `!N`, `owner/repo#N` references (plus a preceding close /
---       reopen keyword) that point at an existing issue the doer can read;
---       see `CrossReference`.
+--       reopen keyword), resolved against `repository` (where `#N` points),
+--       that point at an existing issue the doer can read, found in the
+--       title (null for a comment) and the text; see
+--       `CrossReference`. A reference back to the posting issue itself is
+--       dropped by the rule, not by the function.
 --   commit_references(push) -> Set<CommitReference>
 --   exclusive_scope(label) -> String     -- "" when not exclusive or no scope
 --   is_allowed_file(name, head_bytes) -> Boolean   -- against config.attachment_allowed_types
@@ -630,7 +633,7 @@ rule UserOpensIssue {
             updated_at: now
         )
         IssueOpened(issue: issue, mentions: mentions)
-        TextPosted(issue: issue, comment: null, doer: user, text: title + " " + content)
+        TextPosted(issue: issue, comment: null, doer: user, title: title, text: content)
         AttachmentsLinked(issue: issue, comment: null, doer: user, attachments: attachments)
         if is_manager:
             IssueMetadataInitialised(issue: issue, doer: user)
@@ -675,7 +678,7 @@ rule UserChangesIssueTitle {
                              old_title: issue.title, new_title: trim(title),
                              content: "", content_version: 0, created_at: now, updated_at: now)
     ensures: IssueTitleChanged(issue: issue, doer: user, old_title: issue.title)
-    ensures: TextPosted(issue: issue, comment: null, doer: user, text: trim(title) + " " + issue.content)
+    ensures: TextPosted(issue: issue, comment: null, doer: user, title: trim(title), text: issue.content)
 }
 
 -- Body edits are optimistic: the editor states the version they edited.
@@ -692,7 +695,7 @@ rule UserEditsIssueBody {
     ensures: issue.updated_at = now
     ensures: ContentRevised(issue: issue, comment: null, editor: user, old_content: issue.content, new_content: content)
     ensures: IssueContentChanged(issue: issue, doer: user, old_content: issue.content)
-    ensures: TextPosted(issue: issue, comment: null, doer: user, text: issue.title + " " + content)
+    ensures: TextPosted(issue: issue, comment: null, doer: user, title: issue.title, text: content)
 }
 
 -- Issues only: the branch or tag an issue is about. A set ref limits which
@@ -849,7 +852,7 @@ rule UserComments {
         let c = Comment.created(issue: issue, poster: user, kind: comment, content: content,
                                 content_version: 0, created_at: now, updated_at: now)
         AttachmentsLinked(issue: issue, comment: c, doer: user, attachments: attachments)
-        TextPosted(issue: issue, comment: c, doer: user, text: content)
+        TextPosted(issue: issue, comment: c, doer: user, title: null, text: content)
         IssueCommentCreated(issue: issue, comment: c, doer: user, mentions: mentions)
     ensures: issue.updated_at = now
 }
@@ -858,7 +861,8 @@ rule UserComments {
 -- history (pending-review comments keep no history and notify nobody).
 -- from: services/issue/comments.go:78
 rule UserEditsComment {
-    when: UserEditsComment(user, comment, content, seen_version)
+    when: UserEditsComment(user, issue, comment, content, seen_version)
+    requires: comment.issue = issue
     requires: comment.has_content
     requires: can_read_issue(user, comment.issue)
     requires: user = comment.poster or can_triage(user, comment.issue)
@@ -868,7 +872,7 @@ rule UserEditsComment {
     ensures: comment.content_version = comment.content_version + 1
     ensures: comment.updated_at = now
     ensures: ContentRevised(issue: comment.issue, comment: comment, editor: user, old_content: comment.content, new_content: content)
-    ensures: TextPosted(issue: comment.issue, comment: comment, doer: user, text: content)
+    ensures: TextPosted(issue: comment.issue, comment: comment, doer: user, title: null, text: content)
     ensures: IssueCommentEdited(comment: comment, doer: user, old_content: comment.content)
 }
 
@@ -876,7 +880,8 @@ rule UserEditsComment {
 -- references it made.
 -- from: models/issues/comment.go:1394
 rule UserDeletesComment {
-    when: UserDeletesComment(user, comment)
+    when: UserDeletesComment(user, issue, comment)
+    requires: comment.issue = issue
     requires: comment.has_content
     requires: can_read_issue(user, comment.issue)
     requires: user = comment.poster or can_triage(user, comment.issue)
@@ -915,7 +920,8 @@ rule RecordContentRevision {
 -- comment author and the revision's author can hide their own.
 -- from: routers/web/repo/issue_content_history.go:95
 rule UserHidesContentRevision {
-    when: UserHidesContentRevision(user, revision)
+    when: UserHidesContentRevision(user, issue, revision)
+    requires: revision.issue = issue
     requires: can_read_issue(user, revision.issue)
     requires: not revision.issue.repository.is_archived
     requires:
@@ -927,10 +933,10 @@ rule UserHidesContentRevision {
     ensures: revision.content = ""
 }
 
--- Mentions in posted text are recorded for the issue.
+-- Mentions in posted text (a body or a comment, never a title) are recorded for the issue.
 -- from: models/issues/issue_update.go:484
 rule RecordMentions {
-    when: TextPosted(issue, comment, doer, text)
+    when: TextPosted(issue, comment, doer, title, text)
     ensures: issue.mentioned_users = issue.mentioned_users + resolve_mentions(issue, doer, text)
 }
 
@@ -953,14 +959,14 @@ rule UserViewsIssue {
 -- unchanged reference is left as it is. Self references are ignored.
 -- from: models/issues/issue_xref.go:71
 rule RecordCrossReferences {
-    when: TextPosted(issue, comment, doer, text)
-    let found = cross_references(issue, comment, doer, text)
+    when: TextPosted(issue, comment, doer, title, text)
+    let found = cross_references(issue.repository, doer, title, text)
     let previous = Comments where ref_issue = issue and ref_comment = comment and ref_action != neutered
     ensures:
         for old in previous:
             if not still_referenced(old, found):
                 old.ref_action = neutered
-        for x in found:
+        for x in found where x.target != issue:
             if not already_recorded(x, previous):
                 Comment.created(
                     issue: x.target,
@@ -1036,10 +1042,9 @@ rule ApplyResolvedReference {
 -- from: services/issue/commit.go:106
 rule PushedCommitReferencesIssue {
     when: code/PushReceived(push)
-    for ref in commit_references(push):
+    for ref in commit_references(push) where can_read_issue(push.pusher, ref.target):
         let target = ref.target
         let pusher = push.pusher
-        requires: can_read_issue(pusher, target)
         ensures:
             if not exists Comment{issue: target, kind: commit_ref, commit_sha: ref.commit_sha}:
                 Comment.created(issue: target, poster: pusher, kind: commit_ref, commit_sha: ref.commit_sha,
@@ -1126,7 +1131,8 @@ rule ClosePinGap {
 -- Positions beyond the end are clamped to the end.
 -- from: models/issues/issue.go:859
 rule RepoAdminMovesPin {
-    when: RepoAdminMovesPin(user, pin, position)
+    when: RepoAdminMovesPin(user, repository, pin, position)
+    requires: pin.repository = repository
     requires: is_repo_admin(user, pin.repository)
     requires: not pin.repository.is_archived
     requires: position >= 1
@@ -1158,7 +1164,8 @@ rule TrackerManagerCreatesLabel {
 -- and marks it in pickers.
 -- from: models/issues/label.go:240
 rule TrackerManagerEditsLabel {
-    when: TrackerManagerEditsLabel(user, label, name, description, color, is_exclusive, is_archived)
+    when: TrackerManagerEditsLabel(user, repository, label, name, description, color, is_exclusive, is_archived)
+    requires: label.repository = repository
     requires: label.repository != null
     requires: can_manage_tracker(user, label.repository)
     requires: not label.repository.is_archived
@@ -1179,7 +1186,8 @@ rule TrackerManagerEditsLabel {
 -- Deleting a label removes it from all issues and erases its timeline events.
 -- from: models/issues/label.go:292
 rule TrackerManagerDeletesLabel {
-    when: TrackerManagerDeletesLabel(user, label)
+    when: TrackerManagerDeletesLabel(user, repository, label)
+    requires: label.repository = repository
     requires: label.repository != null
     requires: can_manage_tracker(user, label.repository)
     requires: not label.repository.is_archived
@@ -1199,7 +1207,8 @@ rule OrgOwnerCreatesLabel {
 
 -- from: models/issues/label.go:240
 rule OrgOwnerEditsLabel {
-    when: OrgOwnerEditsLabel(user, label, name, description, color, is_exclusive, is_archived)
+    when: OrgOwnerEditsLabel(user, organization, label, name, description, color, is_exclusive, is_archived)
+    requires: label.organization = organization
     requires: label.organization != null
     requires: is_org_owner(label.organization, user)
     requires: trim(name) != "" and length(name) <= config.max_label_name_length
@@ -1217,7 +1226,8 @@ rule OrgOwnerEditsLabel {
 
 -- from: models/issues/label.go:258
 rule OrgOwnerDeletesLabel {
-    when: OrgOwnerDeletesLabel(user, label)
+    when: OrgOwnerDeletesLabel(user, organization, label)
+    requires: label.organization = organization
     requires: label.organization != null
     requires: is_org_owner(label.organization, user)
     ensures: LabelRemovedEverywhere(doomed: label)
@@ -1338,7 +1348,8 @@ rule TrackerManagerCreatesMilestone {
 
 -- from: models/issues/milestone.go:166
 rule TrackerManagerEditsMilestone {
-    when: TrackerManagerEditsMilestone(user, milestone, name, description, deadline)
+    when: TrackerManagerEditsMilestone(user, repository, milestone, name, description, deadline)
+    requires: milestone.repository = repository
     requires: can_manage_tracker(user, milestone.repository)
     requires: not milestone.repository.is_archived
     requires: trim(name) != "" and length(trim(name)) <= config.max_milestone_name_length
@@ -1350,7 +1361,8 @@ rule TrackerManagerEditsMilestone {
 
 -- from: models/issues/milestone.go:228
 rule TrackerManagerClosesMilestone {
-    when: TrackerManagerClosesMilestone(user, milestone)
+    when: TrackerManagerClosesMilestone(user, repository, milestone)
+    requires: milestone.repository = repository
     requires: can_manage_tracker(user, milestone.repository)
     requires: not milestone.repository.is_archived
     requires: milestone.status = open
@@ -1360,7 +1372,8 @@ rule TrackerManagerClosesMilestone {
 
 -- from: models/issues/milestone.go:228
 rule TrackerManagerReopensMilestone {
-    when: TrackerManagerReopensMilestone(user, milestone)
+    when: TrackerManagerReopensMilestone(user, repository, milestone)
+    requires: milestone.repository = repository
     requires: can_manage_tracker(user, milestone.repository)
     requires: not milestone.repository.is_archived
     requires: milestone.status = closed
@@ -1372,7 +1385,8 @@ rule TrackerManagerReopensMilestone {
 -- "deleted milestone" placeholder.
 -- from: models/issues/milestone.go:245
 rule TrackerManagerDeletesMilestone {
-    when: TrackerManagerDeletesMilestone(user, milestone)
+    when: TrackerManagerDeletesMilestone(user, repository, milestone)
+    requires: milestone.repository = repository
     requires: can_manage_tracker(user, milestone.repository)
     requires: not milestone.repository.is_archived
     ensures:
@@ -1467,7 +1481,8 @@ rule TriagerAddsDependency {
 
 -- from: models/issues/dependency.go:171
 rule TriagerRemovesDependency {
-    when: TriagerRemovesDependency(user, dependency)
+    when: TriagerRemovesDependency(user, issue, dependency)
+    requires: dependency.issue = issue
     requires: dependencies_enabled(dependency.issue.repository)
     requires: can_triage(user, dependency.issue)
     requires: not dependency.issue.repository.is_archived
@@ -1500,7 +1515,8 @@ rule UserStartsStopwatch {
 
 -- from: models/issues/stopwatch.go:154
 rule UserStopsStopwatch {
-    when: UserStopsStopwatch(user, stopwatch)
+    when: UserStopsStopwatch(user, issue, stopwatch)
+    requires: stopwatch.issue = issue
     requires: stopwatch.user = user
     requires: may_track_time(user, stopwatch.issue)
     ensures: StopwatchFinished(stopwatch: stopwatch)
@@ -1521,7 +1537,8 @@ rule FinishStopwatch {
 
 -- from: models/issues/stopwatch.go:255
 rule UserCancelsStopwatch {
-    when: UserCancelsStopwatch(user, stopwatch)
+    when: UserCancelsStopwatch(user, issue, stopwatch)
+    requires: stopwatch.issue = issue
     requires: stopwatch.user = user
     requires: may_track_time(user, stopwatch.issue)
     ensures: Comment.created(issue: stopwatch.issue, poster: user, kind: cancel_tracking, content: "",
@@ -1563,7 +1580,8 @@ rule LogTime {
 -- Only the user who tracked the time or a site admin deletes it.
 -- from: models/issues/tracked_time.go:282
 rule UserDeletesTime {
-    when: UserDeletesTime(user, time)
+    when: UserDeletesTime(user, issue, time)
+    requires: time.issue = issue
     requires: may_track_time(user, time.issue)
     requires: time.user = user or user.is_admin
     requires: not time.is_deleted
@@ -1610,7 +1628,8 @@ rule UserReactsToIssue {
 
 -- from: services/issue/reaction.go:46
 rule UserReactsToComment {
-    when: UserReactsToComment(user, comment, emoji)
+    when: UserReactsToComment(user, issue, comment, emoji)
+    requires: comment.issue = issue
     requires: comment.has_content
     requires: can_read_issue(user, comment.issue)
     requires: not comment.issue.repository.is_archived
@@ -1627,7 +1646,8 @@ rule UserReactsToComment {
 
 -- from: services/issue/reaction.go:36
 rule UserRemovesReaction {
-    when: UserRemovesReaction(user, reaction)
+    when: UserRemovesReaction(user, issue, reaction)
+    requires: reaction.issue = issue
     requires: reaction.user = user
     requires: not reaction.issue.repository.is_archived
     ensures: ReactionRemoved(reaction: reaction)
@@ -1689,7 +1709,8 @@ rule LinkAttachments {
 -- the issue / comment may remove or rename its attachments.
 -- from: routers/web/repo/attachment.go:63
 rule UserDeletesAttachment {
-    when: UserDeletesAttachment(user, attachment)
+    when: UserDeletesAttachment(user, issue, attachment)
+    requires: attachment.issue = null or attachment.issue = issue   -- an upload not yet posted, or one on this issue
     requires: not attachment.repository.is_archived
     requires:
         user = attachment.uploader
@@ -1702,7 +1723,8 @@ rule UserDeletesAttachment {
 
 -- from: routers/api/v1/repo/issue_attachment.go:234
 rule UserRenamesAttachment {
-    when: UserRenamesAttachment(user, attachment, name)
+    when: UserRenamesAttachment(user, issue, attachment, name)
+    requires: attachment.issue = issue
     requires: attachment.issue != null
     requires: not attachment.repository.is_archived
     requires: user = attachment.uploader or user = attachment.issue.poster or can_triage(user, attachment.issue)
@@ -2032,9 +2054,9 @@ surface IssueConversation {
             when not issue.is_locked and not issue.repository.is_archived
         UserReactsToIssue(reader, issue, emoji)
             when not issue.is_locked and not issue.repository.is_archived
-        UserReactsToComment(reader, comment, emoji)
+        UserReactsToComment(reader, issue, comment, emoji)
             when not issue.is_locked and not issue.repository.is_archived
-        UserRemovesReaction(reader, reaction)
+        UserRemovesReaction(reader, issue, reaction)
         UserSetsIssueSubscription(reader, issue, subscriber, watching)
         UserChangesIssueTitle(reader, issue, title)
             when reader = issue.poster
@@ -2046,19 +2068,19 @@ surface IssueConversation {
             when reader = issue.poster and issue.status = open
         UserReopensIssue(reader, issue)
             when reader = issue.poster and issue.status = closed
-        UserEditsComment(reader, comment, content, seen_version)
-        UserDeletesComment(reader, comment)
-        UserHidesContentRevision(reader, revision)
+        UserEditsComment(reader, issue, comment, content, seen_version)
+        UserDeletesComment(reader, issue, comment)
+        UserHidesContentRevision(reader, issue, revision)
         UserStartsStopwatch(reader, issue)
             when may_track_time(reader, issue)
-        UserStopsStopwatch(reader, stopwatch)
-        UserCancelsStopwatch(reader, stopwatch)
+        UserStopsStopwatch(reader, issue, stopwatch)
+        UserCancelsStopwatch(reader, issue, stopwatch)
         UserAddsTime(reader, issue, amount)
             when may_track_time(reader, issue)
-        UserDeletesTime(reader, time)
+        UserDeletesTime(reader, issue, time)
         UserResetsOwnTime(reader, issue)
-        UserDeletesAttachment(reader, attachment)
-        UserRenamesAttachment(reader, attachment, name)
+        UserDeletesAttachment(reader, issue, attachment)
+        UserRenamesAttachment(reader, issue, attachment, name)
 
     @guarantee ReferencesRespectVisibility
         -- Cross-reference entries whose origin the reader cannot read are not
@@ -2132,7 +2154,7 @@ surface IssueTriage {
         TriagerUnlocksIssue(triager, issue) when issue.is_locked
         TriagerAddsDependency(triager, issue, blocker)
             when dependencies_enabled(issue.repository)
-        TriagerRemovesDependency(triager, dependency)
+        TriagerRemovesDependency(triager, issue, dependency)
             when dependencies_enabled(issue.repository)
 
     @guarantee ClosingBlockedIssueExplained
@@ -2182,7 +2204,7 @@ surface PinOrdering {
             p.is_pull
 
     provides:
-        RepoAdminMovesPin(admin, pin, position)
+        RepoAdminMovesPin(admin, repository, pin, position)
 }
 
 -- Labels and milestones of a repository.
@@ -2217,16 +2239,16 @@ surface TrackerSettings {
     provides:
         TrackerManagerCreatesLabel(manager, repository, name, description, color, is_exclusive)
             when not repository.is_archived
-        TrackerManagerEditsLabel(manager, label, name, description, color, is_exclusive, is_archived)
-        TrackerManagerDeletesLabel(manager, label)
+        TrackerManagerEditsLabel(manager, repository, label, name, description, color, is_exclusive, is_archived)
+        TrackerManagerDeletesLabel(manager, repository, label)
         TrackerManagerInitialisesLabels(manager, repository, template)
             when not repository.is_archived
         TrackerManagerCreatesMilestone(manager, repository, name, description, deadline)
             when not repository.is_archived
-        TrackerManagerEditsMilestone(manager, milestone, name, description, deadline)
-        TrackerManagerClosesMilestone(manager, milestone)
-        TrackerManagerReopensMilestone(manager, milestone)
-        TrackerManagerDeletesMilestone(manager, milestone)
+        TrackerManagerEditsMilestone(manager, repository, milestone, name, description, deadline)
+        TrackerManagerClosesMilestone(manager, repository, milestone)
+        TrackerManagerReopensMilestone(manager, repository, milestone)
+        TrackerManagerDeletesMilestone(manager, repository, milestone)
 
     @guidance
         -- Web: POST /{owner}/{repo}/labels/{new,edit,delete,initialize},
@@ -2252,8 +2274,8 @@ surface OrganizationLabels {
 
     provides:
         OrgOwnerCreatesLabel(owner, organization, name, description, color, is_exclusive)
-        OrgOwnerEditsLabel(owner, label, name, description, color, is_exclusive, is_archived)
-        OrgOwnerDeletesLabel(owner, label)
+        OrgOwnerEditsLabel(owner, organization, label, name, description, color, is_exclusive, is_archived)
+        OrgOwnerDeletesLabel(owner, organization, label)
         OrgOwnerInitialisesLabels(owner, organization, template)
 
     @guidance
@@ -2278,8 +2300,8 @@ surface MyTimeTracking {
             t.created_at
 
     provides:
-        UserStopsStopwatch(user, stopwatch)
-        UserCancelsStopwatch(user, stopwatch)
+        UserStopsStopwatch(user, stopwatch.issue, stopwatch)
+        UserCancelsStopwatch(user, stopwatch.issue, stopwatch)
 
     @guidance
         -- Web: navbar stopwatch, /user/stopwatches.
@@ -2296,7 +2318,7 @@ surface SiteTimeAdministration {
             t.amount
 
     provides:
-        UserDeletesTime(admin, time)
+        UserDeletesTime(admin, time.issue, time)
         AdminAddsTimeForUser(admin, issue, user, amount, at)
         UserSetsIssueSubscription(admin, issue, subscriber, watching)
 }

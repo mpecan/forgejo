@@ -58,7 +58,7 @@
 --   CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
 --                                                      -- issues (close/reference keywords), pulls (re-test PRs whose head/base is this branch),
 --                                                      -- notifications (feed), webhooks, actions; repositories (auto-watch, size, updated time)
---                                                      -- (repositories also emits it for branches a pull-mirror sync moved)
+--                                                      -- (also emitted for each branch a pull-mirror sync moved: see repositories/MirrorBranchUpdated)
 --   RefCreated(repository, pusher, ref_kind, ref_name, commit_sha) -- webhooks (create), actions (create): any branch or tag appearing
 --   RefDeleted(repository, pusher, ref_kind, ref_name)             -- webhooks (delete), actions (delete): any branch or tag disappearing
 --   BranchCreated(branch, by)                          -- notifications; finer-grained than RefCreated
@@ -70,7 +70,7 @@
 --   TagDeleted(repository, tag_name, by)               -- releases (drop tag-only release), webhooks, actions
 --   CommitStatusCreated(status)                        -- pulls (auto-merge on success), webhooks (status), notifications
 --   CommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
---                                                      -- also emitted by actions for job results (code records it)
+--                                                      -- internal: the API path and Actions job results both arrive here to be recorded
 --   AgitPullRequestRequested(repository, pusher, base_branch, head_branch, head_sha, title, description)
 --                                                      -- pulls creates the AGit pull request
 --   AgitPullRequestHeadPushed(pull, pusher, old_sha, new_sha) -- pulls updates head, re-tests, adds push comment
@@ -80,8 +80,11 @@
 --   LfsObjectStored(object, by)                        -- quota (usage accounting)
 --
 -- Reacts to:
---   CommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
---                                                      -- from actions (job results) and the status API
+--   actions/JobCommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
+--                                                      -- job results, recorded exactly as a status posted through the API
+--   pulls/HeadBranchDeletionRequested(user, branch)    -- head-branch cleanup after merge: deleted as UserDeletesBranch does
+--   repositories/MirrorBranchUpdated(repository, branch_name, pusher, old_sha, new_sha, is_force)
+--                                                      -- a pull-mirror sync moved a branch: announced as CommitsPushed
 --   administration/DeletedBranchCleanupDue(older_than) -- purge expired deleted-branch records
 --   administration/LfsGarbageCollectionDue(older_than, last_updated_more_than_ago,
 --       number_to_check_per_repo, proportion_to_check_per_repo) -- collect orphaned LFS objects
@@ -95,6 +98,7 @@ use "./keys.allium" as keys
 use "./pulls.allium" as pulls
 use "./quota.allium" as quota
 use "./administration.allium" as administration
+use "./actions.allium" as actions
 
 -- Permission functions (black boxes from access/AuthorizationPolicy, VOCABULARY.md):
 --   can_read_code(user, repository)   = access/can_read(user, repository, code)
@@ -883,8 +887,9 @@ rule AgitPushRequestsPullRequest {
         base_branch: base_branch,
         head_branch: head_branch,
         head_sha: update.new_sha,
-        title: update.push.agit_title ?? commit_summary(repository, update.new_sha),
-        description: update.push.agit_description ?? commit_body(repository, update.new_sha)
+        -- written as `if` rather than `??`: allium-journey 0.1.2 does not evaluate `??`
+        title: if update.push.agit_title != null: update.push.agit_title else: commit_summary(repository, update.new_sha),
+        description: if update.push.agit_description != null: update.push.agit_description else: commit_body(repository, update.new_sha)
     )
     @guidance
         -- Rejected per ref (other refs still apply) when: no topic was given; the target
@@ -898,12 +903,19 @@ rule AgitPushUpdatesPullRequestHead {
     when: RefUpdateAccepted(update)
     requires: update.ref_kind = for_review or update.ref_kind = pull_head
     let repository = update.push.repository
-    let pull = agit_pull_for(update)
+    -- By topic: the open AGit pull request with this pusher's head branch into the target
+    -- branch (the one AgitPushRequestsPullRequest found none of); by refs/pull/<n>/head:
+    -- that pull request.
+    let pull = if update.ref_kind = for_review:
+                   open_agit_pull(repository,
+                       agit_head_branch(update.push.pusher, review_topic(update.ref_name, update.push.agit_topic)),
+                       review_target_branch(repository, update.ref_name))
+               else: agit_pull_for(update)
     requires: pull != null
     requires: update.new_sha != null
-    requires: pull_head_sha(pull) != update.new_sha
-    requires: update.ref_kind = pull_head or update.push.agit_force_push or not is_force_push(repository, pull_head_sha(pull), update.new_sha)
-    ensures: AgitPullRequestHeadPushed(pull: pull, pusher: update.push.pusher, old_sha: pull_head_sha(pull), new_sha: update.new_sha)
+    requires: pull.head_commit_sha != update.new_sha
+    requires: update.ref_kind = pull_head or update.push.agit_force_push or not is_force_push(repository, pull.head_commit_sha, update.new_sha)
+    ensures: AgitPullRequestHeadPushed(pull: pull, pusher: update.push.pusher, old_sha: pull.head_commit_sha, new_sha: update.new_sha)
     @guidance
         -- A non-fast-forward update via refs/for needs `-o force-push=true`.
         -- Deleting refs/pull/<n>/head is ignored, never applied.
@@ -976,15 +988,37 @@ rule UserDeletesBranch {
     requires: branch.status = live
     requires: not branch.is_default
     requires: protection_for(repository, branch.name) = null
-    ensures: branch.status = deleted
-    ensures: branch.deleted_by = user
-    ensures: branch.deleted_at = now
-    ensures: BranchDeleted(branch: branch, by: user)
-    ensures: RefDeleted(repository: repository, pusher: user, ref_kind: branch_ref, ref_name: branch.name)
+    ensures: BranchDeletionAccepted(branch: branch, by: user)
     @guidance
         -- Web: POST /branches/delete; API: DELETE /repos/{o}/{r}/branches/{name}.
-        -- Pulls uses the same operation for "delete head branch after merge", adding its
-        -- own checks (no other open PR from that branch, write on the head repository).
+}
+
+-- Pulls asks for a merged pull request's head branch to be deleted (after its own checks:
+-- no other open PR from that branch, write on the head repository). The deletion is the
+-- same operation, with the same checks, as a user deleting the branch.
+-- from: services/repository/branch.go:502
+rule PullRequestHeadBranchIsDeleted {
+    when: pulls/HeadBranchDeletionRequested(user, branch)
+    let repository = branch.repository
+    requires: can_write_code(user, repository)
+    requires: not repository.is_archived
+    requires: not repository.is_empty
+    requires: branch.status = live
+    requires: not branch.is_default
+    requires: protection_for(repository, branch.name) = null
+    ensures: BranchDeletionAccepted(branch: branch, by: user)
+}
+
+-- What deleting a branch does, however it was asked for: the record is kept as a deleted
+-- branch (restorable until purged) and the deletion is announced.
+-- from: services/repository/branch.go:436
+rule DeleteBranch {
+    when: BranchDeletionAccepted(branch, by)
+    ensures: branch.status = deleted
+    ensures: branch.deleted_by = by
+    ensures: branch.deleted_at = now
+    ensures: BranchDeleted(branch: branch, by: by)
+    ensures: RefDeleted(repository: branch.repository, pusher: by, ref_kind: branch_ref, ref_name: branch.name)
 }
 
 -- Restore a deleted branch at the commit it pointed to.
@@ -1340,6 +1374,15 @@ rule UserRemovesCommitNote {
     ensures: not exists note
 }
 
+-- A pull-mirror sync moved a branch: announced like a push by the account mirror updates are
+-- attributed to, so issues, pulls, webhooks and actions see mirror updates as pushes.
+-- from: services/mirror/mirror_pull.go:595
+rule MirrorBranchUpdateIsAPush {
+    when: repositories/MirrorBranchUpdated(repository, branch_name, pusher, old_sha, new_sha, is_force)
+    ensures: CommitsPushed(repository: repository, branch_name: branch_name, pusher: pusher,
+        old_sha: old_sha, new_sha: new_sha, is_force: is_force)
+}
+
 ------------------------------------------------------------
 -- Rules: commit statuses
 ------------------------------------------------------------
@@ -1355,9 +1398,17 @@ rule ReporterPostsCommitStatus {
         target_url: target_url, description: description, creator: reporter)
 }
 
--- Recording a reported status: from the API (above) or from Actions, which reports job
--- results as the Actions bot for the job's own repository (no permission check: actions
--- is part of the forge and already decided the job may report).
+-- Actions reports a job's result as the Actions bot for the job's own repository. There is
+-- no permission check: actions is part of the forge and already decided the job may report.
+-- The status is recorded exactly as one posted through the API.
+-- from: services/actions/commit_status.go:31
+rule ActionsJobStatusIsRecorded {
+    when: actions/JobCommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
+    ensures: CommitStatusReported(repository: repository, commit_sha: commit_sha, context: context, state: state,
+        target_url: target_url, description: description, creator: creator)
+}
+
+-- Recording a reported status: from the API or from Actions (both above).
 -- from: services/repository/commitstatus/commitstatus.go:72
 rule CommitStatusIsReported {
     when: CommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
@@ -1904,7 +1955,6 @@ surface CodeWriting {
         UserSetsCommitNote(writer, repo, commit_sha, text)
             when not repo.is_archived
         UserLocksLfsPath(writer, repo, path)
-            when config.lfs_start_server
 
     contracts:
         fulfils FileCommit
@@ -1944,7 +1994,6 @@ surface CodeSettings {
         AdminCreatesTagProtection(admin, repo, name_pattern, users, teams)
             when not repo.is_archived
         AdminAssociatesLfsPointers(admin, repo, pointers)
-            when config.lfs_start_server
 
     @guidance
         -- Web: /settings/branches (default branch + rules), /settings/rename_branch,
@@ -2001,18 +2050,16 @@ surface LfsApi {
 
     provides:
         LfsClientRequestsUpload(client, repo, pointers)
-            when config.lfs_start_server
         LfsClientUploadsObject(client, repo, pointer, content_sha256, content_size)
-            when config.lfs_start_server
         UserLocksLfsPath(client, repo, path)
-            when config.lfs_start_server
 
     @guidance
         -- /{o}/{r}.git/info/lfs/objects/batch, /objects/{oid}[/{filename}] (download:
         -- code read, object associated with this repository), /objects/{oid}/{size}
         -- (upload), /verify, /locks (list: read; create, verify, unlock: write).
         -- /locks/verify splits locks into "ours" and "theirs".
-        -- Everything is "not found" when config.lfs_start_server is false.
+        -- Everything is "not found" when config.lfs_start_server is false: every LFS
+        -- rule requires it.
 }
 
 -- External CI and Actions reporting commit statuses.
@@ -2082,9 +2129,9 @@ open question "Deleting a tag through the API is refused when a release uses it,
 -- REQUEST repositories: react to PushToCreateRequested (create repo), PushReceived (size, updated time), CommitsPushed (auto-watch pusher).
 -- REQUEST pulls/PullRequest.allow_maintainer_edit and maintainer_edit_allows(user, repository, branch_name): maintainers pushing to a PR head branch.
 -- REQUEST pulls/PullRequest.may_merge(user) (exists) and pulls/merge_requirements_met(pull) (approvals, status checks, rejected reviews, outdated branch, protected files): used by AcceptProtectedBranchMergePush.
--- REQUEST pulls/pull_by_index, is_agit_pull, pull_poster, pull_head_sha, open_agit_pull, agit_pull_for: AGit flow lookups.
+-- REQUEST pulls/pull_by_index, is_agit_pull, pull_poster, open_agit_pull, agit_pull_for (refs/pull/<n>/head): AGit flow lookups.
 -- REQUEST pulls: react to AgitPullRequestRequested, AgitPullRequestHeadPushed, MergePushCompleted, BranchDeleted, BranchRenamed, CommitsPushed, BranchProtectionChanged, CommitStatusCreated.
 -- REQUEST releases/release_exists(repository, tag_name), releases/has_published_release(repository, tag_name); react to TagCreated/TagUpdated/TagDeleted for tag-only releases.
 -- REQUEST quota/exceeds_git_quota(repository), quota/exceeds_lfs_quota(repository): owner over size quota for git / LFS.
 -- REQUEST issues: react to CommitsPushed for close/reopen keywords and commit references.
--- REQUEST actions: react to DefaultBranchChanged / BranchRenamed (cancel schedules); report job results via CommitStatusReported.
+-- REQUEST actions: react to DefaultBranchChanged / BranchRenamed (cancel schedules). Job results arrive as actions/JobCommitStatusReported (done).

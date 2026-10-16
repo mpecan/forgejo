@@ -25,6 +25,12 @@ world {
         carol.prohibit_login = false
         carol.is_admin = false
         carol.visibility = public
+        -- The unit lists, restated at their defaults: the walker does not read a
+        -- collection literal default from a config block.
+        repositories/config.default_repo_units = {code, issues, pull_requests, releases, wiki, projects, packages, actions}
+        repositories/config.default_fork_repo_units = {code, pull_requests}
+        repositories/config.default_mirror_repo_units = {code, issues, releases, wiki, projects, packages}
+        repositories/config.disabled_repo_units = {}
 }
 
 -- The ordinary beginning: a new, initialised, public repository under one's own name.
@@ -278,6 +284,9 @@ journey CollaboratorsComeAndGo {
         stipulate is_repo_admin(alice, repo) = true
         stipulate is_blocked(alice, bob) = false
         stipulate is_blocked(bob, alice) = false
+        -- what access derives from the grant (access recalculates it)
+        stipulate explicit_mode(bob, repo) = write
+        stipulate has_any_access(bob, repo) = true
         alice does AdminAddsCollaborator(alice, repo, bob) on RepositorySettings
             creating collab: Collaboration
         then AdminAddsCollaborator fires
@@ -288,11 +297,14 @@ journey CollaboratorsComeAndGo {
         alice cannot do AdminAddsCollaborator(alice, repo, bob) on RepositorySettings
 
     4. Alice makes him an admin
-        alice does AdminChangesCollaboratorAccess(alice, collab, admin) on RepositorySettings
+        stipulate explicit_mode(bob, repo) = admin
+        alice does AdminChangesCollaboratorAccess(alice, repo, collab, admin) on RepositorySettings
         then collab.access_mode = admin
 
     5. and removes him
-        alice does AdminRemovesCollaborator(alice, collab) on RepositorySettings
+        -- the repository is public, so he can still read it
+        stipulate explicit_mode(bob, repo) = none
+        alice does AdminRemovesCollaborator(alice, repo, collab) on RepositorySettings
             creating watch: Watch
         then collab does not exist
         then SetWatchSelection fires
@@ -359,6 +371,7 @@ journey GoingPrivateDropsStarsAndForksFollow {
         repo.owner_org = null
         repo.is_private = false
         repo.is_fork = false
+        repo.fork_of = null
         fork.owner_user = bob
         fork.owner_org = null
         fork.is_fork = true
@@ -427,6 +440,8 @@ journey DeletingARepository {
     given:
         repo.owner_user = alice
         repo.owner_org = null
+        repo.is_fork = false
+        repo.fork_of = null
         fork.owner_user = bob
         fork.owner_org = null
         fork.is_fork = true
@@ -438,6 +453,7 @@ journey DeletingARepository {
         bob cannot do OwnerDeletesRepository(bob, repo) on RepositoryDangerZone
 
     2. Alice deletes it
+        stipulate is_repo_owner(alice, repo) = true
         alice does OwnerDeletesRepository(alice, repo) on RepositoryDangerZone
         then OwnerDeletesRepository fires
         then repo does not exist
@@ -478,11 +494,27 @@ journey PullMirrorKeepsItselfCurrent {
           queued; the worker fails once, and the next update run queues it again.
 
     cast:
-        worker: BackgroundWorker
+        worker:  BackgroundWorker
+        m:       migrations/Migration
+        git:     migrations/SourceProfile
+        adapter: migrations/SourceAdapterProcess
     given:
         worker.queue = "mirror"
+        git.kind = plain_git
+        adapter.source_kind = plain_git
+        adapter.active = true
+        -- the migration that reserved the repository, past its git stage
+        m.doer = alice
+        m.source = git
+        m.mirror = true
+        m.mirror_interval = 8.hours
+        m.lfs = false
+        m.lfs_endpoint = null
+        m.from_archive = false
+        m.status = running
+        m.stage = finalizing
 
-    1. the importer reserves and completes the mirror
+    1. the importer reserves the mirror, and the migration completes it
         stipulate is_valid_repo_name("upstream") = true
         stipulate repository_name_free(alice, "upstream") = true
         stipulate within_creation_limit(alice) = true
@@ -490,8 +522,14 @@ journey PullMirrorKeepsItselfCurrent {
             creating repo: Repository
         then repo.status = being_migrated
         then repo.is_mirror = true
-        worker does ImportCompleted(repo, "https://example.org/upstream.git", false, 8.hours, false) on RepositoryIntegrations
+        stipulate m.repository = repo
+        -- the remote has no tags yet
+        stipulate git_tags(repo) = {}
+        stipulate url_of(null) = null
+        adapter does SourceImportFinished(m) on SourceAdapterBoundary
             creating mirror: Mirror
+        then CompleteMigration fires
+        then ImportCompletes fires
         then repo.status = ready
         then mirror.sync_state = idle
         then mirror.interval = 8.hours
@@ -541,7 +579,7 @@ journey MirrorSettingsAreGuarded {
     1. too short an interval is refused
         stipulate is_repo_admin(alice, repo) = true
         stipulate is_allowed_remote("https://example.org/x.git", alice) = true
-        alice cannot do AdminConfiguresPullMirror(alice, mirror, "https://example.org/x.git", false, 5.minutes, true, false) on RepositorySettings
+        alice cannot do AdminConfiguresPullMirror(alice, repo, mirror, "https://example.org/x.git", false, 5.minutes, true, false) on RepositorySettings
 
     2. a reader cannot ask for a sync
         stipulate can_write_code(carol, repo) = false
@@ -654,4 +692,75 @@ journey TopicsAreValidated {
         alice cannot do AdminReplacesTopics(alice, repo, {"Not A Topic!"}) on RepositorySettings
 
     ends: The repository is tagged "go" and "forge".
+}
+
+-- A site admin creates a repository for a user, and later deletes one.
+journey ASiteAdminCreatesAndDeletesForAUser {
+    goal: Root, a site admin, creates "sandbox" for Bob from the admin API: it is Bob's, with
+          the instance defaults, even though Bob is at his creation limit. Later root deletes
+          it from the admin repository list.
+
+    cast:
+        root: accounts/User
+    given:
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+        bob.max_repo_creation = 0
+        -- restated at its default: the walker does not read an enum default from a config block
+        repositories/config.default_object_format = sha1
+
+    1. root creates it for bob
+        stipulate is_valid_repo_name("sandbox") = true
+        stipulate within_repo_quota(bob) = true
+        root does AdminCreatesRepositoryForUser(root, bob, "sandbox") on AdminUserAccount
+            creating box: Repository
+        then SiteAdminCreatesRepositoryForUser fires
+        then CreateUserOwnedRepository fires
+        then box.owner_user = bob
+        then box.is_private = false
+        then box.is_empty = true
+        then box.object_format = sha1
+
+    2. bob cannot create the same name himself
+        stipulate within_creation_limit(bob) = false
+        bob cannot do UserCreatesRepository(bob, "sandbox", "", false, false, false, sha1) on RepositoryCreation
+
+    3. root deletes it
+        root does AdminDeletesRepository(root, box) on AdminRepositoryDirectory
+        then SiteAdminDeletesRepository fires
+        then box does not exist
+
+    ends: Bob had a sandbox for a while; neither its creation nor its deletion was his doing.
+}
+
+-- A pull-mirror sync that moves a branch is announced like a push.
+journey AMirrorSyncMovesABranch {
+    goal: Alice's mirror is being synced; the worker reports that `main` moved. Code
+          announces it as commits pushed by the mirror's owner, as if she had pushed.
+
+    cast:
+        worker: BackgroundWorker
+        repo:   Repository
+        mirror: Mirror
+    given:
+        worker.queue = "mirror"
+        repo.owner_user = alice
+        repo.owner_org = null
+        repo.is_mirror = true
+        repo.is_archived = false
+        repo.default_branch = "main"
+        mirror.repository = repo
+        mirror.sync_state = queued
+
+    1. the worker reports main moved
+        stipulate is_branch_ref("refs/heads/main") = true
+        stipulate branch_of_ref("refs/heads/main") = "main"
+        stipulate mirror_pusher(repo) = alice
+        stipulate is_force_update(repo, "aaa111", "bbb222") = false
+        worker does PullMirrorRefUpdated(worker, mirror, "refs/heads/main", "aaa111", "bbb222", {}) on RepositoryWorkers
+        then PullMirrorRefUpdated fires
+        then MirrorBranchUpdateIsAPush fires
+
+    ends: Everyone who reacts to pushes saw main move, attributed to alice.
 }

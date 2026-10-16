@@ -27,6 +27,8 @@ world {
         repo.is_empty = false
         repo.is_fork = false
         repo.is_private = false
+        repo.owner_user = alice
+        repo.owner_org = null
 }
 
 -- The everyday branch life: create from a commit, delete, find it in the deleted list.
@@ -197,6 +199,7 @@ journey AProtectedBranchTakesOnlyAllowlistedPushes {
         then main.head_commit_sha = "bbb222"
 
     5. she announces the push
+        stipulate commit_references(alices) = {}
         alice does GitClientFinishesPush(alice, alices) on GitTransport
         then alices.status = completed
         then PushCompletes fires
@@ -233,6 +236,10 @@ journey OnlyTheReleaseManagerTagsReleases {
         alice does GitClientPushes(alice, repo, ssh, null, null, null, null, null, null, null, false) on GitTransport
             creating alices: Push
         stipulate may_write_code(alice, alices) = true
+        -- a lightweight tag: no message, no tagger
+        stipulate is_annotated_tag(repo, "v1.0") = false
+        stipulate tag_message(repo, "v1.0") = null
+        stipulate tagger_user(repo, "v1.0") = null
         alice does PusherProposesRefUpdate(alice, alices, tag_ref, "v1.0", null, "fff000") on GitTransport
             creating v1: Tag
         then TagCreatedByPush fires
@@ -266,6 +273,7 @@ journey TheFirstPushFillsAnEmptyRepository {
         then repo.is_empty = false
 
     2. the push completes and is announced
+        stipulate commit_references(push) = {}
         alice does GitClientFinishesPush(alice, push) on GitTransport
         then push.status = completed
         then PushCompletes fires
@@ -335,6 +343,9 @@ journey AReaderProposesAChangeWithAGit {
         stipulate branch_contains(repo, "main", "ddd444") = false
         stipulate commit_summary(repo, "ddd444") = "Fix typo"
         stipulate commit_body(repo, "ddd444") = ""
+        stipulate open_pull_request_exists(repo, "bob/fix-typo", repo, "main") = false
+        stipulate truncate("Fix typo", 255) = "Fix typo"
+        stipulate has_wip_prefix("Fix typo") = false
         bob does PusherProposesRefUpdate(bob, push, for_review, "main/fix-typo", null, "ddd444") on GitTransport
         then AcceptReviewRefPush fires
         then AgitPushRequestsPullRequest fires
@@ -391,6 +402,38 @@ journey LfsIsOffUntilTheInstanceEnablesIt {
         alice cannot do LfsClientRequestsUpload(alice, repo, {}) on LfsApi
 
     ends: With LFS disabled, pointer files are just small text files in git.
+}
+
+-- With LFS switched on, a writer locks a file and the lock is hers to release.
+journey LfsLocksOnAnInstanceThatEnabledIt {
+    goal: The instance runs the LFS server. Alice, a code writer, locks the design file
+          she is about to change; Bob, a reader, cannot lock anything; Alice unlocks it
+          when she is done.
+
+    given:
+        config.lfs_start_server = true
+
+    1. alice locks the file
+        stipulate can_write_code(alice, repo) = true
+        stipulate normalise_path("assets/logo.psd") = "assets/logo.psd"
+        alice does UserLocksLfsPath(alice, repo, "assets/logo.psd") on LfsApi
+            creating lock: LfsLock
+        then lock.path = "assets/logo.psd"
+        then lock.owner = alice
+
+    2. bob, a reader, cannot lock a file
+        stipulate can_write_code(bob, repo) = false
+        stipulate normalise_path("README.md") = "README.md"
+        bob cannot do UserLocksLfsPath(bob, repo, "README.md") on LfsApi
+
+    3. the same path cannot be locked twice
+        alice cannot do UserLocksLfsPath(alice, repo, "assets/logo.psd") on LfsApi
+
+    4. she releases it
+        alice does UserUnlocksLfsPath(alice, lock, false) on LfsLockView
+        then lock does not exist
+
+    ends: The file is unlocked again; nobody else was ever able to lock it meanwhile.
 }
 
 -- Editing on a protected branch: commit to a new branch instead.

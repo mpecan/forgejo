@@ -68,9 +68,9 @@
 --                                                           -- actions (schedules on/off when the actions unit toggles)
 --   RepositoryViewed(viewer, repository)                    -- notifications (transfer-offer threads marked read); provided as UserViewsRepository
 --   MirrorSyncPushed(repository, ref_name, commits)         -- notifications feed (mirror_sync_push)
---   code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
---                                                           -- for each branch a pull-mirror sync moved (issues, pulls,
---                                                              webhooks, actions see mirror updates like pushes)
+--   MirrorBranchUpdated(repository, branch_name, pusher, old_sha, new_sha, is_force)
+--                                                           -- for each branch a pull-mirror sync moved; code announces it as
+--                                                              CommitsPushed (issues, pulls, webhooks, actions see mirror updates like pushes)
 --   MirrorRefCreated(repository, ref_name) / MirrorRefDeleted(repository, ref_name)
 --                                                           -- notifications feed (mirror_sync_create / mirror_sync_delete)
 --   RepositoryDeleted(repository, doer)                     -- every module holding repository-scoped data purges it: issues, pulls (close PRs from its branches first),
@@ -97,7 +97,13 @@
 --
 -- Reacts to:
 --   code/PushReceived(push)          -- push mirrors with sync-on-commit, auto-watch on changes, size refresh
---   migrations/* via ImportReservesRepository / ImportReservesOrgRepository / ImportCompleted / RepositoryDeletionRequested (see REQUEST)
+--   migrations/ImportCompleted(repository, remote_address, has_credentials, interval, lfs_enabled, lfs_endpoint)
+--                                    -- the import finished: ready, and a mirror import becomes a pull mirror
+--   migrations, through ImportReservesRepository / ImportReservesOrgRepository / RepositoryDeletionRequested (see REQUEST)
+--   administration/RepositoryCreationRequestedByAdmin(admin, user, name)
+--                                    -- created as UserCreatesRepository creates, with the instance defaults; no creation limit
+--   administration/RepositoryDeletionRequestedByAdmin(admin, repository)
+--                                    -- deleted with the OwnerDeletesRepository cascade, ending in RepositoryDeleted(repository, doer: admin)
 --   administration/MirrorUpdateDue(pull_limit, push_limit), RepositoryHealthCheckDue(timeout, args),
 --     RepositoryStatsCheckDue() (no-op), RepositoryArchiveCleanupDue(older_than),
 --     AllRepositoryArchivesDeletionDue(), RepositoryGarbageCollectionDue(timeout, args),
@@ -150,6 +156,7 @@ use "./pulls.allium" as pulls
 use "./releases.allium" as releases
 use "./keys.allium" as keys
 use "./administration.allium" as administration
+use "./migrations.allium" as migrations
 
 ------------------------------------------------------------
 -- External Entities
@@ -613,10 +620,30 @@ rule UserCreatesRepository {
     requires: within_repo_quota(user)
     requires: label_template = null or label_template_exists(label_template)
     requires: initial_content = null or initial_content_templates_exist(initial_content)
+    ensures: UserRepositoryCreationAccepted(doer: user, owner: user, name: name, description: description,
+        is_private: is_private, is_template: is_template, auto_init: auto_init, object_format: object_format,
+        initial_content: initial_content, label_template: label_template)
+    @guidance
+        -- With auto_init, the first commit (README.md from initial_content.readme_template,
+        -- .gitignore concatenated from the chosen templates each prefixed "# ---> <name>",
+        -- LICENSE filled with owner, e-mail, repository and year) is authored by the owner and
+        -- signed by the instance key when config.initial_commit_signing allows (keys.allium);
+        -- it lands on the requested default branch. Without auto_init the repository is empty.
+        -- API: when auto_init is set without a README template, the "Default" template is used;
+        -- an unknown README template is rejected.
+        -- Endpoints: GET/POST /repo/create; POST /api/v1/user/repos.
+}
+
+-- What creating a user-owned repository does, whoever asked: the signed-in owner (above) or
+-- a site admin creating it for them (below). `doer` is who asked; it is the doer who is
+-- auto-watched and reported as having created it.
+-- from: services/repository/create.go:200
+rule CreateUserOwnedRepository {
+    when: UserRepositoryCreationAccepted(doer, owner, name, description, is_private, is_template, auto_init, object_format, initial_content?, label_template?)
     ensures:
         let repo = Repository.created(
             name: name,
-            owner_user: user,
+            owner_user: owner,
             owner_org: null,
             description: description,
             website: "",
@@ -641,19 +668,27 @@ rule UserCreatesRepository {
             created_at: now,
             updated_at: now
         )
-        not exists RepoRedirect{owner_user: user, name: name}
-        RepositoryProvisioned(repository: repo, doer: user, unit_kinds: config.default_repo_units)
+        not exists RepoRedirect{owner_user: owner, name: name}
+        RepositoryProvisioned(repository: repo, doer: doer, unit_kinds: config.default_repo_units)
         if label_template != null:
             LabelTemplateApplied(repository: repo, template_name: label_template)
-    @guidance
-        -- With auto_init, the first commit (README.md from initial_content.readme_template,
-        -- .gitignore concatenated from the chosen templates each prefixed "# ---> <name>",
-        -- LICENSE filled with owner, e-mail, repository and year) is authored by the owner and
-        -- signed by the instance key when config.initial_commit_signing allows (keys.allium);
-        -- it lands on the requested default branch. Without auto_init the repository is empty.
-        -- API: when auto_init is set without a README template, the "Default" template is used;
-        -- an unknown README template is rejected.
-        -- Endpoints: GET/POST /repo/create; POST /api/v1/user/repos.
+}
+
+-- A site admin creates a repository for a user (API POST /admin/users/{username}/repos), with
+-- the instance defaults for everything but the name: no description, public (unless the
+-- instance forces private), not a template, not initialised, the default object format.
+-- A site admin is not held to the owner's creation limit.
+-- from: routers/api/v1/admin/repo.go:14
+rule SiteAdminCreatesRepositoryForUser {
+    when: administration/RepositoryCreationRequestedByAdmin(admin, user, name)
+    requires: admin.is_admin
+    requires: is_valid_repo_name(name)
+    requires: not exists Repository{owner_user: user, name: name}
+    requires: not exists UnadoptedRepository{owner_name: user.name, name: name}
+    requires: within_repo_quota(user)
+    ensures: UserRepositoryCreationAccepted(doer: admin, owner: user, name: name, description: "",
+        is_private: false, is_template: false, auto_init: false, object_format: config.default_object_format,
+        initial_content: null, label_template: null)
 }
 
 -- Creating a repository owned by an organisation (web /repo/create with an org owner,
@@ -1176,7 +1211,8 @@ rule AdminDisablesUnit {
 -- Internal issue tracker settings.
 -- from: routers/web/repo/setting/setting.go:188
 rule AdminConfiguresIssueTracker {
-    when: AdminConfiguresIssueTracker(user, unit, settings)
+    when: AdminConfiguresIssueTracker(user, repository, unit, settings)
+    requires: unit.repository = repository
     requires: is_repo_admin(user, unit.repository)
     requires: unit.kind = issues
     ensures: unit.issues_settings = settings
@@ -1185,7 +1221,8 @@ rule AdminConfiguresIssueTracker {
 -- Pull request settings. The default merge style must be one of the allowed styles.
 -- from: routers/web/repo/setting/setting.go:252
 rule AdminConfiguresPullRequests {
-    when: AdminConfiguresPullRequests(user, unit, settings)
+    when: AdminConfiguresPullRequests(user, repository, unit, settings)
+    requires: unit.repository = repository
     requires: is_repo_admin(user, unit.repository)
     requires: unit.kind = pull_requests
     requires: merge_style_allowed(settings, settings.default_merge_style)
@@ -1235,7 +1272,8 @@ rule AdminSetsExternalWiki {
 -- Let every signed-in user edit the built-in wiki.
 -- from: routers/web/repo/setting/setting.go:152
 rule AdminSetsWikiEditableByEveryone {
-    when: AdminSetsWikiEditableByEveryone(user, unit, editable)
+    when: AdminSetsWikiEditableByEveryone(user, repository, unit, editable)
+    requires: unit.repository = repository
     requires: is_repo_admin(user, unit.repository)
     requires: unit.kind = wiki
     ensures: unit.everyone_can_write = editable
@@ -1278,6 +1316,27 @@ rule OwnerUnarchivesRepository {
 rule OwnerDeletesRepository {
     when: OwnerDeletesRepository(user, repository)
     requires: user.is_admin or repository.owner_user = user or (repository.owner_org != null and is_org_owner(repository.owner_org, user))
+    ensures: RepositoryDeletionAccepted(repository: repository, doer: user)
+    @guidance
+        -- Web requires typing the full name to confirm. Pull requests opened *from* this
+        -- repository's branches into other repositories are closed first (pulls reacts).
+        -- API: DELETE /repos/{o}/{r}; web: settings action "delete".
+}
+
+-- A site admin deletes a repository from the admin list (web /admin/repos, API as owner).
+-- from: routers/web/admin/repos.go:42
+rule SiteAdminDeletesRepository {
+    when: administration/RepositoryDeletionRequestedByAdmin(admin, repository)
+    requires: admin.is_admin
+    ensures: RepositoryDeletionAccepted(repository: repository, doer: admin)
+}
+
+-- What deleting a repository does, whoever asked (`doer` is null when the system did): every
+-- record about it goes, forks become standalone, and every module holding repository-scoped
+-- data purges it on RepositoryDeleted.
+-- from: services/repository/delete.go:46
+rule DeleteRepositoryAndItsRecords {
+    when: RepositoryDeletionAccepted(repository, doer)
     ensures:
         for f in repository.forks:
             f.is_fork = false
@@ -1307,11 +1366,7 @@ rule OwnerDeletesRepository {
         for l in repository.language_stats:
             not exists l
         not exists repository
-        RepositoryDeleted(repository: repository, doer: user)
-    @guidance
-        -- Web requires typing the full name to confirm. Pull requests opened *from* this
-        -- repository's branches into other repositories are closed first (pulls reacts).
-        -- API: DELETE /repos/{o}/{r}; web: settings action "delete".
+        RepositoryDeleted(repository: repository, doer: doer)
 }
 
 ------------------------------------------------------------
@@ -1412,8 +1467,8 @@ rule OrgMemberRejectsTransfer {
 -- The current owner withdraws the offer.
 -- from: services/repository/transfer.go:417
 rule OwnerCancelsTransfer {
-    when: OwnerCancelsTransfer(user, transfer)
-    let repository = transfer.repository
+    when: OwnerCancelsTransfer(user, repository, transfer)
+    requires: transfer.repository = repository
     requires: is_repo_owner(user, repository)
     requires: repository.status = pending_transfer
     ensures: repository.status = ready
@@ -1498,7 +1553,8 @@ rule AdminAddsCollaborator {
 
 -- from: modules/repository/collaborator.go:49
 rule AdminChangesCollaboratorAccess {
-    when: AdminChangesCollaboratorAccess(user, collaboration, access_mode)
+    when: AdminChangesCollaboratorAccess(user, repository, collaboration, access_mode)
+    requires: collaboration.repository = repository
     requires: is_repo_admin(user, collaboration.repository)
     requires: access_mode in { read, write, admin }
     requires: access_mode != collaboration.access_mode
@@ -1509,9 +1565,9 @@ rule AdminChangesCollaboratorAccess {
 -- Removing a collaborator also unsubscribes them from the repository.
 -- from: modules/repository/collaborator.go:89
 rule AdminRemovesCollaborator {
-    when: AdminRemovesCollaborator(user, collaboration)
+    when: AdminRemovesCollaborator(user, repository, collaboration)
+    requires: collaboration.repository = repository
     requires: is_repo_admin(user, collaboration.repository)
-    let repository = collaboration.repository
     let removed = collaboration.user
     ensures: not exists collaboration
     ensures: WatchSelectionChosen(user: removed, repository: repository, issues: false, pull_requests: false, releases: false)
@@ -1650,7 +1706,8 @@ rule AdminAddsTopic {
 
 -- from: routers/api/v1/repo/topic.go:201
 rule AdminRemovesTopic {
-    when: AdminRemovesTopic(user, repo_topic)
+    when: AdminRemovesTopic(user, repository, repo_topic)
+    requires: repo_topic.repository = repository
     requires: is_repo_admin(user, repo_topic.repository)
     ensures: not exists repo_topic
 }
@@ -1795,7 +1852,7 @@ rule ProvisionImportedRepository {
 -- The import finished; a mirror import becomes a pull mirror on its schedule.
 -- from: services/repository/migrate.go
 rule ImportCompletes {
-    when: ImportCompleted(repository, remote_address, has_credentials, interval, lfs_enabled, lfs_endpoint?)
+    when: migrations/ImportCompleted(repository, remote_address, has_credentials, interval, lfs_enabled, lfs_endpoint)
     requires: repository.status = being_migrated
     requires: interval = 0.seconds or interval >= config.mirror_min_interval
     ensures: repository.status = ready
@@ -1834,8 +1891,8 @@ rule RepositoryStorageRestored {
 -- credentials (the address must pass the migration allow/block lists), LFS.
 -- from: routers/web/repo/setting/setting.go:431
 rule AdminConfiguresPullMirror {
-    when: AdminConfiguresPullMirror(user, mirror, remote_address, has_credentials, interval, enable_prune, lfs_enabled, lfs_endpoint?)
-    let repository = mirror.repository
+    when: AdminConfiguresPullMirror(user, repository, mirror, remote_address, has_credentials, interval, enable_prune, lfs_enabled, lfs_endpoint?)
+    requires: mirror.repository = repository
     requires: is_repo_admin(user, repository)
     requires: config.mirror_enabled
     requires: repository.is_mirror
@@ -1908,8 +1965,8 @@ rule PullMirrorSyncSucceeds {
 }
 
 -- While fetching, the worker reports each ref that changed. Updated branches are announced
--- like pushes by the repository owner (code/CommitsPushed, so issues, pulls, webhooks and
--- actions see them) and wake push mirrors that sync on commit.
+-- like pushes by the repository owner (MirrorBranchUpdated, which code announces as
+-- CommitsPushed, so issues, pulls, webhooks and actions see them) and wake push mirrors that sync on commit.
 -- from: services/mirror/mirror_pull.go:595
 rule PullMirrorRefUpdated {
     when: PullMirrorRefUpdated(worker, mirror, ref_name, old_sha, new_sha, commits)
@@ -1917,7 +1974,7 @@ rule PullMirrorRefUpdated {
     ensures: MirrorSyncPushed(repository: mirror.repository, ref_name: ref_name, commits: commits)
     ensures:
         if is_branch_ref(ref_name):
-            code/CommitsPushed(repository: mirror.repository, branch_name: branch_of_ref(ref_name),
+            MirrorBranchUpdated(repository: mirror.repository, branch_name: branch_of_ref(ref_name),
                 pusher: mirror_pusher(mirror.repository), old_sha: old_sha, new_sha: new_sha,
                 is_force: is_force_update(mirror.repository, old_sha, new_sha))
     ensures:
@@ -1955,8 +2012,8 @@ rule PullMirrorSyncFails {
 -- Converting a pull mirror into an ordinary repository (owner only).
 -- from: services/repository/repository.go:123
 rule OwnerConvertsMirror {
-    when: OwnerConvertsMirror(user, mirror)
-    let repository = mirror.repository
+    when: OwnerConvertsMirror(user, repository, mirror)
+    requires: mirror.repository = repository
     requires: is_repo_owner(user, repository)
     requires: repository.is_mirror
     ensures: repository.is_mirror = false
@@ -2003,8 +2060,8 @@ rule AdminAddsPushMirror {
 
 -- from: routers/web/repo/setting/setting.go:580
 rule AdminUpdatesPushMirror {
-    when: AdminUpdatesPushMirror(user, push_mirror, interval, branch_filter?)
-    let repository = push_mirror.repository
+    when: AdminUpdatesPushMirror(user, repository, push_mirror, interval, branch_filter?)
+    requires: push_mirror.repository = repository
     requires: is_repo_admin(user, repository)
     requires: config.mirror_enabled
     requires: not repository.is_archived
@@ -2016,7 +2073,8 @@ rule AdminUpdatesPushMirror {
 
 -- from: routers/web/repo/setting/setting.go:632
 rule AdminRemovesPushMirror {
-    when: AdminRemovesPushMirror(user, push_mirror)
+    when: AdminRemovesPushMirror(user, repository, push_mirror)
+    requires: push_mirror.repository = repository
     requires: is_repo_admin(user, push_mirror.repository)
     requires: config.mirror_enabled
     requires: not push_mirror.repository.is_archived
@@ -2026,7 +2084,8 @@ rule AdminRemovesPushMirror {
 -- "Synchronise now" for a push mirror.
 -- from: routers/api/v1/repo/mirror.go:84
 rule AdminRequestsPushMirrorSync {
-    when: AdminRequestsPushMirrorSync(user, push_mirror)
+    when: AdminRequestsPushMirrorSync(user, repository, push_mirror)
+    requires: push_mirror.repository = repository
     requires: is_repo_admin(user, push_mirror.repository)
     requires: config.mirror_enabled
     requires: not push_mirror.repository.is_archived
@@ -2228,30 +2287,7 @@ rule DeleteRepositoriesMissingFromStorage {
 -- from: services/repository/check.go:160
 rule SystemDeletesRepository {
     when: RepositoryDeletionRequested(repository)
-    ensures:
-        for f in repository.forks:
-            f.is_fork = false
-            f.fork_of = null
-        for c in repository.collaborations:
-            not exists c
-        for s in repository.stars:
-            not exists s
-        for w in repository.watches:
-            not exists w
-        for u in repository.units:
-            not exists u
-        for rt in repository.repo_topics:
-            not exists rt
-        for r in repository.redirects:
-            not exists r
-        for pm in repository.push_mirrors:
-            not exists pm
-        for m in repository.mirror:
-            not exists m
-        for a in repository.archives:
-            not exists a
-        not exists repository
-        RepositoryDeleted(repository: repository, doer: null)
+    ensures: RepositoryDeletionAccepted(repository: repository, doer: null)
 }
 
 -- Records whose storage vanished get a fresh empty git repository (reinit_missing_repos, off by default).
@@ -2582,29 +2618,29 @@ surface RepositorySettings {
         AdminSetsCloseIssuesViaAnyBranch(admin, repository, enabled)
         AdminEnablesUnit(admin, repository, kind)
         AdminDisablesUnit(admin, repository, unit)
-        AdminConfiguresIssueTracker(admin, unit, settings)
-        AdminConfiguresPullRequests(admin, unit, settings)
+        AdminConfiguresIssueTracker(admin, repository, unit, settings)
+        AdminConfiguresPullRequests(admin, repository, unit, settings)
         AdminSetsExternalTracker(admin, repository, settings)
         AdminSetsExternalWiki(admin, repository, url)
-        AdminSetsWikiEditableByEveryone(admin, unit, editable)
+        AdminSetsWikiEditableByEveryone(admin, repository, unit, editable)
         AdminAddsCollaborator(admin, repository, collaborator)
-        AdminChangesCollaboratorAccess(admin, collaboration, access_mode)
-        AdminRemovesCollaborator(admin, collaboration)
+        AdminChangesCollaboratorAccess(admin, repository, collaboration, access_mode)
+        AdminRemovesCollaborator(admin, repository, collaboration)
         AdminReplacesTopics(admin, repository, names)
             when not repository.is_archived
         AdminAddsTopic(admin, repository, name)
-        AdminRemovesTopic(admin, repo_topic)
+        AdminRemovesTopic(admin, repository, repo_topic)
         AdminUploadsAvatar(admin, repository, image)
         AdminRemovesAvatar(admin, repository)
-        AdminConfiguresPullMirror(admin, mirror, remote_address, has_credentials, interval, enable_prune, lfs_enabled, lfs_endpoint)
+        AdminConfiguresPullMirror(admin, repository, mirror, remote_address, has_credentials, interval, enable_prune, lfs_enabled, lfs_endpoint)
             when repository.is_mirror and not repository.is_archived
         AdminAddsPushMirror(admin, repository, remote_address, has_credentials, uses_ssh, interval, sync_on_commit, branch_filter)
             when not repository.is_archived
-        AdminUpdatesPushMirror(admin, push_mirror, interval, branch_filter)
+        AdminUpdatesPushMirror(admin, repository, push_mirror, interval, branch_filter)
             when not repository.is_archived
-        AdminRemovesPushMirror(admin, push_mirror)
+        AdminRemovesPushMirror(admin, repository, push_mirror)
             when not repository.is_archived
-        AdminRequestsPushMirrorSync(admin, push_mirror)
+        AdminRequestsPushMirrorSync(admin, repository, push_mirror)
             when not repository.is_archived
 
     @guarantee CredentialsNeverShown
@@ -2643,13 +2679,13 @@ surface RepositoryDangerZone {
             when repository.status = ready
         OwnerTransfersRepositoryToOrg(owner, repository, org, teams)
             when repository.status = ready
-        OwnerCancelsTransfer(owner, transfer)
+        OwnerCancelsTransfer(owner, repository, transfer)
             when repository.status = pending_transfer
         OwnerArchivesRepository(owner, repository)
             when not repository.is_archived and not repository.is_mirror
         OwnerUnarchivesRepository(owner, repository)
             when repository.is_archived
-        OwnerConvertsMirror(owner, mirror)
+        OwnerConvertsMirror(owner, repository, mirror)
             when repository.is_mirror
         OwnerDetachesFork(owner, repository)
             when repository.is_fork
@@ -2800,7 +2836,6 @@ surface RepositoryIntegrations {
     provides:
         ImportReservesRepository(user, owner, name, description, is_private, as_mirror, original_url)
         ImportReservesOrgRepository(user, org, name, description, is_private, as_mirror, original_url)
-        ImportCompleted(repository, remote_address, has_credentials, interval, lfs_enabled, lfs_endpoint)
         RepositoryDeletionRequested(repository)
         RepositoryStorageUnreadable(repository)
         RepositoryStorageRestored(repository)

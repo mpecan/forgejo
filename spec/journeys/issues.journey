@@ -11,8 +11,14 @@ world {
         repo: repositories/Repository
     given:
         repo.is_archived = false
+        repo.owner_user = tess
+        repo.owner_org = null
         ada.is_admin = false
+        ada.is_active = true
+        ada.prohibit_login = false
         tess.is_admin = false
+        tess.is_active = true
+        tess.prohibit_login = false
 }
 
 -- The happy path of opening an issue.
@@ -31,6 +37,7 @@ journey SomebodyReportsABug {
         stipulate next_issue_index(repo) = 7
         stipulate all_assignable({}, repo) = true
         stipulate resolve_mentions_in(repo, ada, "Steps: ...") = {}
+        stipulate cross_references(repo, ada, "Crash on save", "Steps: ...") = {}
         ada does UserOpensIssue(ada, repo, "Crash on save", "Steps: ...", {}, null, {}, null, null, {}) on IssueTracker
             creating issue: Issue
         then UserOpensIssue fires
@@ -69,7 +76,7 @@ journey AConversationUnfolds {
         stipulate is_blocked(ada, tess) = false
         stipulate is_blocked_by_owner(repo, tess) = false
         stipulate resolve_mentions(bug, tess, "Can you share logs?") = {}
-        stipulate cross_references(bug, c, tess, "Can you share logs?") = {}
+        stipulate cross_references(repo, tess, null, "Can you share logs?") = {}
         tess does UserComments(tess, bug, "Can you share logs?", {}) on IssueConversation
             creating c: Comment
         then UserComments fires
@@ -86,14 +93,14 @@ journey AConversationUnfolds {
         stipulate c.has_content = true
         stipulate is_allowed_reaction("heart") = true
         stipulate is_allowed_reaction("party_parrot") = false
-        ada does UserReactsToComment(ada, c, "heart") on IssueConversation
+        ada does UserReactsToComment(ada, bug, c, "heart") on IssueConversation
             creating r: Reaction
         then r.emoji = "heart"
         then r.user = ada
         then r.comment = c
 
     3. but not with an emoji the instance does not offer
-        ada cannot do UserReactsToComment(ada, c, "party_parrot") on IssueConversation
+        ada cannot do UserReactsToComment(ada, bug, c, "party_parrot") on IssueConversation
 
     ends: The issue has one comment from Tess carrying Ada's heart.
 }
@@ -111,6 +118,7 @@ journey ABlockedUserIsKeptOut {
     given:
         mallory.is_admin = false
         bug.repository = repo
+        bug.is_pull = false
         bug.poster = ada
         bug.status = open
         bug.is_locked = false
@@ -144,6 +152,7 @@ journey LockingAHeatedConversation {
 
     given:
         bug.repository = repo
+        bug.is_pull = false
         bug.poster = ada
         bug.status = open
         bug.is_locked = false
@@ -173,7 +182,7 @@ journey LockingAHeatedConversation {
         stipulate is_blocked(ada, tess) = false
         stipulate is_blocked_by_owner(repo, tess) = false
         stipulate resolve_mentions(bug, tess, "Locked until tempers cool.") = {}
-        stipulate cross_references(bug, reply, tess, "Locked until tempers cool.") = {}
+        stipulate cross_references(repo, tess, null, "Locked until tempers cool.") = {}
         tess does UserComments(tess, bug, "Locked until tempers cool.", {}) on IssueTriage
             creating reply: Comment
         then reply.poster = tess
@@ -300,6 +309,7 @@ journey OnlyOnePriorityAtATime {
 
     given:
         bug.repository = repo
+        bug.is_pull = false
         low.repository = repo
         high.repository = repo
         low.name = "priority/low"
@@ -331,6 +341,7 @@ journey AReleaseMilestone {
 
     given:
         bug.repository = repo
+        bug.is_pull = false
         bug.milestone = null
         bug.status = open
 
@@ -356,7 +367,7 @@ journey AReleaseMilestone {
         then note.new_milestone = one
 
     4. and closes it when 1.0 ships
-        tess does TrackerManagerClosesMilestone(tess, one) on TrackerSettings
+        tess does TrackerManagerClosesMilestone(tess, repo, one) on TrackerSettings
         then one.status = closed
 
     ends: Milestone 1.0 is closed and the bug belongs to it.
@@ -375,6 +386,7 @@ journey TrackingTimeOnAnIssue {
 
     given:
         bug.repository = repo
+        bug.is_pull = false
         bug.poster = ada
         bug.status = open
         tess_time.issue = bug
@@ -383,6 +395,7 @@ journey TrackingTimeOnAnIssue {
         tess_time.is_deleted = false
 
     1. she starts the stopwatch
+        stipulate can_read_issue(ada, bug) = true
         stipulate may_track_time(ada, bug) = true
         ada does UserStartsStopwatch(ada, bug) on IssueConversation
             creating sw: Stopwatch
@@ -393,7 +406,7 @@ journey TrackingTimeOnAnIssue {
         after 2.hours
 
     3. she stops it
-        ada does UserStopsStopwatch(ada, sw) on IssueConversation
+        ada does UserStopsStopwatch(ada, bug, sw) on IssueConversation
             creating spent: TrackedTime
         then FinishStopwatch fires
         then spent.amount = 2.hours
@@ -420,6 +433,7 @@ journey EditingKeepsHistory {
 
     given:
         bug.repository = repo
+        bug.is_pull = false
         bug.poster = ada
         bug.title = "Crash on save"
         bug.content = "Stpes: open then save"
@@ -428,8 +442,8 @@ journey EditingKeepsHistory {
     1. she fixes the typo
         stipulate can_read_issue(ada, bug) = true
         stipulate can_triage(ada, bug) = false
-        stipulate cross_references(bug, null, ada, "Crash on save Steps: open then save") = {}
-        stipulate resolve_mentions(bug, ada, "Crash on save Steps: open then save") = {}
+        stipulate cross_references(repo, ada, "Crash on save", "Steps: open then save") = {}
+        stipulate resolve_mentions(bug, ada, "Steps: open then save") = {}
         stipulate original_author(bug, null) = ada
         ada does UserEditsIssueBody(ada, bug, "Steps: open then save", 0) on IssueConversation
         then bug.content = "Steps: open then save"
@@ -474,6 +488,7 @@ journey OnlyAdminsDeleteIssues {
     given:
         owner.is_admin = false
         spam.repository = repo
+        spam.is_pull = false
         spam.poster = ada
         spam.status = open
 
