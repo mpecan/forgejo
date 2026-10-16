@@ -30,7 +30,7 @@ allium-inspect                              # browse it (reads .allium-inspect.t
 | Invariants | 214 |
 | Config parameters | every `app.ini` setting that changes behaviour, with Forgejo's default |
 | Open questions | 201 ([`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md)) |
-| Journeys | 319 in 22 files: **677 of 703 steps hold** with allium-journey 0.1.2; the other 26 are walker limitations, listed below |
+| Journeys | 319 in 22 files: **702 of 703 steps hold** with allium-journey 0.1.3; the one remaining step is a walker limitation, described below |
 | Cross-module reactions | 306; every one matches its emitter's trigger name and argument names |
 | `allium check .` | 0 errors |
 
@@ -106,11 +106,9 @@ the Forgejo code it was distilled from.
 
 ## Conventions forced by the tooling
 
-Open walker issues the spec currently works around: [#16](https://github.com/mpecan/allium-inspect/issues/16), [#17](https://github.com/mpecan/allium-inspect/issues/17), [#19](https://github.com/mpecan/allium-inspect/issues/19), [#25](https://github.com/mpecan/allium-inspect/issues/25), [#26](https://github.com/mpecan/allium-inspect/issues/26), [#27](https://github.com/mpecan/allium-inspect/issues/27). Once they are fixed, the corresponding workarounds can go: named-but-unused listener parameters, local re-emission, repeated per-journey stipulations, restated config defaults, unrolled loops, and `if` in place of `??`.
-
 These shape how the spec is written. They are not domain decisions. They are
-written for allium-journey 0.1.2, which closed allium-inspect
-[#6](https://github.com/mpecan/allium-inspect/issues/6)–[#13](https://github.com/mpecan/allium-inspect/issues/13).
+written for allium-journey 0.1.3. Releases 0.1.2 and 0.1.3 closed allium-inspect
+[#6](https://github.com/mpecan/allium-inspect/issues/6)–[#13](https://github.com/mpecan/allium-inspect/issues/13) and [#16](https://github.com/mpecan/allium-inspect/issues/16)–[#27](https://github.com/mpecan/allium-inspect/issues/27).
 
 - **Permission checks are local predicates.** A rule says
   `requires: can_write_code(user, repository)`, not `access/can_write(...)`,
@@ -121,16 +119,17 @@ written for allium-journey 0.1.2, which closed allium-inspect
 - **Every emission uses named arguments, and listeners use the same names.**
   The walker binds a trigger's arguments per listener: a named argument binds
   only the parameter of that name, and a bare name is positional. Mixing the two
-  is a collision. A listener never writes `_` for a parameter it ignores; it
-  writes the emitter's name and leaves it unused
-  ([#16](https://github.com/mpecan/allium-inspect/issues/16)).
+  is a collision. Cross-module listeners write the emitter's parameter names
+  even for parameters they ignore, so the contract is visible at both ends.
 - **A module never emits into another module's namespace.** It emits its own
   trigger, and the owning module reacts to it, for example
-  `actions/JobCommitStatusReported` and code's reaction to it. That is also the
-  architecture this spec wants
-  ([#17](https://github.com/mpecan/allium-inspect/issues/17)).
-- **A deletion event carries what its listeners need.** The record is gone by the
-  time a listener runs, so a listener reads nothing from it but its identity.
+  `actions/JobCommitStatusReported` and code's reaction to it. The walker
+  supports both styles; this one keeps each module's effects inside the module
+  that owns them.
+- **A deletion event carries what its listeners need, read with `let`.** An
+  emission's arguments see the state *after* the rule, so a rule that deletes a
+  record binds the fields it reports with `let` first. A listener reads nothing
+  from a deleted record but its identity.
   For example, `UserAccountDeleted` carries the user's `kind`, and
   `PackageVersionDeleted` carries its `package`.
 - **Surfaces face real actors, and journeys cast people who match them.** The
@@ -143,6 +142,11 @@ written for allium-journey 0.1.2, which closed allium-inspect
 - **A rule-level `for` filters with `where`.** A member that doesn't qualify is
   skipped by the filter. A `requires` inside the loop would be ambiguous
   between "refuse the rule" and "skip the member".
+- **Black boxes are answered where the story is told.** A call about something
+  that already exists is stipulated in `given` or the file's `world`. A call
+  about something the act creates is answered on the act's `creating` line
+  (`creating issue: issues/Issue where audience(issue) = {}`). Every answer is
+  listed in the journey's stipulation ledger.
 - **Off-by-default features are gated in their rules and walked switched on.**
   Federation, quota, moderation and LFS each check `config.enabled` in `requires`.
   Their journeys set `config.… = true` (it shows in the stipulation ledger), and
@@ -165,19 +169,11 @@ this), **refused**, **unspecified** (the spec has no such thing yet),
 **unexposed**, and **undecided** (the tool could not tell). The undecided steps
 that remain are listed below with their reasons.
 
-### Steps that do not hold, and why
+### The step that does not hold
 
-None of these is a gap in the spec. Each is something allium-journey 0.1.2
-cannot decide, and each has a minimal reproduction.
-
-| Steps | Why |
+| Step | Why |
 |---|---|
-| 21 steps in issues, pulls and repositories, such as *Somebody Reports A Bug* (1), *Review Then Merge* (1, 3), *Transfer Awaits The Recipient* (1), *Bob Forks Alices Repository Once* (1) and *Pull Mirror Keeps Itself Current* (2) | The act creates an issue, pull request, repository or review, and a reaction then loops over a black box called on it, such as `audience(issue)`, `receivers(...)`, `mentions(...)`, `git_tags(fork)` or language-stats `sizes`. A journey can stipulate a call only for an instance that already exists, and the walker can't stipulate one in `given` or `world` either ([#18](https://github.com/mpecan/allium-inspect/issues/18), [#19](https://github.com/mpecan/allium-inspect/issues/19)). |
-| actions: *A Silent Task Becomes A Zombie* (3) | A temporal trigger on an optional timestamp that is still `null` is undecided while the clock moves ("`+` is not defined between a null and a duration"). It should simply not be due ([#20](https://github.com/mpecan/allium-inspect/issues/20)). |
-| actions: *A Schedule Fires* (1) | A derived `if` that returns enum words evaluates to unknown. Then `unknown != status` comes out true ([#21](https://github.com/mpecan/allium-inspect/issues/21)). |
-| webhooks: *A Week Later The History Is Cleaned Up* (1) | After a clock-fired rule deletes an instance, the walker still evaluates that instance's state condition ([#22](https://github.com/mpecan/allium-inspect/issues/22)). |
-| administration: *Administrator Deletes A Repository* (2) | A `for` over a relationship filtered on a derived field reports "may be missing members" when every member is decided ([#23](https://github.com/mpecan/allium-inspect/issues/23)). |
-| packages: *Ada Pushes A Container Image* (4) | When one event wakes sibling rules, a later sibling sees what an earlier one created in the same firing ([#24](https://github.com/mpecan/allium-inspect/issues/24)). |
+| pulls: *Draft Review Stays Private* (3) | Submitting a draft review creates both the review and its code comment. Notifications then asks `code_comment_mentions(comment)` of the comment. An act can catch only one creation with `creating` (a second `creating` line is merged into the first), so the comment's black box can't be answered. A related problem: a module-qualified `where` answer (`where notifications/mentions(x) = {}`) appears in the ledger but answers nothing. |
 
 ## How this was produced
 
@@ -199,3 +195,10 @@ The Allium `distill` process, run as a fan-out:
    that read its schedule after deleting it, a rename redirect that compared a
    name with itself, and listeners that read records their own event had just
    deleted.
+5. A third pass adapted the set to allium-journey 0.1.3, which answers black
+   boxes on an act's creations, takes calls in `given` and `world`, and seeds
+   collection config defaults. Two agents used it to make the remaining steps
+   hold. They also removed the workarounds the earlier walker had needed:
+   restated defaults, unrolled loops, `if` in place of `??`, and stipulations
+   repeated in every journey.
+
