@@ -81,7 +81,7 @@
 --   - organizations/OrganizationVisibilityChanged(organization)
 --   - accounts/AccountStatusChanged(user)          (restricted flag may have changed)
 --   - accounts/UserVisibilityChanged(user, old_visibility, new_visibility)
---   - accounts/UserAccountDeleted(user, purge, delete_contributions)
+--   - accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -1061,7 +1061,7 @@ rule RecalculateOnOrganizationVisibilityChanged {
 
 -- from: services/user/delete.go:106
 rule DropAccessOnUserDeleted {
-    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
     ensures:
         for row in RepoAccesses where user = user:
             not exists row

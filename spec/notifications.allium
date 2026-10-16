@@ -102,7 +102,7 @@
 --   code/BranchCreated(branch, by)
 --   code/BranchDeleted(branch, by)
 --   releases/ReleasePublished(release)                  -- publisher is release.publisher
---   accounts/UserAccountDeleted(user, purge, delete_contributions)
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
 --   accounts/PrimaryEmailChanged(user, old_address, new_address)
 --   authentication/UserSignedUp(user)
 --   authentication/UserSignedOut(user, session)
@@ -855,7 +855,7 @@ rule DeleteNotificationsOfDeletedRepository {
 
 -- from: services/user/delete.go:111
 rule DeleteInboxAndFeedOfDeletedUser {
-    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
     ensures:
         for n in Notifications where recipient = user:
             not exists n

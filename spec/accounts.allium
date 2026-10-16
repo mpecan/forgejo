@@ -86,7 +86,7 @@
 --                                                  -- packages delete owned packages,
 --                                                  -- federation deletes FederatedUser,
 --                                                  -- authentication ends sessions
---   UserAccountDeleted(user, purge, delete_contributions)
+--   UserAccountDeleted(user, kind, purge, delete_contributions)  -- `user` is already gone; read nothing from it but identity
 --                                                  -- every module removes or ghosts the user's
 --                                                  -- rows (see DeleteUserAccount guidance)
 --
@@ -1004,6 +1004,8 @@ rule AdminDeletionCascades {
 -- from: services/user/delete.go:36
 rule DeleteUserAccount {
     when: DeleteUserAccount(user, purge)
+    -- read before the user goes: listeners get it in the event, not from a deleted record
+    let kind = user.kind
     let young = config.user_delete_with_comments_max_time > 0.days
                 and user.created_at + config.user_delete_with_comments_max_time > now
     ensures:
@@ -1015,7 +1017,7 @@ rule DeleteUserAccount {
         for s in user.settings: not exists s
         for ub in user.badges: not exists ub
         for r in user.redirects: not exists r
-        UserAccountDeleted(user: user, purge: purge, delete_contributions: purge or young)
+        UserAccountDeleted(user: user, kind: kind, purge: purge, delete_contributions: purge or young)
         not exists user
     @guidance
         -- Consumers of UserAccountDeleted, all keyed on the user:

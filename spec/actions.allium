@@ -66,7 +66,7 @@
 --   repositories/RepoUnitDisabled(repository, kind)         -- actions unit off: drop schedules
 --   repositories/RepoUnitEnabled(repository, kind)          -- actions unit on: re-detect schedules
 --   repositories/RepositoryDeleted(repository, doer)        -- remove all actions data
---   accounts/UserAccountDeleted(user, purge, delete_contributions),
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions),
 --   organizations/OrganizationDeleted(organization)         -- remove owner-scoped data
 --   accounts/UserBlocked(blocker, blocked)                  -- revoke the blocked user's trust
 --   issues/IssueOpened(issue, mentions), issues/IssueTitleChanged(issue, doer, old_title),
@@ -965,9 +965,9 @@ rule PackagePublishedStartsWorkflows {
 
 -- from: services/actions/notifier.go:715
 rule PackageDeletedStartsWorkflows {
-    when: packages/PackageVersionDeleted(version, doer)
-    requires: version.package.repository != null
-    ensures: ForgeEventObserved(repository: version.package.repository, doer: doer, event: package, activity: "deleted", ref: null, commit_sha: null, pull_request: null)
+    when: packages/PackageVersionDeleted(version, package, doer)
+    requires: package.repository != null
+    ensures: ForgeEventObserved(repository: package.repository, doer: doer, event: package, activity: "deleted", ref: null, commit_sha: null, pull_request: null)
 }
 
 -- Wiki edits match `gollum` and run from the default branch.
@@ -2457,7 +2457,7 @@ rule RepositoryDeletionRemovesActionsData {
 
 -- from: models/actions/runner.go:357
 rule UserDeletionRemovesActionsScope {
-    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
     ensures:
         for scope in ActionsScopes where owner_user = user:
             for runner in scope.runners:

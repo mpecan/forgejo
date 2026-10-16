@@ -1215,8 +1215,8 @@ rule DeletedRepositoryLeavesIndexes {
 -- from: modules/indexer/code/indexer.go:307
 rule QueueCodeIndexJob {
     when: CodeIndexRefreshRequested(repository)
-    let service = code_search_service()
-    requires: service.enabled
+    -- REPO_INDEXER_ENABLED; with the indexer off nothing is queued
+    requires: config.repo_indexer_enabled
     requires: not exists CodeIndexJob{repository: repository, status: queued}
     ensures: CodeIndexJob.created(repository: repository, status: queued, queued_at: now)
 }

@@ -140,6 +140,7 @@ journey AnAdminReindexesARepository {
         root.is_admin = true
         root.is_active = true
         root.prohibit_login = false
+        config.repo_indexer_enabled = true
         svc.enabled = true
         svc.status = ready
         svc.kind = bleve

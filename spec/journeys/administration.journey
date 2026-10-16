@@ -24,6 +24,7 @@ world {
         ada.is_active = true
         ada.prohibit_login = false
         ada.is_restricted = false
+        ada.kind = individual
         proc.is_running = true
 }
 

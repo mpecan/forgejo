@@ -81,7 +81,7 @@
 --    requesting module to read; they are answers, not events.)
 --
 -- Reacts to:
---   accounts/UserAccountDeleted(user, purge, delete_contributions)  -- remove the user's keys
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)  -- remove the user's keys
 --   repositories/RepositoryDeleted(repository, doer)                 -- detach deploy keys
 --   authentication/ExternalSshKeysAsserted(user, source, keys)       -- source-managed keys (LDAP login /
 --                                                                    -- LDAP sync / OAuth2 login)
@@ -813,7 +813,7 @@ rule AuthorizedPrincipalsRewrite {
 -- Deleting an account removes its SSH keys, principals, GPG keys and imports.
 -- from: services/user/delete.go:213
 rule RemoveKeysOfDeletedAccount {
-    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
 
     ensures:
         for key in SshKeys where owner = user:

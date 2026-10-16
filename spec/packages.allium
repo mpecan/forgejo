@@ -47,7 +47,7 @@
 -- Emits:
 --   - PackageVersionCreated(version, publisher)        -- a new version became visible
 --                                                  -- (incl. every container manifest push)
---   - PackageVersionDeleted(version, doer)  -- a visible version was removed by a person
+--   - PackageVersionDeleted(version, package, doer)  -- `version` is already gone, so listeners read `package`; a visible version was removed by a person
 --   (webhooks, actions `on: package`, notifications react to these)
 -- Reacts to:
 --   - repositories/RepositoryDeleted(repository, doer) -- unlink all packages linked to it
@@ -1130,7 +1130,7 @@ rule ContainerDeletesManifest {
     requires: package.kind = container
     requires: can_write_packages(publisher, package.registry)
     ensures: not exists version
-    ensures: PackageVersionDeleted(version: version, doer: publisher)
+    ensures: PackageVersionDeleted(version: version, package: package, doer: publisher)
 }
 
 -- `docker login` exchange: issue a bearer token for the authenticated user,
@@ -1186,7 +1186,7 @@ rule UserDeletesPackageVersion {
         for f in version.files:
             not exists f
     ensures: not exists version
-    ensures: PackageVersionDeleted(version: version, doer: actor)
+    ensures: PackageVersionDeleted(version: version, package: package, doer: actor)
     ensures: RegistryContentChanged(registry: registry, kind: kind, package: package)
     @guidance
         -- RubyGems "yank" and the generic/npm "delete version" endpoints are
@@ -1205,7 +1205,7 @@ rule UserDeletesWholePackage {
     ensures:
         for v in package.visible_versions:
             not exists v
-            PackageVersionDeleted(version: v, doer: actor)
+            PackageVersionDeleted(version: v, package: package, doer: actor)
     ensures: RegistryContentChanged(registry: package.registry, kind: package.kind, package: package)
 }
 
@@ -1226,7 +1226,7 @@ rule UserDeletesPackageFile {
     ensures:
         if was_last_file:
             not exists version
-            PackageVersionDeleted(version: version, doer: actor)
+            PackageVersionDeleted(version: version, package: package, doer: actor)
     ensures: RegistryContentChanged(registry: registry, kind: package.kind, package: package)
 }
 
@@ -1936,4 +1936,4 @@ open question "Owner deletion: users/orgs are refused deletion while they own pa
 -- REQUEST access/config.require_signin_view: imported as config.require_signin_view (used by can_read_packages and the container token exchange).
 -- REQUEST authentication/TokenScope: read:package / write:package and public-only flag consumed by can_read/can_write_packages.
 -- REQUEST quota/quota_allows(owner, size_assets_packages_all) (QuotaGate gate_package_upload, charged: package_owner): quota_allows_package_upload(registry) is exactly this, evaluated for the registry owner (not the uploader) before every write that stores data; quota/QuotaUsage.packages should sum packages/PackageFile sizes per owner (blob shared by two files counts twice, as LIMIT_TOTAL_OWNER_SIZE does).
--- REQUEST webhooks, actions: react to PackageVersionCreated(version, publisher) / PackageVersionDeleted(version, doer) with exactly these parameter names.
+-- REQUEST webhooks, actions: react to PackageVersionCreated(version, publisher) / PackageVersionDeleted(version, package, doer) with exactly these parameter names.

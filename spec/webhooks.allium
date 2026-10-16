@@ -68,7 +68,7 @@
 --   packages/PackageVersionCreated(version, publisher), packages/PackageVersionDeleted(version, doer)
 --   actions/WorkflowRunStatusChanged(run, prior_status), actions/WorkflowRunCompleted(run, prior_status),
 --   actions/WorkflowJobStatusChanged(job, prior_status), actions/WorkflowJobCompleted(job, prior_status)
---   accounts/UserAccountDeleted(user, purge, delete_contributions), organizations/OrganizationDeleted(organization)
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions), organizations/OrganizationDeleted(organization)
 --   administration/HookDeliveryCleanupDue(cleanup_type, older_than, number_to_keep)  -> history cleanup "run now"
 --
 -- Black-box predicates (each the local name of another module's contract):
@@ -692,7 +692,7 @@ rule RemoveWebhooksOfDeletedRepository {
 }
 
 rule RemoveWebhooksOfDeletedUser {
-    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
     for w in Webhooks where scope = per_owner and owner_user = user:
         ensures:
             for d in w.deliveries:
@@ -1228,13 +1228,13 @@ rule PackageVersionCreatedRaisesHookEvent {
 
 -- from: services/webhook/notifier.go:890
 rule PackageVersionDeletedRaisesHookEvent {
-    when: packages/PackageVersionDeleted(version, doer)
+    when: packages/PackageVersionDeleted(version, package, doer)
     ensures: HookEventRaised(
         kind: package,
         action: deleted,
-        source_repo: version.package.repository,
-        owner_user: version.package.owner_user,
-        owner_org: version.package.owner_org,
+        source_repo: package.repository,
+        owner_user: package.owner_user,
+        owner_org: package.owner_org,
         branch: null,
         commit_count: null,
         sender: doer

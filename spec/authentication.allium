@@ -77,7 +77,7 @@
 --   accounts/EmailActivationRequested(user, address) -- re-issue it (resend)
 --   accounts/PrimaryEmailChanged(user, old_address, new_address) -- old codes and remember-me die
 --   accounts/UserPurged(user)                  -- end every session at once
---   accounts/UserAccountDeleted(user, purge, delete_contributions) -- drop every credential
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions) -- drop every credential
 --   administration/InstanceStarted(instance)   -- reconcile the built-in OAuth2 applications
 --   administration/ExternalUserSyncDue(update_existing) -- the sync_external_users cron task
 
@@ -2369,7 +2369,7 @@ rule PurgedUserSessionsEnd {
 
 -- from: models/auth/oauth2.go:647
 rule DeletedUserLosesCredentials {
-    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
 
     ensures:
         for t in AccessTokens where owner = user:

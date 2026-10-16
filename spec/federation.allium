@@ -54,7 +54,7 @@
 -- Reacts to:
 --   repositories/Star.created                         -- local star -> outbound Like
 --   notifications/ActivityRecorded(activity)          -- public local activity -> Create(Note) to remote followers
---   accounts/UserAccountDeleted(user, purge, delete_contributions)  -- forget the federated-user record
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)  -- forget the federated-user record
 --   repositories/RepositoryDeleted(repository, doer)  -- forget its following repos
 --
 -- Black-box predicates. Qualified calls into sibling modules cannot yet be
@@ -811,7 +811,7 @@ rule ForgetFollowingReposOfDeletedRepository {
 -- (in the rebuild) its follow relations and received notes with it.
 -- from: services/user/user.go:282
 rule ForgetFederatedUserOfDeletedAccount {
-    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
     let federated = FederatedUser{user: user}
     requires: exists federated
     ensures:
@@ -826,8 +826,8 @@ rule ForgetFederatedUserOfDeletedAccount {
 -- A deleted local user stops being followed and loses received notes.
 -- from: services/user/user.go:282
 rule ForgetFederationStateOfDeletedLocalUser {
-    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
-    requires: user.kind != activitypub
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+    requires: kind != activitypub
     let followers = FederatedFollowers where followed = user
     let notes = FederatedActivities where recipient = user
     ensures:
