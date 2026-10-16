@@ -70,6 +70,7 @@
 --   AuthorizationDenied(user, app)                       -> (web layer: redirect with error=access_denied)
 --   ClientSecretRegenerated(app)                         -> (web layer: show the new secret once)
 --   AuthSourceSyncRequested(source, update_existing)     -> (internal: per-source sync; LDAP handled here)
+--   RemoteUserClaimed(user, email)                       -> accounts (promote the F3 placeholder)
 --
 -- Reacts to:
 --   accounts/UserEmailAdded(user, address)     -- issue a confirmation code for a new address
@@ -1246,7 +1247,7 @@ rule ProviderIdentityClaimsRemotePlaceholder {
     requires: source.is_active
     requires: placeholder != null
     requires: identity.email != null
-    ensures: accounts/RemoteUserClaimed(user: placeholder, email: identity.email)
+    ensures: RemoteUserClaimed(user: placeholder, email: identity.email)
     @guidance
         -- remote_placeholder_for: the accounts/User of kind remote whose sign-in
         -- source is a Remote source matching `source` (same provider URL) and whose
@@ -2232,7 +2233,7 @@ rule AdminUpdatesAuthSource {
 
     ensures: source.name = name
     ensures: source.is_active = is_active
-    ensures: source.sync_enabled = sync_enabled and source.is_ldap
+    ensures: source.sync_enabled = (sync_enabled and source.is_ldap)
     ensures: source.settings = settings
 }
 

@@ -449,7 +449,7 @@ rule InitialiseSelfRegisteredAccount {
     ensures: user.email_notifications = config.default_email_notifications
     ensures: user.allow_git_hook = false
     ensures: user.allow_import_local = false
-    ensures: user.allow_create_organization = config.default_allow_create_organization and not config.org_creation_disabled
+    ensures: user.allow_create_organization = (config.default_allow_create_organization and not config.org_creation_disabled)
     ensures: user.theme = config.default_theme
     ensures: user.diff_view_style = unified
     ensures: user.enable_repo_unit_hints = true
@@ -503,7 +503,7 @@ rule CreateActivityPubMirror {
 -- through the OAuth2 source that matches the placeholder's remote source.
 -- from: services/remote/promote.go:52
 rule PromoteRemoteUser {
-    when: RemoteUserClaimed(user, email)
+    when: authentication/RemoteUserClaimed(user, email)
     requires: user.kind = remote
     requires: user.primary_email = ""
     requires: not exists EmailAddress{address: email}
@@ -558,7 +558,7 @@ rule RenameNamespace {
     ensures: user.name = new_name
     ensures:
         if not case_only:
-            for r in UserRedirects where same_name(old_name, old_name) or same_name(old_name, new_name):
+            for r in UserRedirects where same_name(r.old_name, old_name) or same_name(r.old_name, new_name):
                 not exists r
             UserRedirect.created(old_name: old_name, user: user, created_at: now)
     ensures: UserRenamed(user: user, old_name: old_name, new_name: new_name)
@@ -1418,7 +1418,6 @@ open question "Purge disables the account outside the deletion transaction so a 
 -- Requests to other modules
 ------------------------------------------------------------
 -- REQUEST authentication/AuthSource.allows_username_change: OAuth2 sources may allow users to rename themselves (UserRenamesSelf).
--- REQUEST authentication: emit RemoteUserClaimed(user, email) when an OAuth2 login matches an F3 placeholder.
 -- REQUEST authentication: the password re-entry for UserDeletesOwnAccount and the "manage_password" feature flag (UserFeature) are yours.
 -- REQUEST organizations: provide is_org_owner(organization, user) and shares_organization(a, b) (both users are members of a common organization, or one is the organization); react to UserPurged by removing memberships and deleting organizations where the user is the last owner; org renames should go through RenameNamespace semantics (UserRedirect with organization set); names are unique across users and organizations.
 -- REQUEST organizations/Organization.follows: Follow.followee_organization relationship for follower counts on org pages.

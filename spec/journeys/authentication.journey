@@ -2,12 +2,11 @@
 -- recovery, tokens, the OAuth2 provider, external sources and the directory sync.
 --
 -- Every journey runs on the instance defaults (open registration, no e-mail
--- confirmation, no mailer, OAuth2 provider enabled), because a journey cannot change
--- configuration.
+-- confirmation, no mailer, OAuth2 provider enabled) unless it says otherwise.
 
 journey SomebodyRegistersOnAnOpenInstance {
     goal: On a default instance anyone may sign up. Ada fills in the form, her account
-          is usable straight away and she is signed in; later she signs out.
+          is usable straight away and she is signed in.
 
     cast:
         s: Session
@@ -30,12 +29,31 @@ journey SomebodyRegistersOnAnOpenInstance {
         then s.status = authenticated
         then s.authenticated_via = password_login
 
-    2. she signs out again
-        s does UserSignsOut(s) on SecuritySettings
+    ends: Ada has an active account and is signed in.
+}
+
+-- Signing out, from the security settings of a signed-in person. Kept apart from the
+-- sign-up journey because a journey can name only one thing an act created, and the
+-- account that signs out is not the login record sign-up is checked by.
+journey SheSignsOutAgain {
+    goal: Ada is signed in. She signs out and her browser session is gone.
+
+    cast:
+        ada: accounts/User
+        s: Session
+
+    given:
+        ada.is_active = true
+        ada.prohibit_login = false
+        s.status = authenticated
+        s.user = ada
+
+    1. she signs out
+        ada does UserSignsOut(s) on SecuritySettings
         then UserSignsOut fires
         then s.status = destroyed
 
-    ends: Ada has an active account and her browser session is gone.
+    ends: Her browser session is destroyed.
 }
 
 journey AWeakPasswordIsRefusedAtSignUp {
@@ -76,15 +94,18 @@ journey AnActivationLinkActivatesTheAccount {
         ada.prohibit_login = false
         login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
         code: EmailVerificationCode { user: ada, purpose: user_activation, email: "ada@example.com", status: pending }
+        addr: accounts/EmailAddress { user: ada, address: "ada@example.com", is_activated: false, is_primary: true }
 
     1. she follows the link and types her password
         stipulate password_matches(ada, "correct horse battery") = true
+        stipulate activated_elsewhere(addr) = false
         s does UserActivatesAccount(s, code, "correct horse battery") on MailedCodeLanding
         then UserActivatesAccount fires
         then code.status = used
         then ada.is_active = true
         then s.status = authenticated
         then s.user = ada
+        then addr.is_activated = true
 
     2. the same link cannot be used a second time
         other cannot do UserActivatesAccount(other, code, "correct horse battery") on MailedCodeLanding
@@ -103,6 +124,9 @@ journey SignInWithAnAuthenticatorApp {
 
     given:
         s.status = anonymous
+        s.pending_link = false
+        s.pending_external_identity = null
+        s.pending_openid_uri = null
         eve.status = anonymous
         ada.is_active = true
         ada.prohibit_login = false
@@ -143,6 +167,9 @@ journey TheScratchCodeIsARecoveryCodeThatWorksOnce {
 
     given:
         s.status = anonymous
+        s.pending_link = false
+        s.pending_external_identity = null
+        s.pending_openid_uri = null
         ada.is_active = true
         ada.prohibit_login = false
         ada.kind = individual
@@ -496,6 +523,8 @@ journey TheDirectorySyncDeactivatesPeopleWhoLeft {
         bob_entry: DirectoryEntry { source: corp, username: "bob", email: "bob@corp.example", is_admin: false, is_restricted: false }
 
     1. root runs the synchronisation from the dashboard
+        -- the directory publishes no SSH key attribute
+        stipulate corp.provides_ssh_keys = false
         root does AdminRunsExternalUserSync(root) on AuthSourceAdministration
         then AdminRunsExternalUserSync fires
         then LdapSourceSynchronised fires

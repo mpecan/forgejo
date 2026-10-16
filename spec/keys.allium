@@ -773,7 +773,7 @@ rule RepoAdminDeletesDeployKey {
 -- no other repository uses).
 -- from: services/repository/delete.go:106
 rule DetachDeployKeysOfDeletedRepository {
-    when: repositories/RepositoryDeleted(repository, _)
+    when: repositories/RepositoryDeleted(repository, doer)
 
     for deploy_key in DeployKeys where repository = repository:
         let material = deploy_key.key
@@ -813,7 +813,7 @@ rule AuthorizedPrincipalsRewrite {
 -- Deleting an account removes its SSH keys, principals, GPG keys and imports.
 -- from: services/user/delete.go:213
 rule RemoveKeysOfDeletedAccount {
-    when: accounts/UserAccountDeleted(user, _, _)
+    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
 
     ensures:
         for key in SshKeys where owner = user:

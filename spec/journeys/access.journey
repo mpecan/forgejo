@@ -220,11 +220,13 @@ journey RestrictedUsersSeeOnlyWhatTheyAreGiven {
           until she is given an explicit grant on it.
 
     cast:
-        rita: RestrictedUser
+        rita: accounts/User
 
     given:
         rita.is_admin = false
         rita.is_restricted = true
+        rita.is_active = true
+        rita.prohibit_login = false
 
     1. a public repository is still closed to her, and hidden from her
         rita cannot do UserReadsUnit(rita, code) on RepositoryUnitAccess
@@ -411,7 +413,7 @@ journey AFineGrainedTokenNarrowsEvenAnAdministrator {
           private repository nor use administrator powers.
 
     cast:
-        ash:   SiteAdmin
+        ash:   accounts/User
         token: CredentialRestriction
         prepo: repositories/Repository
         pcode: repositories/RepoUnit
@@ -419,6 +421,8 @@ journey AFineGrainedTokenNarrowsEvenAnAdministrator {
     given:
         ash.is_admin = true
         ash.is_restricted = false
+        ash.is_active = true
+        ash.prohibit_login = false
         token.reach = public_only
         prepo.owner_user = olga
         prepo.owner_org = null

@@ -15,14 +15,17 @@ world {
         alice.is_admin = false
         alice.is_restricted = false
         alice.prohibit_login = false
+        alice.is_active = true
         bob.kind = individual
         bob.is_admin = false
         bob.is_restricted = false
         bob.prohibit_login = false
+        bob.is_active = true
         carol.kind = individual
         carol.is_admin = false
         carol.is_restricted = false
         carol.prohibit_login = false
+        carol.is_active = true
         carol.primary_email = "carol@example.org"
         org.name = "acme"
         org.visibility = public
@@ -57,6 +60,7 @@ journey AliceFoundsAnOrganization {
         alice.is_admin = false
         alice.allow_create_organization = true
         alice.prohibit_login = false
+        alice.is_active = true
 
     1. she picks a free name and creates the organization
         stipulate is_usable_owner_name("acme") = true
@@ -88,6 +92,7 @@ journey CarolMayNotCreateOrganizations {
         carol.is_admin = false
         carol.allow_create_organization = false
         carol.prohibit_login = false
+        carol.is_active = true
 
     1. she tries anyway
         stipulate is_usable_owner_name("carol-co") = true
@@ -122,7 +127,7 @@ journey AliceBuildsATeam {
         stipulate is_org_member(org, bob) = false
         stipulate is_team_member(docs, bob) = false
         stipulate has_pending_team_invite(docs, bob) = false
-        alice does OwnerAddsTeamMember(alice, docs, bob) on OrganizationSettings
+        alice does OwnerAddsTeamMember(alice, docs, bob) on TeamSettings
             creating bob_on_docs: TeamMembership
         then OwnerAddsTeamMember fires
         then bob_on_docs.reason = added_by_user
@@ -151,7 +156,7 @@ journey BobCannotManageTeams {
     2. bob tries to put carol on devs
         stipulate is_team_member(devs, carol) = false
         stipulate has_pending_team_invite(devs, carol) = false
-        bob cannot do OwnerAddsTeamMember(bob, devs, carol) on OrganizationSettings
+        bob cannot do OwnerAddsTeamMember(bob, devs, carol) on TeamSettings
 
     ends: Nothing changed; only owners shape teams.
 }
@@ -167,7 +172,7 @@ journey TheOwnersTeamHoldsTheLine {
 
     1. she cannot delete the Owners team
         stipulate is_org_owner(org, alice) = true
-        alice cannot do OwnerDeletesTeam(alice, owners) on OrganizationSettings
+        alice cannot do OwnerDeletesTeam(alice, owners) on TeamSettings
 
     2. she cannot step off the Owners team as its last member
         stipulate owners.member_count = 1
@@ -178,7 +183,7 @@ journey TheOwnersTeamHoldsTheLine {
         alice cannot do MemberLeavesOrganization(alice, org) on OrganizationProfile
 
     4. but she can delete an ordinary team
-        alice does OwnerDeletesTeam(alice, devs) on OrganizationSettings
+        alice does OwnerDeletesTeam(alice, devs) on TeamSettings
         then OwnerDeletesTeam fires
         then devs does not exist
 
@@ -195,7 +200,7 @@ journey BobLeavesHisOnlyTeam {
         bob_in_org:  OrgMembership { organization: org, user: bob, is_public: false }
 
     1. bob leaves devs, and with it the organization
-        stipulate is_on_any_team(org, bob) = false
+        stipulate can_view_team(devs, bob) = true
         bob does MemberLeavesTeam(bob, devs) on TeamPage
         then MemberLeavesTeam fires
         then bob_on_devs does not exist
@@ -216,7 +221,7 @@ journey CarolIsInvitedByEmail {
         stipulate is_valid_email("carol@example.org") = true
         stipulate has_pending_team_invite_for_email(devs, "carol@example.org") = false
         stipulate has_member_with_email(devs, "carol@example.org") = false
-        alice does OwnerInvitesEmailToTeam(alice, devs, "carol@example.org") on OrganizationSettings
+        alice does OwnerInvitesEmailToTeam(alice, devs, "carol@example.org") on TeamSettings
             creating invite: TeamInvite
         then OwnerInvitesEmailToTeam fires
         then invite.status = pending
@@ -268,7 +273,7 @@ journey AnInvitationExpires {
         stipulate is_valid_email("carol@example.org") = true
         stipulate has_pending_team_invite_for_email(devs, "carol@example.org") = false
         stipulate has_member_with_email(devs, "carol@example.org") = false
-        alice does OwnerInvitesEmailToTeam(alice, devs, "carol@example.org") on OrganizationSettings
+        alice does OwnerInvitesEmailToTeam(alice, devs, "carol@example.org") on TeamSettings
             creating invite: TeamInvite
         then invite.status = pending
 
@@ -282,7 +287,7 @@ journey AnInvitationExpires {
         carol cannot do InviteeAcceptsTeamInvite(carol, invite, false) on TeamInvitation
 
     4. alice clears it away
-        alice does OwnerRevokesTeamInvite(alice, invite) on OrganizationSettings
+        alice does OwnerRevokesTeamInvite(alice, devs, invite) on TeamSettings
         then invite does not exist
 
     ends: The stale invitation is gone.
@@ -303,18 +308,18 @@ journey DevsGetTheirRepository {
     1. alice adds api to devs
         stipulate is_org_owner(org, alice) = true
         stipulate team_covers(devs, api) = false
-        alice does OwnerAddsRepositoryToTeam(alice, devs, api) on OrganizationSettings
+        alice does OwnerAddsRepositoryToTeam(alice, devs, api) on TeamSettings
             creating link: TeamRepository
         then link.team = devs
         then link.repository = api
 
     2. and removes it again
-        alice does OwnerRemovesRepositoryFromTeam(alice, devs, api) on OrganizationSettings
+        alice does OwnerRemovesRepositoryFromTeam(alice, devs, api) on TeamSettings
         then link does not exist
 
     3. the Owners team keeps every repository
         stipulate team_covers(owners, api) = true
-        alice cannot do OwnerRemovesRepositoryFromTeam(alice, owners, api) on OrganizationSettings
+        alice cannot do OwnerRemovesRepositoryFromTeam(alice, owners, api) on TeamSettings
 
     ends: devs no longer covers api; Owners still does.
 }
@@ -403,7 +408,8 @@ journey ConcealedMembersStayConcealed {
         bob sees alice_in_org.user.name on OrganizationProfile in org
 
     3. bob makes his membership public
-        bob does MemberChangesMembershipVisibility(bob, bob_in_org, true) on OrganizationMembersArea
+        stipulate is_org_member(org, bob) = true
+        bob does MemberChangesMembershipVisibility(bob, org, bob_in_org, true) on OrganizationMembersArea
         then bob_in_org.is_public = true
 
     ends: Everyone can now see that Bob belongs to acme.

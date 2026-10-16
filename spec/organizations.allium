@@ -311,8 +311,17 @@ rule UserCreatesOrganization {
             can_create_org_repo: true,
             is_owners_team: true
         )
-        for g in owner_unit_grants():
-            TeamUnitAccess.created(team: owners, unit: g.unit, access_mode: g.access_mode)
+        -- every unit at owner; the external wiki and tracker at read
+        TeamUnitAccess.created(team: owners, unit: code, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: issues, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: pull_requests, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: releases, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: wiki, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: external_wiki, access_mode: read)
+        TeamUnitAccess.created(team: owners, unit: external_tracker, access_mode: read)
+        TeamUnitAccess.created(team: owners, unit: projects, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: packages, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: actions, access_mode: owner)
         OrgMembership.created(
             organization: org,
             user: creator,
@@ -369,8 +378,17 @@ rule CreateOrganizationForUserByAdmin {
             can_create_org_repo: true,
             is_owners_team: true
         )
-        for g in owner_unit_grants():
-            TeamUnitAccess.created(team: owners, unit: g.unit, access_mode: g.access_mode)
+        -- every unit at owner; the external wiki and tracker at read
+        TeamUnitAccess.created(team: owners, unit: code, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: issues, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: pull_requests, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: releases, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: wiki, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: external_wiki, access_mode: read)
+        TeamUnitAccess.created(team: owners, unit: external_tracker, access_mode: read)
+        TeamUnitAccess.created(team: owners, unit: projects, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: packages, access_mode: owner)
+        TeamUnitAccess.created(team: owners, unit: actions, access_mode: owner)
         OrgMembership.created(
             organization: org,
             user: owner,
@@ -596,8 +614,9 @@ rule ModeratorPurgesOrganization {
 -- member.
 -- from: routers/web/org/members.go:93
 rule MemberChangesMembershipVisibility {
-    when: MemberChangesMembershipVisibility(actor, membership, is_public)
+    when: MemberChangesMembershipVisibility(actor, org, membership, is_public)
 
+    requires: membership.organization = org
     requires: actor = membership.user
         or is_org_owner(membership.organization, actor)
         or actor.is_admin
@@ -709,7 +728,7 @@ rule DropOrgMembershipWithoutTeams {
     let membership = OrgMembership{organization: team.organization, user: user}
 
     requires: exists membership
-    requires: not is_on_any_team(team.organization, user)
+    requires: not exists TeamMembership{organization: team.organization, user: user}
 
     ensures: not exists membership
     ensures: OrgMemberRemoved(organization: team.organization, user: user)
@@ -751,10 +770,30 @@ rule OwnerCreatesTeam {
             can_create_org_repo: can_create_org_repo,
             is_owners_team: false
         )
-        for g in normalised_unit_grants(access_mode, grants):
-            TeamUnitAccess.created(team: team, unit: g.unit, access_mode: g.access_mode)
+        if access_mode = admin:
+            -- every unit at admin; the external wiki and tracker at read
+            TeamUnitAccess.created(team: team, unit: code, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: issues, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: pull_requests, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: releases, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: wiki, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: external_wiki, access_mode: read)
+            TeamUnitAccess.created(team: team, unit: external_tracker, access_mode: read)
+            TeamUnitAccess.created(team: team, unit: projects, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: packages, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: actions, access_mode: admin)
+        else:
+            for g in grants:
+                if g.unit in {external_wiki, external_tracker}:
+                    if g.access_mode != none:
+                        TeamUnitAccess.created(team: team, unit: g.unit, access_mode: read)
+                else:
+                    if g.access_mode in {read, write}:
+                        TeamUnitAccess.created(team: team, unit: g.unit, access_mode: g.access_mode)
+                    if g.access_mode in {admin, owner}:
+                        TeamUnitAccess.created(team: team, unit: g.unit, access_mode: write)
         if includes_all_repositories:
-            for r in org_repositories(org):
+            for r in repositories/Repositories where r.owner_org = org:
                 TeamRepository.created(team: team, repository: r)
         TeamCreated(team: team, actor: actor)
 
@@ -793,11 +832,31 @@ rule OwnerEditsTeam {
     ensures:
         for old in team.unit_accesses:
             not exists old
-        for g in normalised_unit_grants(access_mode, grants):
-            TeamUnitAccess.created(team: team, unit: g.unit, access_mode: g.access_mode)
+        if access_mode = admin:
+            -- every unit at admin; the external wiki and tracker at read
+            TeamUnitAccess.created(team: team, unit: code, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: issues, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: pull_requests, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: releases, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: wiki, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: external_wiki, access_mode: read)
+            TeamUnitAccess.created(team: team, unit: external_tracker, access_mode: read)
+            TeamUnitAccess.created(team: team, unit: projects, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: packages, access_mode: admin)
+            TeamUnitAccess.created(team: team, unit: actions, access_mode: admin)
+        else:
+            for g in grants:
+                if g.unit in {external_wiki, external_tracker}:
+                    if g.access_mode != none:
+                        TeamUnitAccess.created(team: team, unit: g.unit, access_mode: read)
+                else:
+                    if g.access_mode in {read, write}:
+                        TeamUnitAccess.created(team: team, unit: g.unit, access_mode: g.access_mode)
+                    if g.access_mode in {admin, owner}:
+                        TeamUnitAccess.created(team: team, unit: g.unit, access_mode: write)
     ensures:
         if includes_all_repositories and not was_includes_all:
-            for r in org_repositories(team.organization):
+            for r in repositories/Repositories where r.owner_org = team.organization:
                 if not team_covers(team, r):
                     TeamRepository.created(team: team, repository: r)
     ensures: TeamUpdated(team: team, actor: actor)
@@ -1154,8 +1213,9 @@ rule InviteeDeclinesTeamInvite {
 
 -- from: models/organization/team_invite.go:247
 rule OwnerRevokesTeamInvite {
-    when: OwnerRevokesTeamInvite(actor, invite)
+    when: OwnerRevokesTeamInvite(actor, team, invite)
 
+    requires: invite.team = team
     requires: is_org_owner(invite.organization, actor) or actor.is_admin
 
     ensures: not exists invite
@@ -1264,7 +1324,7 @@ rule OwnerAddsAllRepositoriesToTeam {
     requires: is_org_owner(team.organization, actor) or actor.is_admin
 
     ensures:
-        for r in org_repositories(team.organization):
+        for r in repositories/Repositories where r.owner_org = team.organization:
             if not team_covers(team, r):
                 TeamRepository.created(team: team, repository: r)
                 TeamRepositoryAdded(team: team, repository: r)
@@ -1404,7 +1464,8 @@ invariant TeamRepositoriesBelongToOrganization {
 -- An includes-all team covers every repository of its organization.
 invariant IncludesAllMeansAll {
     for t in Teams where includes_all_repositories = true:
-        org_repositories(t.organization).all(r => r in t.repositories)
+        for r in repositories/Repositories where r.owner_org = t.organization:
+            r in t.repositories
 }
 
 -- External wiki and tracker units can at most be read.
@@ -1453,6 +1514,13 @@ actor OrgOwner {
 actor OrgMember {
     within: Organization
     identified_by: accounts/User where is_org_member(within, this) or is_admin = true
+}
+
+-- An owner of the organization a team belongs to (or a site admin), managing
+-- that team.
+actor TeamOwner {
+    within: Team
+    identified_by: accounts/User where is_org_owner(within.organization, this) or is_admin = true
 }
 
 -- Somebody allowed to open a given team's page.
@@ -1587,7 +1655,7 @@ surface OrganizationMembersArea {
             i.team.name when i.invited_user = member
 
     provides:
-        MemberChangesMembershipVisibility(member, membership, is_public)
+        MemberChangesMembershipVisibility(member, org, membership, is_public)
             when membership.organization = org and (membership.user = member or is_org_owner(org, member))
         MemberLeavesOrganization(member, org)
             when not is_org_owner(org, member) or owner_count(org) > 1
@@ -1680,30 +1748,11 @@ surface OrganizationSettings {
             when org.has_custom_avatar
         OwnerDeletesOrganization(owner, org, confirmation_name)
         OwnerCreatesTeam(owner, org, name, description, access_mode, grants, includes_all_repositories, can_create_org_repo)
-        OwnerEditsTeam(owner, team, name, description, access_mode, grants, includes_all_repositories, can_create_org_repo)
-            when team.organization = org and not team.is_owners_team
-        OwnerEditsOwnersTeamDescription(owner, team, description)
-            when team.organization = org and team.is_owners_team
-        OwnerDeletesTeam(owner, team)
-            when team.organization = org and not team.is_owners_team
         OwnerAddsMemberToOrganization(owner, org, user, teams)
         OwnerRemovesOrgMember(owner, org, user)
-        OwnerAddsTeamMember(owner, team, user)
-            when team.organization = org
-        OwnerInvitesEmailToTeam(owner, team, email)
-            when team.organization = org and mail_service_enabled()
-        OwnerRemovesTeamMember(owner, team, user)
-            when team.organization = org
-        OwnerRevokesTeamInvite(owner, invite)
-            when invite.organization = org
-        OwnerAddsRepositoryToTeam(owner, team, repository)
-            when team.organization = org
-        OwnerRemovesRepositoryFromTeam(owner, team, repository)
-            when team.organization = org and not team.includes_all_repositories
-        OwnerAddsAllRepositoriesToTeam(owner, team)
-            when team.organization = org
-        OwnerRemovesAllRepositoriesFromTeam(owner, team)
-            when team.organization = org and not team.includes_all_repositories
+
+    related:
+        TeamSettings(t) when t.organization = org
 
     @guarantee LastOwnerStays
         -- No operation leaves the Owners team empty: removing, leaving or
@@ -1719,19 +1768,67 @@ surface OrganizationSettings {
 
     @guidance
         -- Web: /org/{org}/settings (options, avatar, delete,
-        -- blocked_users), /org/{org}/teams/new, /org/{org}/teams/{team}/edit,
-        -- /org/{org}/teams/{team}/delete, /org/{org}/members/action/{add,remove},
-        -- /org/{org}/teams/{team}/action/{add,remove,remove_invite,join},
-        -- /org/{org}/teams/{team}/action/repo/{add,remove,addall,removeall}.
+        -- blocked_users), /org/{org}/teams/new, /org/{org}/members/action/{add,remove}.
         -- API: PATCH/DELETE /orgs/{org}, POST /orgs/{org}/rename,
         -- POST/DELETE /orgs/{org}/avatar, DELETE /orgs/{org}/members/{username},
-        -- POST /orgs/{org}/teams, PATCH/DELETE /teams/{id},
-        -- PUT/DELETE /teams/{id}/members/{username},
-        -- GET/DELETE /teams/{id}/invitations/{inviteid},
-        -- PUT/DELETE /teams/{id}/repos/{org}/{repo},
+        -- POST /orgs/{org}/teams.
+        -- Managing one team is TeamSettings.
         -- Settings sub-pages for blocked users (accounts), webhooks, labels,
         -- actions, packages, OAuth2 applications and storage overview belong
         -- to their own modules.
+        -- A non-owner member gets "forbidden"; a non-member gets "not found".
+}
+
+-- Managing one team: only owners of its organization (and site admins).
+surface TeamSettings {
+    facing owner: TeamOwner
+
+    context team: Team
+
+    exposes:
+        team.name
+        team.description
+        team.access_mode
+        team.includes_all_repositories
+        team.can_create_org_repo
+        for i in team.pending_invites:
+            i.email
+            i.expires_at
+        for i in team.expired_invites:
+            i.email
+            i.expires_at
+
+    provides:
+        OwnerEditsTeam(owner, team, name, description, access_mode, grants, includes_all_repositories, can_create_org_repo)
+            when not team.is_owners_team
+        OwnerEditsOwnersTeamDescription(owner, team, description)
+            when team.is_owners_team
+        OwnerDeletesTeam(owner, team)
+            when not team.is_owners_team
+        OwnerAddsTeamMember(owner, team, user)
+        OwnerInvitesEmailToTeam(owner, team, email)
+            when mail_service_enabled()
+        OwnerRemovesTeamMember(owner, team, user)
+        OwnerRevokesTeamInvite(owner, team, invite)
+            when invite.team = team
+        OwnerAddsRepositoryToTeam(owner, team, repository)
+        OwnerRemovesRepositoryFromTeam(owner, team, repository)
+            when not team.includes_all_repositories
+        OwnerAddsAllRepositoriesToTeam(owner, team)
+        OwnerRemovesAllRepositoriesFromTeam(owner, team)
+            when not team.includes_all_repositories
+
+    @guarantee OwnersTeamIsPermanent
+        -- The Owners team cannot be deleted, renamed, narrowed below owner
+        -- access, or detached from any repository.
+
+    @guidance
+        -- Web: /org/{org}/teams/{team}/edit, /org/{org}/teams/{team}/delete,
+        -- /org/{org}/teams/{team}/action/{add,remove,remove_invite},
+        -- /org/{org}/teams/{team}/action/repo/{add,remove,addall,removeall}.
+        -- API: PATCH/DELETE /teams/{id}, PUT/DELETE /teams/{id}/members/{username},
+        -- GET/DELETE /teams/{id}/invitations/{inviteid},
+        -- PUT/DELETE /teams/{id}/repos/{org}/{repo}.
         -- A non-owner member gets "forbidden"; a non-member gets "not found".
 }
 
@@ -1847,7 +1944,6 @@ open question "Expired invitations are never cleaned up automatically; they stay
 --   organization_visible_to(org, user) -- org.is_visible_to(user); anonymous: org.is_public
 --                                      -- (same as access/can_see_organization(viewer, org))
 --   owner_count(org)                   -- org.owner_count
---   is_on_any_team(org, user)          -- some TeamMembership{organization: org, user: user} exists
 --   belongs_to_organizations(user)     -- some OrgMembership{user: user} exists
 --   shares_organization(a, b)          -- a and b are members of a common org, or one is that org
 --   can_read_unit(user, org, unit) / can_write_unit(user, org, unit)
@@ -1868,9 +1964,7 @@ open question "Expired invitations are never cleaned up automatically; they stay
 --   owner_name_claimable(name, org)  -- not within accounts' USERNAME_COOLDOWN_PERIOD of another owner's release
 --   owned_repository_count(org)      -- repositories with owner_org = org
 --   owned_package_count(org)         -- packages owned by org
---   org_repositories(org)            -- repositories with owner_org = org
---   owner_unit_grants()              -- every UnitKind at owner, external wiki/tracker at read
---   normalised_unit_grants(mode, grants), team_mode_for(mode, grants)  -- see OwnerCreatesTeam guidance;
+--   team_mode_for(mode, grants)      -- see OwnerCreatesTeam guidance;
 --                                      -- `grants` is a set of {unit: repositories/UnitKind,
 --                                      -- access_mode: access/AccessMode} pairs (API units_map)
 --   new_invite_token()               -- unguessable, unique

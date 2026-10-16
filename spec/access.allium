@@ -913,13 +913,18 @@ rule AnnounceLostAccess {
 }
 
 -- Full recalculation for one repository: every user who holds or held an
--- explicit grant.
+-- explicit grant (a collaborator, a member of a team covering it, or anybody
+-- with an index row).
 -- from: models/perm/access/access.go:285
 rule RecalculateWholeRepository {
     when: RecalculateRepositoryAccess(repository)
     ensures:
-        for user in explicit_grantees(repository):
-            RecalculateUserRepositoryAccess(repository: repository, user: user)
+        for c in repository.collaborations:
+            RecalculateUserRepositoryAccess(repository: repository, user: c.user)
+    ensures:
+        for link in organizations/TeamRepositories where link.repository = repository:
+            for m in link.team.memberships:
+                RecalculateUserRepositoryAccess(repository: repository, user: m.user)
     ensures:
         for stale in RepoAccesses where repository = repository:
             RecalculateUserRepositoryAccess(repository: repository, user: stale.user)
@@ -937,44 +942,44 @@ rule RecalculateUserAcrossRepositories {
 
 -- from: modules/repository/collaborator.go:44
 rule RecalculateOnCollaboratorAdded {
-    when: repositories/CollaboratorAdded(repository, user, _)
+    when: repositories/CollaboratorAdded(repository, user, doer)
     ensures: RecalculateUserRepositoryAccess(repository: repository, user: user)
 }
 
 -- from: modules/repository/collaborator.go:80
 rule RecalculateOnCollaboratorAccessChanged {
-    when: repositories/CollaboratorAccessChanged(repository, user, _)
+    when: repositories/CollaboratorAccessChanged(repository, user, doer)
     ensures: RecalculateUserRepositoryAccess(repository: repository, user: user)
 }
 
 -- from: modules/repository/collaborator.go:106
 rule RecalculateOnCollaboratorRemoved {
-    when: repositories/CollaboratorRemoved(repository, user, _)
+    when: repositories/CollaboratorRemoved(repository, user, doer)
     ensures: RecalculateUserRepositoryAccess(repository: repository, user: user)
 }
 
 -- New organization repositories are picked up by includes-all teams.
 -- from: modules/repository/create.go:151
 rule RecalculateOnRepositoryCreated {
-    when: repositories/RepositoryCreated(repository, _)
+    when: repositories/RepositoryCreated(repository, doer)
     ensures: RecalculateRepositoryAccess(repository: repository)
 }
 
 -- from: services/repository/transfer.go:192
 rule RecalculateOnRepositoryTransferred {
-    when: repositories/RepositoryTransferred(repository, _, _)
+    when: repositories/RepositoryTransferred(repository, doer, old_owner_name)
     ensures: RecalculateRepositoryAccess(repository: repository)
 }
 
 -- from: modules/repository/create.go:262
 rule RecalculateOnVisibilityChanged {
-    when: repositories/RepositoryVisibilityChanged(repository, _)
+    when: repositories/RepositoryVisibilityChanged(repository, doer)
     ensures: RecalculateRepositoryAccess(repository: repository)
 }
 
 -- from: services/repository/delete.go:440
 rule DropAccessOnRepositoryDeleted {
-    when: repositories/RepositoryDeleted(repository, _)
+    when: repositories/RepositoryDeleted(repository, doer)
     ensures:
         for row in RepoAccesses where repository = repository:
             not exists row
@@ -983,13 +988,17 @@ rule DropAccessOnRepositoryDeleted {
 -- from: models/org_team.go:431
 rule RecalculateOnTeamMemberAdded {
     when: organizations/TeamMemberAdded(team, user)
-    ensures: RecalculateUserAccessForRepositories(user: user, repositories: team_repositories(team))
+    ensures:
+        for link in team.repository_links:
+            RecalculateUserRepositoryAccess(repository: link.repository, user: user)
 }
 
 -- from: models/org_team.go:494
 rule RecalculateOnTeamMemberRemoved {
     when: organizations/TeamMemberRemoved(team, user)
-    ensures: RecalculateUserAccessForRepositories(user: user, repositories: team_repositories(team))
+    ensures:
+        for link in team.repository_links:
+            RecalculateUserRepositoryAccess(repository: link.repository, user: user)
 }
 
 -- from: models/org_team.go:49
@@ -1009,7 +1018,7 @@ rule RecalculateOnTeamRepositoryRemoved {
 rule RecalculateOnTeamAccessChanged {
     when: organizations/TeamAccessChanged(team)
     ensures:
-        for repository in organization_repositories(team.organization):
+        for repository in repositories/Repositories where repository.owner_org = team.organization:
             RecalculateRepositoryAccess(repository: repository)
 }
 
@@ -1017,7 +1026,7 @@ rule RecalculateOnTeamAccessChanged {
 rule RecalculateOnTeamDeleted {
     when: organizations/TeamDeleted(team)
     ensures:
-        for repository in organization_repositories(team.organization):
+        for repository in repositories/Repositories where repository.owner_org = team.organization:
             RecalculateRepositoryAccess(repository: repository)
 }
 
@@ -1036,9 +1045,9 @@ rule RecalculateOnUserRestrictionChanged {
 -- (in)visible to non-collaborators; announce lost access where it applies.
 -- from: models/organization/org.go:475
 rule RecalculateOnOwnerVisibilityChanged {
-    when: accounts/UserVisibilityChanged(user, _, _)
+    when: accounts/UserVisibilityChanged(user, old_visibility, new_visibility)
     ensures:
-        for repository in owned_repositories(user):
+        for repository in repositories/Repositories where repository.owner_user = user:
             RecalculateRepositoryAccess(repository: repository)
 }
 
@@ -1046,13 +1055,13 @@ rule RecalculateOnOwnerVisibilityChanged {
 rule RecalculateOnOrganizationVisibilityChanged {
     when: organizations/OrganizationVisibilityChanged(organization)
     ensures:
-        for repository in organization_repositories(organization):
+        for repository in repositories/Repositories where repository.owner_org = organization:
             RecalculateRepositoryAccess(repository: repository)
 }
 
 -- from: services/user/delete.go:106
 rule DropAccessOnUserDeleted {
-    when: accounts/UserAccountDeleted(user, _, _)
+    when: accounts/UserAccountDeleted(user, purge, delete_contributions)
     ensures:
         for row in RepoAccesses where user = user:
             not exists row
@@ -1142,7 +1151,7 @@ invariant RestrictedUsersOnlyThroughExplicitGrants {
 
 -- Anyone reaching the forge, signed in or not: the party behind one request.
 actor Visitor {
-    identified_by: RequestParty where channel != null
+    identified_by: RequestParty
 }
 
 -- Anyone signed in with a usable account (active, login not prohibited).
@@ -1550,5 +1559,3 @@ open question "Visibility of repositories after a repository is made private: fo
 -- REQUEST authentication: derive access/CredentialRestriction from authentication/AccessToken (all_repositories and not public_only -> all_repositories; public_only -> public_only; not all_repositories -> listed_repositories with `repositories`) and likewise from AuthorizedIntegration; scope-category checks stay in authentication (table column "scope").
 -- REQUEST actions: Task reaches its repository as task.job.run.repository; access treats status = running as the token being usable.
 -- REQUEST pulls/PullRequest.allow_maintainer_edit: Boolean; branch-scoped write delegation (table C1).
--- REQUEST organizations: owned black boxes organization_repositories(organization) and team_repositories(team) (includes-all teams cover every organization repository).
--- REQUEST accounts: owned black box owned_repositories(user) (repositories owned by a user) - or repositories provides it.

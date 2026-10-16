@@ -83,6 +83,7 @@ journey OldNameIsReservedDuringCooldown {
     2. a month passes and the name is free
         after 31.days
         stipulate old.in_cooldown = false
+        stipulate same_name("bob", "ada") = false
         bob does UserRenamesSelf(bob, "ada") on OwnProfileSettings
         then bob.name = "ada"
 
@@ -384,4 +385,44 @@ journey AnOrganizationBlocksATroll {
         then block.blocker_organization = org
 
     ends: The organization's block stands; repositories it owns now refuse Bob.
+}
+
+-- Somebody whose work was migrated in as a placeholder claims it by signing in
+-- through the matching OAuth2 source. authentication recognises the placeholder
+-- and says so; accounts turns it into a real account.
+journey AMigratedAuthorClaimsTheirPlaceholder {
+    goal: Mia's issues were imported from another forge under a placeholder
+          account. The first time she signs in through that forge, the
+          placeholder becomes her account, with her address confirmed.
+
+    cast:
+        mia:   User
+        forge: authentication/AuthSource
+        s:     authentication/Session
+        ident: authentication/ExternalIdentity
+
+    given:
+        mia.name = "mia"
+        mia.kind = remote
+        mia.primary_email = ""
+        mia.prohibit_login = true
+        mia.is_active = true
+        forge.name = "forge"
+        forge.kind = oauth2
+        forge.is_active = true
+        s.status = anonymous
+        ident.source = forge
+        ident.external_id = "42"
+        ident.email = "mia@example.org"
+
+    1. she comes back from the forge's sign-in page
+        stipulate remote_placeholder_for(forge, "42") = mia
+        forge does ProviderReturnsIdentity(s, ident) on IdentityProviderCallback
+        then ProviderIdentityClaimsRemotePlaceholder fires
+        then PromoteRemoteUser fires
+        then mia.kind = individual
+        then mia.primary_email = "mia@example.org"
+        then mia.prohibit_login = false
+
+    ends: The placeholder is Mia's account and she may sign in with it.
 }
