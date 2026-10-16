@@ -2,9 +2,10 @@
 -- quota.allium — storage quotas: rules, groups, who they govern, and which storage-consuming operations they refuse.
 --
 -- Feature switch: [quota] ENABLED (config.enabled, default off) removes every
---   quota surface (admin API, user/org usage API and storage overview pages)
---   and makes quota_allows always true; the management rules below are only
---   reachable through those surfaces.
+--   quota surface (admin API, user/org usage API and storage overview pages:
+--   their exposures are guarded by it) and admits every storage-growing
+--   operation; every management rule below requires it. Login-source sync of
+--   quota groups is not switched: Forgejo records memberships either way.
 -- Scope: Instance-wide storage quota for users and organizations ("quota holders").
 --   An administrator defines quota rules (a byte limit over a set of storage
 --   subjects), bundles them into quota groups, and assigns holders to groups
@@ -317,7 +318,7 @@ default QuotaGate gate_artifact_upload = { operation: upload_actions_artifact, s
 -- from: models/quota/quota.go:20
 rule StorageConsumptionGated {
     when: StorageConsumptionRequested(requester, account, subject, operation)
-    requires: quota_allows(account, subject)
+    requires: not config.enabled or quota_allows(account, subject)
     ensures: StorageConsumptionAdmitted(account: account, subject: subject, operation: operation)
     @guidance
         -- Enforcement points (web, API, git, LFS, package registry, Actions
@@ -340,6 +341,7 @@ rule StorageConsumptionGated {
 rule AdminCreatesQuotaRule {
     when: AdminCreatesQuotaRule(admin, name, limit, subjects)
     requires: admin.is_admin
+    requires: config.enabled
     requires: name != ""
     requires: limit != null
     requires: limit >= -1
@@ -353,6 +355,7 @@ rule AdminCreatesQuotaRule {
 rule AdminEditsQuotaRule {
     when: AdminEditsQuotaRule(admin, rule, new_limit, new_subjects)
     requires: admin.is_admin
+    requires: config.enabled
     requires: new_limit = null or new_limit >= -1
     ensures:
         if new_limit != null:
@@ -366,6 +369,7 @@ rule AdminEditsQuotaRule {
 rule AdminDeletesQuotaRule {
     when: AdminDeletesQuotaRule(admin, rule)
     requires: admin.is_admin
+    requires: config.enabled
     let links = rule.group_links
     ensures:
         for l in links:
@@ -383,6 +387,7 @@ rule AdminDeletesQuotaRule {
 rule AdminCreatesQuotaGroup {
     when: AdminCreatesQuotaGroup(admin, name, rule_specs)
     requires: admin.is_admin
+    requires: config.enabled
     requires: name != ""
     requires: not exists QuotaGroup{name: name}
     ensures:
@@ -400,6 +405,7 @@ rule AdminCreatesQuotaGroup {
 rule AdminDeletesQuotaGroup {
     when: AdminDeletesQuotaGroup(admin, group)
     requires: admin.is_admin
+    requires: config.enabled
     let links = group.rule_links
     let members = group.memberships
     ensures:
@@ -416,6 +422,7 @@ rule AdminDeletesQuotaGroup {
 rule AdminAddsRuleToQuotaGroup {
     when: AdminAddsRuleToQuotaGroup(admin, group, rule)
     requires: admin.is_admin
+    requires: config.enabled
     requires: not exists QuotaGroupRule{group: group, rule: rule}
     ensures: QuotaGroupRule.created(group: group, rule: rule)
 }
@@ -424,6 +431,7 @@ rule AdminAddsRuleToQuotaGroup {
 rule AdminRemovesRuleFromQuotaGroup {
     when: AdminRemovesRuleFromQuotaGroup(admin, group, rule)
     requires: admin.is_admin
+    requires: config.enabled
     requires: exists QuotaGroupRule{group: group, rule: rule}
     ensures: not exists QuotaGroupRule{group: group, rule: rule}
 }
@@ -434,6 +442,7 @@ rule AdminRemovesRuleFromQuotaGroup {
 rule AdminAddsHolderToQuotaGroup {
     when: AdminAddsHolderToQuotaGroup(admin, group, account)
     requires: admin.is_admin
+    requires: config.enabled
     requires: not exists QuotaGroupMembership{group: group, account: account}
     ensures: QuotaGroupMembership.created(group: group, account: account, origin: admin_assigned)
     ensures: QuotaGroupsChanged(account: account)
@@ -443,6 +452,7 @@ rule AdminAddsHolderToQuotaGroup {
 rule AdminRemovesHolderFromQuotaGroup {
     when: AdminRemovesHolderFromQuotaGroup(admin, group, account)
     requires: admin.is_admin
+    requires: config.enabled
     requires: exists QuotaGroupMembership{group: group, account: account}
     ensures: not exists QuotaGroupMembership{group: group, account: account}
     ensures: QuotaGroupsChanged(account: account)
@@ -454,6 +464,7 @@ rule AdminRemovesHolderFromQuotaGroup {
 rule AdminSetsHolderQuotaGroups {
     when: AdminSetsHolderQuotaGroups(admin, account, groups)
     requires: admin.is_admin
+    requires: config.enabled
     let previous = account.memberships
     ensures:
         for m in previous:
@@ -554,31 +565,31 @@ surface QuotaAdministration {
 
     exposes:
         for r in QuotaRules:
-            r.name
-            r.limit
-            r.subjects
+            r.name when config.enabled
+            r.limit when config.enabled
+            r.subjects when config.enabled
         for g in QuotaGroups:
-            g.name
+            g.name when config.enabled
             for l in g.rule_links:
-                l.rule.name
+                l.rule.name when config.enabled
             for m in g.memberships:
-                m.account.user.name
-                m.account.organization.name
+                m.account.user.name when config.enabled
+                m.account.organization.name when config.enabled
         for a in QuotaAccounts:
-            a.usage
-            a.memberships
+            a.usage when config.enabled
+            a.memberships when config.enabled
 
     provides:
-        AdminCreatesQuotaRule(admin, name, limit, subjects) when config.enabled
-        AdminEditsQuotaRule(admin, rule, new_limit, new_subjects) when config.enabled
-        AdminDeletesQuotaRule(admin, rule) when config.enabled
-        AdminCreatesQuotaGroup(admin, name, rule_specs) when config.enabled
-        AdminDeletesQuotaGroup(admin, group) when config.enabled
-        AdminAddsRuleToQuotaGroup(admin, group, rule) when config.enabled
-        AdminRemovesRuleFromQuotaGroup(admin, group, rule) when config.enabled
-        AdminAddsHolderToQuotaGroup(admin, group, account) when config.enabled
-        AdminRemovesHolderFromQuotaGroup(admin, group, account) when config.enabled
-        AdminSetsHolderQuotaGroups(admin, account, groups) when config.enabled
+        AdminCreatesQuotaRule(admin, name, limit, subjects)
+        AdminEditsQuotaRule(admin, rule, new_limit, new_subjects)
+        AdminDeletesQuotaRule(admin, rule)
+        AdminCreatesQuotaGroup(admin, name, rule_specs)
+        AdminDeletesQuotaGroup(admin, group)
+        AdminAddsRuleToQuotaGroup(admin, group, rule)
+        AdminRemovesRuleFromQuotaGroup(admin, group, rule)
+        AdminAddsHolderToQuotaGroup(admin, group, account)
+        AdminRemovesHolderFromQuotaGroup(admin, group, account)
+        AdminSetsHolderQuotaGroups(admin, account, groups)
 
     @guidance
         -- API only (no admin web UI). Endpoints:
@@ -600,19 +611,19 @@ surface OwnStorageOverview {
     context account: QuotaAccount where user = viewer
 
     exposes:
-        account.usage.repos_public
-        account.usage.repos_private
-        account.usage.git_lfs
-        account.usage.attachments_issues
-        account.usage.attachments_releases
-        account.usage.artifacts
-        account.usage.packages
-        account.usage.all
-        quota_allows(account, subject)
+        account.usage.repos_public when config.enabled
+        account.usage.repos_private when config.enabled
+        account.usage.git_lfs when config.enabled
+        account.usage.attachments_issues when config.enabled
+        account.usage.attachments_releases when config.enabled
+        account.usage.artifacts when config.enabled
+        account.usage.packages when config.enabled
+        account.usage.all when config.enabled
+        quota_allows(account, subject) when config.enabled
         for m in account.memberships:
             for l in m.group.rule_links:
-                l.rule.limit
-                l.rule.subjects
+                l.rule.limit when config.enabled
+                l.rule.subjects when config.enabled
 
     @guarantee EffectiveGroupsShown
         -- The overview shows the groups that actually govern the holder: the
@@ -635,15 +646,15 @@ surface OrganizationStorageOverview {
     context account: QuotaAccount where organization != null and is_org_owner(organization, owner)
 
     exposes:
-        account.usage.repos_public
-        account.usage.repos_private
-        account.usage.git_lfs
-        account.usage.attachments_issues
-        account.usage.attachments_releases
-        account.usage.artifacts
-        account.usage.packages
-        account.usage.all
-        quota_allows(account, subject)
+        account.usage.repos_public when config.enabled
+        account.usage.repos_private when config.enabled
+        account.usage.git_lfs when config.enabled
+        account.usage.attachments_issues when config.enabled
+        account.usage.attachments_releases when config.enabled
+        account.usage.artifacts when config.enabled
+        account.usage.packages when config.enabled
+        account.usage.all when config.enabled
+        quota_allows(account, subject) when config.enabled
 
     @guidance
         -- Web: /org/{org}/settings/storage_overview.

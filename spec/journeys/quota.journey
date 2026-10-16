@@ -1,4 +1,7 @@
 -- Journeys through storage quota: administration, the gate, self-service.
+--
+-- Quota is off by default ([quota] ENABLED); these journeys run on an instance
+-- that turned it on, except the last two, which show what turning it off means.
 
 world {
     cast:
@@ -7,10 +10,16 @@ world {
         bob:   accounts/User
         acct:  QuotaAccount
     given:
+        quota/config.enabled = true
         root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
         ada.is_admin = false
         ada.is_active = true
+        ada.prohibit_login = false
         bob.is_admin = false
+        bob.is_active = true
+        bob.prohibit_login = false
         acct.user = ada
         acct.organization = null
 }
@@ -106,7 +115,6 @@ journey DeletingARuleDetachesIt {
     after: AnAdminSetsUpAFreeTier
 
     1. she deletes the rule
-        stipulate rule.group_links = {link}
         root does AdminDeletesQuotaRule(root, rule) on QuotaAdministration
         then AdminDeletesQuotaRule fires
         then link does not exist
@@ -126,7 +134,6 @@ journey AnAdminReplacesAdasGroups {
             creating supporter: QuotaGroup
 
     2. she replaces Ada's groups
-        stipulate acct.memberships = {membership}
         root does AdminSetsHolderQuotaGroups(root, acct, {supporter}) on QuotaAdministration
         then AdminSetsHolderQuotaGroups fires
         then membership does not exist
@@ -161,6 +168,9 @@ journey SignInGrantsAQuotaGroup {
         stipulate login.has_second_factor = false
         stipulate quota_groups_mapped_from(source, {"sponsors"}) = {supporter}
         stipulate quota_groups_mapped_from_unclaimed(source, {"sponsors"}) = {}
+        stipulate teams_mapped_from(source, {"sponsors"}) = {}
+        stipulate teams_unmapped_from(source, ada, {"sponsors"}) = {}
+        stipulate is_numeric_id("ada-sub") = false
         s does VisitorLinksPendingIdentityBySignIn(s, ada, "correct horse battery", false) on SignInPage
             creating granted: QuotaGroupMembership
         then VisitorLinksPendingIdentityBySignIn fires
@@ -169,4 +179,36 @@ journey SignInGrantsAQuotaGroup {
         then granted.group = supporter
 
     ends: Ada is in the supporter group because her identity provider says so.
+}
+
+journey WithQuotaOffThereIsNothingToManage {
+    goal: On an instance that never turned quota on, the site admin finds no
+          quota administration: creating a rule is refused.
+
+    given:
+        quota/config.enabled = false
+
+    1. she tries to define a rule
+        root cannot do AdminCreatesQuotaRule(root, "repos-1g", 1_073_741_824, {size_repos_all}) on QuotaAdministration
+        then AdminCreatesQuotaRule does not fire
+
+    ends: No rule exists; quota is not something this instance does.
+}
+
+journey WithQuotaOffNothingIsGated {
+    goal: With quota off, Ada's push is admitted even though her usage would
+          be over any limit, and she has no storage overview to look at.
+
+    given:
+        quota/config.enabled = false
+
+    1. the push asks the gate and goes through
+        stipulate quota_allows(acct, size_repos_all) = false
+        ada does StorageConsumptionRequested(ada, acct, size_repos_all, git_push) on QuotaGateReference
+        then StorageConsumptionGated fires
+
+    2. there is no storage overview
+        ada cannot see acct.usage.all on OwnStorageOverview in acct
+
+    ends: Nothing is measured against a limit while quota is off.
 }

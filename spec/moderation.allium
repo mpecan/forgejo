@@ -2,8 +2,10 @@
 -- moderation.allium — abuse reports, the evidence preserved for them, and what site admins do about them.
 --
 -- Feature switch: [moderation] ENABLED (config.enabled, default off) removes
---   every surface of this module (report entries and form, admin queue) and
---   the purge task; the rules below are reachable only through those surfaces.
+--   every surface of this module (report entries and form, admin queue; their
+--   exposures are guarded by it) and the purge task. Reporting, every
+--   moderation action and the purge require it. Evidence capture does not:
+--   Forgejo snapshots a reported item whenever reports on it lack a copy.
 -- Scope: Signed-in users report abusive content (a user or organization
 --   profile, a repository, an issue or pull request, a comment) under a
 --   category with remarks. Reports on the same item are grouped; the item's
@@ -256,6 +258,7 @@ config {
 -- from: routers/web/moderation/report.go:76
 rule UserReportsContent {
     when: UserReportsContent(reporter, content, category, remarks)
+    requires: config.enabled
     requires: not reporter.prohibit_login
     requires: not content.is_deleted
     requires: remarks_length(remarks) >= config.remarks_min_length
@@ -273,7 +276,8 @@ rule UserReportsContent {
         category: category,
         remarks: remarks,                 -- stored trimmed
         created_at: now,
-        status: open
+        status: open,
+        shadow_copy: null                 -- evidence waits for the first edit or deletion
     )
     ensures: AbuseReported(content: content, reporter: reporter, category: category)
 }
@@ -328,6 +332,7 @@ rule ReportedContentDeleted {
 rule AdminResolvesReports {
     when: AdminResolvesReports(admin, content, resolution)
     let pending = content.open_reports
+    requires: config.enabled
     requires: admin.is_admin
     requires: resolution != none
     requires: pending.count > 0
@@ -364,6 +369,7 @@ rule AdminSuspendsReportedAccount {
     when: AdminSuspendsReportedAccount(admin, content, resolution)
     let target = content.reported_user
     let pending = content.open_reports
+    requires: config.enabled
     requires: admin.is_admin
     requires: content.kind = user
     requires: not content.is_deleted
@@ -385,6 +391,7 @@ rule AdminDeletesReportedAccount {
     when: AdminDeletesReportedAccount(admin, content, resolution)
     let target = content.reported_user
     let pending = content.open_reports
+    requires: config.enabled
     requires: admin.is_admin
     requires: content.kind = user
     requires: not content.is_deleted
@@ -404,6 +411,7 @@ rule AdminDeletesReportedOrganization {
     when: AdminDeletesReportedOrganization(admin, content, resolution)
     let target = content.reported_organization
     let pending = content.open_reports
+    requires: config.enabled
     requires: admin.is_admin
     requires: content.kind = organization
     requires: not content.is_deleted
@@ -420,6 +428,7 @@ rule AdminDeletesReportedRepository {
     when: AdminDeletesReportedRepository(admin, content, resolution)
     let target = content.reported_repository
     let pending = content.open_reports
+    requires: config.enabled
     requires: admin.is_admin
     requires: content.kind = repository
     requires: not content.is_deleted
@@ -436,6 +445,7 @@ rule AdminDeletesReportedIssue {
     when: AdminDeletesReportedIssue(admin, content, resolution)
     let target = content.reported_issue
     let pending = content.open_reports
+    requires: config.enabled
     requires: admin.is_admin
     requires: content.kind = issue
     requires: not content.is_deleted
@@ -452,6 +462,7 @@ rule AdminDeletesReportedComment {
     when: AdminDeletesReportedComment(admin, content, resolution)
     let target = content.reported_comment
     let pending = content.open_reports
+    requires: config.enabled
     requires: admin.is_admin
     requires: content.kind = comment
     requires: not content.is_deleted
@@ -466,12 +477,14 @@ rule AdminDeletesReportedComment {
 -- ---- Retention ----------------------------------------------------------
 
 -- Daily (by default) purge of reports resolved longer ago than the retention
--- period; a retention of zero or less keeps resolved reports forever. In
--- Forgejo the cron task carrying this is registered only when moderation is
--- enabled and is itself disabled by default (see open question).
+-- period; a retention of zero or less keeps resolved reports forever. The
+-- cron task carrying this is registered only when moderation is enabled and
+-- is itself disabled by default (config.purge_task_enabled; see open question).
 -- from: services/moderation/reporting.go:135
 rule PurgeResolvedReport {
     when: report: AbuseReport.resolved_at + config.keep_resolved_reports_for <= now
+    requires: config.enabled
+    requires: config.purge_task_enabled
     requires: config.keep_resolved_reports_for > 0.days
     requires: report.status = handled or report.status = ignored
     ensures: ResolvedReportRemoved(report: report)
@@ -482,6 +495,7 @@ rule PurgeResolvedReport {
 -- from: services/cron/tasks_extended.go (remove_resolved_reports)
 rule ScheduledResolvedReportRemoval {
     when: administration/ResolvedReportRemovalDue(keep_for)
+    requires: config.enabled
     requires: keep_for > 0.days
     ensures:
         for report in AbuseReports where status in {handled, ignored} and resolved_at + keep_for <= now:
@@ -542,13 +556,13 @@ surface ReportAbuse {
     context content: ReportableContent
 
     exposes:
-        content.kind
-        content.reference
-        content.has_open_report_from(reporter)
+        content.kind when config.enabled
+        content.reference when config.enabled
+        content.has_open_report_from(reporter) when config.enabled
 
     provides:
         UserReportsContent(reporter, content, category, remarks)
-            when config.enabled and not content.has_open_report_from(reporter)
+            when not content.has_open_report_from(reporter)
 
     @guarantee ReportersSeeNoOneElsesReports
         -- A reporter learns only whether they themself already have an open
@@ -573,36 +587,36 @@ surface ModerationQueue {
     context content: ReportableContent where is_in_queue
 
     exposes:
-        content.kind
-        content.reference
-        content.is_deleted
-        content.poster
-        content.times_reported
+        content.kind when config.enabled
+        content.reference when config.enabled
+        content.is_deleted when config.enabled
+        content.poster when config.enabled
+        content.times_reported when config.enabled
         for r in content.open_reports:
-            r.reporter.name
-            r.category
-            r.remarks
-            r.created_at
-            r.shadow_copy.captured_at
-            r.shadow_copy.user_snapshot
-            r.shadow_copy.repository_snapshot
-            r.shadow_copy.issue_snapshot
-            r.shadow_copy.comment_snapshot
+            r.reporter.name when config.enabled
+            r.category when config.enabled
+            r.remarks when config.enabled
+            r.created_at when config.enabled
+            r.shadow_copy.captured_at when config.enabled
+            r.shadow_copy.user_snapshot when config.enabled
+            r.shadow_copy.repository_snapshot when config.enabled
+            r.shadow_copy.issue_snapshot when config.enabled
+            r.shadow_copy.comment_snapshot when config.enabled
 
     provides:
-        AdminResolvesReports(admin, content, resolution) when config.enabled
+        AdminResolvesReports(admin, content, resolution)
         AdminSuspendsReportedAccount(admin, content, resolution)
-            when config.enabled and content.kind = user and not content.is_deleted
+            when content.kind = user and not content.is_deleted
         AdminDeletesReportedAccount(admin, content, resolution)
-            when config.enabled and content.kind = user and not content.is_deleted
+            when content.kind = user and not content.is_deleted
         AdminDeletesReportedOrganization(admin, content, resolution)
-            when config.enabled and content.kind = organization and not content.is_deleted
+            when content.kind = organization and not content.is_deleted
         AdminDeletesReportedRepository(admin, content, resolution)
-            when config.enabled and content.kind = repository and not content.is_deleted
+            when content.kind = repository and not content.is_deleted
         AdminDeletesReportedIssue(admin, content, resolution)
-            when config.enabled and content.kind = issue and not content.is_deleted
+            when content.kind = issue and not content.is_deleted
         AdminDeletesReportedComment(admin, content, resolution)
-            when config.enabled and content.kind = comment and not content.is_deleted
+            when content.kind = comment and not content.is_deleted
 
     @guarantee OneRowPerItem
         -- The queue lists each item with open reports once, oldest first,
@@ -661,7 +675,7 @@ open question "Duplicate reports by the same reporter on the same open item are 
 open question "Organizations get no shadow copy before deletion (only user deletion snapshots). Should org deletion preserve evidence too?"
 open question "There is no notification to admins when a report arrives and no API. Should a rebuild add either?"
 open question "Should reporters be told when their report is resolved?"
-open question "Forgejo ships the purge task disabled ([cron.remove_resolved_reports] ENABLED=false), so resolved reports and their evidence are kept forever unless an admin turns it on. The spec purges after keep_resolved_reports_for; should a rebuild keep the separate task switch?"
+open question "Forgejo ships the purge task disabled ([cron.remove_resolved_reports] ENABLED=false), so resolved reports and their evidence are kept forever unless an admin turns it on. The spec keeps that switch (config.purge_task_enabled); should a rebuild purge by default instead?"
 
 -- Requests to other modules
 -- REQUEST accounts/User: raise moderation/ReportableContentChanging(content, update) before changing any of name, full_name, email (incl. primary-email switch), login_name, location, website, pronouns, description, avatar, avatar_email; and (content, deletion) before deleting a user.

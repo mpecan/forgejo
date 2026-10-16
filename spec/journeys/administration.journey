@@ -181,6 +181,7 @@ journey TheMirrorTaskRunsOnItsSchedule {
 
     1. the instance starts and schedules it
         stipulate time_until_next("@every 10m") = 10.minutes
+        stipulate authentication/config.oauth2_default_applications = {git_credential_oauth, git_credential_manager, tea}
         proc does InstanceStarted(site) on BackgroundWorkReporting
         then ScheduleTasksAtStart fires
         then StartCronTaskRun does not fire
@@ -380,9 +381,9 @@ journey AdministratorTurnsOffGravatarWithoutARestart {
 
 -- Adopting a repository directory that has no record.
 journey AdministratorAdoptsAStrayRepository {
-    goal: A repository directory was copied into ada's folder by hand. Root
-          finds it among the unadopted repositories and adopts it; it becomes a
-          private repository of ada's.
+    goal: An empty repository directory (git init --bare, no commits yet) was
+          made in ada's folder by hand. Root finds it among the unadopted
+          repositories and adopts it; it becomes a repository of ada's.
 
     given:
         stray: repositories/UnadoptedRepository { owner_name: "ada", name: "old-notes" }
@@ -391,11 +392,40 @@ journey AdministratorAdoptsAStrayRepository {
         root sees stray.name on UnadoptedRepositories in stray
 
     2. root adopts it
+        stipulate storage_is_empty(stray) = true
+        stipulate repositories/config.default_repo_units = {code, issues, pull_requests, releases, wiki, projects, packages, actions}
+        stipulate repositories/config.disabled_repo_units = {}
         root does UserAdoptsRepository(root, stray, ada) on RepositoryAdministration
         then UserAdoptsRepository fires
         then stray does not exist
 
-    ends: ada owns a private repository "old-notes".
+    ends: ada owns a repository "old-notes", private or public as the instance defaults say.
+}
+
+-- Deleting someone else's repository from the admin list.
+journey AdministratorDeletesARepository {
+    goal: Ada's repository breaks the instance's terms. Root deletes it from
+          the admin repository list; repositories carries out the same cascade
+          an owner's deletion would. Ada, not an administrator, cannot use the
+          admin list to do the same.
+
+    cast:
+        notes: repositories/Repository
+
+    given:
+        notes.name = "notes"
+        notes.owner_user = ada
+        notes.owner_org = null
+
+    1. ada cannot use the admin list
+        ada cannot do AdminDeletesRepository(ada, notes) on AdminRepositoryDirectory
+
+    2. root deletes it
+        root does AdminDeletesRepository(root, notes) on AdminRepositoryDirectory
+        then AdminDeletesRepository fires
+        then notes does not exist
+
+    ends: The repository is gone, deleted by the administrator.
 }
 
 -- The health endpoint.

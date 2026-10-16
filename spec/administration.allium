@@ -114,9 +114,11 @@
 --   UserTwoFactorResetByAdmin(admin, user)              -> authentication
 --   UserPasswordSetByAdmin(admin, user, password) / UserPasswordSetByOperator(operator, user, password) -> authentication (hash + store)
 --   UserAvatarChangedByAdmin(admin, user) / UserAvatarRemovedByAdmin(admin, user)
---   repositories/OwnerDeletesRepository(user, repository)  -> admin deletion handed to repositories (full cascade)
+--   RepositoryDeletionRequestedByAdmin(admin, repository)  -> repositories (the OwnerDeletesRepository
+--                                                       -- cascade, ending in RepositoryDeleted)
 --   OrganizationCreatedForUserByAdmin(admin, user, name, visibility)  -> organizations (creates it)
---   repositories/UserCreatesRepository(user, name, ...)   -> admin creation handed to repositories
+--   RepositoryCreationRequestedByAdmin(admin, user, name)  -> repositories (creates it with the
+--                                                       -- instance defaults; no creation limit)
 --   SshKeyAddedForUserByAdmin / SshKeyRemovedForUserByAdmin -> keys
 --   AccessTokenRequestedForUser(requester, user, token_name, scopes) -> authentication
 --   TestMailRequested(admin, address)                   -> notifications
@@ -134,6 +136,9 @@
 --   SystemFailureReported(kind, description)  -- any module reporting a background
 --                                             -- failure (e.g. file removal failed,
 --                                             -- repository deletion left files behind)
+--   migrations/MigrationFailureReported(kind, description)
+--                                             -- a failed import, or source data an import
+--                                             -- had to drop, worth an operator's attention
 --   CronWorkCompleted(task, outcome, message) -- the owning module reporting the end
 --                                             -- of the work it was asked to do
 --   ReleaseFeedAnswered(supported_versions, error)  -- the update-check lookup result
@@ -781,11 +786,13 @@ rule RecordSystemNotice {
     ensures: SystemNoticeRecorded(kind: kind)
 }
 
--- A failed or flagged repository migration leaves a repository notice.
--- from: services/migrations/migrate.go (via task failure handling)
+-- A failed migration, or source data an import had to drop, leaves a notice.
+-- migrations decides which of its failures merit one and words it.
+-- from: services/migrations/migrate.go:57, services/migrations/common.go:17
 rule RecordMigrationFailureNotice {
-    when: migrations/MigrationFailed(migration)
-    ensures: SystemNotice.created(kind: repository, description: migration_failure_text(migration), created_at: now)
+    when: migrations/MigrationFailureReported(kind, description)
+    ensures: SystemNotice.created(kind: kind, description: description, created_at: now)
+    ensures: SystemNoticeRecorded(kind: kind)
 }
 
 -- from: routers/web/admin/notice.go:46
@@ -1396,7 +1403,7 @@ rule AdminDeletesUser {
     requires: user != admin
     requires: not user.is_admin or has_other_admin(user)
     requires: purge or not owns_content(user)
-    ensures: not exists user
+    -- accounts removes the account at the end of its cascade (AdminDeletionCascades).
     ensures: UserDeletedByAdmin(admin: admin, user: user, purge: purge)
 }
 
@@ -1438,10 +1445,11 @@ rule AdminCreatesOrganizationForUser {
 rule AdminCreatesRepositoryForUser {
     when: AdminCreatesRepositoryForUser(admin, user, name)
     requires: admin.is_admin = true
-    -- repositories owns creation; the new repository uses the instance defaults.
-    ensures: repositories/UserCreatesRepository(user: user, name: name, description: "",
-        is_private: false, is_template: false, auto_init: false,
-        object_format: repositories/config.default_object_format)
+    -- repositories owns creation: it reacts by creating the repository with
+    -- the instance defaults (empty description, public, not a template, not
+    -- initialised, the default object format); a site admin is not held to
+    -- the owner's creation limit.
+    ensures: RepositoryCreationRequestedByAdmin(admin: admin, user: user, name: name)
 }
 
 -- Add / remove an SSH key on a user's account (API).
@@ -1478,7 +1486,7 @@ rule AdminDeletesRepository {
     requires: admin.is_admin = true
     -- repositories owns the deletion and its cascade (RepositoryDeleted reaches
     -- access, webhooks, packages, actions, ...); a site admin passes its check.
-    ensures: repositories/OwnerDeletesRepository(user: admin, repository: repository)
+    ensures: RepositoryDeletionRequestedByAdmin(admin: admin, repository: repository)
 }
 
 -- Adopting an unadopted directory, or deleting its files, is repositories'
@@ -1588,7 +1596,7 @@ rule OperatorDeletesUser {
     when: OperatorDeletesUser(operator, user, purge)
     requires: not user.is_admin or has_other_admin(user)
     requires: purge or not owns_content(user)
-    ensures: not exists user
+    -- accounts removes the account at the end of its cascade (AdminDeletionCascades).
     ensures: UserDeletedByAdmin(admin: operator, user: user, purge: purge)
 }
 
@@ -2209,19 +2217,19 @@ open question "Admins may edit their own account in ways that remove their admin
 open question "Unadopted-repository listing is instance-wide for admins; users with ALLOW_ADOPTION_OF_UNADOPTED_REPOSITORIES can adopt their own — is that capability repositories' or ours?"
 open question "Should the update checker default to on? It contacts a third-party endpoint (DNS release.forgejo.org) weekly, which offline-minded installs may not expect."
 open question "Should doctor checks also be runnable from the web admin (Forgejo exposes them only via CLI)?"
-open question "migrations asks for a repository notice on ImportedContentFlagged(migration, detail) as well as on MigrationFailed; only the latter is recorded here — should flagged content also raise a notice?"
 
 ------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
 -- REQUEST accounts/User: fields used here already exist (max_repo_creation with null = default, allow_git_hook, allow_import_local, allow_create_organization, login_source, profile fields); config.disable_regular_org_creation now lives in organizations' config.
 -- REQUEST authentication/UserLogin { user, source, login_name, has_password, must_change_password, password_changed_at }: administration creates it on admin/CLI account creation and sets must_change_password / source / login_name on admin edit and CLI.
--- REQUEST accounts: react to UserDeletedByAdmin(admin, user, purge) with the cascade (purge: disable first, delete repos, leave orgs and delete sole-owned orgs, delete packages and federated identity; remove user dir and avatar, record SystemFailureReported on file-removal failure).
+-- REQUEST accounts: react to UserDeletedByAdmin(admin, user, purge) with the cascade (purge: disable first, delete repos, leave orgs and delete sole-owned orgs, delete packages and federated identity; remove user dir and avatar, report a file-removal failure for a system notice (see the last request)).
 -- REQUEST accounts: react to UserRenamedByAdmin with the same redirect/ownership handling as a self rename; react to UserAvatarChangedByAdmin / UserAvatarRemovedByAdmin.
 -- REQUEST accounts: own InactiveAccountCleanupDue(older_than) — delete never-activated accounts older than that and report CronWorkCompleted.
 -- REQUEST authentication: react to UserTwoFactorResetByAdmin (delete TOTP + WebAuthn), AccessTokenRequestedForUser, AuthorizedIntegrationRequested, AuthSourceConfiguredFromCli, ExternalUserSyncDue(update_existing), UserPasswordSetByAdmin / UserPasswordSetByOperator (hash + store).
 -- REQUEST authentication: expose the password policy as password_acceptable(password) (MIN_PASSWORD_LENGTH default 8, PASSWORD_COMPLEXITY, PASSWORD_CHECK_PWN) and password_long_enough(password).
--- REQUEST repositories: react to MirrorUpdateDue, RepositoryHealthCheckDue, RepositoryStatsCheckDue, RepositoryArchiveCleanupDue, AllRepositoryArchivesDeletionDue, RepositoryGarbageCollectionDue, MissingRepositoryReinitDue, MissingRepositoryDeletionDue, GeneratedRepositoryAvatarDeletionDue. (Done in integration: all nine have reactions; admin repo create/delete are handed to repositories directly.)
+-- REQUEST repositories: react to MirrorUpdateDue, RepositoryHealthCheckDue, RepositoryStatsCheckDue, RepositoryArchiveCleanupDue, AllRepositoryArchivesDeletionDue, RepositoryGarbageCollectionDue, MissingRepositoryReinitDue, MissingRepositoryDeletionDue, GeneratedRepositoryAvatarDeletionDue. (Done in integration: all nine have reactions.)
+-- REQUEST repositories: react to RepositoryCreationRequestedByAdmin(admin, user, name) by creating the repository with instance defaults as UserCreatesRepository does (a site admin bypasses the creation limit), and to RepositoryDeletionRequestedByAdmin(admin, repository) with the OwnerDeletesRepository cascade, ending in RepositoryDeleted(repository, doer: admin).
 -- REQUEST code: react to DeletedBranchCleanupDue, LfsGarbageCollectionDue, AllRepositoryBranchesResyncRequested.
 -- REQUEST releases: react to AllRepositoryTagsResyncRequested and ReleasesSyncWithTagsRequested.
 -- REQUEST keys: react to AuthorizedKeysRewriteDue, AuthorizedPrincipalsRewriteDue, AuthorizedKeysRegenerationRequested, SshKeyAddedForUserByAdmin, SshKeyRemovedForUserByAdmin.
@@ -2230,7 +2238,7 @@ open question "migrations asks for a repository notice on ImportedContentFlagged
 -- REQUEST notifications: notifications reacts to the AdminSendsTestMail stimulus directly (fine); also react to OldActivityDeletionDue, MassMailRequested, UserCreatedByAdmin (send "account created" mail when send_notification); honour config.notify_admins_on_new_user and config.default_email_notifications.
 -- REQUEST discovery: react to IssueIndexRebuildDue.
 -- REQUEST moderation: react to ResolvedReportRemovalDue(keep_for).
--- REQUEST migrations: react to MigrationPosterIdUpdateDue. (MigrationFailed is consumed here to record a repository notice; ImportedContentFlagged could be too — see open question.)
+-- REQUEST migrations: react to MigrationPosterIdUpdateDue; emit MigrationFailureReported(kind, description) (local) for every failure or dropped source data that merits a repository notice — administration records it.
 -- REQUEST actions: react to ZombieActionsTaskStopDue, EndlessActionsTaskStopDue, AbandonedActionsJobCancellationDue, LingeringActionsLogTransferDue, ActionsScheduleStartDue, ActionsCleanupDue, OfflineRunnerCleanupDue, ActionsUserCleanupDue.
 -- REQUEST organizations: react to OrganizationCreatedForUserByAdmin; honour config.disable_regular_org_creation.
--- REQUEST all modules owning cron work: emit CronWorkCompleted(task, outcome, message) when the work finishes, and SystemFailureReported(kind, description) for background failures worth an operator's attention.
+-- REQUEST all modules owning cron work: emit CronWorkCompleted(task, outcome, message) when the work finishes, and, for background failures worth an operator's attention, a failure report of their own (as migrations/MigrationFailureReported(kind, description)) that administration reacts to by recording a SystemNotice; a qualified emission of SystemFailureReported is not applied.

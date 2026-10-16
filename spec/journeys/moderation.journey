@@ -1,4 +1,7 @@
 -- Journeys through abuse reporting and moderation.
+--
+-- Moderation is off by default ([moderation] ENABLED); these journeys run on an
+-- instance that turned it on, except those that show what off means.
 
 world {
     cast:
@@ -9,11 +12,15 @@ world {
         remark:  issues/Comment
         item:    ReportableContent
     given:
+        moderation/config.enabled = true
         ada.prohibit_login = false
+        ada.is_active = true
         ada.is_admin = false
         bruno.prohibit_login = false
+        bruno.is_active = true
         bruno.is_admin = false
         root.is_admin = true
+        root.is_active = true
         root.prohibit_login = false
         remark.issue = thread
         item.kind = comment
@@ -110,14 +117,11 @@ journey EvidenceSurvivesTheEdit {
     after: AUserReportsAnAbusiveComment
 
     1. the author edits the reported comment
-        stipulate item.reports_without_copy = {report}
         bruno does ReportableContentChanging(item, update) on ReportedContentLifecycle
         then PreserveEvidenceBeforeChange fires
         then ReportedContentDeleted does not fire
 
     2. the admin reviews the queue
-        stipulate item.is_in_queue = true
-        stipulate item.open_reports = {report}
         root sees report.remarks on ModerationQueue in item
 
     ends: The admin judges the comment as it was when reported.
@@ -130,7 +134,6 @@ journey DeletionLeavesATombstone {
     after: AUserReportsAnAbusiveComment
 
     1. the author deletes it
-        stipulate item.reports_without_copy = {report}
         bruno does ReportableContentChanging(item, deletion) on ReportedContentLifecycle
         then PreserveEvidenceBeforeChange fires
         then ReportedContentDeleted fires
@@ -146,7 +149,6 @@ journey AnAdminDismissesTheReport {
     after: AUserReportsAnAbusiveComment
 
     1. she ignores the reports
-        stipulate item.open_reports = {report}
         root does AdminResolvesReports(root, item, ignored) on ModerationQueue
         then AdminResolvesReports fires
         then CloseReportAsIgnored fires
@@ -162,7 +164,6 @@ journey AnAdminDeletesTheCommentAndClosesTheReport {
     after: AUserReportsAnAbusiveComment
 
     1. she deletes the comment
-        stipulate item.open_reports = {report}
         root does AdminDeletesReportedComment(root, item, handled) on ModerationQueue
         then AdminDeletesReportedComment fires
         then CloseReportAsHandled fires
@@ -231,10 +232,47 @@ journey ResolvedReportsArePurged {
 
     after: AnAdminDismissesTheReport
 
+    given:
+        moderation/config.purge_task_enabled = true
+
     1. a week and a day pass
         after 8.days
         then PurgeResolvedReport fires
         then report does not exist
 
     ends: Only recent resolutions remain on record.
+}
+
+journey AResolvedReportStaysWhileThePurgeTaskIsOff {
+    goal: The purge task ships disabled. Left that way, a report ignored more
+          than the retention period ago is kept.
+
+    after: AnAdminDismissesTheReport
+
+    1. a week and a day pass
+        after 8.days
+        then PurgeResolvedReport does not fire
+        then report exists
+
+    ends: Resolved reports and their evidence are kept until the task is on.
+}
+
+journey WithModerationOffNothingCanBeReported {
+    goal: On an instance that never turned moderation on, there is no
+          "Report abuse" entry and no queue: Ada's report is refused, and the
+          admin cannot act on the item either.
+
+    given:
+        moderation/config.enabled = false
+
+    1. ada tries to report the comment
+        stipulate can_read_conversation(ada, thread) = true
+        stipulate remarks_length("This comment links to a phishing site twice.") = 45
+        ada cannot do UserReportsContent(ada, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
+        ada cannot see item.kind on ReportAbuse in item
+
+    2. nor can the admin moderate it
+        root cannot do AdminDeletesReportedComment(root, item, handled) on ModerationQueue
+
+    ends: Nothing is reported and nothing is moderated while the feature is off.
 }
