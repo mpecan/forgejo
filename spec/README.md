@@ -106,6 +106,8 @@ the Forgejo code it was distilled from.
 
 ## Conventions forced by the tooling
 
+Open walker issues the spec currently works around: [#16](https://github.com/mpecan/allium-inspect/issues/16), [#17](https://github.com/mpecan/allium-inspect/issues/17), [#19](https://github.com/mpecan/allium-inspect/issues/19), [#25](https://github.com/mpecan/allium-inspect/issues/25), [#26](https://github.com/mpecan/allium-inspect/issues/26), [#27](https://github.com/mpecan/allium-inspect/issues/27). Once they are fixed, the corresponding workarounds can go: named-but-unused listener parameters, local re-emission, repeated per-journey stipulations, restated config defaults, unrolled loops, and `if` in place of `??`.
+
 These shape how the spec is written. They are not domain decisions. They are
 written for allium-journey 0.1.2, which closed allium-inspect
 [#6](https://github.com/mpecan/allium-inspect/issues/6)–[#13](https://github.com/mpecan/allium-inspect/issues/13).
@@ -170,12 +172,12 @@ cannot decide, and each has a minimal reproduction.
 
 | Steps | Why |
 |---|---|
-| 21 steps in issues, pulls and repositories, such as *Somebody Reports A Bug* (1), *Review Then Merge* (1, 3), *Transfer Awaits The Recipient* (1), *Bob Forks Alices Repository Once* (1) and *Pull Mirror Keeps Itself Current* (2) | The act creates an issue, pull request, repository or review, and a reaction then loops over a black box called on it, such as `audience(issue)`, `receivers(...)`, `mentions(...)`, `git_tags(fork)` or language-stats `sizes`. A journey can stipulate a call only for an instance that already exists, and the walker can't stipulate one in `given` or `world` either. |
-| actions: *A Silent Task Becomes A Zombie* (3) | A temporal trigger on an optional timestamp that is still `null` is undecided while the clock moves ("`+` is not defined between a null and a duration"). It should simply not be due. |
-| actions: *A Schedule Fires* (1) | A derived `if` that returns enum words evaluates to unknown. Then `unknown != status` comes out true. |
-| webhooks: *A Week Later The History Is Cleaned Up* (1) | After a clock-fired rule deletes an instance, the walker still evaluates that instance's state condition. |
-| administration: *Administrator Deletes A Repository* (2) | A `for` over a relationship filtered on a derived field reports "may be missing members" when every member is decided. |
-| packages: *Ada Pushes A Container Image* (4) | When one event wakes sibling rules, a later sibling sees what an earlier one created in the same firing. |
+| 21 steps in issues, pulls and repositories, such as *Somebody Reports A Bug* (1), *Review Then Merge* (1, 3), *Transfer Awaits The Recipient* (1), *Bob Forks Alices Repository Once* (1) and *Pull Mirror Keeps Itself Current* (2) | The act creates an issue, pull request, repository or review, and a reaction then loops over a black box called on it, such as `audience(issue)`, `receivers(...)`, `mentions(...)`, `git_tags(fork)` or language-stats `sizes`. A journey can stipulate a call only for an instance that already exists, and the walker can't stipulate one in `given` or `world` either ([#18](https://github.com/mpecan/allium-inspect/issues/18), [#19](https://github.com/mpecan/allium-inspect/issues/19)). |
+| actions: *A Silent Task Becomes A Zombie* (3) | A temporal trigger on an optional timestamp that is still `null` is undecided while the clock moves ("`+` is not defined between a null and a duration"). It should simply not be due ([#20](https://github.com/mpecan/allium-inspect/issues/20)). |
+| actions: *A Schedule Fires* (1) | A derived `if` that returns enum words evaluates to unknown. Then `unknown != status` comes out true ([#21](https://github.com/mpecan/allium-inspect/issues/21)). |
+| webhooks: *A Week Later The History Is Cleaned Up* (1) | After a clock-fired rule deletes an instance, the walker still evaluates that instance's state condition ([#22](https://github.com/mpecan/allium-inspect/issues/22)). |
+| administration: *Administrator Deletes A Repository* (2) | A `for` over a relationship filtered on a derived field reports "may be missing members" when every member is decided ([#23](https://github.com/mpecan/allium-inspect/issues/23)). |
+| packages: *Ada Pushes A Container Image* (4) | When one event wakes sibling rules, a later sibling sees what an earlier one created in the same firing ([#24](https://github.com/mpecan/allium-inspect/issues/24)). |
 
 ## How this was produced
 
