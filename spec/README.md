@@ -128,7 +128,8 @@ written for allium-journey 0.1.3. Releases 0.1.2 and 0.1.3 closed allium-inspect
   that owns them.
 - **A deletion event carries what its listeners need, read with `let`.** An
   emission's arguments see the state *after* the rule, so a rule that deletes a
-  record binds the fields it reports with `let` first. A listener reads nothing
+  record binds the fields it reports with `let` first.
+  (The walker's verdict here currently depends on line order: [#33](https://github.com/mpecan/allium-inspect/issues/33).) A listener reads nothing
   from a deleted record but its identity.
   For example, `UserAccountDeleted` carries the user's `kind`, and
   `PackageVersionDeleted` carries its `package`.
@@ -173,7 +174,7 @@ that remain are listed below with their reasons.
 
 | Step | Why |
 |---|---|
-| pulls: *Draft Review Stays Private* (3) | Submitting a draft review creates both the review and its code comment. Notifications then asks `code_comment_mentions(comment)` of the comment. An act can catch only one creation with `creating` (a second `creating` line is merged into the first), so the comment's black box can't be answered. A related problem: a module-qualified `where` answer (`where notifications/mentions(x) = {}`) appears in the ledger but answers nothing. |
+| pulls: *Draft Review Stays Private* (3) | Submitting a draft review creates both the review and its code comment. Notifications then asks `code_comment_mentions(comment)` of the comment. An act can catch only one creation with `creating` (a second `creating` line is merged into the first), so the comment's black box can't be answered. A related problem: a module-qualified `where` answer (`where notifications/mentions(x) = {}`) appears in the ledger but answers nothing ([#31](https://github.com/mpecan/allium-inspect/issues/31), [#32](https://github.com/mpecan/allium-inspect/issues/32)). |
 
 ## How this was produced
 
