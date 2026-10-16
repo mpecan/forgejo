@@ -1048,12 +1048,13 @@ rule DeleteUserAccount {
 -- from: services/user/user.go:363
 rule DeleteInactiveAccounts {
     when: administration/InactiveAccountCleanupDue(older_than)
-    for user in Users where is_active = false and kind = individual:
-        requires: user.created_at + older_than <= now
-        requires: not owns_repositories(user)
-        requires: not belongs_to_organizations(user)
-        requires: not owns_packages(user)
-        requires: not (user.is_admin and admin_count() <= 1)
+    -- an account that does not qualify is skipped, not a reason to stop the sweep
+    for user in Users where is_active = false and kind = individual
+            and created_at + older_than <= now
+            and not owns_repositories(this)
+            and not belongs_to_organizations(this)
+            and not owns_packages(this)
+            and not (is_admin and admin_count() <= 1):
         ensures: DeleteUserAccount(user: user, purge: false)
 }
 
