@@ -8,8 +8,7 @@ and says so in the question.
 
 Generated from the `.allium` files; regenerate rather than edit by hand.
 
-**202 questions across 22 modules.**
-
+**201 questions across 22 modules.**
 
 ## accounts (9)
 
@@ -203,7 +202,7 @@ Generated from the `.allium` files; regenerate rather than edit by hand.
 8. The release mail is sent only for non-prerelease releases while the activity feed records prereleases too. Intended?
 9. Failed mail is dropped without retry. Should a rebuild retry transient transport failures?
 
-## administration (10)
+## administration (9)
 
 1. Running a cron task via the API records the scheduler, not the administrator, as the doer (web records the admin). Should a rebuild always record the admin?
 2. app.ini documents [cron] ENABLED / RUN_AT_START as global switches but the code ignores them; should a rebuild honour a global cron on/off?
@@ -214,7 +213,6 @@ Generated from the `.allium` files; regenerate rather than edit by hand.
 7. Unadopted-repository listing is instance-wide for admins; users with ALLOW_ADOPTION_OF_UNADOPTED_REPOSITORIES can adopt their own — is that capability repositories' or ours?
 8. Should the update checker default to on? It contacts a third-party endpoint (DNS release.forgejo.org) weekly, which offline-minded installs may not expect.
 9. Should doctor checks also be runnable from the web admin (Forgejo exposes them only via CLI)?
-10. migrations asks for a repository notice on ImportedContentFlagged(migration, detail) as well as on MigrationFailed; only the latter is recorded here — should flagged content also raise a notice?
 
 ## quota (9)
 
@@ -238,7 +236,7 @@ Generated from the `.allium` files; regenerate rather than edit by hand.
 6. Organizations get no shadow copy before deletion (only user deletion snapshots). Should org deletion preserve evidence too?
 7. There is no notification to admins when a report arrives and no API. Should a rebuild add either?
 8. Should reporters be told when their report is resolved?
-9. Forgejo ships the purge task disabled ([cron.remove_resolved_reports] ENABLED=false), so resolved reports and their evidence are kept forever unless an admin turns it on. The spec purges after keep_resolved_reports_for; should a rebuild keep the separate task switch?
+9. Forgejo ships the purge task disabled ([cron.remove_resolved_reports] ENABLED=false), so resolved reports and their evidence are kept forever unless an admin turns it on. The spec keeps that switch (config.purge_task_enabled); should a rebuild purge by default instead?
 
 ## federation (10)
 

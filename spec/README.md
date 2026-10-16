@@ -23,17 +23,16 @@ allium-inspect                              # browse it (reads .allium-inspect.t
 
 | | |
 |---|---|
-| Modules | 22 `.allium` files, about 39,900 lines |
+| Modules | 22 `.allium` files, about 40,200 lines |
 | Entities | 196, plus 18 external entities and 54 value types |
-| Rules | 1,170 |
-| Surfaces | 205, for 66 actors |
+| Rules | 1,184 |
+| Surfaces | 206, for 67 actors |
 | Invariants | 214 |
 | Config parameters | every `app.ini` setting that changes behaviour, with Forgejo's default |
-| Open questions | 202 ([`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md)) |
-| Journeys | 306 in 22 files: **674 of 682 steps hold**; the other 8 are undecided because of walker limitations (see below) |
-| Cross-module reactions | 299; every one matches its emitter's trigger name and argument names |
+| Open questions | 201 ([`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md)) |
+| Journeys | 319 in 22 files: **677 of 703 steps hold** with allium-journey 0.1.2; the other 26 are walker limitations, listed below |
+| Cross-module reactions | 306; every one matches its emitter's trigger name and argument names |
 | `allium check .` | 0 errors |
-
 
 ## Modules
 
@@ -107,29 +106,45 @@ the Forgejo code it was distilled from.
 
 ## Conventions forced by the tooling
 
-The `allium-journey` limitations behind these are filed on allium-inspect as [#6](https://github.com/mpecan/allium-inspect/issues/6)–[#13](https://github.com/mpecan/allium-inspect/issues/13).
-
-These shape how the spec is written. They are not domain decisions.
+These shape how the spec is written. They are not domain decisions. They are
+written for allium-journey 0.1.2, which closed allium-inspect
+[#6](https://github.com/mpecan/allium-inspect/issues/6)–[#13](https://github.com/mpecan/allium-inspect/issues/13).
 
 - **Permission checks are local predicates.** A rule says
   `requires: can_write_code(user, repository)`, not `access/can_write(...)`,
-  because the parser reads a qualified call as a division and the journey
-  walker cannot stipulate one. Each module's header maps every local predicate to
-  the `access` contract function it stands for (`AuthorizationPolicy` in
-  `access.allium`). An implementation should route all of them through one
-  authorisation service.
-- **Triggers that cross modules carry named arguments**
-  (`PullRequestMerged(pull_request: pr, merger: user)`), and consumers bind the
-  same names. The journey walker binds chained-trigger arguments by name.
-- **Visibility is written as `context … where` or `for x in C where …`**, not as
-  `when`-guarded `exposes` lines. The walker treats a `when`-guarded exposure as
-  never shown, which would make `cannot see` claims vacuous.
-- **Actors are documentation; `requires` are enforcement.** The walker does not
-  check a surface's `facing` actor, so every permission is restated as a rule
-  precondition.
-- **Journeys run on default config.** A behaviour that is off by default
-  (federation, quota, moderation, LFS) is gated on its surfaces with
-  `provides … when config.enabled`. Its rules are walked as if it were on.
+  because the parser reads a qualified call as a division. Each module's header
+  maps every local predicate to the `access` contract function it stands for
+  (`AuthorizationPolicy` in `access.allium`). An implementation should route all
+  of them through one authorisation service.
+- **Every emission uses named arguments, and listeners use the same names.**
+  The walker binds a trigger's arguments per listener: a named argument binds
+  only the parameter of that name, and a bare name is positional. Mixing the two
+  is a collision. A listener never writes `_` for a parameter it ignores; it
+  writes the emitter's name and leaves it unused
+  ([#16](https://github.com/mpecan/allium-inspect/issues/16)).
+- **A module never emits into another module's namespace.** It emits its own
+  trigger, and the owning module reacts to it, for example
+  `actions/JobCommitStatusReported` and code's reaction to it. That is also the
+  architecture this spec wants
+  ([#17](https://github.com/mpecan/allium-inspect/issues/17)).
+- **A deletion event carries what its listeners need.** The record is gone by the
+  time a listener runs, so a listener reads nothing from it but its identity.
+  For example, `UserAccountDeleted` carries the user's `kind`, and
+  `PackageVersionDeleted` carries its `package`.
+- **Surfaces face real actors, and journeys cast people who match them.** The
+  walker checks `facing`. The shared actors live in `access.allium`: `Visitor`
+  (anyone), `SignedInUser`, `RestrictedUser`, `SiteAdmin` and `RepoAdmin`. Cast
+  users carry the fields those actors need (`is_active`, `prohibit_login`, …).
+  A surface facing a `within` actor passes that context (repository, issue,
+  organization, team) as an argument of every trigger it provides. Permissions
+  are *also* rule `requires`: a rule never trusts its caller.
+- **A rule-level `for` filters with `where`.** A member that doesn't qualify is
+  skipped by the filter. A `requires` inside the loop would be ambiguous
+  between "refuse the rule" and "skip the member".
+- **Off-by-default features are gated in their rules and walked switched on.**
+  Federation, quota, moderation and LFS each check `config.enabled` in `requires`.
+  Their journeys set `config.… = true` (it shows in the stipulation ledger), and
+  each has one journey showing the refusal when it is off.
 
 ## Journeys
 
@@ -150,16 +165,17 @@ that remain are listed below with their reasons.
 
 ### Steps that do not hold, and why
 
-None of these is a gap in the spec. Each is something `allium-journey` (0.1.1)
-cannot decide.
+None of these is a gap in the spec. Each is something allium-journey 0.1.2
+cannot decide, and each has a minimal reproduction.
 
-| Journey | Why |
+| Steps | Why |
 |---|---|
-| actions: *A Dispatched Workflow Runs To Success* (step 5), *A Running Run Cannot Be Rerun Until It Finishes* (3), *A Silent Task Becomes A Zombie* (3), *A Job Nobody Picks Up Is Abandoned* (2); pulls: *Auto Merge Waits For Required Checks* (3) | During an `after` step the walker treats an entity collection as open-world. `webhooks/FanOutHookEvent` loops `for w in Webhooks where …`, which yields an unknown member even when the journey casts no webhook, so the downstream `QueueDeliveryForMatchedEvent` cannot be decided "while the clock moved". This reproduces in a 20-line spec. The same fan-out holds in non-timed steps. ([#6](https://github.com/mpecan/allium-inspect/issues/6)) |
-| webhooks: *A Week Later The History Is Cleaned Up* | The same open-world behaviour, applied to the timeout timer of a delivery that the cleanup just removed ([#6](https://github.com/mpecan/allium-inspect/issues/6)) |
-| federation: *A Repository Admin Follows A Remote Repository* (2) | The walker cannot evaluate `.all(…)` over a collection ([#7](https://github.com/mpecan/allium-inspect/issues/7)) |
-| releases: *A Maintainer Links An External Asset* (1) | The walker does not bind an `issues/Attachment` created by a releases rule ([#9](https://github.com/mpecan/allium-inspect/issues/9)) |
-
+| 21 steps in issues, pulls and repositories, such as *Somebody Reports A Bug* (1), *Review Then Merge* (1, 3), *Transfer Awaits The Recipient* (1), *Bob Forks Alices Repository Once* (1) and *Pull Mirror Keeps Itself Current* (2) | The act creates an issue, pull request, repository or review, and a reaction then loops over a black box called on it, such as `audience(issue)`, `receivers(...)`, `mentions(...)`, `git_tags(fork)` or language-stats `sizes`. A journey can stipulate a call only for an instance that already exists, and the walker can't stipulate one in `given` or `world` either. |
+| actions: *A Silent Task Becomes A Zombie* (3) | A temporal trigger on an optional timestamp that is still `null` is undecided while the clock moves ("`+` is not defined between a null and a duration"). It should simply not be due. |
+| actions: *A Schedule Fires* (1) | A derived `if` that returns enum words evaluates to unknown. Then `unknown != status` comes out true. |
+| webhooks: *A Week Later The History Is Cleaned Up* (1) | After a clock-fired rule deletes an instance, the walker still evaluates that instance's state condition. |
+| administration: *Administrator Deletes A Repository* (2) | A `for` over a relationship filtered on a derived field reports "may be missing members" when every member is decided. |
+| packages: *Ada Pushes A Container Image* (4) | When one event wakes sibling rules, a later sibling sees what an earlier one created in the same firing. |
 
 ## How this was produced
 
@@ -173,3 +189,11 @@ The Allium `distill` process, run as a fan-out:
 3. An integration pass audited every cross-module trigger reaction against its
    emitter (name, arity, argument names). It unified duplicated concepts and
    actors, and wired every scheduled task to its owner.
+4. A second pass adapted the set to allium-journey 0.1.2. That release enforces
+   `facing`, binds arguments per listener, follows chains to the end, and reads
+   `when` guards, quantifiers, creations and config. Five agents worked on
+   disjoint files from one brief. Along the way they turned up and fixed real spec
+   bugs: an admin user deletion that skipped the accounts cascade, an auto-merge
+   that read its schedule after deleting it, a rename redirect that compared a
+   name with itself, and listeners that read records their own event had just
+   deleted.
