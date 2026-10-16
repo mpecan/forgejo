@@ -154,6 +154,13 @@ enum SignedOperation { initial_commit | web_edit | merge | wiki_edit }
 
 enum SigningMode { never | always | conditional }
 
+-- One entry of a [repository.signing] list (INITIAL_COMMIT, CRUD_ACTIONS,
+-- MERGES, WIKI), as written in app.ini.
+enum SigningListEntry {
+    never | always | pubkey | twofa | parentsigned
+    | basesigned | headsigned | commitssigned | approved
+}
+
 -- Why the forge declined to sign (the first failing condition).
 enum SigningRefusal {
     no_instance_key        -- no signing key configured / available ("nokey")
@@ -373,10 +380,10 @@ config {
     signing_name: String = ""                           -- SIGNING_NAME
     signing_email: String = ""                          -- SIGNING_EMAIL
     signing_format: SignatureFormat = openpgp           -- FORMAT
-    initial_commit_signing: String = "always"           -- INITIAL_COMMIT (materialised as SigningPolicy initial_commit)
-    crud_actions_signing: String = "pubkey,twofa,parentsigned"   -- CRUD_ACTIONS (SigningPolicy web_edit)
-    merges_signing: String = "pubkey,twofa,basesigned,commitssigned"  -- MERGES (SigningPolicy merge)
-    wiki_signing: String = "never"                      -- WIKI (SigningPolicy wiki_edit)
+    initial_commit_signing: Set<SigningListEntry> = {always}           -- INITIAL_COMMIT (materialised as SigningPolicy initial_commit)
+    crud_actions_signing: Set<SigningListEntry> = {pubkey, twofa, parentsigned}   -- CRUD_ACTIONS (SigningPolicy web_edit)
+    merges_signing: Set<SigningListEntry> = {pubkey, twofa, basesigned, commitssigned}  -- MERGES (SigningPolicy merge)
+    wiki_signing: Set<SigningListEntry> = {never}                      -- WIKI (SigningPolicy wiki_edit)
     default_trust_model: TrustModel = collaborator      -- DEFAULT_TRUST_MODEL ("default" also means collaborator; instance_default is not a valid value here)
 
     -- Hard-coded in Forgejo
@@ -536,6 +543,9 @@ rule UserVerifiesSshKey {
 -- from: services/asymkey/ssh_key.go:17
 rule UserDeletesSshKey {
     when: UserDeletesSshKey(actor, key)
+    -- read before the record goes: an emission sees the resulting state
+    let key_owner = key.owner
+    let key_fingerprint = key.fingerprint
 
     requires: manages_own_ssh_keys(actor)
     requires: key.kind = personal
@@ -543,7 +553,7 @@ rule UserDeletesSshKey {
     requires: not key.is_externally_managed
 
     ensures: not exists key
-    ensures: SshKeyDeleted(owner: key.owner, fingerprint: key.fingerprint, actor: actor)
+    ensures: SshKeyDeleted(owner: key_owner, fingerprint: key_fingerprint, actor: actor)
 
     @guidance
         -- Web: POST /user/settings/keys/delete (type=ssh). API: DELETE /api/v1/user/keys/{id}.
@@ -554,13 +564,15 @@ rule UserDeletesSshKey {
 -- from: routers/api/v1/admin/user.go:361
 rule RemoveSshKeyOfUserByAdmin {
     when: administration/SshKeyRemovedForUserByAdmin(admin, user, key)
+    -- read before the record goes: an emission sees the resulting state
+    let key_fingerprint = key.fingerprint
 
     requires: admin.is_admin
     requires: key.kind in {personal, principal}
     requires: key.owner = user
 
     ensures: not exists key
-    ensures: SshKeyDeleted(owner: user, fingerprint: key.fingerprint, actor: admin)
+    ensures: SshKeyDeleted(owner: user, fingerprint: key_fingerprint, actor: admin)
 
     @guidance
         -- API: DELETE /api/v1/admin/users/{username}/keys/{id}. Unlike the
@@ -611,12 +623,14 @@ rule UserAddsPrincipal {
 -- from: routers/web/user/setting/keys.go:277
 rule UserDeletesPrincipal {
     when: UserDeletesPrincipal(actor, key)
+    -- read before the record goes: an emission sees the resulting state
+    let key_owner = key.owner
 
     requires: key.kind = principal
     requires: key.owner = actor or actor.is_admin
 
     ensures: not exists key
-    ensures: SshKeyDeleted(owner: key.owner, fingerprint: null, actor: actor)
+    ensures: SshKeyDeleted(owner: key_owner, fingerprint: null, actor: actor)
 }
 
 ------------------------------------------------------------
@@ -751,6 +765,9 @@ rule RepoAdminAddsDeployKey {
 -- from: models/repo.go:278
 rule RepoAdminDeletesDeployKey {
     when: RepoAdminDeletesDeployKey(admin, deploy_key)
+    -- read before the record goes: an emission sees the resulting state
+    let key_repository = deploy_key.repository
+    let key_name = deploy_key.name
 
     let material = deploy_key.key
     let shared = material.attachments.count > 1
@@ -761,7 +778,7 @@ rule RepoAdminDeletesDeployKey {
     ensures:
         if not shared:
             not exists material
-    ensures: DeployKeyDeleted(repository: deploy_key.repository, name: deploy_key.name, actor: admin)
+    ensures: DeployKeyDeleted(repository: key_repository, name: key_name, actor: admin)
 
     @guidance
         -- Web: POST /{owner}/{repo}/settings/keys/delete.
@@ -968,6 +985,8 @@ rule UserVerifiesGpgKey {
 -- from: models/asymkey/gpg_key.go:230
 rule UserDeletesGpgKey {
     when: UserDeletesGpgKey(owner, key)
+    -- read before the record goes: an emission sees the resulting state
+    let deleted_key_id = key.key_id
 
     requires: manages_own_gpg_keys(owner)
     requires: key.owner = owner
@@ -980,7 +999,7 @@ rule UserDeletesGpgKey {
         for imported in key.original_import:
             not exists imported
     ensures: not exists key
-    ensures: GpgKeyDeleted(owner: owner, key_id: key.key_id, actor: owner)
+    ensures: GpgKeyDeleted(owner: owner, key_id: deleted_key_id, actor: owner)
 
     @guidance
         -- Web: POST /user/settings/keys/delete (type=gpg).

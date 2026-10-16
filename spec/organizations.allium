@@ -312,16 +312,10 @@ rule UserCreatesOrganization {
             is_owners_team: true
         )
         -- every unit at owner; the external wiki and tracker at read
-        TeamUnitAccess.created(team: owners, unit: code, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: issues, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: pull_requests, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: releases, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: wiki, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: external_wiki, access_mode: read)
-        TeamUnitAccess.created(team: owners, unit: external_tracker, access_mode: read)
-        TeamUnitAccess.created(team: owners, unit: projects, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: packages, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: actions, access_mode: owner)
+        for u in {code, issues, pull_requests, releases, wiki, projects, packages, actions}:
+            TeamUnitAccess.created(team: owners, unit: u, access_mode: owner)
+        for u in {external_wiki, external_tracker}:
+            TeamUnitAccess.created(team: owners, unit: u, access_mode: read)
         OrgMembership.created(
             organization: org,
             user: creator,
@@ -379,16 +373,10 @@ rule CreateOrganizationForUserByAdmin {
             is_owners_team: true
         )
         -- every unit at owner; the external wiki and tracker at read
-        TeamUnitAccess.created(team: owners, unit: code, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: issues, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: pull_requests, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: releases, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: wiki, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: external_wiki, access_mode: read)
-        TeamUnitAccess.created(team: owners, unit: external_tracker, access_mode: read)
-        TeamUnitAccess.created(team: owners, unit: projects, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: packages, access_mode: owner)
-        TeamUnitAccess.created(team: owners, unit: actions, access_mode: owner)
+        for u in {code, issues, pull_requests, releases, wiki, projects, packages, actions}:
+            TeamUnitAccess.created(team: owners, unit: u, access_mode: owner)
+        for u in {external_wiki, external_tracker}:
+            TeamUnitAccess.created(team: owners, unit: u, access_mode: read)
         OrgMembership.created(
             organization: org,
             user: owner,
@@ -772,16 +760,10 @@ rule OwnerCreatesTeam {
         )
         if access_mode = admin:
             -- every unit at admin; the external wiki and tracker at read
-            TeamUnitAccess.created(team: team, unit: code, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: issues, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: pull_requests, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: releases, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: wiki, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: external_wiki, access_mode: read)
-            TeamUnitAccess.created(team: team, unit: external_tracker, access_mode: read)
-            TeamUnitAccess.created(team: team, unit: projects, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: packages, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: actions, access_mode: admin)
+            for u in {code, issues, pull_requests, releases, wiki, projects, packages, actions}:
+                TeamUnitAccess.created(team: team, unit: u, access_mode: admin)
+            for u in {external_wiki, external_tracker}:
+                TeamUnitAccess.created(team: team, unit: u, access_mode: read)
         else:
             for g in grants:
                 if g.unit in {external_wiki, external_tracker}:
@@ -834,16 +816,10 @@ rule OwnerEditsTeam {
             not exists old
         if access_mode = admin:
             -- every unit at admin; the external wiki and tracker at read
-            TeamUnitAccess.created(team: team, unit: code, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: issues, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: pull_requests, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: releases, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: wiki, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: external_wiki, access_mode: read)
-            TeamUnitAccess.created(team: team, unit: external_tracker, access_mode: read)
-            TeamUnitAccess.created(team: team, unit: projects, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: packages, access_mode: admin)
-            TeamUnitAccess.created(team: team, unit: actions, access_mode: admin)
+            for u in {code, issues, pull_requests, releases, wiki, projects, packages, actions}:
+                TeamUnitAccess.created(team: team, unit: u, access_mode: admin)
+            for u in {external_wiki, external_tracker}:
+                TeamUnitAccess.created(team: team, unit: u, access_mode: read)
         else:
             for g in grants:
                 if g.unit in {external_wiki, external_tracker}:

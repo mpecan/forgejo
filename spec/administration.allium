@@ -1161,9 +1161,11 @@ rule AdminPublishesAnnouncement {
 -- from: routers/web/admin/service_message.go:71
 rule AdminWithdrawsAnnouncement {
     when: AdminWithdrawsAnnouncement(admin, announcement)
+    -- read before the record goes: an emission sees the resulting state
+    let withdrawn_kind = announcement.kind
     requires: admin.is_admin = true
     ensures: not exists announcement
-    ensures: AnnouncementWithdrawn(kind: announcement.kind)
+    ensures: AnnouncementWithdrawn(kind: withdrawn_kind)
 }
 
 -- from: routers/web/user/service_message.go:15

@@ -87,6 +87,7 @@ journey ADispatchedWorkflowRunsToSuccess {
         stipulate job.runs_on = {"docker"}
         stipulate job.oidc_requested = false
         stipulate job.is_incomplete = false
+        stipulate job.status_changed_at = now
         stipulate run.aggregated_status = waiting
         after 1.second
         then ExpandRunIntoJobs fires
@@ -519,15 +520,28 @@ journey AnArtifactExpires {
         task:   Task
 
     given:
+        runner.scope = site
+        runner.is_ephemeral = false
+        runner.token = "runner-secret"
         run.repository = repo
+        run.event = workflow_dispatch
+        run.is_fork_pull_request = false
+        run.needs_approval = false
         run.jobs_expanded = true
         run.pre_execution_error = null
         job.run = run
+        job.status = running
+        job.status_changed_at = now
         task.job = job
         task.runner = runner
         task.status = running
+        task.started_at = now
+        task.last_activity_at = now
+        task.stopped_at = null
+        task.log_archived = false
+        task.log_expired = false
 
-    1. the job uploads and finalises an artifact
+    1. the job uploads and finalises an artifact, then finishes
         stipulate quota_allows_artifacts(repo) = true
         task does TaskCreatesArtifact(task, "dist") on RunningJobCapabilities
             creating artifact: Artifact
@@ -537,6 +551,9 @@ journey AnArtifactExpires {
         then artifact.status = upload_confirmed
         then artifact.run = run
         then artifact.size = 2048
+        runner does RunnerReportsTaskResult(runner, task, success) on RunnerService
+        then task.status = success
+        then job.status = success
 
     2. eighty-nine days later it is still there
         after 89.days
@@ -579,6 +596,9 @@ journey AScheduleFires {
         stipulate concurrency_mode_for_schedule(schedule) = unlimited
         stipulate job_definitions(repo, "nightly.yml", "abc123") = {}
         stipulate consistency_problem(repo, "nightly.yml", "abc123") = null
+        -- The sweep that notices the due entry runs a minute later and asks
+        -- for the occurrence after the next minute: for @daily, a day on.
+        stipulate next_cron_occurrence(spec, now + 2.minutes) = now + 1.day
         after 1.minute
         then ScheduleFires fires
 

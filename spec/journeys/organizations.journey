@@ -43,6 +43,8 @@ world {
         devs.access_mode = write
         devs.includes_all_repositories = false
         devs.can_create_org_repo = false
+        -- Alice owns the organization in every story here.
+        is_org_owner(org, alice) = true
 }
 
 -- The happy path of founding an organization.
@@ -109,7 +111,6 @@ journey AliceBuildsATeam {
           puts Bob, who is not yet in the org, on it. Bob becomes an org member.
 
     1. alice creates the team
-        stipulate is_org_owner(org, alice) = true
         stipulate is_alpha_dash_dot("leads") = true
         stipulate length("leads") = 5
         stipulate lower("leads") = "leads"
@@ -171,7 +172,6 @@ journey TheOwnersTeamHoldsTheLine {
         alice_in_org: OrgMembership { organization: org, user: alice, is_public: true }
 
     1. she cannot delete the Owners team
-        stipulate is_org_owner(org, alice) = true
         alice cannot do OwnerDeletesTeam(alice, owners) on TeamSettings
 
     2. she cannot step off the Owners team as its last member
@@ -216,7 +216,6 @@ journey CarolIsInvitedByEmail {
           link, accepts while keeping her membership hidden, and is on the team.
 
     1. alice sends the invitation
-        stipulate is_org_owner(org, alice) = true
         stipulate mail_service_enabled() = true
         stipulate is_valid_email("carol@example.org") = true
         stipulate has_pending_team_invite_for_email(devs, "carol@example.org") = false
@@ -268,7 +267,6 @@ journey AnInvitationExpires {
           it away.
 
     1. alice sends the invitation
-        stipulate is_org_owner(org, alice) = true
         stipulate mail_service_enabled() = true
         stipulate is_valid_email("carol@example.org") = true
         stipulate has_pending_team_invite_for_email(devs, "carol@example.org") = false
@@ -306,7 +304,6 @@ journey DevsGetTheirRepository {
         api.owner_org = org
 
     1. alice adds api to devs
-        stipulate is_org_owner(org, alice) = true
         stipulate team_covers(devs, api) = false
         alice does OwnerAddsRepositoryToTeam(alice, devs, api) on TeamSettings
             creating link: TeamRepository
@@ -343,7 +340,6 @@ journey RepoAdminAndTeamAccess {
         bob cannot do RepoAdminAddsTeamToRepository(bob, api, devs) on RepositoryTeamAccess
 
     2. alice lets repository admins manage team access
-        stipulate is_org_owner(org, alice) = true
         alice does OwnerSetsRepoAdminTeamAccess(alice, org, true) on OrganizationSettings
         then org.repo_admin_change_team_access = true
 
@@ -361,7 +357,6 @@ journey AcmeStillOwnsRepositories {
           the deletion is refused until they are deleted or transferred.
 
     1. refused while repositories remain
-        stipulate is_org_owner(org, alice) = true
         stipulate owned_repository_count(org) = 2
         stipulate owned_package_count(org) = 0
         alice cannot do OwnerDeletesOrganization(alice, org, "acme") on OrganizationSettings
@@ -373,7 +368,6 @@ journey DeletingAnEmptyAcme {
     goal: acme owns nothing any more. Alice must type its name to delete it.
 
     1. refused when the confirmation name is wrong
-        stipulate is_org_owner(org, alice) = true
         stipulate owned_repository_count(org) = 0
         stipulate owned_package_count(org) = 0
         alice cannot do OwnerDeletesOrganization(alice, org, "acne") on OrganizationSettings
@@ -429,7 +423,6 @@ journey PrivateOrganizationIsInvisibleAnonymously {
         stranger sees org.name on AnonymousOrganizationProfile in org
 
     2. alice makes it private
-        stipulate is_org_owner(org, alice) = true
         alice does OwnerChangesOrganizationVisibility(alice, org, private) on OrganizationSettings
         then org.visibility = private
 

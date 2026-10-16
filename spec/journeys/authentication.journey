@@ -203,6 +203,9 @@ journey RememberMeLapsesAfterAMonth {
     given:
         s.status = anonymous
         later.status = anonymous
+        -- `later` is the fresh browser session she comes back with a month
+        -- on; the forge first hears from it on that day.
+        later.last_activity_at = now + 32.days
         ada.is_active = true
         ada.prohibit_login = false
         ada.kind = individual

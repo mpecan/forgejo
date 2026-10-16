@@ -72,6 +72,10 @@ world {
         -- The code indexer is off (REPO_INDEXER_ENABLED defaults to false),
         -- so a finished import queues no code-index job.
         indexer.enabled = false
+        -- "widget" is a valid name that Alice has not used yet, in every story
+        -- here unless one says otherwise.
+        is_valid_repo_name("widget") = true
+        repository_name_free(alice, "widget") = true
 }
 
 -- The main path: a full import from GitHub, from the form to a ready
@@ -84,10 +88,8 @@ journey AliceImportsARepositoryFromGitHub {
     1. she submits the migration form
         stipulate gh.supports = {milestones, labels, release_items, release_assets, issue_items, comments, pull_requests, reviews, reactions}
         stipulate req.wanted = {issue_items, comments, reactions, labels, milestones}
-        stipulate is_valid_repo_name("widget") = true
         stipulate length("widget") = 6
         stipulate length("Widgets") = 7
-        stipulate repository_name_free(alice, "widget") = true
         stipulate within_creation_limit(alice) = true
         stipulate quota_allows_new_repository(alice) = true
         stipulate is_allowed_remote("https://github.com/acme/widget", alice) = true
@@ -136,7 +138,6 @@ journey AGogsImportSkipsWhatGogsCannotGive {
     1. he submits the form
         stipulate gogs.supports = {milestones, labels, issue_items, comments}
         stipulate req.wanted = {issue_items, comments, pull_requests}
-        stipulate is_valid_repo_name("widget") = true
         stipulate length("widget") = 6
         stipulate length("Widgets") = 7
         stipulate repository_name_free(bob, "widget") = true
@@ -165,10 +166,8 @@ journey AliceMirrorsARepository {
     1. she asks for a mirror
         stipulate gh.supports = {milestones, labels, issue_items, comments}
         stipulate req.wanted = {}
-        stipulate is_valid_repo_name("widget") = true
         stipulate length("widget") = 6
         stipulate length("Widgets") = 7
-        stipulate repository_name_free(alice, "widget") = true
         stipulate within_creation_limit(alice) = true
         stipulate quota_allows_new_repository(alice) = true
         stipulate is_allowed_remote("https://github.com/acme/widget", alice) = true
@@ -202,8 +201,6 @@ journey AMirrorCarriesNoIssueTracker {
     1. she asks for a mirror with issues
         stipulate gh.supports = {milestones, labels, issue_items, comments}
         stipulate req.wanted = {issue_items, comments}
-        stipulate is_valid_repo_name("widget") = true
-        stipulate repository_name_free(alice, "widget") = true
         stipulate is_allowed_remote("https://github.com/acme/widget", alice) = true
         alice cannot do UserRequestsMigration(alice, alice, req) on MigrationForm
 
@@ -217,8 +214,6 @@ journey BobCannotImportIntoAliceNamespace {
     1. he tries
         stipulate gh.supports = {milestones, labels, issue_items, comments}
         stipulate req.wanted = {issue_items, comments}
-        stipulate is_valid_repo_name("widget") = true
-        stipulate repository_name_free(alice, "widget") = true
         stipulate is_allowed_remote("https://github.com/acme/widget", bob) = true
         bob cannot do UserRequestsMigration(bob, alice, req) on MigrationForm
 
@@ -237,8 +232,6 @@ journey CredentialsInTheAddressAreRefused {
     1. she submits it
         stipulate gh.supports = {milestones, labels, issue_items, comments}
         stipulate req.wanted = {issue_items, comments}
-        stipulate is_valid_repo_name("widget") = true
-        stipulate repository_name_free(alice, "widget") = true
         stipulate is_allowed_remote("https://alice:hunter2@github.com/acme/widget", alice) = true
         alice cannot do UserRequestsMigration(alice, alice, req) on MigrationForm
 
@@ -258,7 +251,6 @@ journey AServerPathIsNotForEveryone {
         stipulate gh.supports = {milestones, labels, issue_items, comments}
         stipulate req.wanted = {issue_items, comments}
         stipulate may_import_local_paths(bob) = false
-        stipulate is_valid_repo_name("widget") = true
         stipulate repository_name_free(bob, "widget") = true
         bob cannot do UserRequestsMigration(bob, bob, req) on MigrationForm
 
@@ -276,8 +268,6 @@ journey ABlockedHostIsRefused {
     1. she submits it
         stipulate gh.supports = {milestones, labels, issue_items, comments}
         stipulate req.wanted = {issue_items, comments}
-        stipulate is_valid_repo_name("widget") = true
-        stipulate repository_name_free(alice, "widget") = true
         stipulate is_allowed_remote("https://git.internal/acme/widget", alice) = false
         alice cannot do UserRequestsMigration(alice, alice, req) on MigrationForm
 
@@ -545,7 +535,6 @@ journey AnOperatorRestoresAnArchive {
 
     2. the operator restores it
         stipulate sel.units = {}
-        stipulate repository_name_free(alice, "widget") = true
         stipulate first_site_admin() = admin
         stipulate profile_for(gitlab) = lab
         op does OperatorRestoresRepository(op, archive, alice, "widget", sel) on RepositoryArchiveConsole

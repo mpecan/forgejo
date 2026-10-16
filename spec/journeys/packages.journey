@@ -27,6 +27,10 @@ world {
         maven_row:     KindPolicy { kind: maven, version_mode: additive, file_overwrite: replace_metadata, has_repository_index: false, signing: none, size_limit: -1 }
         cargo_row:     KindPolicy { kind: cargo, version_mode: immutable, file_overwrite: refuse, has_repository_index: false, signing: none, size_limit: -1 }
         container_row: KindPolicy { kind: container, version_mode: reference, file_overwrite: refuse, has_repository_index: false, signing: none, size_limit: -1 }
+        -- Ada may write to her own registry, and it is under quota, in every story
+        -- here unless one says otherwise.
+        can_write_packages(ada, reg) = true
+        quota_allows_package_upload(reg) = true
 }
 
 -- The happy path of the generic registry: the first upload of a new name
@@ -36,9 +40,7 @@ journey AdaPublishesAGenericPackage {
           becomes a package other tools can be told about.
 
     1. she uploads the first file of a new package
-        stipulate can_write_packages(ada, reg) = true
         stipulate valid_coordinates(generic, "tool", "1.0.0", "tool.tar.gz") = true
-        stipulate quota_allows_package_upload(reg) = true
         stipulate reg.stored_size = 0
         stipulate reg.visible_version_count = 0
         ada does PublisherUploadsPackageFile(ada, reg, generic, "tool", "1.0.0", "tool.tar.gz", null, true, 2048, "abc123") on PackageClientProtocol
@@ -67,8 +69,6 @@ journey AdaAddsASecondFileToTheSameVersion {
         file:  PackageFile { version: v1, blob: blob, name: "tool.tar.gz", composite_key: null, is_lead: true }
 
     1. she uploads a checksum file next to the archive
-        stipulate can_write_packages(ada, reg) = true
-        stipulate quota_allows_package_upload(reg) = true
         stipulate reg.stored_size = 2048
         stipulate reg.visible_version_count = 1
         stipulate valid_coordinates(generic, "tool", "1.0.0", "tool.sha256") = true
@@ -94,9 +94,7 @@ journey NpmRefusesToRepublishAVersion {
         v1:   PackageVersion { package: lib, creator: ada, version: "1.0.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
 
     1. the same version again is a conflict
-        stipulate can_write_packages(ada, reg) = true
         stipulate valid_coordinates(npm, "left-pad", "1.0.0", "left-pad-1.0.0.tgz") = true
-        stipulate quota_allows_package_upload(reg) = true
         stipulate reg.stored_size = 0
         stipulate reg.visible_version_count = 1
         ada cannot do PublisherUploadsPackageFile(ada, reg, npm, "left-pad", "1.0.0", "left-pad-1.0.0.tgz", null, true, 512, "aaa111") on PackageClientProtocol
@@ -126,9 +124,7 @@ journey AnOversizedHelmChartIsRefused {
           bigger.
 
     1. a chart bigger than the limit is refused
-        stipulate can_write_packages(ada, reg) = true
         stipulate valid_coordinates(helm, "web", "0.1.0", "web-0.1.0.tgz") = true
-        stipulate quota_allows_package_upload(reg) = true
         stipulate reg.stored_size = 0
         stipulate reg.visible_version_count = 0
         ada cannot do PublisherUploadsPackageFile(ada, reg, helm, "web", "0.1.0", "web-0.1.0.tgz", null, true, 5000, "big999") on PackageClientProtocol
@@ -173,7 +169,6 @@ journey AdaDeletesADebianVersion {
         v2:   PackageVersion { package: pkg, creator: ada, version: "2.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
 
     1. she deletes the version from its settings page
-        stipulate can_write_packages(ada, reg) = true
         stipulate index_scopes_of(reg, debian) = {}
         stipulate generated_public_key(reg, debian) = "PGP KEY"
         ada does UserRemovesPackageVersion(ada, v2) on PackageVersionSettings
@@ -194,7 +189,6 @@ journey AdaLinksAPackageToHerRepository {
         pkg:  Package { registry: reg, kind: generic, name: "tool", is_internal: false, repository: null, autolink_pending: false }
 
     1. she links it
-        stipulate can_write_packages(ada, reg) = true
         stipulate same_owner(reg, repo) = true
         stipulate can_write_repo_packages(ada, repo) = true
         ada does UserLinksPackage(ada, pkg, repo) on PackageVersionSettings
@@ -215,7 +209,6 @@ journey AdaYanksACrate {
         v3:    PackageVersion { package: crate, creator: ada, version: "0.3.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
 
     1. she yanks it
-        stipulate can_write_packages(ada, reg) = true
         ada does PublisherYanksCargoVersion(ada, v3) on PackageClientProtocol
         then CargoYanksVersion fires
         then v3.is_yanked = true
@@ -224,7 +217,6 @@ journey AdaYanksACrate {
         ada cannot do PublisherYanksCargoVersion(ada, v3) on PackageClientProtocol
 
     3. and she brings it back
-        stipulate quota_allows_package_upload(reg) = true
         ada does PublisherUnyanksCargoVersion(ada, v3) on PackageClientProtocol
         then CargoUnyanksVersion fires
         then v3.is_yanked = false
@@ -236,9 +228,7 @@ journey AdaYanksACrate {
 -- image package and tries to auto-link it.
 journey AdaPushesAContainerImage {
     1. she starts a blob upload
-        stipulate can_write_packages(ada, reg) = true
         stipulate valid_image_reference("web", "") = true
-        stipulate quota_allows_package_upload(reg) = true
         ada does ContainerClientStartsBlobUpload(ada, reg, "web") on ContainerRegistryProtocol
             creating upload: BlobUpload
         then upload.bytes_received = 0
@@ -261,10 +251,12 @@ journey AdaPushesAContainerImage {
         stipulate reg.visible_version_count = 0
         ada does ContainerClientPushesManifest(ada, reg, "web", "v1", true, 512, "man1") on ContainerRegistryProtocol
             creating image: Package
+            where autolink_candidate(image) = null
         then ContainerPushesManifestForNewImage fires
         then AttachManifestLayers fires
         then AutolinkContainerImage fires
         then image.autolink_pending = false
+        then image.repository = null
 
     ends: Ada's registry has image "web" with tag v1; auto-linking was tried
           once and will not be tried again.
@@ -278,8 +270,6 @@ journey AdaRepointsTheLatestTag {
         old:   PackageVersion { package: image, creator: ada, version: "latest", is_internal: false, download_count: 42, is_tagged: true, is_yanked: false }
 
     1. she pushes a new manifest as latest
-        stipulate can_write_packages(ada, reg) = true
-        stipulate quota_allows_package_upload(reg) = true
         stipulate manifest_references_resolve(reg, "web", "man2") = true
         ada does ContainerClientPushesManifest(ada, reg, "web", "latest", true, 600, "man2") on ContainerRegistryProtocol
             creating fresh: PackageVersion

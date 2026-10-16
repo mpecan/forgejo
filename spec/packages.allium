@@ -950,6 +950,9 @@ rule ContainerAppendsChunk {
 rule ContainerCompletesBlobUpload {
     when: ContainerClientCompletesBlobUpload(publisher, upload, sha256)
     let registry = upload.registry
+    -- read before the upload goes: postconditions see the resulting state
+    let image = upload.image
+    let bytes = upload.bytes_received
     let policy = KindPolicy{kind: container}
     let existing_blob = PackageBlob{hash_sha256: sha256}
     requires: config.packages_enabled
@@ -958,13 +961,13 @@ rule ContainerCompletesBlobUpload {
     requires: upload_digest_matches(upload, sha256)
     requires: publisher.is_admin or policy.size_limit < 0 or upload.bytes_received <= policy.size_limit
     requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + upload.bytes_received <= config.limit_total_owner_size
-    ensures: not exists upload
     ensures:
         if exists existing_blob:
-            ContainerUploadedBlob.created(registry: registry, image: upload.image, blob: existing_blob, uploaded_at: now)
+            ContainerUploadedBlob.created(registry: registry, image: image, blob: existing_blob, uploaded_at: now)
         else:
-            let blob = PackageBlob.created(size: upload.bytes_received, hash_md5: md5_of(sha256), hash_sha1: sha1_of(sha256), hash_sha256: sha256, hash_sha512: sha512_of(sha256), hash_blake2b: blake2b_of(sha256), created_at: now)
-            ContainerUploadedBlob.created(registry: registry, image: upload.image, blob: blob, uploaded_at: now)
+            let blob = PackageBlob.created(size: bytes, hash_md5: md5_of(sha256), hash_sha1: sha1_of(sha256), hash_sha256: sha256, hash_sha512: sha512_of(sha256), hash_blake2b: blake2b_of(sha256), created_at: now)
+            ContainerUploadedBlob.created(registry: registry, image: image, blob: blob, uploaded_at: now)
+    ensures: not exists upload
 }
 
 -- from: routers/api/packages/container/container.go:395

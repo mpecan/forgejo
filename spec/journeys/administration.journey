@@ -182,7 +182,6 @@ journey TheMirrorTaskRunsOnItsSchedule {
 
     1. the instance starts and schedules it
         stipulate time_until_next("@every 10m") = 10.minutes
-        stipulate authentication/config.oauth2_default_applications = {git_credential_oauth, git_credential_manager, tea}
         proc does InstanceStarted(site) on BackgroundWorkReporting
         then ScheduleTasksAtStart fires
         then StartCronTaskRun does not fire
@@ -211,7 +210,8 @@ journey OldNoticesAgeOut {
           over a year ago is removed on its weekly run.
 
     given:
-        tidy: CronTask { name: delete_old_system_notices, owner: administration, requires_feature: always, enabled: true, run_at_start: false, schedule: "@every 168h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+        tidy: CronTask { name: delete_old_system_notices, owner: administration, requires_feature: always, enabled: true, run_at_start: false, schedule: "@every 168h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0, next_run_at: now + 168.hours }
+        time_until_next("@every 168h") = 168.hours
 
     1. a background failure is reported
         proc does SystemFailureReported(repository, "Failed to remove /data/repos/x.git") on BackgroundWorkReporting
@@ -219,9 +219,9 @@ journey OldNoticesAgeOut {
         then RecordSystemNotice fires
         then old.kind = repository
 
-    2. a year and a bit later root runs the cleanup
+    2. a year and a bit later the weekly run falls due
         after 400.days
-        root does AdminRunsCronTask(root, tidy) on CronTaskMonitor
+        then CronTaskFallsDue fires
         then DispatchDeleteOldSystemNotices fires
         then DeleteOldSystemNotices fires
         then old does not exist
@@ -394,8 +394,6 @@ journey AdministratorAdoptsAStrayRepository {
 
     2. root adopts it
         stipulate storage_is_empty(stray) = true
-        stipulate repositories/config.default_repo_units = {code, issues, pull_requests, releases, wiki, projects, packages, actions}
-        stipulate repositories/config.disabled_repo_units = {}
         root does UserAdoptsRepository(root, stray, ada) on RepositoryAdministration
         then UserAdoptsRepository fires
         then stray does not exist
@@ -417,6 +415,7 @@ journey AdministratorDeletesARepository {
         notes.name = "notes"
         notes.owner_user = ada
         notes.owner_org = null
+        notes.fork_of = null
 
     1. ada cannot use the admin list
         ada cannot do AdminDeletesRepository(ada, notes) on AdminRepositoryDirectory
