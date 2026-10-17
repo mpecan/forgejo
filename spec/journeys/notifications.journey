@@ -234,6 +234,7 @@ journey AdaRepliesFromHerMailClient {
         token.purpose = reply
         token.holder = ada
         token.issue = issue
+        token.revoked = false
         token.replied_to = null
 
     1. the mailbox hands over her reply
@@ -262,6 +263,7 @@ journey AnOutOfOfficeReplyIsIgnored {
         token.purpose = reply
         token.holder = ada
         token.issue = issue
+        token.revoked = false
 
     1. the auto-reply arrives and is refused
         stipulate token.is_valid = true
@@ -285,6 +287,7 @@ journey AnExpiredReplyAddressNoLongerWorks {
         token.purpose = reply
         token.holder = ada
         token.issue = issue
+        token.revoked = false
 
     1. her reply is refused
         -- expires_at is a year after composition; past it, is_valid is false.
@@ -309,6 +312,7 @@ journey AdaUnsubscribesByMail {
         token.purpose = unsubscribe
         token.holder = ada
         token.issue = issue
+        token.revoked = false
 
     1. the unsubscribe mail arrives
         stipulate token.is_valid = true
@@ -320,33 +324,59 @@ journey AdaUnsubscribesByMail {
     ends: Ada is no longer subscribed to the issue.
 }
 
--- Visibility: private activity on a profile.
+-- Visibility: private activity on a profile. Feeds are computed when read
+-- (decided notifications 6), so the activity itself is what each feed shows.
+-- (Updated: this used to go through a per-feed copy, FeedEntry.)
 journey BobCannotSeeAdasPrivateActivity {
     goal: Ada works in a private repository. Bob visits her profile and does
           not see that activity; Ada, on her own dashboard, does.
 
     cast:
         act:   Activity
-        entry: FeedEntry
 
     given:
         repo.is_private = true
         act.kind = create_issue
         act.actor = ada
         act.repository = repo
-        act.is_private = true
-        entry.activity = act
-        entry.owner_user = ada
 
     1. bob looks at her profile
         stipulate activity_visible_to(act, bob, false) = false
-        bob cannot see entry.activity.content on ProfileActivity in ada
+        bob cannot see act.content on ProfileActivity in ada
 
     2. ada looks at her dashboard
+        stipulate in_feed_of(ada, act) = true
         stipulate activity_visible_to(act, ada, true) = true
-        ada sees entry.activity.content on UserDashboard
+        ada sees act.content on UserDashboard
 
     ends: Private work stays private to people who can see the repository.
+}
+
+-- Computed on read: once Bob stops watching, the activity is gone from his
+-- dashboard, though it happened while he watched. (decided notifications 6)
+journey BobStopsWatchingAndTheFeedForgets {
+    goal: Ada opened an issue in her public repository while Bob watched it.
+          Bob stops watching; his dashboard no longer shows the activity.
+
+    cast:
+        act:   Activity
+
+    given:
+        repo.is_private = false
+        act.kind = create_issue
+        act.actor = ada
+        act.repository = repo
+
+    1. while he watches, he sees it
+        stipulate in_feed_of(bob, act) = true
+        stipulate activity_visible_to(act, bob, true) = true
+        bob sees act.content on UserDashboard
+
+    2. after he stops watching, it is gone
+        stipulate in_feed_of(bob, act) = false
+        bob cannot see act.content on UserDashboard
+
+    ends: Bob's feed follows what he watches now, not what he watched then.
 }
 
 -- Temporal: the live stream pushes the unread count on its own schedule.
@@ -419,7 +449,107 @@ journey AReleaseLandsInTheFeed {
         then RecordReleasePublished fires
         then MailOnReleasePublished does not fire
         then act.kind = publish_release
-        then act.is_private = false
+        then act.watch_category = releases
 
     ends: The release is on Ada's dashboard and in her watchers' feeds.
+}
+
+-- A password change revokes the reply and unsubscribe addresses of old mail.
+-- (decided notifications 3)
+journey AdasPasswordChangeRetiresOldReplyAddresses {
+    goal: Ada fears an old conversation mail leaked. She changes her
+          password; a reply sent to the address in that mail no longer posts
+          anything.
+
+    cast:
+        imap:  MailServer
+        token: MailToken
+        login: UserLogin
+
+    given:
+        imap.direction = incoming
+        token.purpose = reply
+        token.holder = ada
+        token.issue = issue
+        token.revoked = false
+        login.user = ada
+        login.source = null
+        login.has_password = true
+        login.must_change_password = false
+
+    1. she changes her password
+        stipulate password_matches(ada, "old secret") = true
+        stipulate password_acceptable("new secret") = true
+        ada does UserChangesPassword(ada, "old secret", "new secret") on SecuritySettings
+        then UserChangesPassword fires
+        then RevokeMailTokensOnPasswordChange fires
+        then token.revoked = true
+
+    2. a reply to the old address is refused
+        stipulate token.is_valid = true
+        stipulate can_read_issue(ada, issue) = true
+        stipulate can_comment_on_issue(ada, issue) = true
+        imap cannot do IncomingMailArrives(imap, token, "Posting as Ada", 0, false) on IncomingMailGateway
+
+    ends: Old reply addresses are dead; new mail carries new ones.
+}
+
+-- A collaborator invitation is mailed to the invitee, whichever way it is
+-- made. (decided notifications 5)
+journey BobIsMailedAnInvitationToCollaborate {
+    goal: Ada invites Bob to collaborate on her repository. With mail on, Bob
+          gets a mail saying who invited him and where; the access itself waits
+          for his answer.
+
+    given:
+        config.mailer_enabled = true
+        repo.is_archived = false
+
+    1. ada invites bob
+        stipulate repo.owner = ada
+        stipulate is_repo_admin(ada, repo) = true
+        stipulate is_blocked(ada, bob) = false
+        stipulate is_blocked(bob, ada) = false
+        ada does AdminInvitesCollaborator(ada, repo, bob) on RepositorySettings
+            creating message: MailMessage
+        then AdminInvitesCollaborator fires
+        then MailOnCollaboratorInvited fires
+        then MailOnCollaboratorAdded does not fire
+        then message.recipient = bob
+        then message.category = collaborator_invited
+        then message.status = queued
+
+    ends: Bob has an invitation mail with accept and decline links.
+}
+
+-- Mentions go through the audience filters: somebody who unsubscribed from
+-- an issue is not pulled back in by an @-mention. (decided notifications 1)
+journey AnUnsubscribedMentionStaysQuiet {
+    goal: Ada unsubscribed from an issue. Bob mentions her in a comment; she
+          gets no inbox thread for it.
+
+    cast:
+        optout: issues/IssueWatch
+
+    given:
+        issue.poster = bob
+        issue.status = open
+        repo.is_archived = false
+        optout.user = ada
+        optout.issue = issue
+        optout.is_watching = false
+
+    1. bob comments, mentioning ada
+        stipulate can_read_issue(bob, issue) = true
+        stipulate is_blocked(bob, bob) = false
+        stipulate is_blocked_by_owner(repo, bob) = false
+        stipulate issue_notification_audience(issue, bob) = {}
+        stipulate resolve_mentions(issue, bob, "@ada what do you think?") = {ada}
+        stipulate cross_references(repo, bob, null, "@ada what do you think?") = {}
+        bob does UserComments(bob, issue, "@ada what do you think?", {}) on IssueConversation
+        then InboxOnComment fires
+        then ExpandIssueThreadAudience fires
+        then DeliverIssueNotification does not fire
+
+    ends: Ada's opt-out holds even against a mention.
 }
