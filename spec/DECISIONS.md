@@ -325,3 +325,18 @@ Questions that came up while the decisions were applied.
 |---|---|---|
 | 1 | Site admins reading private repositories they have no role in | **Kept, but audited.** Admins can open any repository, but search and listings don't surface private repositories they have no role in, and each such access is logged. |
 | 2 | Package count limits after folding into quota | **Quota gains count subjects** (for example packages and repositories per owner), alongside the byte subjects. |
+
+## requests
+
+Questions raised while resolving the modules' cross-module requests.
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Pushes and runs made by a deploy key | **The key is recorded.** Comments and workflow runs carry an optional deploy key next to an optional user; failure mail goes to the repository's admins. |
+| 2 | Discarding a failed import | **Through the normal repository deletion cascade.** |
+| 3 | Quota for "update branch" | **The head repository's owner,** where the commits land. |
+| 4 | Where a user's sign-in source lives | **The login record** in authentication; the account's field is derived, and admins change it through authentication. |
+| 5 | Finishing scheduled task runs | **The owning module reports back** with its own finished/failed event, which administration maps to the run. |
+| 6 | OAuth2 quota groups | **A separate event** (`ExternalQuotaGroupsAsserted`) from authentication: the OAuth2 quota claim, or LDAP entry groups. Quota listens to it. |
+| 7 | LDAP periodic sync and groups | **Sync re-asserts group memberships** when the source has group lookup enabled. |
+| 8 | A refused LDAP sync | **A system notice** for admins. |
