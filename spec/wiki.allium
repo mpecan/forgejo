@@ -13,7 +13,9 @@
 --   - create / edit (incl. rename) / delete page with commit message
 --   - reading: view (rendered with sidebar and footer), page list, raw,
 --     revisions, search
---   - git transport to the wiki repository (clone with read, push with write)
+--   - git transport to the wiki repository (clone with read, push with write); a push's
+--     per-page changes become page records and events
+--   - nested pages: a "/" in a page name is a directory path
 --   - changing / normalising the wiki branch, deleting the wiki
 --   - external wiki: when the repository uses an external wiki, readers are
 --     sent to its URL instead
@@ -39,6 +41,8 @@
 --   WikiPageDeleted(repository, doer, page)          -- page: the deleted page's name (String)
 --   WikiDeleted(wiki, deleter)                       -- repositories reacts by disabling the wiki unit
 --   (the commit message of each change is the newest WikiRevision.message of the page)
+--   (a git push emits one WikiPageCreated / WikiPageEdited / WikiPageDeleted per page it
+--    added / changed / removed, attributed to the pusher)
 -- Reacts to:
 --   repositories/RepositoryCreated(repository, doer)
 
@@ -84,16 +88,19 @@ entity Wiki {
     is_empty: pages.count = 0
 }
 
--- One page = one Markdown file at the top of the wiki branch.
+-- One page = one Markdown file on the wiki branch, at the top or in a directory.
+-- decided: nested pages are supported; a "/" in a page name is a directory path
+-- ("Guides/Install" is the file Guides/Install.md).
 -- from: services/wiki/wiki_path.go:20
 entity WikiPage {
     wiki: Wiki
-    name: String                         -- canonical page name derived from the title (see page_name_for)
+    name: String                         -- canonical page path derived from the title (see page_name_for); "/" separates directories
     title: String                        -- what users see: name with dashes shown as spaces, unescaped
     content: String                      -- Markdown
     kind: WikiPageKind
     last_author: accounts/User?          -- null when the last commit's author maps to no account
     updated_at: Timestamp
+    revision: Integer                    -- bumped by every change to the page (web, API or push); an edit names the one it started from
 
     -- Derived
     is_special: kind in {sidebar, footer}
@@ -149,7 +156,12 @@ rule GitAccessInitialisesWiki {
 }
 
 -- Pushing to the wiki repository with git. Pages are whatever Markdown files
--- the pushed branch holds. No feed entries or notifications are produced.
+-- the pushed branch holds; each page the push added, changed or removed is
+-- recorded and announced like a web edit, attributed to the pusher.
+-- decided: a git push emits an event per changed page (created, edited,
+-- deleted), attributed to the pusher (Forgejo emits nothing: TODO there).
+-- decided: empty page content is refused on every path, so a push that would
+-- leave an empty page is refused.
 -- from: routers/web/repo/githttp.go:93
 rule UserPushesToWiki {
     when: UserPushesToWiki(user, wiki)
@@ -158,28 +170,96 @@ rule UserPushesToWiki {
     requires: not wiki.repository.is_archived
     requires: not wiki.repository.is_mirror
     requires: wiki_quota_allows(wiki.repository)
+    requires: not push_leaves_empty_page(wiki)
     ensures: wiki.status = initialised
-    ensures: WikiRevision.created(
-        wiki: wiki,
-        page_name: "",
-        kind: pushed,
-        author: user,
-        message: "",
-        created_at: now
-    )
+    ensures:
+        for name in pushed_added_pages(wiki):
+            PushAddsWikiPage(user: user, wiki: wiki, name: name)
+    ensures:
+        for page in pushed_changed_pages(wiki):
+            PushEditsWikiPage(user: user, page: page)
+    ensures:
+        for page in pushed_removed_pages(wiki):
+            PushDeletesWikiPage(user: user, page: page)
     @guidance
         -- Clone URL: <repo clone URL>.wiki.git over HTTP(S) and SSH.
         -- Write access over HTTP is checked up front for wiki pushes (there
         -- is no AGit flow on the wiki); "pull requests are not supported on
         -- the wiki". Pushing before the repository itself exists is refused.
-        -- Page set after a push = the top-level *.md files of the wiki branch.
+        -- Page set after a push = the *.md files of the wiki branch, in any
+        -- directory. The added/changed/removed sets compare the wiki branch
+        -- before and after the push; a file moved by the push is a removal
+        -- plus an addition. The empty-page check runs in pre-receive.
 }
 
--- A repository owner deletes all wiki data. The wiki unit is switched off.
+-- A page file the push added.
+rule PushAddsWikiPage {
+    when: PushAddsWikiPage(user, wiki, name)
+    requires: not exists WikiPage{wiki: wiki, name: name}
+    ensures:
+        let page = WikiPage.created(
+            wiki: wiki,
+            name: name,
+            title: page_title_for(name),
+            content: pushed_content(wiki, name),
+            kind: kind_of_page(name),
+            last_author: user,
+            updated_at: now,
+            revision: 1
+        )
+        WikiRevision.created(
+            wiki: wiki,
+            page_name: name,
+            kind: pushed,
+            author: user,
+            message: pushed_message(wiki, name),
+            created_at: now
+        )
+        WikiPageCreated(repository: wiki.repository, doer: user, page: page)
+}
+
+-- A page file the push changed.
+rule PushEditsWikiPage {
+    when: PushEditsWikiPage(user, page)
+    ensures: page.content = pushed_content(page.wiki, page.name)
+    ensures: page.last_author = user
+    ensures: page.updated_at = now
+    ensures: page.revision = page.revision + 1
+    ensures: WikiRevision.created(
+        wiki: page.wiki,
+        page_name: page.name,
+        kind: pushed,
+        author: user,
+        message: pushed_message(page.wiki, page.name),
+        created_at: now
+    )
+    ensures: WikiPageEdited(repository: page.wiki.repository, doer: user, page: page)
+}
+
+-- A page file the push removed.
+rule PushDeletesWikiPage {
+    when: PushDeletesWikiPage(user, page)
+    let page_name = page.name
+    let the_wiki = page.wiki
+    ensures: not exists page
+    ensures: WikiRevision.created(
+        wiki: the_wiki,
+        page_name: page_name,
+        kind: pushed,
+        author: user,
+        message: pushed_message(the_wiki, page_name),
+        created_at: now
+    )
+    ensures: WikiPageDeleted(repository: the_wiki.repository, doer: user, page: page_name)
+}
+
+-- A repository admin deletes all wiki data. The wiki unit is switched off.
+-- decided: repository admins delete wiki data and change the wiki branch, on
+-- every path (Forgejo's web settings restrict both to owners).
 -- from: services/wiki/wiki.go:381
-rule OwnerDeletesWiki {
-    when: OwnerDeletesWiki(user, wiki, confirmation)
-    requires: is_repo_owner(user, wiki.repository)
+rule AdminDeletesWiki {
+    when: AdminDeletesWiki(user, wiki, confirmation)
+    requires: can_admin_repository(user, wiki.repository)
     requires: confirmation = repository_full_name(wiki.repository)
     ensures:
         for p in wiki.pages:
@@ -196,6 +276,7 @@ rule OwnerDeletesWiki {
 
 -- Renaming the wiki branch: to the instance default ("normalise", web) or to
 -- any name (API repository edit).
+-- decided: repository admins on every path (see AdminDeletesWiki).
 -- from: services/wiki/wiki.go:50
 rule AdminChangesWikiBranch {
     when: AdminChangesWikiBranch(user, wiki, new_branch)
@@ -205,7 +286,7 @@ rule AdminChangesWikiBranch {
     ensures: wiki.repository.wiki_branch = new_branch
     @guidance
         -- Web: settings danger zone "rename wiki branch to <default>" (repo
-        -- owner). API: PATCH /repos/{o}/{r} with wiki_branch (repo admin).
+        -- admin). API: PATCH /repos/{o}/{r} with wiki_branch (repo admin).
         -- The git branch is renamed and HEAD moved when the old branch exists
         -- and the new one does not; an uninitialised wiki just records it.
 }
@@ -223,6 +304,7 @@ rule UserCreatesWikiPage {
     requires: can_write_wiki(user, wiki.repository)
     requires: not wiki.repository.is_archived
     requires: title != ""
+    requires: content != ""              -- decided: empty page content is refused on every path
     requires: name not in {"_pages", "_new", "_edit", "raw"}
     requires: not exists WikiPage{wiki: wiki, name: name}
     requires: wiki_quota_allows(wiki.repository)
@@ -236,7 +318,8 @@ rule UserCreatesWikiPage {
             content: content,
             kind: kind_of_page(name),
             last_author: user,
-            updated_at: now
+            updated_at: now,
+            revision: 1
         )
         WikiRevision.created(
             wiki: wiki,
@@ -253,13 +336,23 @@ rule UserCreatesWikiPage {
         -- title, content_base64, message.
         -- The commit is authored and committed by the user (or signed by the
         -- instance key per keys' wiki signing policy).
+        -- A title with "/" creates the page in that directory
+        -- ("Guides/Install" -> Guides/Install.md).
 }
 
 -- Editing a page; a different title renames it in the same commit.
+-- decided: the page must exist; editing never creates one (Forgejo's API PATCH
+-- on a missing page creates it).
+-- decided: renaming onto another existing page is refused (Forgejo overwrites it).
+-- decided: stale edits are refused: the edit carries the revision it started
+-- from, and the save is refused if the page has changed since.
+-- decided: empty page content is refused on every path (Forgejo's API allows it).
 -- from: services/wiki/wiki.go:290
 rule UserEditsWikiPage {
-    when: UserEditsWikiPage(user, wiki, page, title, content, message)
+    when: UserEditsWikiPage(user, wiki, page, base_revision, title, content, message)
     requires: page.wiki = wiki
+    requires: base_revision = page.revision
+    requires: content != ""
     let new_name = if title = "": page.name else: page_name_for(title)
     requires: wiki_unit_enabled(wiki.repository)
     requires: can_write_wiki(user, wiki.repository)
@@ -276,6 +369,7 @@ rule UserEditsWikiPage {
     ensures: page.kind = kind_of_page(new_name)
     ensures: page.last_author = user
     ensures: page.updated_at = now
+    ensures: page.revision = page.revision + 1
     ensures: WikiRevision.created(
         wiki: wiki,
         page_name: new_name,
@@ -288,8 +382,9 @@ rule UserEditsWikiPage {
     @guidance
         -- Web: GET /{o}/{r}/wiki/{page}?action=_edit, POST /wiki/{page}.
         -- API: PATCH /repos/{o}/{r}/wiki/page/{pageName} (empty title keeps
-        -- the name).
-        -- There is no conflict detection: the last save wins.
+        -- the name). Web and API both send the revision the edit started
+        -- from (the page's last commit); a stale save is refused with a
+        -- conflict and the editor reloads the page.
 }
 
 -- from: services/wiki/wiki.go:296
@@ -445,11 +540,12 @@ surface WikiEditing {
             p.name
             p.title
             p.content
+            p.revision
 
     provides:
         UserCreatesWikiPage(editor, wiki, title, content, message)
             when not wiki.repository.is_archived
-        UserEditsWikiPage(editor, wiki, page, title, content, message)
+        UserEditsWikiPage(editor, wiki, page, base_revision, title, content, message)
             when not wiki.repository.is_archived
         UserDeletesWikiPage(editor, wiki, page)
             when not wiki.repository.is_archived
@@ -475,7 +571,7 @@ surface WikiAdministration {
         wiki.status
 
     provides:
-        OwnerDeletesWiki(admin, wiki, confirmation)
+        AdminDeletesWiki(admin, wiki, confirmation)
         AdminChangesWikiBranch(admin, wiki, new_branch)
             when not wiki.repository.is_archived
 }
@@ -487,24 +583,11 @@ surface WikiAdministration {
 deferred page_name_for    -- see: services/wiki/wiki_path.go (title -> page name escaping)
 
 ------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Renaming a page onto the name of another existing page silently overwrites it in Forgejo; this spec refuses the rename. Confirm."
-open question "Saving an edit has no conflict detection (last write wins). Should a rebuild require the base revision and refuse stale edits?"
-open question "The web form requires non-empty content but the API accepts an empty page. Which is intended?"
-open question "Pushing to the wiki with git produces no activity-feed entry, notification or webhook (TODO in Forgejo). Should it emit WikiPageEdited per changed page?"
-open question "Deleting wiki data is restricted to repository owners on the web, while changing the wiki branch is allowed to repo admins via the API but only owners on the web. Unify on repo admin?"
-open question "Forgejo's API PATCH on a page that does not exist creates it; this spec requires the page to exist (create is a separate operation). Confirm."
-open question "Wiki pages are flat (a '/' in a title is escaped into the name). Should a rebuild support nested page directories?"
-
-------------------------------------------------------------
 -- Black-box functions used (non-normative index)
 ------------------------------------------------------------
 -- can_read_wiki(user, repository)        = access/can_read(user, repository, wiki)
 -- can_write_wiki(user, repository)       = access/can_write(user, repository, wiki)
 -- can_admin_repository(user, repository) = access/is_repo_admin(user, repository)
--- is_repo_owner(user, repository)        = owner-level access (owner, org owner, site admin)
 -- wiki_unit_enabled(repository)          = repositories/RepoUnit{kind: wiki}.enabled (internal wiki, not external)
 -- external_wiki_url(repository)          = repositories/RepoUnit{kind: external_wiki}.external_wiki_url, or null
 --   (the "anyone may edit" option is repositories/RepoUnit.everyone_can_write; access applies it)
@@ -512,10 +595,20 @@ open question "Wiki pages are flat (a '/' in a title is escaped into the name). 
 -- wiki_quota_allows(repository)          = quota subject size:wiki
 -- search_wiki(wiki, query)               = up to search_max_files pages whose content contains query literally
 -- kind_of_page(name)                     = sidebar for "_Sidebar", footer for "_Footer", else regular
+-- page_title_for(name)                   = the displayed title for a page path (reverse of page_name_for)
+-- pushed_added_pages(wiki)               = names of the page files the push being received adds
+-- pushed_changed_pages(wiki)             = existing pages whose file the push changes
+-- pushed_removed_pages(wiki)             = existing pages whose file the push removes
+-- pushed_content(wiki, name)             = the page file's content at the pushed head
+-- pushed_message(wiki, name)             = message of the newest pushed commit touching that file
+-- push_leaves_empty_page(wiki)           = some page file at the pushed head is empty
 -- page_name_for(title):
---   trim the title; if it contains "-" or ends in ".md", keep dashes and mark
---   the name with a trailing ".-"; otherwise spaces become "-"; the result is
---   URL-query-escaped (so "/" becomes "%2F"); an empty result is "unnamed".
+--   split the title on "/" into directory segments, dropping empty segments;
+--   per segment: trim; if it contains "-" or ends in ".md", keep dashes and mark
+--   the segment with a trailing ".-"; otherwise spaces become "-"; the segment is
+--   URL-query-escaped ("." and ".." are escaped, never path steps); an empty
+--   result is "unnamed". Segments are joined with "/" (decided: nested pages;
+--   Forgejo escapes "/" into "%2F" and keeps the wiki flat).
 --   The page file is <name>.md with "%20"/"+" shown as spaces. The displayed
 --   title reverses this (dashes back to spaces unless marked).
 
@@ -540,3 +633,9 @@ open question "Wiki pages are flat (a '/' in a title is escaped into the name). 
 --   WikiPageDeleted (feed entries, `wiki` webhook event with created/edited/deleted).
 -- REQUEST code: git transport must route "<repo>.wiki" to the wiki repository with
 --   wiki-unit permissions and emit wiki/UserPushesToWiki / UserOpensWikiOverGit.
+-- REQUEST code: for a push to "<repo>.wiki", pre-receive asks wiki whether the push is
+--   allowed (wiki/UserPushesToWiki's requires, incl. no empty page file) and post-receive
+--   hands wiki the before/after diff of the wiki branch (the pushed_* black boxes) so
+--   wiki emits one WikiPageCreated / WikiPageEdited / WikiPageDeleted per page, by the pusher.
+-- REQUEST webhooks / notifications: wiki events now also arrive from git pushes (one per
+--   changed page); no new event kinds needed.

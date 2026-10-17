@@ -182,3 +182,7 @@ invariants or config. Numbers refer to the question's position in its module in
 | 2 | Who manages repo secrets, variables and runners | **Repository admins,** on every path. |
 | 3 | Artifact retention vs `ARTIFACT_RETENTION_DAYS` | **The config is only the default.** A workflow may request any retention. |
 | 4 | Runner registration tokens | **Expire after a configurable lifetime** (default 1 hour), reusable for several runners until then. |
+| 5 | Legacy OIDC subject format | **Dropped.** One subject format only; no `legacy_forgejo_15` option. |
+| 6 | Artifact protocols | **v1–v4 all supported.** |
+| 7 | Pruning old run records | **Admin config, off by default.** When set, finished runs older than the retention age are deleted with their logs and artifacts. |
+| 8 | Disabling schedules for inactivity | **Admin config, off by default.** When set, a repository with no activity for that period has its scheduled workflows disabled and its admins are notified. |
