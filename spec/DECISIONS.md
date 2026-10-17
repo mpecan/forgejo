@@ -228,3 +228,4 @@ invariants or config. Numbers refer to the question's position in its module in
 | 6 | Activity feeds | **Computed on read:** events from what the reader follows or watches now, filtered by current visibility. |
 | 7 | The `commit` notification source | **Dropped.** |
 | 8 | Release mail for prereleases | **Prereleases are mailed too.** |
+| 9 | Retrying failed mail | **No retry.** A failed mail is dropped and logged. |
