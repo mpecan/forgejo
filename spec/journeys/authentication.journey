@@ -327,9 +327,13 @@ journey APersonalAccessTokenForTheCommandLine {
         stipulate secret_suffix() = "9f3c1a7e"
         ada does UserCreatesAccessToken(ada, ada, "ci", {read_repository}, false, true, {}, session) on ApplicationSettings
             creating token: AccessToken
+            creating reach: access/CredentialRestriction
         then UserCreatesAccessToken fires
         then token.owner = ada
         then token.all_repositories = true
+        then AccessTokenRestrictionDerived fires
+        then reach.reach = all_repositories
+        then reach.has_admin_scope = false
         then token.last_eight = "9f3c1a7e"
         ada sees token.last_eight on ApplicationSettings
 
@@ -342,6 +346,7 @@ journey APersonalAccessTokenForTheCommandLine {
     4. she deletes it
         ada does UserDeletesAccessToken(ada, token, session) on ApplicationSettings
         then token does not exist
+        then reach does not exist
 
     ends: The token is gone.
 }
@@ -512,12 +517,16 @@ journey TheDirectorySyncDeactivatesPeopleWhoLeft {
         ada:  accounts/User
         bob:  accounts/User
         corp: AuthSource
+        corp_settings: AuthSourceSettings
 
     given:
         root.is_admin = true
         root.is_active = true
         root.prohibit_login = false
         ada.is_active = true
+        -- the directory's group lookup is off
+        corp.settings = corp_settings
+        corp_settings.groups_enabled = false
         corp.name = "corp-ldap"
         corp.kind = ldap_bind_dn
         corp.is_active = true
@@ -536,6 +545,92 @@ journey TheDirectorySyncDeactivatesPeopleWhoLeft {
         then bob.is_active = true
 
     ends: Ada's account is inactive; she can no longer sign in or use tokens.
+}
+
+-- decided: requests 7 — with group lookup on, the periodic sync re-asserts the
+-- directory's group memberships, as a sign-in would.
+journey TheDirectorySyncRefreshesHerGroups {
+    goal: Ada's directory entry now lists her in "staff", which the source maps
+          to the "staffers" quota group. The next synchronisation, without her
+          signing in, puts her in that group.
+
+    cast:
+        root: accounts/User
+        ada:  accounts/User
+        corp: AuthSource
+        corp_settings: AuthSourceSettings
+        staffers: quota/QuotaGroup
+
+    given:
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+        ada.is_active = true
+        corp.settings = corp_settings
+        corp_settings.groups_enabled = true
+        corp_settings.quota_group_map_removal = false
+        corp.name = "corp-ldap"
+        corp.kind = ldap_bind_dn
+        corp.is_active = true
+        corp.sync_enabled = true
+        login: UserLogin { user: ada, source: corp, login_name: "ada", has_password: false, must_change_password: false }
+        entry: DirectoryEntry { source: corp, username: "ada", email: "ada@corp.example", is_admin: false, is_restricted: false, groups: {"staff"} }
+        quota_view: quota/QuotaAccount { user: ada, organization: null }
+
+    1. root runs the synchronisation
+        -- the directory publishes no SSH key attribute
+        stipulate corp.provides_ssh_keys = false
+        stipulate quota_groups_mapped_from(corp, {"staff"}) = {staffers}
+        stipulate quota_groups_mapped_from_unclaimed(corp, {"staff"}) = {}
+        stipulate teams_mapped_from(corp, {"staff"}) = {}
+        stipulate teams_unmapped_from(corp, ada, {"staff"}) = {}
+        root does AdminRunsExternalUserSync(root) on AuthSourceAdministration
+            creating granted: quota/QuotaGroupMembership
+        then LdapSourceSynchronised fires
+        then LoginSourceSyncsQuotaGroups fires
+        then granted.group = staffers
+        then granted.account = quota_view
+
+    ends: Ada is in the staffers quota group because the directory says so.
+}
+
+-- decided: requests 8 — a sync the directory cannot answer is refused, and
+-- the operator finds out from the system notices.
+journey AnEmptyDirectoryAnswerIsRefusedAndNoticed {
+    goal: The directory search comes back empty, perhaps from a broken filter.
+          The source may not deactivate everyone, so the sync is refused: Ada
+          stays active, and a system notice tells the administrators.
+
+    cast:
+        root: accounts/User
+        ada:  accounts/User
+        corp: AuthSource
+        corp_settings: AuthSourceSettings
+
+    given:
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+        ada.is_active = true
+        corp.settings = corp_settings
+        corp_settings.allow_deactivate_all = false
+        corp_settings.groups_enabled = false
+        corp.name = "corp-ldap"
+        corp.kind = ldap_bind_dn
+        corp.is_active = true
+        corp.sync_enabled = true
+        login: UserLogin { user: ada, source: corp, login_name: "ada", has_password: false, must_change_password: false }
+
+    1. root runs the synchronisation
+        root does AdminRunsExternalUserSync(root) on AuthSourceAdministration
+            creating notice: administration/SystemNotice
+        then LdapSourceSynchronised does not fire
+        then LdapSourceSyncRefused fires
+        then RecordRefusedDirectorySyncNotice fires
+        then notice.kind = task
+        then ada.is_active = true
+
+    ends: Nobody was deactivated, and the refusal waits in the notice log.
 }
 
 -- Updated for the decision "tokens everywhere": this journey used to show password
@@ -1005,4 +1100,41 @@ journey AnAdminSetPasswordForgetsOldDevices {
         then login.must_change_password = true
 
     ends: Only the new password signs Ada in, and she must change it first.
+}
+
+-- An authorized integration's JWTs reach only what the integration names, the
+-- same way a repository-specific token does (access reduces by it).
+journey AnIntegrationReachesOnlyItsRepository {
+    goal: Ada lets her CI provider's tokens act on her "tool" repository only.
+          The integration carries a restriction listing that repository and no
+          admin scope; when she deletes the integration, the restriction goes.
+
+    cast:
+        ada:  accounts/User
+        tool: repositories/Repository
+
+    given:
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.is_admin = false
+
+    1. she authorizes the integration for one repository
+        stipulate issuer_trustworthy("https://ci.example") = true
+        stipulate claim_rules_well_formed([]) = true
+        stipulate can_read_code(ada, tool) = true
+        ada does UserCreatesAuthorizedIntegration(ada, "ci", generic, "https://ci.example", "forgejo", [], {read_repository}, false, false, {tool}) on ApplicationSettings
+            creating ci: AuthorizedIntegration
+            creating reach: access/CredentialRestriction
+        then AuthorizedIntegrationRestrictionDerived fires
+        then reach.integration = ci
+        then reach.reach = listed_repositories
+        then reach.listed = {tool}
+        then reach.has_admin_scope = false
+
+    2. she deletes it
+        ada does UserDeletesAuthorizedIntegration(ada, ci) on ApplicationSettings
+        then ci does not exist
+        then reach does not exist
+
+    ends: Nothing the integration's tokens could reach is left behind.
 }

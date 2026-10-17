@@ -37,7 +37,8 @@
 --
 -- Emits:
 --   FederationHostDiscovered(host)
---   FederatedUserMaterialised(federated_user)
+--   RemoteActorDiscovered(handle, full_name, email)  -- accounts creates the activitypub mirror account
+--   FederatedUserMaterialised(federated_user)         -- the record is linked to its mirror account
 --   RemoteUserFollowedUser(follower)                  -- follower: FederatedFollower
 --   RemoteUserUnfollowedUser(user, federated_user)
 --   RemoteFollowAccepted(user, federated_user)
@@ -224,10 +225,13 @@ entity FederationHost {
 
 -- The federation-side record of a remote person known to this instance. Its
 -- `user` is an accounts/User of kind activitypub that can own stars, follow,
--- and appear in feeds, but can never sign in.
+-- and appear in feeds, but can never sign in. accounts creates that account
+-- (it owns every User): until it has, `user` is null and `handle` is the name
+-- the account will carry.
 -- from: models/user/federated_user.go:13
 entity FederatedUser {
-    user: accounts/User
+    user: accounts/User?
+    handle: String                       -- "@<preferredUsername>@<host>[:port]", the mirror account's name
     host: FederationHost
     external_id: String                  -- the id segment of the remote actor URI
     original_url: String                 -- normalised canonical actor URI (informational, used for alias resolution)
@@ -448,10 +452,10 @@ rule RecogniseKnownHost {
     ensures: RemoteActorOnKnownHost(remote: remote, host: host)
 }
 
--- A remote Person seen for the first time becomes a local account of kind
--- activitypub, plus the FederatedUser record that links it to its server.
--- An alias URI (e.g. /@name) that resolves to an already known canonical
--- actor reuses that record.
+-- A remote Person seen for the first time becomes a FederatedUser record that
+-- links it to its server, and accounts is asked for the local account of kind
+-- activitypub that stands for it. An alias URI (e.g. /@name) that resolves to
+-- an already known canonical actor reuses that record.
 -- from: services/federation/federation_service.go:51
 rule MaterialiseFederatedUser {
     when: RemoteActorOnKnownHost(remote, host)
@@ -461,19 +465,9 @@ rule MaterialiseFederatedUser {
     requires: not exists FederatedUser{host: host, original_url: remote.canonical_uri}
     let handle = fediverse_handle(remote.preferred_username, remote.host_fqdn, remote.host_port, host.has_default_port)
     ensures:
-        let account = accounts/User.created(
-            name: handle,
-            kind: activitypub,
-            full_name: remote.display_name ?? handle,
-            primary_email: synthetic_email(),
-            is_admin: false,
-            is_active: false,
-            is_restricted: false,
-            prohibit_login: true,
-            email_notifications: disabled
-        )
-        let federated = FederatedUser.created(
-            user: account,
+        FederatedUser.created(
+            user: null,
+            handle: handle,
             host: host,
             external_id: remote.external_id,
             original_url: remote.canonical_uri,
@@ -482,7 +476,7 @@ rule MaterialiseFederatedUser {
             public_key: remote.public_key,
             latest_activity: null
         )
-        FederatedUserMaterialised(federated_user: federated)
+        RemoteActorDiscovered(handle: handle, full_name: remote.display_name ?? handle, email: synthetic_email())
     @guidance
         -- handle = "@<preferredUsername>@<host>" with ":<port>" appended for a
         -- non-default port; it must match the fediverse-handle pattern
@@ -490,6 +484,18 @@ rule MaterialiseFederatedUser {
         -- "<external id>@<host>[:port]". The synthetic e-mail is
         -- "f<uuid>@<local host>" (the local host is implicitly allowed by the
         -- e-mail domain allowlist while federation is on). No password.
+}
+
+-- accounts created the mirror account of a newly met person: the record is
+-- linked to it, and the person is materialised.
+rule LinkFederatedUserToMirrorAccount {
+    when: accounts/UserAccountCreated(user)
+    requires: user.kind = activitypub
+    let federated = FederatedUser{handle: user.name}
+    requires: exists federated
+    requires: federated.user = null
+    ensures: federated.user = user
+    ensures: FederatedUserMaterialised(federated_user: federated)
 }
 
 -- A known person presenting a key id this instance has not cached (key
@@ -1070,14 +1076,14 @@ invariant UniqueFederatedUserPerHost {
 invariant OneFederatedRecordPerAccount {
     for a in FederatedUsers:
         for b in FederatedUsers:
-            a != b implies a.user != b.user
+            a != b and a.user != null implies a.user != b.user
 }
 
 -- Remote people are never interactive accounts.
 -- from: services/federation/federation_service.go:232
 invariant FederatedAccountsCannotSignIn {
     for f in FederatedUsers:
-        f.user.kind = activitypub and f.user.prohibit_login and not f.user.is_admin
+        f.user = null or (f.user.kind = activitypub and f.user.prohibit_login and not f.user.is_admin)
 }
 
 invariant UniqueOutboundFollow {

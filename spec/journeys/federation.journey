@@ -34,6 +34,19 @@ world {
         alice.visibility = public
         repo.is_private = false
         federation/config.enabled = true
+        -- accounts reads the same switch when it creates a remote person's
+        -- mirror account
+        accounts/config.federation_enabled = true
+        -- The handles of the remote people met here, which accounts accepts
+        -- as names nobody here holds yet; each mirror account gets a made-up
+        -- address, as no real one is known.
+        fediverse_handle("bob", "code.example", 443, true) = "@bob@code.example"
+        fediverse_handle("carol", "code.example", 443, true) = "@carol@code.example"
+        is_valid_activitypub_handle("@bob@code.example") = true
+        is_valid_activitypub_handle("@carol@code.example") = true
+        name_taken("@bob@code.example") = false
+        name_taken("@carol@code.example") = false
+        synthetic_email() = "f0@forge.local"
 }
 
 journey ARemotePersonIsMetForTheFirstTime {
@@ -44,9 +57,16 @@ journey ARemotePersonIsMetForTheFirstTime {
     1. bob's server signs a request with bob's key
         peer does RemoteRequestSigned(peer, bob_doc) on PersonActorEndpoint
             creating bob: FederatedUser
+            creating bobs_account: accounts/User
         then ResolveSigningActor fires
         then DiscoverFederationHost fires
         then MaterialiseFederatedUser fires
+        then CreateActivityPubMirror fires
+        then LinkFederatedUserToMirrorAccount fires
+        then bob.user = bobs_account
+        then bobs_account.name = "@bob@code.example"
+        then bobs_account.kind = activitypub
+        then bobs_account.prohibit_login = true
         then bob.external_id = "7"
         then bob.inbox_path = "/api/v1/activitypub/user-id/7/inbox"
         then bob.key_id = "https://code.example/api/v1/activitypub/user-id/7#main-key"

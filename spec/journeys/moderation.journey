@@ -14,6 +14,9 @@ world {
         item:    ReportableContent
     given:
         moderation/config.enabled = true
+        -- None of these stories is about CI: Actions is off on this instance,
+        -- so deleting reported content starts no workflow.
+        actions/config.actions_enabled = false
         ada.prohibit_login = false
         ada.is_active = true
         ada.is_admin = false

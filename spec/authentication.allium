@@ -63,7 +63,10 @@
 --   PasswordChanged(user)                                -> notifications (security mail)
 --   TotpEnrolled(user) / TotpDisabled(user)              -> notifications (security mail)
 --   SecurityKeyRemoved(user, name)                       -> notifications (security mail)
---   ExternalGroupsAsserted(user, source, groups)         -> organizations (team mapping), quota (quota-group mapping)
+--   ExternalGroupsAsserted(user, source, groups)         -> organizations (team mapping)
+--   ExternalQuotaGroupsAsserted(user, source, groups)    -> quota (quota-group mapping): the OAuth2
+--                                                           quota-group claim, or the LDAP entry's
+--                                                           groups (decided: requests 6)
 --   ExternalSshKeysAsserted(user, source, keys)          -> keys (source-managed SSH keys)
 --   ExternalAvatarAsserted(user, url)                    -> accounts (avatar upload)
 --   ExternalAdminFlagsAsserted(user, is_admin, is_restricted) -> accounts
@@ -76,9 +79,12 @@
 --   ConsentRequested(user, app, redirect_uri, scopes)    -> (web layer: render the consent page)
 --   AuthorizationDenied(user, app)                       -> (web layer: redirect with error=access_denied)
 --   ClientSecretRegenerated(app)                         -> (web layer: show the new secret once)
+--   ExternalUserSyncRefused(source)                      -> administration (a system notice: the directory
+--                                                           returned nobody and deactivating all is off)
 --   AuthSourceSyncRequested(source, update_existing)     -> (internal: per-source sync; LDAP handled here)
 --   RemoteUserClaimed(user, email)                       -> accounts (promote the F3 placeholder)
 --
+--   ExternalUserSyncFinished()          -- administration: the sync_external_users run is done
 -- Reacts to:
 --   accounts/UserEmailAdded(user, address)     -- issue a confirmation code for a new address
 --   accounts/EmailActivationRequested(user, address) -- re-issue it (resend)
@@ -88,6 +94,7 @@
 --   administration/InstanceStarted(instance)   -- reconcile the built-in OAuth2 applications
 --   administration/ExternalUserSyncDue(update_existing) -- the sync_external_users cron task
 --   administration/UserTwoFactorResetByAdmin(admin, user)  -- drop every second factor
+--   administration/UserLoginSourceSetByAdmin(admin, user, login_source, login_name) -- rebind the UserLogin
 --   administration/UserPasswordSetByAdmin(admin, user, password),
 --   administration/UserPasswordSetByOperator(operator, user, password) -- remember-me dies, security mail
 --   administration/AccessTokenRequestedForUser(requester, user, token_name, scopes) -- admin API / CLI token
@@ -261,6 +268,9 @@ contract CredentialPolicy {
     -- re-entering the password before a sensitive act (accounts' own deletion).
     -- from: routers/web/user/setting/account.go:277
     password_matches: (user: accounts/User, password: String) -> Boolean
+    -- The source the account signs in through: UserLogin{user}.source, null for
+    -- a local account (decided: requests 4; accounts/User.login_source reads it).
+    login_source_of: (user: accounts/User) -> AuthSource?
     -- UserLogin{user}.has_second_factor: TOTP or any WebAuthn credential enrolled.
     has_two_factor: (user: accounts/User) -> Boolean
     -- UserLogin{user}.requires_two_factor (config.global_two_factor_requirement).
@@ -1039,6 +1049,7 @@ rule VisitorSignsInWithPassword {
     ensures:
         if login.source != null and login.source.is_ldap and login.source.settings.groups_enabled:
             ExternalGroupsAsserted(user: user, source: login.source, groups: DirectoryEntry{source: login.source, username: login.login_name}.groups)
+            ExternalQuotaGroupsAsserted(user: user, source: login.source, groups: DirectoryEntry{source: login.source, username: login.login_name}.groups)
     ensures:
         if login.source != null and login.source.is_ldap:
             ExternalSshKeysAsserted(user: user, source: login.source, keys: DirectoryEntry{source: login.source, username: login.login_name}.ssh_public_keys)
@@ -1098,6 +1109,7 @@ rule ExternalPasswordSourceProvisionsUser {
         UserSignedUp(user)
         ExternalSshKeysAsserted(user: user, source: source, keys: entry.ssh_public_keys)
         ExternalGroupsAsserted(user: user, source: source, groups: entry.groups)
+        ExternalQuotaGroupsAsserted(user: user, source: source, groups: entry.groups)
         session.status = authenticated
         session.user = user
         session.authenticated_via = password_login
@@ -1377,6 +1389,7 @@ rule ProviderReturnsKnownIdentity {
     ensures: ExternalAvatarAsserted(user: user, url: identity.avatar_url)
     ensures: ExternalSshKeysAsserted(user: user, source: source, keys: identity.ssh_public_keys)
     ensures: ExternalGroupsAsserted(user: user, source: source, groups: identity.groups)
+    ensures: ExternalQuotaGroupsAsserted(user: user, source: source, groups: identity.quota_groups)
     ensures: ExternalAdminFlagsAsserted(user: user, is_admin: admin_from_groups(source, identity), is_restricted: restricted_from_groups(source, identity, user.is_restricted))
     ensures:
         if exists known_link:
@@ -1478,6 +1491,7 @@ rule ProviderIdentityAutoRegisters {
         UserLogin.created(user: user, source: source, login_name: identity.external_id, has_password: false, must_change_password: false, password_changed_at: null, last_sign_in_at: now)
         UserSignedUp(user)
         ExternalGroupsAsserted(user: user, source: source, groups: identity.groups)
+        ExternalQuotaGroupsAsserted(user: user, source: source, groups: identity.quota_groups)
         if needs_confirmation and config.oauth2_client_register_email_confirm:
             EmailVerificationCode.created(user: user, purpose: user_activation, email: identity.email, expires_at: now + config.activation_code_lifetime, status: pending)
         session.status = authenticated
@@ -1585,6 +1599,7 @@ rule VisitorLinksPendingIdentityBySignIn {
             session.last_activity_at = now
             UserSignedIn(user: user, method: password_login)
             ExternalGroupsAsserted(user: user, source: identity.source, groups: identity.groups)
+            ExternalQuotaGroupsAsserted(user: user, source: identity.source, groups: identity.quota_groups)
 
     @guidance
         -- Web: POST /user/link_account_signin. With 2FA enrolled the link is made after
@@ -1625,6 +1640,7 @@ rule VisitorRegistersFromPendingIdentity {
         ExternalLogin.created(user: user, source: identity.source, external_id: identity.external_id, provider: identity.source.settings.provider, email: identity.email, name: identity.full_name, nickname: identity.nickname, avatar_url: identity.avatar_url, linked_at: now)
         UserSignedUp(user)
         ExternalGroupsAsserted(user: user, source: identity.source, groups: identity.groups)
+        ExternalQuotaGroupsAsserted(user: user, source: identity.source, groups: identity.quota_groups)
         session.pending_external_identity = null
         session.status = authenticated
         session.user = user
@@ -2246,6 +2262,17 @@ rule UserUpdatesAuthorizedIntegration {
     ensures: integration.public_only = public_only
     ensures: integration.all_repositories = all_repositories
     ensures: integration.repositories = repositories
+    -- its restriction follows the new reach and scopes
+    ensures:
+        for r in access/CredentialRestrictions where r.integration = integration:
+            if not all_repositories:
+                r.reach = listed_repositories
+            else if public_only:
+                r.reach = public_only
+            else:
+                r.reach = all_repositories
+            r.listed = repositories
+            r.has_admin_scope = scopes.any(sc => sc in {read_admin, write_admin})
 }
 
 -- from: routers/web/user/setting/authorized_integrations.go:418
@@ -2253,6 +2280,10 @@ rule UserDeletesAuthorizedIntegration {
     when: UserDeletesAuthorizedIntegration(user, integration)
     requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: integration.owner = user
+    let doomed = integration
+    ensures:
+        for r in access/CredentialRestrictions where r.integration = doomed:
+            not exists r
     ensures: not exists integration
 }
 
@@ -2554,6 +2585,7 @@ rule ScheduledExternalUserSync {
     ensures:
         for source in AuthSources where is_active = true and sync_enabled = true:
             AuthSourceSyncRequested(source: source, update_existing: update_existing)
+    ensures: ExternalUserSyncFinished()   -- decided: requests 5 (the owner reports the run done)
 }
 
 -- The admin dashboard's "synchronise external user data" button.
@@ -2594,6 +2626,17 @@ rule LdapSourceSynchronised {
                 UserLogin.created(user: user, source: src, login_name: e.username, has_password: false, must_change_password: false, password_changed_at: null, last_sign_in_at: null)
                 UserSignedUp(user)
                 ExternalSshKeysAsserted(user: user, source: src, keys: e.ssh_public_keys)
+                if src.settings.groups_enabled:
+                    ExternalGroupsAsserted(user: user, source: src, groups: e.groups)
+                    ExternalQuotaGroupsAsserted(user: user, source: src, groups: e.groups)
+    -- decided: requests 7 — with group lookup on, the sync re-asserts every
+    -- account's group memberships, as a sign-in does (team and quota groups)
+    ensures:
+        if src.settings.groups_enabled:
+            for login in UserLogins where source = src:
+                if exists DirectoryEntry{source: src, username: login.login_name}:
+                    ExternalGroupsAsserted(user: login.user, source: src, groups: DirectoryEntry{source: src, username: login.login_name}.groups)
+                    ExternalQuotaGroupsAsserted(user: login.user, source: src, groups: DirectoryEntry{source: src, username: login.login_name}.groups)
     ensures:
         if update_existing:
             for login in UserLogins where source = src:
@@ -2611,7 +2654,18 @@ rule LdapSourceSynchronised {
         -- is set) and restricted (only when a restricted filter is set and the user is not
         -- admin) refreshed. Users are matched by login name, then by e-mail. If the search
         -- returns nothing and allow_deactivate_all is off, the sync is refused rather than
-        -- deactivating everyone.
+        -- deactivating everyone (LdapSourceSyncRefused).
+}
+
+-- A directory search that found nobody, on a source that may not deactivate
+-- everyone, refuses the sync; the operator is told.
+-- decided: requests 8 — a refused LDAP sync leaves a system notice for admins.
+rule LdapSourceSyncRefused {
+    when: AuthSourceSyncRequested(source, update_existing)
+    requires: source.is_ldap
+    requires: (DirectoryEntries where source = source).count = 0
+    requires: not source.settings.allow_deactivate_all
+    ensures: ExternalUserSyncRefused(source: source)
 }
 
 ------------------------------------------------------------
@@ -2627,12 +2681,36 @@ rule LdapSourceSynchronised {
 -- from: services/authz/authorization_reducer.go:11
 rule AccessTokenRestrictionDerived {
     when: token: AccessToken.created
-    ensures: access/CredentialRestriction.created(
-        token: token,
-        reach: if not token.all_repositories: listed_repositories else if token.public_only: public_only else: all_repositories,
-        listed: token.repositories,
-        has_admin_scope: read_admin in token.scopes or write_admin in token.scopes
-    )
+    -- (each reach is written as its own creation: a value chosen inside an
+    -- `if` expression is not read as the target field's state)
+    let admin_scoped = token.scopes.any(sc => sc in {read_admin, write_admin})
+    ensures:
+        if not token.all_repositories:
+            access/CredentialRestriction.created(token: token, integration: null, reach: listed_repositories,
+                listed: token.repositories, has_admin_scope: admin_scoped)
+        else if token.public_only:
+            access/CredentialRestriction.created(token: token, integration: null, reach: public_only,
+                listed: token.repositories, has_admin_scope: admin_scoped)
+        else:
+            access/CredentialRestriction.created(token: token, integration: null, reach: all_repositories,
+                listed: token.repositories, has_admin_scope: admin_scoped)
+}
+
+-- An authorized integration's JWTs carry the same kind of reach, derived the
+-- same way from the integration's repositories, public-only flag and scopes.
+rule AuthorizedIntegrationRestrictionDerived {
+    when: integration: AuthorizedIntegration.created
+    let admin_scoped = integration.scopes.any(sc => sc in {read_admin, write_admin})
+    ensures:
+        if not integration.all_repositories:
+            access/CredentialRestriction.created(token: null, integration: integration, reach: listed_repositories,
+                listed: integration.repositories, has_admin_scope: admin_scoped)
+        else if integration.public_only:
+            access/CredentialRestriction.created(token: null, integration: integration, reach: public_only,
+                listed: integration.repositories, has_admin_scope: admin_scoped)
+        else:
+            access/CredentialRestriction.created(token: null, integration: integration, reach: all_repositories,
+                listed: integration.repositories, has_admin_scope: admin_scoped)
 }
 
 ------------------------------------------------------------
@@ -2649,6 +2727,16 @@ rule AdminResetRemovesSecondFactors {
             not exists t
         for c in WebAuthnCredentials where user = user:
             not exists c
+}
+
+-- An administrator rebound an account to a login source and login name: the
+-- login record is the one place that binding lives (decided: requests 4).
+rule RebindLoginForAdmin {
+    when: administration/UserLoginSourceSetByAdmin(admin, user, login_source, login_name)
+    let login = UserLogin{user: user}
+    requires: exists login
+    ensures: login.source = login_source
+    ensures: login.login_name = login_name
 }
 
 -- A password set by an administrator or the operator is stored like any other:
@@ -2765,6 +2853,8 @@ rule DeletedUserLosesCredentials {
 
     ensures:
         for r in access/CredentialRestrictions where r.token != null and r.token.owner = user:
+            not exists r
+        for r in access/CredentialRestrictions where r.integration != null and r.integration.owner = user:
             not exists r
         for t in AccessTokens where owner = user:
             not exists t
@@ -3353,7 +3443,7 @@ surface AuthenticationService {
 -- Local black box: can_read_code(user, repository) is access/can_read(user, repository, code).
 deferred AccessToken.enforcement           -- see: access.allium (scope/public-only/repository reducers per endpoint)
 deferred ExternalGroupsAsserted.team_mapping -- see: organizations.allium (group_team_map, dynamic maps, removal)
-deferred ExternalGroupsAsserted.quota_mapping -- see: quota.allium (quota_group_map)
+deferred ExternalQuotaGroupsAsserted.quota_mapping -- see: quota.allium (quota_group_map)
 
 ------------------------------------------------------------
 -- Requests to other modules
@@ -3364,10 +3454,8 @@ deferred ExternalGroupsAsserted.quota_mapping -- see: quota.allium (quota_group_
 -- REQUEST accounts/user_count(): number of user accounts (first account becomes admin).
 -- REQUEST accounts/user_by_email(email): the account holding this activated address, for account-link auto mode (decided: e-mail only, no name match).
 -- REQUEST accounts: react to ExternalAvatarAsserted(user, url), ExternalAdminFlagsAsserted(user, is_admin, is_restricted).
--- REQUEST accounts: User.login_source duplicates authentication/UserLogin.source; keep one (UserLogin also carries login_name and must_change_password).
 -- REQUEST accounts: UserLogin is created by authentication for self-registration; administration's "admin creates user" must create a UserLogin (with must_change_password) too.
 -- REQUEST organizations: react to ExternalGroupsAsserted(user, source, groups) per the source's group_team_map / dynamic maps; react to AuthSourceDeleted(source) by clearing membership provenance.
--- REQUEST quota: react to ExternalGroupsAsserted for quota-group mapping.
 -- REQUEST keys/SshKey.owner: accounts/User — the key an HTTP signature is verified against; react to ExternalSshKeysAsserted(user, source, keys) (source-managed keys).
 -- REQUEST access: consume RequestAuthenticated(user, method) and the token's scopes / public_only / repositories to reduce permissions; access/can_read(user, repository, unit).
 -- REQUEST notifications: send mail for ActivationEmailRequested, EmailConfirmationRequested, PasswordResetRequested, PasswordChanged, TotpEnrolled, TotpDisabled, SecurityKeyRemoved; push "logout" on UserSignedOut.

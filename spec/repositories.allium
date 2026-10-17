@@ -110,6 +110,15 @@
 --   MirrorConvertedToRepository(repository, doer)
 --   ForkDetached(repository, doer)
 --
+--   MirrorUpdateSweepFinished()         -- administration: the update_mirrors run is done
+--   ArchiveCleanupFinished()            -- administration: the archive_cleanup run is done
+--   AllArchivesDeletionFinished()       -- administration: the delete_repo_archives run is done
+--   HealthCheckSweepFinished()          -- administration: the repo_health_check run is done
+--   GarbageCollectionSweepFinished()    -- administration: the git_gc_repos run is done
+--   MissingRepositoryDeletionFinished() -- administration: the delete_missing_repos run is done
+--   MissingRepositoryReinitFinished()   -- administration: the reinit_missing_repos run is done
+--   RepositoryStatsCheckFinished()      -- administration: the check_repo_stats run is done
+--   GeneratedAvatarDeletionFinished()   -- administration: the delete_generated_repository_avatars run is done
 -- Reacts to:
 --   access/UserLostRepositoryAccess(user, repository)
 --                                    -- the user's watch on the repository is removed (UnwatchOnLostAccess)
@@ -120,10 +129,12 @@
 --   Repository.created with status being_migrated -- migrations reserved the record (it creates it itself, with its
 --                                    Migration): provisioned like any new repository (ProvisionMigratedRepository)
 --   migrations/MigratedContentDiscarded(repository) -- a retry wipes what was imported; the record stays (ResetDiscardedImport)
+--   migrations/FailedImportDiscarded(repository, doer) -- a discarded failed import is deleted (DeleteDiscardedImport)
 --   migrations/TopicsImported(repository, topics)   -- imported topics replace the repository's topics
 --   code/PushToCreateRequested(pusher, owner_name, repository_name, is_private) -- push-to-create
 --   code/TagDeleted(repository, tag_name, by)       -- the release archive download counters of that tag go
 --   discovery/LanguageStatsComputed(repository, commit_sha, sizes) -- the stats indexer's result
+--   packages/CargoIndexInitialized(manager, registry) -- the owner's `_cargo-index` repository is created (or reused)
 --   accounts/UserBlocked(blocker, blocked), accounts/OrganizationBlockedUser(organization, blocked)
 --                                    -- the blocked user stops watching and collaborating on the blocker's repositories,
 --                                       and their pending transfers to the blocker are cancelled
@@ -223,6 +234,7 @@ use "./migrations.allium" as migrations
 use "./discovery.allium" as discovery
 use "./moderation.allium" as moderation
 use "./wiki.allium" as wiki
+use "./packages.allium" as packages
 
 ------------------------------------------------------------
 -- External Entities
@@ -816,6 +828,19 @@ rule UserCreatesOrgRepository {
     requires: within_repo_quota(org)
     requires: label_template = null or label_template_exists(label_template)
     requires: initial_content = null or initial_content_templates_exist(initial_content)
+    ensures: OrgRepositoryCreationAccepted(doer: user, org: org, name: name, description: description,
+        is_private: is_private, is_template: is_template, auto_init: auto_init, object_format: object_format,
+        initial_content: initial_content, label_template: label_template)
+    @guidance
+        -- Teams of the organisation that include all repositories get the new repository
+        -- (organizations / access react to RepositoryCreated).
+}
+
+-- What creating an organisation-owned repository does, whoever asked: a member through the
+-- form or API (above) or packages' Cargo index (below). `doer` is the creator.
+-- from: routers/api/v1/repo/repo.go:509
+rule CreateOrgOwnedRepository {
+    when: OrgRepositoryCreationAccepted(doer, org, name, description, is_private, is_template, auto_init, object_format, initial_content?, label_template?)
     ensures:
         let repo = Repository.created(
             name: name,
@@ -845,13 +870,27 @@ rule UserCreatesOrgRepository {
             updated_at: now
         )
         not exists RepoRedirect{owner_org: org, name: name}
-        RepositoryProvisioned(repository: repo, doer: user, unit_kinds: config.default_repo_units)
-        OrgRepositoryCreatorGranted(repository: repo, doer: user)
+        RepositoryProvisioned(repository: repo, doer: doer, unit_kinds: config.default_repo_units)
+        OrgRepositoryCreatorGranted(repository: repo, doer: doer)
         if label_template != null:
             LabelTemplateApplied(repository: repo, template_name: label_template)
-    @guidance
-        -- Teams of the organisation that include all repositories get the new repository
-        -- (organizations / access react to RepositoryCreated).
+}
+
+-- A Cargo registry's index lives in the owner's `_cargo-index` repository. Initialising
+-- the index creates it as an ordinary new repository (public unless the instance forces
+-- private, empty, the default units, created by the manager), or reuses one already there.
+rule CargoIndexGetsItsRepository {
+    when: packages/CargoIndexInitialized(manager, registry)
+    ensures:
+        if registry.owner_user != null and not exists Repository{owner_user: registry.owner_user, name: "_cargo-index"}:
+            UserRepositoryCreationAccepted(doer: manager, owner: registry.owner_user, name: "_cargo-index",
+                description: "", is_private: false, is_template: false, auto_init: false,
+                object_format: config.default_object_format, initial_content: null, label_template: null)
+    ensures:
+        if registry.owner_org != null and not exists Repository{owner_org: registry.owner_org, name: "_cargo-index"}:
+            OrgRepositoryCreationAccepted(doer: manager, org: registry.owner_org, name: "_cargo-index",
+                description: "", is_private: false, is_template: false, auto_init: false,
+                object_format: config.default_object_format, initial_content: null, label_template: null)
 }
 
 -- The creator of an organisation repository who is not already a repository admin through a
@@ -1502,6 +1541,14 @@ rule SiteAdminDeletesRepository {
     requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
     requires: admin.is_admin
     ensures: RepositoryDeletionAccepted(repository: repository, doer: admin)
+}
+
+-- A repository admin discarded a failed import: the half-made repository is deleted like
+-- any other (decided: requests 2).
+rule DeleteDiscardedImport {
+    when: migrations/FailedImportDiscarded(repository, doer)
+    requires: repository.status = being_migrated
+    ensures: RepositoryDeletionAccepted(repository: repository, doer: doer)
 }
 
 -- A site admin deletes a reported repository from the moderation queue.
@@ -2636,10 +2683,19 @@ rule AdministrationUpdatesMirrors {
         for pm in PushMirrors where sync_state = idle and interval > 0.seconds and next_sync_at <= now:
             pm.sync_state = queued
             PushMirrorSyncDue(push_mirror: pm)
+    ensures: MirrorUpdateSweepFinished()   -- decided: requests 5 (the owner reports the run done)
     @guidance
         -- At most pull_limit pull mirrors and push_limit push mirrors are queued per run
         -- (least recently synced first); the rest wait for the next run. A negative limit
         -- means no limit.
+}
+
+-- When AdministrationUpdatesMirrors cannot do its work the run is still reported done, so it never
+-- stays running (decided: requests 5).
+rule AdministrationUpdatesMirrorsSkipped {
+    when: administration/MirrorUpdateDue(pull_limit, push_limit)
+    requires: not (config.mirror_enabled)
+    ensures: MirrorUpdateSweepFinished()
 }
 
 -- The worker pushed (branches/tags matching the filter, or everything with prune semantics,
@@ -2749,6 +2805,7 @@ rule AdministrationCleansUpArchives {
     ensures:
         for a in RepoArchives where state = ready and created_at + older_than <= now:
             not exists a
+    ensures: ArchiveCleanupFinished()   -- decided: requests 5 (the owner reports the run done)
 }
 
 -- Admin-triggered purge of all generated archives (delete_repo_archives, disabled by default).
@@ -2758,6 +2815,7 @@ rule PurgeAllArchives {
     ensures:
         for a in RepoArchives:
             not exists a
+    ensures: AllArchivesDeletionFinished()   -- decided: requests 5 (the owner reports the run done)
 }
 
 ------------------------------------------------------------
@@ -2772,6 +2830,7 @@ rule ScheduledHealthCheck {
         for repository in Repositories where is_fsck_enabled = true:
             if not passes_fsck(repository):
                 RepositoryHealthCheckFailed(repository: repository, reason: fsck_report(repository))
+    ensures: HealthCheckSweepFinished()   -- decided: requests 5 (the owner reports the run done)
     @guidance
         -- `git fsck` runs with the task's args and is bounded by its timeout. One
         -- RepositoryHealthCheckFailed per failing repository (administration records a notice).
@@ -2787,6 +2846,7 @@ rule ScheduledGarbageCollection {
                 repository.git_size = measured_git_size(repository)
             else:
                 RepositoryGarbageCollectionFailed(repository: repository, reason: gc_report(repository))
+    ensures: GarbageCollectionSweepFinished()   -- decided: requests 5 (the owner reports the run done)
     @guidance
         -- `git gc` runs with the task's args and is bounded by its timeout. One
         -- RepositoryGarbageCollectionFailed per failing repository (administration records a notice).
@@ -2796,8 +2856,10 @@ rule ScheduledGarbageCollection {
 -- from: services/repository/check.go:148
 rule DeleteRepositoriesMissingFromStorage {
     when: administration/MissingRepositoryDeletionDue()
-    for repository in Repositories where storage_missing(repository):
-        ensures: RepositoryDeletionRequested(repository: repository)
+    ensures:
+        for repository in Repositories where storage_missing(repository):
+            RepositoryDeletionRequested(repository: repository)
+    ensures: MissingRepositoryDeletionFinished()   -- decided: requests 5 (the owner reports the run done)
 }
 
 -- The deletion cascade for a system-initiated delete (no doer).
@@ -2811,8 +2873,10 @@ rule SystemDeletesRepository {
 -- from: services/repository/check.go:176
 rule ReinitialiseRepositoriesMissingFromStorage {
     when: administration/MissingRepositoryReinitDue()
-    for repository in Repositories where storage_missing(repository):
-        ensures: RepositoryStorageRecreated(repository: repository)
+    ensures:
+        for repository in Repositories where storage_missing(repository):
+            RepositoryStorageRecreated(repository: repository)
+    ensures: MissingRepositoryReinitFinished()   -- decided: requests 5 (the owner reports the run done)
 }
 
 -- check_repo_stats: repository counters (stars, watches, forks, issues, ...) are derived
@@ -2821,6 +2885,7 @@ rule ReinitialiseRepositoriesMissingFromStorage {
 rule AdministrationChecksRepositoryStats {
     when: administration/RepositoryStatsCheckDue()
     ensures: RepositoryStatsChecked()
+    ensures: RepositoryStatsCheckFinished()   -- decided: requests 5 (the owner reports the run done)
     @guidance
         -- Implementation workaround for denormalised counters; a rebuild that derives
         -- counts has no work to do.
@@ -2831,6 +2896,7 @@ rule AdministrationChecksRepositoryStats {
 -- from: services/cron/tasks_extended.go:107
 rule AdministrationDeletesGeneratedAvatars {
     when: administration/GeneratedRepositoryAvatarDeletionDue()
+    ensures: GeneratedAvatarDeletionFinished()   -- decided: requests 5 (the owner reports the run done)
     ensures: GeneratedRepositoryAvatarsChecked()
 }
 
@@ -3429,7 +3495,6 @@ deferred LanguageDetection.classify         -- see: modules/analyze (linguist-st
 -- REQUEST pulls/MergeStyle (incl. manually_merged, fast_forward_only) and pulls/UpdateStyle = merge | rebase
 -- REQUEST releases/Release.repository and a way to find the release of a tag, so ReaderDownloadsArchive can count release archive downloads
 -- REQUEST issues: react to LabelTemplateApplied(repository, template_name) and RepositoryGeneratedFromTemplate(labels) to create labels; CollaboratorRemoved unassigns
--- REQUEST migrations: emit ImportReservesRepository(user, owner, name, description, is_private, as_mirror, original_url) / ImportReservesOrgRepository(user, org, ...) instead of creating repositories/Repository directly (this module owns the record and its provisioning: units, auto-watch, creator admin); emit ImportCompleted(repository, remote_address, has_credentials, interval, lfs_enabled, lfs_endpoint?); a failed import stays being_migrated; discarding it emits RepositoryDeletionRequested(repository); expose is_allowed_remote(address, user)
 -- NOTE for integration: webhooks listens for repositories/RepositoryMigrated(repository, doer) but migrations emits its own RepositoryMigrated; one of them should own it (this module would need the doer in ImportCompleted)
 -- NOTE for integration: siblings call some of this module's triggers with other shapes — RepositoryDeleted(repository) (here: repository, doer), RepositoryForked(fork, source, doer) (here: source, fork, doer), RepositoryGeneratedFromTemplate(repository, template, include_webhooks) (here: template, repository, doer, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches), RepositoryTransferred(repository, old_owner)
 -- REQUEST administration/CronTask: schedule this module's tasks and emit their *Due triggers with named arguments (see Reacts to); create SystemNotice on PullMirrorSyncFailed / RepositoryHealthCheckFailed / RepositoryGarbageCollectionFailed

@@ -14,7 +14,7 @@ world {
         ada.prohibit_login = false
         ada.is_admin = false
         ada.is_restricted = false
-        ada.login_source = null
+        login_source_of(ada) = null
         ada.visibility = public
         ada.primary_email = "ada@example.org"
         bob.name = "bob"
@@ -23,7 +23,7 @@ world {
         bob.prohibit_login = false
         bob.is_admin = false
         bob.is_restricted = false
-        bob.login_source = null
+        login_source_of(bob) = null
         bob.visibility = public
         root.name = "root"
         root.kind = individual
@@ -279,7 +279,7 @@ journey AdminCannotDeleteThemselves {
         stipulate owns_repositories(root) = false
         stipulate belongs_to_organizations(root) = false
         stipulate has_other_admin(root) = false
-        root cannot do UserDeletesOwnAccount(root) on OwnAccountSettings
+        root cannot do UserDeletesOwnAccount(root, "my password") on OwnAccountSettings
 
     ends: The instance keeps an admin; root has to appoint another first.
 }
@@ -306,7 +306,8 @@ journey AnAdminLeavesWhileAnotherRemains {
         stipulate owns_repositories(root) = false
         stipulate belongs_to_organizations(root) = false
         stipulate has_other_admin(root) = true
-        root does UserDeletesOwnAccount(root) on OwnAccountSettings
+        stipulate password_matches(root, "my password") = true
+        root does UserDeletesOwnAccount(root, "my password") on OwnAccountSettings
         then DeleteUserAccount fires
         then root does not exist
 
@@ -322,15 +323,16 @@ journey AdaCannotLeaveWhileOwningRepositories {
         stipulate owns_packages(ada) = false
         stipulate owns_repositories(ada) = true
         stipulate belongs_to_organizations(ada) = false
-        ada cannot do UserDeletesOwnAccount(ada) on OwnAccountSettings
+        ada cannot do UserDeletesOwnAccount(ada, "my password") on OwnAccountSettings
 
     ends: Nothing is orphaned by a self-deletion.
 }
 
 -- With nothing left to own, she can go.
 journey AdaDeletesHerAccount {
-    goal: Ada owns nothing and belongs to no organization; she deletes her
-          account and it is gone, together with her addresses and follows.
+    goal: Ada owns nothing and belongs to no organization; she re-enters her
+          password, deletes her account and it is gone, together with her
+          addresses and follows.
 
     cast:
         mine: EmailAddress
@@ -344,12 +346,17 @@ journey AdaDeletesHerAccount {
         tie.follower = bob
         tie.followee = ada
 
-    1. she deletes her account
+    1. a mistyped password does not delete it
         stipulate owns_repositories(ada) = false
         stipulate belongs_to_organizations(ada) = false
         stipulate owns_packages(ada) = false
         stipulate deletion_disabled_for(ada) = false
-        ada does UserDeletesOwnAccount(ada) on OwnAccountSettings
+        stipulate password_matches(ada, "my pasword") = false
+        ada cannot do UserDeletesOwnAccount(ada, "my pasword") on OwnAccountSettings
+
+    2. she deletes her account
+        stipulate password_matches(ada, "my password") = true
+        ada does UserDeletesOwnAccount(ada, "my password") on OwnAccountSettings
         then DeleteUserAccount fires
         then ada does not exist
         then mine does not exist

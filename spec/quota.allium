@@ -49,7 +49,7 @@
 --          trigger.
 --   accounts/UserAccountCreated(user)
 --       -- the new account's QuotaAccount is created.
---   authentication/ExternalGroupsAsserted(user, source, groups)
+--   authentication/ExternalQuotaGroupsAsserted(user, source, groups)
 --       -- authentication's sign-in / registration / account link through an
 --          external source (OAuth2 or LDAP); the source's quota group mapping
 --          applies.
@@ -350,7 +350,9 @@ default QuotaGate gate_release_attachment = { operation: upload_release_attachme
 default QuotaGate gate_issue_attachment = { operation: upload_issue_attachment, subject: size_assets_attachments_issues, charged: repository_owner }
 default QuotaGate gate_wiki = { operation: edit_wiki_page, subject: size_wiki, charged: repository_owner }
 default QuotaGate gate_merge_pull = { operation: merge_pull_request, subject: size_git_all, charged: repository_owner }
-default QuotaGate gate_update_pull = { operation: update_pull_request_branch, subject: size_git_all, charged: repository_owner }
+-- decided: requests 3 — "update branch" charges the head repository's owner,
+-- where the commits land (as an applied suggestion does)
+default QuotaGate gate_update_pull = { operation: update_pull_request_branch, subject: size_git_all, charged: head_repository_owner }
 default QuotaGate gate_apply_suggestion = { operation: apply_review_suggestion, subject: size_git_all, charged: head_repository_owner }
 -- decided (quota 6): a manual mirror sync is gated on size:git:all, like a push, on web and API
 default QuotaGate gate_mirror_manual = { operation: sync_mirror_manually, subject: size_git_all, charged: repository_owner }
@@ -617,8 +619,10 @@ rule AdminSetsHolderQuotaGroups {
 -- from: services/auth/source/source_quota_group_sync.go:15
 -- decided (quota 8): every group-capable source syncs quota groups, LDAP
 -- included (Forgejo synced OAuth2 only).
+-- decided: requests 6 — authentication asserts quota groups in an event of
+-- their own, apart from the team-mapping groups.
 rule LoginSourceSyncsQuotaGroups {
-    when: authentication/ExternalGroupsAsserted(user, source, groups)
+    when: authentication/ExternalQuotaGroupsAsserted(user, source, groups)
     let account = QuotaAccount{user: user}
     let to_add = quota_groups_mapped_from(source, groups)
     let to_remove = quota_groups_mapped_from_unclaimed(source, groups)

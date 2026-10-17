@@ -541,7 +541,8 @@ journey ADeletedAccountTakesItsWebhooks {
         stipulate accounts/owns_packages(ada) = false
         stipulate accounts/owns_repositories(ada) = false
         stipulate accounts/belongs_to_organizations(ada) = false
-        ada does UserDeletesOwnAccount(ada) on OwnAccountSettings
+        stipulate password_matches(ada, "my password") = true
+        ada does UserDeletesOwnAccount(ada, "my password") on OwnAccountSettings
         then RemoveWebhooksOfDeletedUser fires
         then hook does not exist
         then old does not exist

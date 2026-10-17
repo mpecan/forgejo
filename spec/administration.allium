@@ -138,6 +138,7 @@
 --   ReleasesSyncWithTagsRequested(operator)             -> releases
 --   AuthSourceConfiguredFromCli(operator, kind, action, source, name, is_active, sync_enabled, settings) -> authentication
 --   AuthorizedIntegrationRequested(operator, user, name, description, issuer, claim_rules, scopes, all_repositories, repositories) -> authentication
+--   UserLoginSourceSetByAdmin(admin, user, login_source, login_name) -> authentication (rebinds the UserLogin)
 --   UserPrimaryEmailSetByAdmin(admin, user, old_address, new_address) -> accounts (announces PrimaryEmailChanged)
 --   DoctorRunRequested(operator, checks, fix)
 --   DoctorRunRequestedByAdmin(run)                    -- report-only checks started from the web
@@ -158,6 +159,7 @@
 --   DoctorRunFinished(run, report)            -- a web-started doctor run has its report
 --   accounts/AccountPurgeFailed(purge)        -- a purge stopped short (SystemNotice)
 --   keys/ExternalSshKeyRefused(user, source, fingerprint)  -- a directory key was refused (SystemNotice)
+--   authentication/ExternalUserSyncRefused(source)  -- an LDAP sync found nobody and was refused (SystemNotice)
 --   repositories/PullMirrorSyncFailed(mirror, reason)  -- a pull mirror failed to sync (SystemNotice)
 --   repositories/RepositoryHealthCheckFailed(repository, reason)       -- git fsck failed (SystemNotice)
 --   repositories/RepositoryGarbageCollectionFailed(repository, reason) -- git gc failed (SystemNotice)
@@ -166,6 +168,32 @@
 --   accounts/InactiveAccountCleanupFinished(older_than)      -- the delete_inactive_accounts run is done
 --   keys/KeyFilesRewritten(kind)              -- the resync_all_sshkeys / resync_all_sshprincipals run is done
 --   migrations/RelinkSweepCompleted(outcome, message) -- the update_migration_poster_id run is done
+--   actions/ZombieTaskSweepFinished()          -- the stop_zombie_tasks run is done
+--   actions/EndlessTaskSweepFinished()         -- the stop_endless_tasks run is done
+--   actions/AbandonedJobSweepFinished()        -- the cancel_abandoned_jobs run is done
+--   actions/LingeringLogSweepFinished()        -- the transfer_lingering_logs run is done
+--   actions/ScheduleSweepFinished()            -- the start_schedule_tasks run is done
+--   actions/ActionsCleanupSweepFinished()      -- the cleanup_actions run is done
+--   actions/TrustedContributorSweepFinished()  -- the actions_action_user run is done
+--   actions/OfflineRunnerSweepFinished()       -- the cleanup_offline_runners run is done
+--   code/DeletedBranchCleanupFinished()        -- the deleted_branches_cleanup run is done
+--   code/LfsGarbageCollectionFinished()        -- the gc_lfs run is done
+--   discovery/IssueIndexRebuildTaskFinished()  -- the rebuild_issue_indexer run is done
+--   moderation/ResolvedReportRemovalFinished() -- the remove_resolved_reports run is done
+--   notifications/OldActivityDeletionFinished() -- the delete_old_actions run is done
+--   packages/PackageCleanupTaskFinished()      -- the cleanup_packages run is done
+--   repositories/MirrorUpdateSweepFinished()   -- the update_mirrors run is done
+--   repositories/ArchiveCleanupFinished()      -- the archive_cleanup run is done
+--   repositories/AllArchivesDeletionFinished() -- the delete_repo_archives run is done
+--   repositories/HealthCheckSweepFinished()    -- the repo_health_check run is done
+--   repositories/GarbageCollectionSweepFinished() -- the git_gc_repos run is done
+--   repositories/MissingRepositoryDeletionFinished() -- the delete_missing_repos run is done
+--   repositories/MissingRepositoryReinitFinished() -- the reinit_missing_repos run is done
+--   repositories/RepositoryStatsCheckFinished() -- the check_repo_stats run is done
+--   repositories/GeneratedAvatarDeletionFinished() -- the delete_generated_repository_avatars run is done
+--   webhooks/HookDeliveryCleanupFinished()     -- the cleanup_hook_task_table run is done
+--   issues/OrphanedUploadCleanupFinished()     -- the delete_orphaned_attachments run is done
+--   authentication/ExternalUserSyncFinished()  -- the sync_external_users run is done
 --   InstanceStarted(instance)                 -- process start (run-at-start tasks)
 
 use "./accounts.allium" as accounts
@@ -256,7 +284,9 @@ enum SettingKey {
 }
 
 -- from: models/system/notice.go:20
-enum NoticeKind { repository | task }
+-- (`repo`, not `repository`: a rule hearing a repository's failure has a
+-- `repository` parameter, which would shadow the value)
+enum NoticeKind { repo | task }
 
 -- Outcome of one cron run as the owning module reports it.
 -- from: services/cron/tasks.go:117
@@ -809,6 +839,14 @@ rule RecordReleaseFeedAnswer {
     ensures: instance.update_check_error = error
     ensures: instance.release_state = release_state_of(instance.version, supported_versions)
     ensures: instance.recommended_upgrade = recommended_upgrade_of(instance.version, supported_versions)
+    -- decided: requests 5 (the update_checker run ends with the answer; a
+    -- failed lookup is a failed run)
+    ensures:
+        for task in CronTasks where name = update_checker and run_state = running:
+            if error = null:
+                CronWorkCompleted(job: task, outcome: finished, message: null)
+            else:
+                CronWorkCompleted(job: task, outcome: failed, message: error)
 }
 
 ------------------------------------------------------------
@@ -872,28 +910,36 @@ rule RecordRefusedExternalKeyNotice {
     ensures: SystemNoticeRecorded(kind: task)
 }
 
+-- An LDAP synchronisation found nobody in the directory and was refused rather
+-- than deactivate every account of the source (decided: requests 8).
+rule RecordRefusedDirectorySyncNotice {
+    when: authentication/ExternalUserSyncRefused(source)
+    ensures: SystemNotice.created(kind: task, description: refused_sync_notice_text(source), created_at: now)
+    ensures: SystemNoticeRecorded(kind: task)
+}
+
 -- Background repository failures worth an operator's attention.
 -- from: services/mirror/mirror_pull.go:248
 rule RecordPullMirrorFailureNotice {
     when: repositories/PullMirrorSyncFailed(mirror, reason)
-    ensures: SystemNotice.created(kind: repository, description: reason, created_at: now)
-    ensures: SystemNoticeRecorded(kind: repository)
+    ensures: SystemNotice.created(kind: repo, description: reason, created_at: now)
+    ensures: SystemNoticeRecorded(kind: repo)
 }
 
 -- git fsck found a broken repository (repo_health_check).
 -- from: services/repository/check.go:24
 rule RecordHealthCheckFailureNotice {
     when: repositories/RepositoryHealthCheckFailed(repository, reason)
-    ensures: SystemNotice.created(kind: repository, description: reason, created_at: now)
-    ensures: SystemNoticeRecorded(kind: repository)
+    ensures: SystemNotice.created(kind: repo, description: reason, created_at: now)
+    ensures: SystemNoticeRecorded(kind: repo)
 }
 
 -- git gc failed on a repository (git_gc_repos).
 -- from: services/repository/check.go:61
 rule RecordGarbageCollectionFailureNotice {
     when: repositories/RepositoryGarbageCollectionFailed(repository, reason)
-    ensures: SystemNotice.created(kind: repository, description: reason, created_at: now)
-    ensures: SystemNoticeRecorded(kind: repository)
+    ensures: SystemNotice.created(kind: repo, description: reason, created_at: now)
+    ensures: SystemNoticeRecorded(kind: repo)
 }
 
 -- An indexer did not start in time: search is unavailable until it is ready
@@ -1015,6 +1061,192 @@ rule FinishRelinkSweepRun {
     ensures:
         for task in CronTasks where name = update_migration_poster_id and run_state = running:
             CronWorkCompleted(job: task, outcome: outcome, message: message)
+}
+
+-- decided: requests 5 — every other owning module reports the end of the work
+-- it was asked to do with a finished event of its own, mapped here to the
+-- running task of that name.
+
+rule FinishZombieTaskSweepRun {
+    when: actions/ZombieTaskSweepFinished()
+    ensures:
+        for task in CronTasks where name = stop_zombie_tasks and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishEndlessTaskSweepRun {
+    when: actions/EndlessTaskSweepFinished()
+    ensures:
+        for task in CronTasks where name = stop_endless_tasks and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishAbandonedJobSweepRun {
+    when: actions/AbandonedJobSweepFinished()
+    ensures:
+        for task in CronTasks where name = cancel_abandoned_jobs and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishLingeringLogSweepRun {
+    when: actions/LingeringLogSweepFinished()
+    ensures:
+        for task in CronTasks where name = transfer_lingering_logs and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishScheduleSweepRun {
+    when: actions/ScheduleSweepFinished()
+    ensures:
+        for task in CronTasks where name = start_schedule_tasks and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishActionsCleanupSweepRun {
+    when: actions/ActionsCleanupSweepFinished()
+    ensures:
+        for task in CronTasks where name = cleanup_actions and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishTrustedContributorSweepRun {
+    when: actions/TrustedContributorSweepFinished()
+    ensures:
+        for task in CronTasks where name = actions_action_user and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishOfflineRunnerSweepRun {
+    when: actions/OfflineRunnerSweepFinished()
+    ensures:
+        for task in CronTasks where name = cleanup_offline_runners and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishDeletedBranchCleanupRun {
+    when: code/DeletedBranchCleanupFinished()
+    ensures:
+        for task in CronTasks where name = deleted_branches_cleanup and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishLfsGarbageCollectionRun {
+    when: code/LfsGarbageCollectionFinished()
+    ensures:
+        for task in CronTasks where name = gc_lfs and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishIssueIndexRebuildTaskRun {
+    when: discovery/IssueIndexRebuildTaskFinished()
+    ensures:
+        for task in CronTasks where name = rebuild_issue_indexer and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishResolvedReportRemovalRun {
+    when: moderation/ResolvedReportRemovalFinished()
+    ensures:
+        for task in CronTasks where name = remove_resolved_reports and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishOldActivityDeletionRun {
+    when: notifications/OldActivityDeletionFinished()
+    ensures:
+        for task in CronTasks where name = delete_old_actions and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishPackageCleanupTaskRun {
+    when: packages/PackageCleanupTaskFinished()
+    ensures:
+        for task in CronTasks where name = cleanup_packages and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishMirrorUpdateSweepRun {
+    when: repositories/MirrorUpdateSweepFinished()
+    ensures:
+        for task in CronTasks where name = update_mirrors and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishArchiveCleanupRun {
+    when: repositories/ArchiveCleanupFinished()
+    ensures:
+        for task in CronTasks where name = archive_cleanup and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishAllArchivesDeletionRun {
+    when: repositories/AllArchivesDeletionFinished()
+    ensures:
+        for task in CronTasks where name = delete_repo_archives and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishHealthCheckSweepRun {
+    when: repositories/HealthCheckSweepFinished()
+    ensures:
+        for task in CronTasks where name = repo_health_check and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishGarbageCollectionSweepRun {
+    when: repositories/GarbageCollectionSweepFinished()
+    ensures:
+        for task in CronTasks where name = git_gc_repos and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishMissingRepositoryDeletionRun {
+    when: repositories/MissingRepositoryDeletionFinished()
+    ensures:
+        for task in CronTasks where name = delete_missing_repos and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishMissingRepositoryReinitRun {
+    when: repositories/MissingRepositoryReinitFinished()
+    ensures:
+        for task in CronTasks where name = reinit_missing_repos and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishRepositoryStatsCheckRun {
+    when: repositories/RepositoryStatsCheckFinished()
+    ensures:
+        for task in CronTasks where name = check_repo_stats and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishGeneratedAvatarDeletionRun {
+    when: repositories/GeneratedAvatarDeletionFinished()
+    ensures:
+        for task in CronTasks where name = delete_generated_repository_avatars and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishHookDeliveryCleanupRun {
+    when: webhooks/HookDeliveryCleanupFinished()
+    ensures:
+        for task in CronTasks where name = cleanup_hook_task_table and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishOrphanedUploadCleanupRun {
+    when: issues/OrphanedUploadCleanupFinished()
+    ensures:
+        for task in CronTasks where name = delete_orphaned_attachments and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishExternalUserSyncRun {
+    when: authentication/ExternalUserSyncFinished()
+    ensures:
+        for task in CronTasks where name = sync_external_users and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
 }
 
 ------------------------------------------------------------
@@ -1255,6 +1487,10 @@ rule DeleteOldSystemNotices {
     ensures:
         for n in SystemNotices where created_at + older_than < now:
             not exists n
+    -- decided: requests 5 (this module owns the work, so it finishes the run itself)
+    ensures:
+        for task in CronTasks where name = delete_old_system_notices and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
 }
 
 -- The update check: DNS TXT lookup on the domain endpoint (preferred) or the
@@ -1537,16 +1773,14 @@ rule AdminSetsUserPassword {
 }
 
 -- Rebind an account to a login source and login name (source and name
--- together, via the API).
+-- together, via the API). decided: requests 4 — the binding is authentication's
+-- login record, so authentication applies it (RebindLoginForAdmin).
 -- from: routers/api/v1/admin/user.go:170
 rule AdminSetsUserLoginSource {
     when: AdminSetsUserLoginSource(admin, user, login_source, login_name)
     requires: admin.is_admin = true
     requires: login_name != null
-    let login = authentication/UserLogin{user: user}
-    ensures: user.login_source = login_source
-    ensures: login.source = login_source
-    ensures: login.login_name = login_name
+    ensures: UserLoginSourceSetByAdmin(admin: admin, user: user, login_source: login_source, login_name: login_name)
     ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
@@ -2602,7 +2836,6 @@ deferred instance_statistics       -- see: models/activities/statistic.go — co
 -- REQUEST migrations: react to MigrationPosterIdUpdateDue; emit MigrationFailureReported(kind, description) (local) for every failure or dropped source data that merits a repository notice — administration records it.
 -- REQUEST actions: react to ZombieActionsTaskStopDue, EndlessActionsTaskStopDue, AbandonedActionsJobCancellationDue, LingeringActionsLogTransferDue, ActionsScheduleStartDue, ActionsCleanupDue, OfflineRunnerCleanupDue, ActionsUserCleanupDue.
 -- REQUEST organizations: react to OrganizationCreatedForUserByAdmin; honour config.disable_regular_org_creation.
--- REQUEST all modules owning cron work: emit CronWorkCompleted(task, outcome, message) when the work finishes, and, for background failures worth an operator's attention, a failure report of their own (as migrations/MigrationFailureReported(kind, description)) that administration reacts to by recording a SystemNotice; a qualified emission of SystemFailureReported is not applied.
 -- REQUEST all modules with writes outside repository units (accounts, organizations, issues, pulls, releases, wiki, packages, projects, keys, webhooks, actions, moderation, federation, migrations, authentication settings, notifications settings): refuse every user-initiated write while access/InstanceWriteGate.read_only (decided: administration 3); access already gates UserWritesUnit / UserContributesToRepository; code's git push goes through access table C (changes_git_content).
 -- REQUEST code: refuse git push over HTTP and SSH while access/InstanceWriteGate.read_only, with the read-only message on the client's terminal (decided: administration 3).
 -- REQUEST accounts: the self-edit guard of decision administration 6 counts admins via has_other_admin(user) — another active administrator who may sign in (is_admin, is_active, not prohibit_login, not being_purged).

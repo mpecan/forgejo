@@ -65,7 +65,7 @@
 --   TeamCreated(team, actor)
 --   TeamUpdated(team, actor)
 --   TeamAccessChanged(team)
---   TeamDeleted(team)
+--   TeamDeleted(team, organization)
 --   TeamMemberAdded(team, user)
 --   TeamMemberRemoved(team, user)
 --   TeamInviteCreated(invite, inviter)   -- notifications mails the invitee
@@ -76,8 +76,8 @@
 -- Reacts to:
 --   repositories/Repository.created  -- add new org repo to includes-all teams (every creation path)
 --   repositories/TeamsReceiveTransferredRepository(repository, teams)  -- named teams get it
---   repositories/RepositoryTransferred(repository, doer, old_owner_name)
---       -- leave the old org's teams, join the new org's includes-all teams
+--   repositories/OrgRepositoryDeparted(repository, organization)  -- leave that org's teams
+--   repositories/OrgRepositoryArrived(repository)  -- join the new org's includes-all teams
 --   repositories/RepositoryDeleted(repository, doer)  -- drop its team links
 --   authentication/ExternalGroupsAsserted(user, source, groups)  -- group-to-team sync
 --   authentication/AuthSourceDeleted(source)                      -- forget provenance
@@ -943,6 +943,10 @@ rule OwnerDeletesTeam {
     -- decided: deleting the Owners team is forbidden on every path (Forgejo only hides the button).
     requires: not team.is_owners_team
 
+    -- the event carries the organization: listeners must not read it through
+    -- the team, which no longer exists once it is delivered
+    let organization = team.organization
+
     ensures:
         for i in team.invites:
             not exists i
@@ -954,7 +958,7 @@ rule OwnerDeletesTeam {
             not exists tm
             TeamMemberRemoved(team: team, user: tm.user)
         not exists team
-        TeamDeleted(team: team)
+        TeamDeleted(team: team, organization: organization)
 
     @guidance
         -- Web: POST /org/{org}/teams/{team}/delete. API: DELETE /teams/{id}.
@@ -1461,29 +1465,43 @@ rule LinkTeamsNamedOnTransfer {
         -- another organization are ignored.
 }
 
--- A transferred repository leaves every team of the organization it left and
--- joins every includes-all team of the organization it arrived in.
+-- A repository transferred out of an organization leaves every team of it.
+-- A deleted repository departs too, but its links go silently with
+-- DropTeamLinksOfDeletedRepository, so only a repository that still exists
+-- announces the removal.
 -- from: services/repository/transfer.go:186
-rule RelinkTeamsOfTransferredRepository {
-    when: repositories/RepositoryTransferred(repository, doer, old_owner_name)
+rule DropTeamLinksOfDepartedRepository {
+    when: repositories/OrgRepositoryDeparted(repository, organization)
+
+    requires: exists repository
 
     ensures:
         for tr in TeamRepositories where repository = repository:
-            if tr.team.organization != repository.owner_org:
+            if tr.team.organization = organization:
                 let old_team = tr.team
                 not exists tr
                 TeamRepositoryRemoved(team: old_team, repository: repository)
-    ensures:
-        if repository.owner_org != null:
-            for t in repository.owner_org.teams where includes_all_repositories = true:
-                if not team_covers(t, repository):
-                    TeamRepository.created(team: t, repository: repository)
-                    TeamRepositoryAdded(team: t, repository: repository)
 
     @guidance
-        -- A transfer between two organizations does both. Members of the old
-        -- organization's teams who lose read access are announced by access
-        -- (it reacts to TeamRepositoryRemoved and RepositoryTransferred).
+        -- Members of the old organization's teams who lose read access are
+        -- announced by access (it reacts to TeamRepositoryRemoved and
+        -- RepositoryTransferred).
+}
+
+-- A repository transferred into an organization joins every includes-all team
+-- of it. A transfer between two organizations departs one and arrives in the
+-- other.
+-- from: services/repository/transfer.go:186
+rule IncludeArrivedRepositoryInAllRepoTeams {
+    when: repositories/OrgRepositoryArrived(repository)
+
+    requires: repository.owner_org != null
+
+    ensures:
+        for t in repository.owner_org.teams where includes_all_repositories = true:
+            if not team_covers(t, repository):
+                TeamRepository.created(team: t, repository: repository)
+                TeamRepositoryAdded(team: t, repository: repository)
 }
 
 -- A deleted repository leaves every team. No TeamRepositoryRemoved is
@@ -2089,7 +2107,6 @@ deferred Organization.unit_permission    -- see: access.allium (org-level read o
 -- REQUEST accounts: OrganizationBlocksUser should also require that the blocked user is not the acting owner (Forgejo refuses blocking yourself).
 -- REQUEST accounts: owner-name namespace — a name may be held by a User or an Organization, never both (is_usable_owner_name, owner_name_available, owner_name_claimable as black boxes over accounts' rules).
 -- REQUEST access: derive repository permission for org repositories from TeamRepository + TeamUnitAccess + Team.kind (owner/admin teams: that mode on all units; unit_grants teams: their TeamUnitAccess rows only — there is no team summary mode), and org-level unit read (projects/packages/code) from team units or org visibility. - already (access Derivation steps 4-6, explicit_mode / explicit_unit_mode / organization_unit_mode).
--- REQUEST repositories: emit OrgRepositoryArrived(repository) after a transfer into an org, and OrgRepositoryDeparted(repository, organization) when an org repository is transferred out or deleted.
 -- REQUEST repositories: when an org repository is created and no team gives its creator admin, add the creator as an admin Collaboration; check can_create_repository_in(user, org) and Organization.max_repo_creation for creation, forks, transfers and push-to-create.
 -- REQUEST repositories: react to TeamMemberAdded / TeamRepositoryAdded with auto-watch when AUTO_WATCH_NEW_REPOS; react to TeamMemberRemoved / OrgMemberRemoved / TeamRepositoryRemoved by unwatching repositories the user can no longer read; react to OrganizationPurgeStarted by deleting all org repositories.
 -- REQUEST issues: react to TeamMemberRemoved / OrgMemberRemoved / TeamRepositoryRemoved by removing IssueWatch and assignments the user can no longer hold.

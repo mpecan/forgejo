@@ -57,7 +57,8 @@
 --
 -- Emits:
 --   PullRequestOpened(pull_request)
---   PullRequestSynchronized(pull_request, doer)        -- head moved (webhook "synchronized", actions)
+--   PullRequestSynchronized(pull_request, doer, deploy_key) -- head moved (webhook "synchronized", actions);
+--                                                      -- deploy_key set (doer null) for a deploy-key push
 --   PullRequestHeadUpdated(pull_request, pusher, old_commit_sha, new_commit_sha, is_force_push)
 --                                                      -- the "pushed commits" timeline entry (notifications)
 --   PullRequestTargetBranchChanged(pull_request, doer, old_base_branch)
@@ -88,7 +89,7 @@
 --   ReviewCommentDeleted(pull_request, comment)        -- (comment is gone: identity only)
 --
 -- Reacts to:
---   code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
+--   code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force, deploy_key)
 --                                       -- head pushes update PRs; base pushes re-check PRs
 --   code/AgitPullRequestRequested(repository, pusher, base_branch, head_branch, head_sha, title, description)
 --   code/AgitPullRequestHeadPushed(pull, pusher, old_sha, new_sha)
@@ -103,7 +104,7 @@
 --   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
 --                                       -- the user's auto-merge schedules, viewed-file marks,
 --                                       -- review requests and draft reviews go
---   organizations/TeamDeleted(team)     -- the team's review requests go
+--   organizations/TeamDeleted(team, organization)     -- the team's review requests go
 --   notifications/MailReplyReceived(author, issue, replied_to, replied_to_code, body, attachment_count)
 --                                       -- a mail reply to a code comment continues that conversation
 --
@@ -833,7 +834,7 @@ rule AgitPushUpdatesPullRequest {
     requires: pull.flow = agit
     requires: pull.is_open
     requires: can_write_code(pusher, pull.base_repository) or pusher = pull.issue.poster
-    ensures: PullRequestHeadMoved(pull_request: pull, pusher: pusher, old_commit_sha: old_sha, new_commit_sha: new_sha)
+    ensures: PullRequestHeadMoved(pull_request: pull, pusher: pusher, deploy_key: null, old_commit_sha: old_sha, new_commit_sha: new_sha)
 }
 
 -- AGit head branch names carry the poster's name; renaming the user renames them.
@@ -860,12 +861,12 @@ rule AgitHeadBranchesFollowPosterRename {
 -- A push to a branch updates every open branch-flow PR using it as head.
 -- from: services/pull/pull.go:298
 rule HeadBranchPushUpdatesPullRequests {
-    when: code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
+    when: code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force, deploy_key)
     for pr in PullRequests where head_repository = repository and head_branch = branch_name
             and flow = branch and issue.status = open
             and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error)
             and head_commit_sha != new_sha:
-        ensures: PullRequestHeadMoved(pull_request: pr, pusher: pusher, old_commit_sha: pr.head_commit_sha, new_commit_sha: new_sha)
+        ensures: PullRequestHeadMoved(pull_request: pr, pusher: pusher, deploy_key: deploy_key, old_commit_sha: pr.head_commit_sha, new_commit_sha: new_sha)
     @guidance
         -- Only PRs that existed before the push was received are updated (a PR
         -- opened from the just-pushed commit is already current).
@@ -879,7 +880,7 @@ rule HeadBranchPushUpdatesPullRequests {
 -- decided: every head move outdates code conversations, AGit pushes included
 -- from: services/pull/pull.go:378
 rule PullRequestHeadMoves {
-    when: PullRequestHeadMoved(pull_request, pusher, old_commit_sha, new_commit_sha)
+    when: PullRequestHeadMoved(pull_request, pusher, deploy_key, old_commit_sha, new_commit_sha)
     let pr = pull_request
     requires: (pr.status = checking or pr.status = mergeable or pr.status = conflict or pr.status = empty or pr.status = ancestor or pr.status = error)
     let diff_changed = diff_differs(pr, old_commit_sha, new_commit_sha)
@@ -903,11 +904,13 @@ rule PullRequestHeadMoves {
         for conversation in CodeConversations where pull_request = pr and is_outdated = false:
             if anchored_lines_changed(conversation, new_commit_sha):
                 conversation.is_outdated = true
-        issues/Comment.created(issue: pr.issue, poster: pusher, kind: pull_push,
+        -- decided: requests 1 — a deploy-key push is recorded as the key's
+        -- (poster null, deploy_key set)
+        issues/Comment.created(issue: pr.issue, poster: pusher, deploy_key: deploy_key, kind: pull_push,
             content: commits_between_shas(pr.base_repository, old_commit_sha, new_commit_sha),
             content_version: 0, created_at: now, updated_at: now)
         PullRequestHeadUpdated(pull_request: pr, pusher: pusher, old_commit_sha: old_commit_sha, new_commit_sha: new_commit_sha, is_force_push: forced)
-        PullRequestSynchronized(pull_request: pr, doer: pusher)
+        PullRequestSynchronized(pull_request: pr, doer: pusher, deploy_key: deploy_key)
     @guidance
         -- "Diff differs" compares the diff of old head vs base with new head vs
         -- base (a rebase that keeps the same changes does not make reviews
@@ -919,7 +922,7 @@ rule PullRequestHeadMoves {
 -- A push to a branch re-checks every open PR that targets it.
 -- from: services/pull/pull.go:357
 rule BaseBranchPushRechecksPullRequests {
-    when: code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
+    when: code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force, deploy_key)
     for pr in PullRequests where base_repository = repository and base_branch = branch_name and issue.status = open
             and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error):
         ensures: pr.status = checking
@@ -1185,7 +1188,7 @@ rule DeletedAccountLeavesPullRequests {
 -- A deleted team's review requests are withdrawn.
 -- from: models/org_team.go:356
 rule DeletedTeamLeavesReviewRequests {
-    when: organizations/TeamDeleted(team)
+    when: organizations/TeamDeleted(team, organization)
     ensures:
         for request in ReviewRequests where team = team:
             not exists request
@@ -1212,8 +1215,8 @@ rule UserUpdatesPullRequestBranch {
     requires: (pr.flow = branch and ((style = merge and may_update_by_merge(user, pr)) or (style = rebase and may_update_by_rebase(user, pr))))
         or (pr.flow = agit and (can_write_code(user, pr.base_repository) or user = pr.issue.poster)
             and (style = merge or rebase_update_allowed(pr.base_repository)))
-    requires: within_quota(pr.head_repository)
-    ensures: PullRequestHeadMoved(pull_request: pr, pusher: user, old_commit_sha: pr.head_commit_sha, new_commit_sha: updated_head(pr, style))
+    requires: within_quota(pr.head_repository)   -- decided: requests 3 (the head repository's owner, where the commits land)
+    ensures: PullRequestHeadMoved(pull_request: pr, pusher: user, deploy_key: null, old_commit_sha: pr.head_commit_sha, new_commit_sha: updated_head(pr, style))
     ensures: PullRequestBranchUpdated(pull_request: pr, doer: user, style: style)
     @guidance
         -- Branch flow — may_update_by_merge: the user may "merge into" the head branch (code
@@ -2039,7 +2042,7 @@ rule UserAppliesSuggestions {
         for thread in threads:
             if pr.may_resolve_conversations(user):
                 thread.resolved_by = user
-        PullRequestHeadMoved(pull_request: pr, pusher: user, old_commit_sha: pr.head_commit_sha,
+        PullRequestHeadMoved(pull_request: pr, pusher: user, deploy_key: null, old_commit_sha: pr.head_commit_sha,
             new_commit_sha: suggestion_commit(pr, threads, summary, message))
         SuggestionsApplied(pull_request: pr, doer: user, conversations: threads)
     @guidance
@@ -2489,5 +2492,4 @@ deferred MergeExecution.commit          -- see: services/pull/merge_*.go per sty
 -- REQUEST notifications: Forgejo does notify team members of a team review request — each member except the PR poster (services/issue/assignee.go:238); consume TeamReviewRequested(pull_request, requester, team) like ReviewRequested, per member.
 -- REQUEST notifications: a PR close / reopen is pulls/PullRequestClosed(pull_request, doer) / PullRequestReopened(pull_request, doer) (doer null when a repository deletion closed it); pulls cannot emit issues/IssueClosed, so consume these for pull requests.
 -- REQUEST discovery: react to ReviewCommentEdited(pull_request, comment) / ReviewCommentDeleted(pull_request, comment) (emitted by UserEditsReviewComment / UserDeletesReviewComment; the deleted comment carries identity only).
--- REQUEST quota: gate_update_pull should charge the head repository's owner (where update-branch writes), as gate_apply_suggestion does; pulls checks within_quota(pr.head_repository).
 

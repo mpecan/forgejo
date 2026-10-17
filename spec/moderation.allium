@@ -48,6 +48,7 @@
 --   ModeratorDeletesRepository(admin, repository)      -- repositories: delete repository
 --   ModeratorDeletesIssue(admin, issue)                -- issues: delete issue / pull request
 --   ModeratorDeletesComment(admin, comment)            -- issues: delete comment
+--   ResolvedReportRemovalFinished()     -- administration: the remove_resolved_reports run is done
 -- Reacts to:
 --   ReportableContentChanging(content, change)
 --       -- internal: raised by this module's reactions to the owners' events
@@ -61,7 +62,7 @@
 --     RepositoryDeleted(repository, doer)
 --   issues/IssueTitleChanged(issue, doer, old_title),
 --     IssueContentChanged(issue, doer, old_content), IssueDeleted(issue, doer),
---     IssueCommentEdited(comment, doer, old_content), IssueCommentDeleted(comment, doer)
+--     IssueCommentEdited(comment, doer, old_content), IssueCommentDeleted(comment, issue, doer)
 --   organizations/OrganizationDeleted(organization)
 --       -- an organization was deleted (by its owners, a purge or moderation):
 --          its reports keep a shadow copy, as for users.
@@ -437,7 +438,7 @@ rule PreserveEvidenceOnCommentEdit {
 }
 
 rule PreserveEvidenceOnCommentDeletion {
-    when: issues/IssueCommentDeleted(comment, doer)
+    when: issues/IssueCommentDeleted(comment, issue, doer)
     ensures:
         for content in ReportableContents where reported_comment = comment:
             ReportableContentChanging(content: content, change: deletion)
@@ -641,6 +642,15 @@ rule ScheduledResolvedReportRemoval {
     ensures:
         for report in AbuseReports where status in {handled, ignored} and resolved_at + keep_for <= now:
             ResolvedReportRemoved(report: report)
+    ensures: ResolvedReportRemovalFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- When ScheduledResolvedReportRemoval cannot do its work the run is still reported done, so it never
+-- stays running (decided: requests 5).
+rule ScheduledResolvedReportRemovalSkipped {
+    when: administration/ResolvedReportRemovalDue(keep_for)
+    requires: not (config.enabled) or not (keep_for > 0.days)
+    ensures: ResolvedReportRemovalFinished()
 }
 
 -- The one place a resolved report is removed, from either path above.

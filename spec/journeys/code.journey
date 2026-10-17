@@ -954,3 +954,45 @@ journey ADeployKeyPushesOnlyWithAWriteGrant {
 
     ends: Only the read-write grant opened a push, and it pushes as the key.
 }
+
+-- A deleted team leaves the protection allowlists it was on.
+journey ADeletedTeamLeavesTheAllowlists {
+    goal: The release team may push to main and create v* tags. When the organization
+          owner deletes the team, main's push allowlist and the tag rule no longer name
+          it; the other team on the allowlist stays.
+
+    cast:
+        org:     organizations/Organization
+        release: organizations/Team
+        ops:     organizations/Team
+        prot:    ProtectedBranch
+        guard:   ProtectedTag
+
+    given:
+        org.name = "acme"
+        release.organization = org
+        release.name = "release"
+        release.is_owners_team = false
+        ops.organization = org
+        ops.name = "ops"
+        ops.is_owners_team = false
+        organizations/is_org_owner(org, alice) = true
+        prot.repository = repo
+        prot.rule_name = "main"
+        prot.push_allowlist_teams = {release, ops}
+        prot.force_push_allowlist_teams = {}
+        prot.merge_allowlist_teams = {}
+        prot.approvals_allowlist_teams = {}
+        guard.repository = repo
+        guard.name_pattern = "v*"
+        guard.allowlist_teams = {release}
+
+    1. the owner deletes the release team
+        alice does OwnerDeletesTeam(alice, release) on TeamSettings
+        then OwnerDeletesTeam fires
+        then DeletedTeamLeavesProtectionAllowlists fires
+        then prot.push_allowlist_teams = {ops}
+        then guard.allowlist_teams = {}
+
+    ends: No protection rule names a team that no longer exists.
+}

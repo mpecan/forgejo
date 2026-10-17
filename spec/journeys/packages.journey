@@ -555,3 +555,24 @@ journey ReadOnlyModeFreezesTheRegistry {
 
     ends: The registry is unchanged until the instance is writable again.
 }
+
+-- Initialising the Cargo index creates the owner's `_cargo-index` repository.
+journey AdaInitialisesHerCargoIndex {
+    goal: Ada turns on the Cargo index of her registry. The index is recorded
+          and repositories creates her `_cargo-index` repository for it: an
+          ordinary new repository, empty and public, created by her.
+
+    1. she initialises the index
+        stipulate can_manage_registry(ada, reg) = true
+        ada does ManagerInitializesCargoIndex(ada, reg) on OwnerPackageSettings
+            creating index: CargoIndex
+            creating repo: repositories/Repository
+        then index.repository_name = "_cargo-index"
+        then CargoIndexGetsItsRepository fires
+        then repo.name = "_cargo-index"
+        then repo.owner_user = ada
+        then repo.is_empty = true
+        then repo.is_private = false
+
+    ends: Ada's registry has a Cargo index, kept in her new `_cargo-index` repository.
+}

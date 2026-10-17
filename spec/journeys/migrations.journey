@@ -348,6 +348,11 @@ journey AFailedImportCanBeThrownAway {
     given:
         repo.status = being_migrated
         repo.is_mirror = false
+        -- alice's own fresh import: nothing was forked from it, and it is not a fork
+        repo.owner_user = alice
+        repo.owner_org = null
+        repo.fork_of = null
+        repo.is_fork = false
         m.repository = repo
         m.doer = alice
         m.source = gh
@@ -369,6 +374,8 @@ journey AFailedImportCanBeThrownAway {
         stipulate is_repo_admin(alice, repo) = true
         alice does RepoAdminDiscardsFailedMigration(alice, m) on MigrationAdministration
         then RepoAdminDiscardsFailedMigration fires
+        then DeleteDiscardedImport fires
+        then DeleteRepositoryAndItsRecords fires
         then m does not exist
         then repo does not exist
 

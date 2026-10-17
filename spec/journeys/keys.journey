@@ -12,19 +12,19 @@ world {
         ada.is_active = true
         ada.prohibit_login = false
         ada.is_admin = false
-        ada.login_source = null
+        login_source_of(ada) = null
         ada.primary_email = "ada@example.org"
         bob.name = "bob"
         bob.is_active = true
         bob.prohibit_login = false
         bob.is_admin = false
-        bob.login_source = null
+        login_source_of(bob) = null
         bob.primary_email = "bob@example.org"
         root.name = "root"
         root.is_active = true
         root.prohibit_login = false
         root.is_admin = true
-        root.login_source = null
+        login_source_of(root) = null
 }
 
 -- The happy path: a personal SSH key is registered and shows up on her keys page.
@@ -482,6 +482,7 @@ journey TheDirectoryManagesHerKeys {
 
     cast:
         corp:  authentication/AuthSource
+        corp_settings: authentication/AuthSourceSettings
 
     given:
         corp.name = "corp"
@@ -489,6 +490,9 @@ journey TheDirectoryManagesHerKeys {
         corp.is_active = true
         corp.sync_enabled = true
         corp.provides_ssh_keys = true
+        -- the directory's group lookup is off: the sync asserts no groups
+        corp.settings = corp_settings
+        corp_settings.groups_enabled = false
         login: authentication/UserLogin { user: ada, source: corp, login_name: "ada", has_password: false, must_change_password: false }
         entry: authentication/DirectoryEntry { source: corp, username: "ada", email: "ada@example.org", is_admin: false, is_restricted: false, ssh_public_keys: {"ssh-ed25519 AAAAcorp ada@corp"} }
 
@@ -714,6 +718,7 @@ journey AWeakDirectoryKeyIsSkipped {
 
     cast:
         corp:  authentication/AuthSource
+        corp_settings: authentication/AuthSourceSettings
 
     given:
         corp.name = "corp"
@@ -721,6 +726,9 @@ journey AWeakDirectoryKeyIsSkipped {
         corp.is_active = true
         corp.sync_enabled = true
         corp.provides_ssh_keys = true
+        -- the directory's group lookup is off: the sync asserts no groups
+        corp.settings = corp_settings
+        corp_settings.groups_enabled = false
         login: authentication/UserLogin { user: ada, source: corp, login_name: "ada", has_password: false, must_change_password: false }
         entry: authentication/DirectoryEntry { source: corp, username: "ada", email: "ada@example.org", is_admin: false, is_restricted: false, ssh_public_keys: {"ssh-rsa AAAAweak ada@old"} }
 

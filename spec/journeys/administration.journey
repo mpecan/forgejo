@@ -118,28 +118,62 @@ journey InstallRefusesToLockEveryoneOut {
 -- decided: administration 1 — the admin who ran it is recorded as the doer.
 journey AdministratorRunsADisabledTaskByHand {
     goal: Root wants to garbage-collect every repository now. The task is
-          disabled on the schedule, but the dashboard still offers it. It runs,
-          the run reports a failure, and the failure is waiting in the system
-          notices.
+          disabled on the schedule, but the dashboard still offers it. It runs;
+          one repository fails to collect, which is waiting in the system
+          notices, and repositories reports the run done, so the task is idle
+          again and a second click runs it again.
 
+    cast:
+        app: repositories/Repository
     given:
         sweep: CronTask { name: git_gc_repos, owner: repositories, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 72h", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
 
     1. root runs it from the dashboard
+        stipulate repositories/gc_succeeds(app) = false
+        stipulate repositories/gc_report(app) = "app: object store corrupt"
         root does AdminRunsCronTask(root, sweep) on AdminDashboard
+            creating notice: SystemNotice
         then AdminRunsCronTask fires
         then StartCronTaskRun fires
         then DispatchGitGcRepos fires
-        then sweep.run_state = running
+        then ScheduledGarbageCollection fires
+        then FinishGarbageCollectionSweepRun fires
+        then FinishCronTaskRun fires
+        then notice.kind = repo
+        then sweep.run_state = idle
+        then sweep.last_outcome = finished
         then sweep.exec_times = 1
         then sweep.last_doer = root
 
-    2. a second click while it runs does not start it twice
+    2. a second click runs it again
+        root does AdminRunsCronTask(root, sweep) on CronTaskMonitor
+        then StartCronTaskRun fires
+        then sweep.exec_times = 2
+
+    3. root reads the notice and the task's last outcome
+        root sees notice.description on SystemNoticeLog in notice
+        root sees sweep.last_outcome on CronTaskMonitor in sweep
+
+    ends: The failing repository is in the notice log; the task finished its runs.
+}
+
+-- decided: requests 5 — the work reports its own end; a run the worker saw
+-- crash is still reported, and a second start while it runs is dropped.
+journey ACrashedRunIsReported {
+    goal: A garbage-collection run Root started is still running when the
+          worker crashes on a locked database. A click meanwhile does not start
+          it twice; the crash is reported as a failed run, which is waiting in
+          the system notices.
+
+    given:
+        sweep: CronTask { name: git_gc_repos, owner: repositories, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 72h", notice_on_success: false, shown_on_dashboard: true, run_state: running, last_outcome: never_run, exec_times: 1 }
+
+    1. a click while it runs does not start it twice
         root does AdminRunsCronTask(root, sweep) on CronTaskMonitor
         then StartCronTaskRun does not fire
         then sweep.exec_times = 1
 
-    3. the run reports it failed
+    2. the run reports it failed
         proc does CronWorkCompleted(sweep, failed, "database is locked") on BackgroundWorkReporting
             creating notice: SystemNotice
         then FinishCronTaskRun fires
@@ -147,7 +181,7 @@ journey AdministratorRunsADisabledTaskByHand {
         then sweep.last_outcome = failed
         then notice.kind = task
 
-    4. root reads the notice and the task's last outcome
+    3. root reads the notice and the task's last outcome
         root sees notice.description on SystemNoticeLog in notice
         root sees sweep.last_message on CronTaskMonitor in sweep
 
@@ -204,7 +238,7 @@ journey TheMirrorTaskRunsOnItsSchedule {
     goal: The instance starts. update_mirrors is enabled every ten minutes and
           not run at start; ten minutes later it falls due, starts, and asks
           the repositories module to sync up to fifty pull and fifty push
-          mirrors.
+          mirrors; repositories reports the sweep done and the run finishes.
 
     given:
         mirrors: CronTask { name: update_mirrors, owner: repositories, requires_feature: mirrors, enabled: true, run_at_start: false, schedule: "@every 10m", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
@@ -221,12 +255,13 @@ journey TheMirrorTaskRunsOnItsSchedule {
         then CronTaskFallsDue fires
         then StartCronTaskRun fires
         then DispatchUpdateMirrors fires
-        then mirrors.run_state = running
         then mirrors.exec_times = 1
 
-    3. the sync finishes cleanly; nothing is noticed
-        proc does CronWorkCompleted(mirrors, finished, null) on BackgroundWorkReporting
+    3. repositories reports the sweep done; nothing is noticed
+        then AdministrationUpdatesMirrors fires
+        then FinishMirrorUpdateSweepRun fires
         then FinishCronTaskRun fires
+        then mirrors.run_state = idle
         then mirrors.last_outcome = finished
         root sees mirrors.last_outcome on CronTaskMonitor in mirrors
 
@@ -243,10 +278,10 @@ journey OldNoticesAgeOut {
         time_until_next("@every 168h") = 168.hours
 
     1. a background failure is reported
-        proc does SystemFailureReported(repository, "Failed to remove /data/repos/x.git") on BackgroundWorkReporting
+        proc does SystemFailureReported(repo, "Failed to remove /data/repos/x.git") on BackgroundWorkReporting
             creating old: SystemNotice
         then RecordSystemNotice fires
-        then old.kind = repository
+        then old.kind = repo
 
     2. a year and a bit later the weekly run falls due
         after 400.days
@@ -685,6 +720,30 @@ journey AnAdminMovesAdaToANewAddress {
         then fresh.is_activated = true
         then old.is_primary = false
         then old exists
+        then AdminPrimaryEmailChangeAnnounced fires
 
-    ends: Ada has one primary, activated address and keeps the old one.
+    ends: Ada has one primary, activated address and keeps the old one; the
+          change is announced as hers would be, so the old address is told.
+}
+
+-- decided: requests 4 — the sign-in source lives on authentication's login
+-- record; an admin's rebind is applied there, and the account reads it back.
+journey AnAdminMovesAdaToTheCompanyDirectory {
+    goal: The company moved its people to LDAP. Root rebinds Ada's local
+          account to the directory source under her directory login name; her
+          login record now names the source, and the account is no longer local.
+
+    cast:
+        corp:  authentication/AuthSource
+    given:
+        login: authentication/UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+
+    1. root rebinds her account
+        root does AdminSetsUserLoginSource(root, ada, corp, "ada.lovelace") on AdminUserAccount
+        then AdminSetsUserLoginSource fires
+        then RebindLoginForAdmin fires
+        then login.source = corp
+        then login.login_name = "ada.lovelace"
+
+    ends: Ada signs in through the directory from now on.
 }

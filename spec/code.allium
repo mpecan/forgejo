@@ -55,7 +55,8 @@
 -- Emits (domain triggers other modules react to):
 --   RefUpdateAccepted(update)                          -- internal hand-off from pre-receive to post-receive; not for other modules
 --   PushReceived(push)                                 -- notifications (activity feed), webhooks (push), actions (push event)
---   CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
+--   CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force, deploy_key)
+--                                                      -- deploy_key: the key of a deploy-key push (pusher null)
 --                                                      -- issues (close/reference keywords), pulls (re-test PRs whose head/base is this branch),
 --                                                      -- notifications (feed), webhooks, actions; repositories (auto-watch, size, updated time)
 --                                                      -- (also emitted for each branch a pull-mirror sync moved: see repositories/MirrorBranchUpdated)
@@ -101,6 +102,8 @@
 --   RefUpdate.full_ref_name                  = refs/heads/<b>, refs/tags/<t>, refs/for/<t>,
 --                                              refs/pull/<n>/head, or the name as pushed -- actions
 --
+--   DeletedBranchCleanupFinished()      -- administration: the deleted_branches_cleanup run is done
+--   LfsGarbageCollectionFinished()      -- administration: the gc_lfs run is done
 -- Reacts to:
 --   actions/JobCommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
 --                                                      -- job results, recorded exactly as a status posted through the API
@@ -120,7 +123,7 @@
 --                                                      -- to the base branch's head as a push by doer
 --   releases/ReleaseTagRequested(release, doer)        -- publishing a release creates its tag as an internal tag push
 --   keys/SshKeyAuthenticated(connection, key)          -- a deploy key on git-receive-pack opens a deploy-key push
---   organizations/TeamDeleted(team)                    -- the team leaves every branch / tag protection allowlist
+--   organizations/TeamDeleted(team, organization)                    -- the team leaves every branch / tag protection allowlist
 --   accounts/UserAccountDeleted(user, kind, purge, delete_contributions) -- the user leaves every allowlist
 --   repositories/CollaboratorRemoved(repository, user, doer) -- the user leaves that repository's allowlists
 --   keys/DeployKeyDeleted(deploy_key, repository, name, actor) -- the key leaves that repository's allowlists
@@ -1003,7 +1006,7 @@ rule BranchCreatedByPush {
         if repository.is_empty:
             repository.default_branch = update.ref_name
             repository.is_empty = false
-    ensures: CommitsPushed(repository: repository, branch_name: update.ref_name, pusher: update.push.pusher, old_sha: update.old_sha, new_sha: update.new_sha, is_force: false)
+    ensures: CommitsPushed(repository: repository, branch_name: update.ref_name, pusher: update.push.pusher, old_sha: update.old_sha, new_sha: update.new_sha, is_force: false, deploy_key: update.push.deploy_key)
     ensures: RefCreated(repository: repository, pusher: update.push.pusher, ref_kind: branch_ref, ref_name: update.ref_name, commit_sha: update.new_sha)
     @guidance
         -- When an empty repository receives several branches at once, `main`/`master`
@@ -1025,7 +1028,7 @@ rule BranchUpdatedByPush {
     ensures: branch.pusher = update.push.pusher
     ensures: branch.pushed_by_key = update.push.deploy_key
     ensures: branch.updated_at = now
-    ensures: CommitsPushed(repository: repository, branch_name: update.ref_name, pusher: update.push.pusher, old_sha: update.old_sha, new_sha: update.new_sha, is_force: is_force_push(repository, update.old_sha, update.new_sha))
+    ensures: CommitsPushed(repository: repository, branch_name: update.ref_name, pusher: update.push.pusher, old_sha: update.old_sha, new_sha: update.new_sha, is_force: is_force_push(repository, update.old_sha, update.new_sha), deploy_key: update.push.deploy_key)
 }
 
 -- A branch deleted by push. The record is kept (deleted) for restoration.
@@ -1265,7 +1268,7 @@ rule UserRestoresBranch {
     ensures: branch.pushed_by_key = null
     ensures: branch.updated_at = now
     ensures: BranchCreated(branch: branch, by: user)
-    ensures: CommitsPushed(repository: repository, branch_name: branch.name, pusher: user, old_sha: null, new_sha: branch.head_commit_sha, is_force: false)
+    ensures: CommitsPushed(repository: repository, branch_name: branch.name, pusher: user, old_sha: null, new_sha: branch.head_commit_sha, is_force: false, deploy_key: null)
     ensures: RefCreated(repository: repository, pusher: user, ref_kind: branch_ref, ref_name: branch.name, commit_sha: branch.head_commit_sha)
 }
 
@@ -1603,7 +1606,7 @@ rule DeletedDeployKeyLeavesProtectionAllowlists {
 -- A deleted team leaves every branch and tag protection allowlist it was on.
 -- from: models/git/protected_branch.go:499
 rule DeletedTeamLeavesProtectionAllowlists {
-    when: organizations/TeamDeleted(team)
+    when: organizations/TeamDeleted(team, organization)
     ensures:
         for p in ProtectedBranches where team in push_allowlist_teams or team in force_push_allowlist_teams
                 or team in merge_allowlist_teams or team in approvals_allowlist_teams:
@@ -1731,7 +1734,7 @@ rule UserRemovesCommitNote {
 rule MirrorBranchUpdateIsAPush {
     when: repositories/MirrorBranchUpdated(repository, branch_name, pusher, old_sha, new_sha, is_force)
     ensures: CommitsPushed(repository: repository, branch_name: branch_name, pusher: pusher,
-        old_sha: old_sha, new_sha: new_sha, is_force: is_force)
+        old_sha: old_sha, new_sha: new_sha, is_force: is_force, deploy_key: null)
 }
 
 ------------------------------------------------------------
@@ -2075,6 +2078,7 @@ rule AdministrationCleansDeletedBranches {
     ensures:
         for branch in Branches where status = deleted and deleted_at + older_than <= now:
             DeletedBranchRecordPurgeDue(branch: branch)
+    ensures: DeletedBranchCleanupFinished()   -- decided: requests 5 (the owner reports the run done)
 }
 
 -- from: models/git/branch.go:276
@@ -2111,9 +2115,18 @@ rule AdministrationCollectsOrphanedLfsObjects {
         for object in LfsObjects where created_at + older_than <= now and last_checked_at + last_updated_more_than_ago <= now:
             if not lfs_pointer_reachable(object.repository, object.oid):
                 OrphanedLfsObjectRemovalDue(object: object)
+    ensures: LfsGarbageCollectionFinished()   -- decided: requests 5 (the owner reports the run done)
     @guidance
         -- The budget only limits how many objects one run inspects; the next run
         -- continues. Referenced objects get last_checked_at = now.
+}
+
+-- When AdministrationCollectsOrphanedLfsObjects cannot do its work the run is still reported done, so it never
+-- stays running (decided: requests 5).
+rule AdministrationCollectsOrphanedLfsObjectsSkipped {
+    when: administration/LfsGarbageCollectionDue(older_than, last_updated_more_than_ago, number_to_check_per_repo, proportion_to_check_per_repo)
+    requires: not (config.lfs_start_server)
+    ensures: LfsGarbageCollectionFinished()
 }
 
 -- from: services/repository/lfs.go:54
@@ -2674,7 +2687,6 @@ deferred LfsGarbageCollection.batch       -- see: services/repository/lfs.go —
 -- REQUEST repositories/Repository.is_template, is_private, is_fork, is_empty, is_mirror, is_archived, status, default_branch: written by post-receive (is_empty, default_branch, is_private, is_template).
 -- REQUEST repositories: react to PushToCreateRequested (create repo), PushReceived (size, updated time), CommitsPushed (auto-watch pusher).
 -- REQUEST pulls/PullRequest.allow_maintainer_edit and maintainer_edit_allows(user, repository, branch_name): maintainers pushing to a PR head branch.
--- REQUEST pulls/PullRequest.may_merge(user) (exists) and pulls/merge_requirements_met(pull) (approvals, status checks, rejected reviews, outdated branch, protected files): used by AcceptProtectedBranchMergePush.
 -- REQUEST pulls/pull_by_index, is_agit_pull, pull_poster, open_agit_pull, agit_pull_for (refs/pull/<n>/head): AGit flow lookups.
 -- REQUEST pulls: react to AgitPullRequestRequested, AgitPullRequestHeadPushed, MergePushCompleted, BranchDeleted, BranchRenamed, CommitsPushed, BranchProtectionChanged, CommitStatusCreated.
 -- REQUEST releases/release_exists(repository, tag_name), releases/has_published_release(repository, tag_name); react to TagCreated/TagUpdated/TagDeleted for tag-only releases.

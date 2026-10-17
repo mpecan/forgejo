@@ -50,6 +50,7 @@
 --   - CargoIndexInitialized(manager, registry)        -- repositories creates (or reuses) the owner's `_cargo-index` repository
 --   - PackageVersionDeleted(version, package, doer)  -- `version` is already gone, so listeners read `package`; a visible version was removed by a person
 --   (webhooks, actions `on: package`, notifications react to these)
+--   PackageCleanupTaskFinished()        -- administration: the cleanup_packages run is done
 -- Reacts to:
 --   - repositories/RepositoryDeleted(repository, doer) -- unlink all packages linked to it
 --   - accounts/UserPurged(user)                    -- remove everything in the user's registry
@@ -1475,7 +1476,16 @@ rule RunScheduledPackageCleanup {
 rule AdministrationRunsPackageCleanup {
     when: administration/PackageCleanupDue(older_than)
     requires: config.packages_enabled
+    ensures: PackageCleanupTaskFinished()   -- decided: requests 5 (the owner reports the run done)
     ensures: PackageCleanupRun(older_than: older_than)
+}
+
+-- When AdministrationRunsPackageCleanup cannot do its work the run is still reported done, so it never
+-- stays running (decided: requests 5).
+rule AdministrationRunsPackageCleanupSkipped {
+    when: administration/PackageCleanupDue(older_than)
+    requires: not (config.packages_enabled)
+    ensures: PackageCleanupTaskFinished()
 }
 
 -- One cleanup run, however started: apply every enabled cleanup rule, then

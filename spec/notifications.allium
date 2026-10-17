@@ -69,6 +69,7 @@
 --   NotificationCountPushed(user, unread_count)        -- the web client refreshes its badge
 --   SignOutPushed(connection, session)                 -- the web client signs that tab out
 --
+--   OldActivityDeletionFinished()       -- administration: the delete_old_actions run is done
 -- Reacts to (names and parameters as the integration's canonical table gives them):
 --   issues/IssueOpened(issue, mentions)                 -- issues only (PRs: pulls/PullRequestOpened)
 --   issues/IssueClosed(issue, doer, comment)            -- issues (pulls never emits it for a PR)
@@ -88,6 +89,7 @@
 --   pulls/PullRequestCodeCommented(pull_request, comment)
 --   pulls/ReviewDismissed(review, dismisser, message)
 --   pulls/ReviewRequested(pull_request, requester, reviewer)
+--   pulls/TeamReviewRequested(pull_request, requester, team) -- each member but the poster
 --   repositories/RepositoryCreated(repository, doer)
 --   repositories/RepositoryForked(source, fork, doer)
 --   repositories/RepositoryRenamed(repository, doer, old_name)
@@ -682,6 +684,16 @@ rule InboxOnAssigned {
 rule InboxOnReviewRequested {
     when: pulls/ReviewRequested(pull_request, requester, reviewer)
     ensures: IssueThreadActivityFor(issue: pull_request.issue, comment: null, author: requester, receiver: reviewer)
+}
+
+-- A review requested from a team reaches each member of the team but the
+-- pull request's poster.
+rule InboxOnTeamReviewRequested {
+    when: pulls/TeamReviewRequested(pull_request, requester, team)
+    ensures:
+        for member in team.members:
+            if member != pull_request.issue.poster:
+                IssueThreadActivityFor(issue: pull_request.issue, comment: null, author: requester, receiver: member)
 }
 
 -- An auto-merge that could not be carried out tells the user who scheduled
@@ -1413,6 +1425,7 @@ rule MailOnActionsRunFailed {
     requires: not (prior_status in {success, failure, cancelled, skipped})
     requires: config.mailer_enabled
     requires: run.notify_email
+    requires: run.trigger_deploy_key = null
     let target = run_failure_recipient(run)
     requires: target != null
     requires: target.email_notifications != disabled
@@ -1435,6 +1448,37 @@ rule MailOnActionsRunFailed {
         -- run_failure_recipient(run) = run.trigger_user, or the repository
         -- owner (a user; nobody for an organization) when the run was
         -- triggered by the Actions bot (scheduled runs).
+}
+
+-- A failed run that a deploy-key push started has no user to tell: the
+-- repository's administrators are mailed instead, one mail each, under the
+-- same once-per-attempt rule.
+-- decided: requests 1 (failure mail for a deploy key's run goes to the admins)
+rule MailOnDeployKeyRunFailed {
+    when: actions/WorkflowRunCompleted(run, prior_status)
+    requires: is_failure(run.status)
+    requires: not (prior_status in {success, failure, cancelled, skipped})
+    requires: config.mailer_enabled
+    requires: run.notify_email
+    requires: run.trigger_deploy_key != null
+    ensures:
+        for a in repository_admins(run.repository):
+            if mail_eligible(a, false):
+                MailMessage.created(
+                    to_address: a.primary_email,
+                    recipient: a,
+                    category: actions_run_failed,
+                    subject: run_failure_subject(run, a.language),
+                    sender_display_name: "",
+                    language: a.language,
+                    issue: null,
+                    comment: null,
+                    code_comment: null,
+                    via_mention: false,
+                    thread_key: null,
+                    status: queued,
+                    queued_at: now
+                )
 }
 
 -- A scheduled workflow switched off for inactivity is mailed to the
@@ -2183,6 +2227,15 @@ rule DeleteOldActivity {
     ensures:
         for a in expired:
             not exists a
+    ensures: OldActivityDeletionFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- When DeleteOldActivity cannot do its work the run is still reported done, so it never
+-- stays running (decided: requests 5).
+rule DeleteOldActivitySkipped {
+    when: administration/OldActivityDeletionDue(older_than)
+    requires: not (older_than > 0.seconds)
+    ensures: OldActivityDeletionFinished()
 }
 
 ------------------------------------------------------------
@@ -2587,7 +2640,6 @@ deferred Heatmap.aggregate       -- see: models/activities/user_heatmap.go
 -- REQUEST pulls: react to notifications/MailReplyReceived with replied_to_code set (reply in that code conversation); expose the mentions of a PR description, a review body and a code comment (issue_mentions / review_mentions / code_comment_mentions).
 -- RESOLVED (integration): pulls emits both triggers for an auto-merge and sets
 --   PullRequest.merged_automatically; the plain-merge rules here skip auto-merges.
--- REQUEST pulls: TeamReviewRequested(pull_request, requester, team) is not consumed; Forgejo notifies nobody per team member — confirm.
 -- RESOLVED (actions): WorkflowRun.{status, notify_email, trigger_user, repository} are present; WorkflowRunCompleted(run, prior_status) fires once per attempt and actions' Emits list now puts the failure mail under it (decided notifications 4).
 -- RESOLVED (actions): ScheduledWorkflowDisabledForInactivity(repository, workflow_file) is emitted by actions and consumed by MailOnScheduledWorkflowDisabled.
 -- REQUEST access: repository_admins(repository) = individual users with is_repo_admin(user, repository) (used for the workflow-disabled mail).

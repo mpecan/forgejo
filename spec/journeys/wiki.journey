@@ -10,12 +10,26 @@ world {
     given:
         repo.is_archived = false
         repo.is_mirror = false
+        repo.status = ready
+        repo.is_empty = false
+        repo.is_private = false
         wiki.repository = repo
         repo.wiki_branch = "main"
         wiki.status = uninitialised
+        -- Ada and Bob are signed-in, active users; git reaches the wiki over
+        -- SSH, and neither must use two-factor authentication.
+        ada.is_active = true
+        ada.prohibit_login = false
+        bob.is_active = true
+        bob.prohibit_login = false
+        must_have_two_factor(ada) = false
+        must_have_two_factor(bob) = false
         -- None of these stories is about CI: Actions is off on this instance,
         -- so a wiki change starts no workflow.
         actions/config.actions_enabled = false
+        -- Nor are they about commit signing: the instance has no signing key,
+        -- so every wiki commit is written unsigned.
+        keys/instance_signing_key_available(repo) = false
         -- The wiki unit is on, Ada may write to it, and it is under quota, in
         -- every story here unless one says otherwise.
         wiki_unit_enabled(repo) = true
@@ -225,7 +239,8 @@ journey ADeveloperWorksOnTheWikiWithGit {
 
     1. she clones
         stipulate can_read_wiki(ada, repo) = true
-        ada does UserOpensWikiOverGit(ada, wiki) on WikiReading
+        ada does GitClientFetchesWiki(ada, repo, ssh) on GitTransport
+        then GitFetchReachesWiki fires
         then GitAccessInitialisesWiki fires
         then wiki.status = initialised
 
@@ -238,8 +253,9 @@ journey ADeveloperWorksOnTheWikiWithGit {
         stipulate pushed_message(wiki, "Home") = "Initial pages"
         stipulate page_title_for("Home") = "Home"
         stipulate kind_of_page("Home") = regular
-        ada does UserPushesToWiki(ada, wiki) on WikiEditing
+        ada does GitClientPushesToWiki(ada, repo, ssh) on GitTransport
             creating home: WikiPage
+        then GitPushReachesWiki fires
         then UserPushesToWiki fires
         then PushAddsWikiPage fires
         then home.name = "Home"
@@ -247,8 +263,13 @@ journey ADeveloperWorksOnTheWikiWithGit {
         then home.last_author = ada
 
     3. bob, a reader, cannot push
+        -- the transport lets his authenticated push through to the wiki,
+        -- whose pre-receive refuses it for want of wiki write
         stipulate can_write_wiki(bob, repo) = false
-        bob cannot do UserPushesToWiki(bob, wiki) on WikiEditing
+        bob does GitClientPushesToWiki(bob, repo, ssh) on GitTransport
+        then GitPushReachesWiki fires
+        then UserPushesToWiki does not fire
+        then home.last_author = ada
 
     ends: The wiki holds Ada's pushed Home page, announced as created by her; Bob could only clone.
 }
@@ -284,7 +305,7 @@ journey APushIsAnnouncedPageByPage {
         stipulate pushed_content(wiki, "Home") = "Welcome pushed"
         stipulate pushed_message(wiki, "Home") = "Tidy up"
         stipulate pushed_message(wiki, "Old") = "Tidy up"
-        ada does UserPushesToWiki(ada, wiki) on WikiEditing
+        ada does GitClientPushesToWiki(ada, repo, ssh) on GitTransport
         then PushEditsWikiPage fires
         then PushDeletesWikiPage fires
         then home.content = "Welcome pushed"
@@ -309,7 +330,10 @@ journey APushWithAnEmptyPageIsRefused {
 
     1. she pushes
         stipulate push_leaves_empty_page(wiki) = true
-        ada cannot do UserPushesToWiki(ada, wiki) on WikiEditing
+        ada does GitClientPushesToWiki(ada, repo, ssh) on GitTransport
+        then GitPushReachesWiki fires
+        then UserPushesToWiki does not fire
+        then wiki.status = initialised
 
     ends: Nothing changed.
 }
@@ -475,7 +499,7 @@ journey ReadOnlyModeFreezesTheWiki {
 
     2. nor push to the wiki
         stipulate push_leaves_empty_page(wiki) = false
-        ada cannot do UserPushesToWiki(ada, wiki) on WikiEditing
+        ada cannot do GitClientPushesToWiki(ada, repo, ssh) on GitTransport
 
     3. once maintenance is over, the page is saved
         stipulate gate.read_only = false

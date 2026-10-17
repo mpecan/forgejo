@@ -79,7 +79,7 @@
 --   - organizations/TeamMemberRemoved(team, user)
 --   - organizations/TeamRepositoryRemoved(team, repository)
 --   - organizations/TeamAccessChanged(team)   (team kind, unit access, includes-all)
---   - organizations/TeamDeleted(team)
+--   - organizations/TeamDeleted(team, organization)
 --   - organizations/OrganizationVisibilityChanged(organization)
 --   - accounts/AccountStatusChanged(user)          (restricted flag may have changed)
 --   - accounts/UserVisibilityChanged(user, old_visibility, new_visibility)
@@ -416,7 +416,10 @@ external entity RequestParty {
 -- admin powers need a token with the admin scope)
 -- from: services/authz/authorization_reducer.go:11
 entity CredentialRestriction {
+    -- the credential it restricts: an access token or an authorized
+    -- integration (exactly one of the two; authentication derives both)
     token: authentication/AccessToken?
+    integration: authentication/AuthorizedIntegration?
     reach: all_repositories | public_only | listed_repositories
     listed: Set<repositories/Repository>
     -- the credential carries the admin scope category (read:admin / write:admin)
@@ -1026,7 +1029,7 @@ rule AnnounceLostAccessOnCollaboratorRemoved {
 rule AnnounceLostAccessOnTeamMemberRemoved {
     when: organizations/TeamMemberRemoved(team, user)
     ensures:
-        for repository in repositories/Repositories where owner_org = team.organization:
+        for repository in repositories/Repositories where owner_org = organization:
             if not has_any_access(user, repository):
                 UserLostRepositoryAccess(user: user, repository: repository)
 }
@@ -1045,7 +1048,7 @@ rule AnnounceLostAccessOnTeamRepositoryRemoved {
 rule AnnounceLostAccessOnTeamAccessChanged {
     when: organizations/TeamAccessChanged(team)
     ensures:
-        for repository in repositories/Repositories where owner_org = team.organization:
+        for repository in repositories/Repositories where owner_org = organization:
             for m in team.memberships:
                 if not has_any_access(m.user, repository):
                     UserLostRepositoryAccess(user: m.user, repository: repository)
@@ -1054,9 +1057,9 @@ rule AnnounceLostAccessOnTeamAccessChanged {
 -- The deleted team's members are no longer known; check everybody.
 -- from: models/org_team.go:316
 rule AnnounceLostAccessOnTeamDeleted {
-    when: organizations/TeamDeleted(team)
+    when: organizations/TeamDeleted(team, organization)
     ensures:
-        for repository in repositories/Repositories where owner_org = team.organization:
+        for repository in repositories/Repositories where owner_org = organization:
             RepositoryAccessMayHaveNarrowed(repository: repository)
 }
 

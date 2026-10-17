@@ -56,12 +56,14 @@
 --       webhooks (repository created), activity feed, notifications; the
 --       doer is migrations/Migration{repository}.doer
 --   - MigrationFailed(migration)                 -- progress page, notifications
---   - MigrationFailureReported(kind, description) -- kind: repository; on a
+--   - MigrationFailureReported(kind, description) -- kind: repo; on a
 --       failed import and on dropped unsafe source data; administration
 --       records it as a SystemNotice
 --   - ImportCompleted(repository, remote_address, has_credentials, interval,
 --       lfs_enabled, lfs_endpoint)            -- repositories finishes the
 --       repository (ready; pull mirror for a mirror import)
+--   - FailedImportDiscarded(repository, doer)   -- repositories deletes the half-made repository
+--                                                (its usual cascade)
 --   - MigratedContentDiscarded(repository)       -- core wipes partially
 --       imported content before a retry
 --   - ExternalAuthorLinked(authorship, user)     -- imported content now
@@ -1068,7 +1070,7 @@ rule GitCloneTimesOut {
     ensures: migration.ended_at = now
     ensures: migration.git_deadline = null
     ensures: MigrationFailed(migration: migration)
-    ensures: MigrationFailureReported(kind: repository, description: migration.message)
+    ensures: MigrationFailureReported(kind: repo, description: migration.message)
 }
 
 -- "N issues / pull requests migrated so far".
@@ -1100,7 +1102,7 @@ rule RejectRewrittenCloneAddress {
     ensures: migration.message = "the source redirected to a disallowed address"
     ensures: migration.ended_at = now
     ensures: MigrationFailed(migration: migration)
-    ensures: MigrationFailureReported(kind: repository, description: migration.message)
+    ensures: MigrationFailureReported(kind: repo, description: migration.message)
 }
 
 -- ===== What gets imported =====
@@ -1402,7 +1404,7 @@ rule RefuseUnsafePullRequest {
     ensures: migration.message = "pull request was not checked for safety"
     ensures: migration.ended_at = now
     ensures: MigrationFailed(migration: migration)
-    ensures: MigrationFailureReported(kind: repository, description: migration.message)
+    ensures: MigrationFailureReported(kind: repo, description: migration.message)
 }
 
 -- Comments attach to an already imported issue / pull request. Close,
@@ -1458,7 +1460,7 @@ rule RefuseOrphanComment {
     ensures: migration.message = "comment belongs to an issue that was not imported"
     ensures: migration.ended_at = now
     ensures: MigrationFailed(migration: migration)
-    ensures: MigrationFailureReported(kind: repository, description: migration.message)
+    ensures: MigrationFailureReported(kind: repo, description: migration.message)
 }
 
 -- Reviews attach to an imported pull request. Code comments are kept only
@@ -1541,7 +1543,7 @@ rule FlagDroppedSourceData {
 
     requires: migration.status = running
 
-    ensures: MigrationFailureReported(kind: repository, description: detail)
+    ensures: MigrationFailureReported(kind: repo, description: detail)
 }
 
 -- ===== Finishing =====
@@ -1661,6 +1663,9 @@ rule RepoAdminRetriesMigration {
 
 -- A repository admin gives up on a failed migration and deletes the
 -- half-made repository.
+-- decided: requests 2 — through the normal repository deletion cascade:
+-- repositories deletes it, and the migration task goes with it
+-- (ForgetImportRecordsOfDeletedRepository).
 -- from: templates/repo/migrate/migrating.tmpl:39
 rule RepoAdminDiscardsFailedMigration {
     when: RepoAdminDiscardsFailedMigration(admin, migration)
@@ -1670,10 +1675,7 @@ rule RepoAdminDiscardsFailedMigration {
     requires: is_repo_admin(admin, migration.repository)
     requires: migration.status = failed
 
-    let repository = migration.repository
-
-    ensures: not exists migration
-    ensures: not exists repository
+    ensures: FailedImportDiscarded(repository: migration.repository, doer: admin)
 
     @guidance
         -- Web: POST /{owner}/{repo}/settings action=delete, offered on the

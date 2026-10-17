@@ -626,6 +626,14 @@ journey AnUnpostedUploadExpires {
     goal: Ada uploads a screenshot but never posts the comment it was for.
           A day later the upload is gone; it was never linked to anything.
           (decided, issues 5: orphan uploads expire after 24 hours by default)
+          The hourly delete_orphaned_attachments task sweeps it; its next run
+          is a day after she uploads.
+
+    given:
+        sweep: administration/CronTask { name: delete_orphaned_attachments, owner: issues, requires_feature: always, enabled: true, run_at_start: false, schedule: "@every 1h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0, next_run_at: now + 24.hours }
+        time_until_next("@every 1h") = 1.hours
+        -- the task hands over issues' own expiry (its default, 24 hours)
+        administration/config.delete_orphaned_attachments_older_than = 24.hours
 
     1. she uploads a screenshot
         stipulate can_read_tracker(ada, repo) = true
@@ -643,8 +651,9 @@ journey AnUnpostedUploadExpires {
         after 2.hours
         then OrphanUploadExpires fires
         then shot does not exist
+        then sweep.last_outcome = finished
 
-    ends: The orphan upload has been swept.
+    ends: The orphan upload has been swept, and the sweep's run is finished.
 }
 
 -- Timeline events survive the deletion of their label or milestone.

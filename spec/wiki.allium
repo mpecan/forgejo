@@ -49,10 +49,14 @@
 --    added / changed / removed, attributed to the pusher)
 -- Reacts to:
 --   repositories/RepositoryCreated(repository, doer)
+--   repositories/RepositoryDeleted(repository, doer)  -- the wiki, its pages and revisions go
+--   code/WikiFetchRequested(client, repository, protocol) -- a git clone of `<repo>.wiki`
+--   code/WikiPushReceived(pusher, repository)          -- a git push to `<repo>.wiki`
 
 use "./accounts.allium" as accounts
 use "./repositories.allium" as repositories
 use "./access.allium" as access
+use "./code.allium" as code
 
 ------------------------------------------------------------
 -- Enumerations
@@ -151,6 +155,40 @@ rule RepositoryGetsAWiki {
         repository: repository,
         status: uninitialised
     )
+}
+
+-- A deleted repository takes its wiki with it: the wiki git data is removed by
+-- repositories' cascade, and the records describing it go here. No page event
+-- is announced; the repository's own deletion is the news.
+rule DeletedRepositoryTakesItsWiki {
+    when: repositories/RepositoryDeleted(repository, doer)
+    let wiki = Wiki{repository: repository}
+    requires: exists wiki
+    ensures:
+        for p in wiki.pages:
+            not exists p
+        for r in wiki.revisions:
+            not exists r
+        not exists wiki
+}
+
+-- A git client reaches the wiki only through code's transport, which checks the
+-- client (protocol switched on, active account, token rather than password) and
+-- hands over the fetch or the push; what the wiki unit allows is decided here.
+rule GitFetchReachesWiki {
+    when: code/WikiFetchRequested(client, repository, protocol)
+    let wiki = Wiki{repository: repository}
+    requires: exists wiki
+    ensures: UserOpensWikiOverGit(user: client, wiki: wiki)
+}
+
+-- The pre-receive is UserPushesToWiki's requires and the post-receive its page
+-- events, so code hands over the push and nothing more.
+rule GitPushReachesWiki {
+    when: code/WikiPushReceived(pusher, repository)
+    let wiki = Wiki{repository: repository}
+    requires: exists wiki
+    ensures: UserPushesToWiki(user: pusher, wiki: wiki)
 }
 
 -- Opening the wiki over SSH initialises an empty wiki repository so it can be
@@ -518,8 +556,8 @@ surface WikiReading {
         search_wiki(wiki, query)
         external_wiki_url(wiki.repository)
 
-    provides:
-        UserOpensWikiOverGit(reader, wiki)
+    -- Cloning over git goes through code/GitTransport (GitClientFetchesWiki),
+    -- which emits the WikiFetchRequested that GitFetchReachesWiki hears.
 
     @guarantee ExternalWikiRedirects
         -- When the repository uses an external wiki, every wiki page view
@@ -567,8 +605,6 @@ surface WikiEditing {
             when not wiki.repository.is_archived
         UserDeletesWikiPage(editor, wiki, page)
             when not wiki.repository.is_archived
-        UserPushesToWiki(editor, wiki)
-            when not wiki.repository.is_archived and not wiki.repository.is_mirror
 
     @guarantee ArchivedWikisAreReadOnly
         -- The edit controls are hidden and every write is refused while the
@@ -663,11 +699,5 @@ deferred page_name_for    -- see: services/wiki/wiki_path.go (title -> page name
 --   reacts rather than wiki emitting keys/WikiEditSigningRequested).
 -- REQUEST notifications / webhooks: react to WikiPageCreated / WikiPageEdited /
 --   WikiPageDeleted (feed entries, `wiki` webhook event with created/edited/deleted).
--- REQUEST code: git transport must route "<repo>.wiki" to the wiki repository with
---   wiki-unit permissions and emit wiki/UserPushesToWiki / UserOpensWikiOverGit.
--- REQUEST code: for a push to "<repo>.wiki", pre-receive asks wiki whether the push is
---   allowed (wiki/UserPushesToWiki's requires, incl. no empty page file) and post-receive
---   hands wiki the before/after diff of the wiki branch (the pushed_* black boxes) so
---   wiki emits one WikiPageCreated / WikiPageEdited / WikiPageDeleted per page, by the pusher.
 -- REQUEST webhooks / notifications: wiki events now also arrive from git pushes (one per
 --   changed page); no new event kinds needed.

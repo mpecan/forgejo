@@ -39,6 +39,7 @@
 --   HookDeliveryQueued(delivery)
 --   HookDeliveryCompleted(delivery)      -- succeeded, failed or skipped
 --
+--   HookDeliveryCleanupFinished()       -- administration: the cleanup_hook_task_table run is done
 -- Reacts to:
 --   code/PushReceived(push)                               -> push (one per pushed branch or tag)
 --   code/RefCreated(repository, pusher, ref_kind, ref_name, commit_sha)  -> create
@@ -64,10 +65,10 @@
 --   issues/IssueLabelsChanged(issue, doer, added, removed), issues/IssueLabelsCleared(issue, doer)
 --   issues/IssueMilestoneChanged(issue, doer, old_milestone)
 --   issues/IssueCommentCreated(issue, comment, doer, mentions), issues/IssueCommentEdited(comment, doer, old_content),
---   issues/IssueCommentDeleted(comment, doer)
+--   issues/IssueCommentDeleted(comment, issue, doer)
 --   pulls/PullRequestOpened(pull_request), pulls/PullRequestMerged(pull_request, merger) (also emitted for auto-merges),
 --   pulls/PullRequestTargetBranchChanged(pull_request, doer, old_base_branch),
---   pulls/PullRequestSynchronized(pull_request, doer), pulls/ReviewSubmitted(review),
+--   pulls/PullRequestSynchronized(pull_request, doer, deploy_key), pulls/ReviewSubmitted(review),
 --   pulls/ReviewRequested(pull_request, requester, reviewer), pulls/ReviewRequestRemoved(pull_request, doer, reviewer)
 --   wiki/WikiPageCreated(repository, doer, page), wiki/WikiPageEdited(...), wiki/WikiPageDeleted(...)
 --   releases/ReleasePublished(release), releases/ReleaseUpdated(release, doer), releases/ReleaseDeleted(release, doer),
@@ -1227,11 +1228,11 @@ rule CommentEditedRaisesHookEvent {
 
 -- from: services/webhook/notifier.go:437
 rule CommentDeletedRaisesHookEvent {
-    when: issues/IssueCommentDeleted(comment, doer)
+    when: issues/IssueCommentDeleted(comment, issue, doer)
     ensures: HookEventRaised(
-        kind: if comment.issue.is_pull: pull_request_comment else: issue_comment,
+        kind: if issue.is_pull: pull_request_comment else: issue_comment,
         action: deleted,
-        source_repo: comment.issue.repository,
+        source_repo: issue.repository,
         owner_user: null,
         owner_org: null,
         branch: null,
@@ -1280,7 +1281,7 @@ rule ReviewRequestRemovedRaisesHookEvent {
 -- New commits on the head branch.
 -- from: services/webhook/notifier.go:785
 rule SynchronizeRaisesHookEvent {
-    when: pulls/PullRequestSynchronized(pull_request, doer)
+    when: pulls/PullRequestSynchronized(pull_request, doer, deploy_key)
     ensures: HookEventRaised(kind: pull_request_sync, action: synchronized, source_repo: pull_request.issue.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
@@ -1629,6 +1630,7 @@ rule CleanupDeliveryHistoryWhenDue {
             for w in Webhooks:
                 for d in oldest_beyond(w.finished_deliveries, number_to_keep):
                     not exists d
+    ensures: HookDeliveryCleanupFinished()   -- decided: requests 5 (the owner reports the run done)
 }
 
 ------------------------------------------------------------

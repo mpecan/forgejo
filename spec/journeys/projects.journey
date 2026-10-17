@@ -614,7 +614,8 @@ journey DeletingAnAccountDeletesItsBoards {
         stipulate belongs_to_organizations(bob) = false
         stipulate owns_packages(bob) = false
         stipulate deletion_disabled_for(bob) = false
-        bob does UserDeletesOwnAccount(bob) on OwnAccountSettings
+        stipulate password_matches(bob, "my password") = true
+        bob does UserDeletesOwnAccount(bob, "my password") on OwnAccountSettings
         then UserDeletionRemovesProjects fires
         then board does not exist
         then col does not exist

@@ -119,10 +119,11 @@
 --   authentication/EmailConfirmationLinkFollowed(user, email) -- mark the address activated
 --   authentication/AccountActivated(user)          -- mark the primary address activated
 --   authentication/UnconfirmedPrimaryEmailReplaced(user, new_address) -- swap the primary row
---   federation/RemoteActorDiscovered(name, full_name, email)
+--   federation/RemoteActorDiscovered(handle, full_name, email) -- a newly met fediverse person: its mirror account
 --   administration/UserRenamedByAdmin(admin, user, old_name, new_name)
 --   administration/UserDeletedByAdmin(admin, user, purge)
 --   administration/UserAvatarChangedByAdmin(admin, user)
+--   administration/UserPrimaryEmailSetByAdmin(admin, user, old_address, new_address) -- announced as PrimaryEmailChanged
 --   administration/UserAvatarRemovedByAdmin(admin, user)
 --   administration/InactiveAccountCleanupDue(older_than)
 --   administration/UserCreatedByAdmin(admin, user, send_notification) -- apply creation defaults
@@ -184,6 +185,7 @@ use "./administration.allium" as administration
 use "./access.allium" as access
 use "./repositories.allium" as repositories
 use "./moderation.allium" as moderation
+use "./federation.allium" as federation
 
 ------------------------------------------------------------
 -- Enumerations
@@ -256,7 +258,6 @@ entity User {
     created_at: Timestamp
     updated_at: Timestamp                -- last change to the account record (any field); discovery sorts by it
     last_login_at: Timestamp?
-    login_source: authentication/AuthSource?   -- null for local accounts
 
     -- Profile
     full_name: String                    -- max 100
@@ -319,6 +320,9 @@ entity User {
     num_followers: follows_received.count
     num_following: follows_given.count
     num_repos: owned_repositories.count  -- repositories and quota (count_repos) read it
+    -- decided: requests 4 — the sign-in source lives once, on authentication's
+    -- UserLogin; the account reads it from there (null for a local account)
+    login_source: login_source_of(this)
     is_local: login_source = null
     is_system: false                     -- stored users are never system identities
     -- decided: a purge is a recorded job; while it runs the account cannot sign in
@@ -499,7 +503,7 @@ config {
     disable_git_hooks: Boolean = true                        -- [security] DISABLE_GIT_HOOKS
     import_local_paths: Boolean = false                      -- [security] IMPORT_LOCAL_PATHS
     packages_enabled: Boolean = true                         -- [packages] ENABLED
-    federation_enabled: Boolean = false                      -- [federation] ENABLED
+    federation_enabled: Boolean = federation/config.enabled  -- [federation] ENABLED, owned by federation
 
     -- [cron.delete_inactive_accounts] ENABLED / SCHEDULE / OLDER_THAN belong to
     -- administration's CronTask, which passes OLDER_THAN (default
@@ -625,7 +629,7 @@ rule InitialiseAdminCreatedAccount {
 -- A fediverse actor seen for the first time gets a local mirror account.
 -- from: services/federation/federation_service.go:232
 rule CreateActivityPubMirror {
-    when: RemoteActorDiscovered(handle, full_name, email)
+    when: federation/RemoteActorDiscovered(handle, full_name, email)
     requires: config.federation_enabled
     requires: is_valid_activitypub_handle(handle)
     requires: not name_taken(handle)
@@ -984,6 +988,15 @@ rule AdminAvatarRemovalApplies {
     ensures: UserAvatarChanged(user: user)
 }
 
+-- A site admin set a user's primary address (administration owns the entry
+-- point and keeps the EmailAddress rows consistent). It is announced like the
+-- user's own change, so the old address is told and old codes stop working.
+rule AdminPrimaryEmailChangeAnnounced {
+    when: administration/UserPrimaryEmailSetByAdmin(admin, user, old_address, new_address)
+    ensures: ReportableUserChanging(user: user, change: update)
+    ensures: PrimaryEmailChanged(user: user, old_address: old_address, new_address: new_address)
+}
+
 -- An OAuth2 source handed over the user's avatar on sign-in. With
 -- [oauth2_client] UPDATE_AVATAR on, the image at that address replaces the
 -- avatar when it can be fetched and passes the upload limits; otherwise it is
@@ -1248,8 +1261,9 @@ rule OrganizationUnblocksUser {
 -- from: routers/web/user/setting/account.go:240
 -- decided: admins may self-delete while another active admin remains (Forgejo refuses every admin)
 rule UserDeletesOwnAccount {
-    when: UserDeletesOwnAccount(user)
+    when: UserDeletesOwnAccount(user, password)
     requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: password_matches(user, password)   -- authentication/CredentialPolicy: the re-entered password
     requires: not deletion_disabled_for(user)   -- = user.has_feature_disabled(deletion)
     -- has_other_admin(user): some other site admin is active and may sign in (see header)
     requires: not user.is_admin or has_other_admin(user)
@@ -1691,7 +1705,7 @@ surface OwnAccountSettings {
         UserMakesEmailPrimary(user, address)
         UserDeletesEmail(user, address)
         UserChangesEmailNotifications(user, preference)
-        UserDeletesOwnAccount(user)
+        UserDeletesOwnAccount(user, password)
             when not deletion_disabled_for(user)
 
     @guarantee DeletionWarnsAboutContributions
@@ -1908,7 +1922,6 @@ deferred is_usable_username           -- see: header comment "Names"
 -- Requests to other modules
 ------------------------------------------------------------
 -- REQUEST authentication/AuthSource.allows_username_change: OAuth2 sources may allow users to rename themselves (UserRenamesSelf).
--- REQUEST authentication: the password re-entry for UserDeletesOwnAccount and the "manage_password" feature flag (UserFeature) are yours.
 -- REQUEST organizations: provide is_org_owner(organization, user) and shares_organization(a, b) (both users are members of a common organization, or one is the organization); react to UserPurged by removing memberships and deleting organizations where the user is the last owner; org renames should go through RenameNamespace semantics (UserRedirect with organization set); names are unique across users and organizations.
 -- REQUEST organizations/Organization.follows: Follow.followee_organization relationship for follower counts on org pages.
 -- REQUEST repositories: provide owns_repositories(user) (any repository with owner_user = user); used by deletion preconditions.
@@ -1923,7 +1936,6 @@ deferred is_usable_username           -- see: header comment "Names"
 -- REQUEST administration: AdminSetsUserPrimaryEmail must keep EmailAddress rows consistent (promote an existing address of the same user or create one, mark it primary and activated, keep the old primary as a secondary address, skip email-domain lists) and emit accounts' PrimaryEmailChanged; AdminCreatesUser must create the primary EmailAddress (activated), delete any UserRedirect for the name, and apply the same creation defaults as CreateAccountBySelfRegistration minus prefix/cooldown/domain checks.
 -- REQUEST administration: AdminSetsUserAdmin / AdminDeletesUser must refuse removing the last admin (invariant AtLeastOneAdmin).
 -- REQUEST notifications: send the confirmation mail on authentication/EmailConfirmationRequested (not on EmailActivationRequested), primary-change mail to the old address on PrimaryEmailChanged; honour User.email_notifications and User.can_receive_mail; honour activity_readable_by for feeds and heatmap.
--- REQUEST federation: emit RemoteActorDiscovered(handle, full_name, email); react to UserPurged (delete FederatedUser).
 -- REQUEST access: anonymous visitors see only public profiles; restricted users see only public profiles (plus their own and admins' rules); expose an anonymous actor this module's profile surface can face.
 -- REQUEST moderation: keep a shadow copy of a reported user's profile fields before UserProfileUpdated / PrimaryEmailChanged / deletion.
 -- REQUEST authentication: username_available(name) must also refuse a name held by an accounts/ReservedName (case-insensitive); refuse sign-in for an account whose User.being_purged is true (User.can_sign_in).

@@ -67,6 +67,7 @@
 --     commits: every new commit's result = verified), releases (tag badges), pulls
 --   SigningDecision (answer to the *SigningRequested triggers)       -- code (web edits,
 --     can_sign_as), pulls (merge_signing_satisfied), wiki, repositories (initial commit)
+--   The CommitSigning contract (code): new_commits_verified, can_sign_as.
 --   Black boxes other modules call by these names, each standing for the keys
 --   value on the right:
 --     new_commits_verified(repository, old_sha, new_sha)  -- code: every commit reachable from
@@ -136,6 +137,27 @@ use "./wiki.allium" as wiki
 -- integration surfaces below a party to face.
 external entity ForgeSubsystem {
     name: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- What code asks of keys when it writes commits: whether a push's new commits
+-- are all verified, and whether a web edit would be signed. Both are keys'
+-- answers (CommitVerification, SigningDecision); code never raises keys'
+-- triggers to get them.
+contract CommitSigning {
+    -- every commit reachable from new_sha and not from old_sha has a
+    -- CommitVerification with result = verified (require signed commits)
+    new_commits_verified: (repository: repositories/Repository, old_sha: String?, new_sha: String) -> Boolean
+    -- the SigningDecision for a web edit by user on branch has will_sign = true
+    -- (the parent counts as verified when the branch head's CommitVerification is)
+    can_sign_as: (user: accounts/User, repository: repositories/Repository, branch: String) -> Boolean
+
+    @invariant AnswersMatchTheDecisions
+        -- Each answer is the one the matching SignatureVerificationRequested /
+        -- WebEditSigningRequested decision would give at that moment.
 }
 
 ------------------------------------------------------------
@@ -1946,6 +1968,9 @@ surface SigningService {
         InitialCommitSigningRequested(actor, repository)
         WebEditSigningRequested(actor, repository, parent_verified)
         MergeSigningRequested(actor, pull, base_verified, head_verified, all_commits_verified, has_approval)
+
+    contracts:
+        fulfils CommitSigning
 }
 
 ------------------------------------------------------------

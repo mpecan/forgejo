@@ -72,6 +72,7 @@
 --     TemplateRead(client, template), IssueIndexRebuildStarted(service)
 --       -- internal / informational
 --
+--   IssueIndexRebuildTaskFinished()     -- administration: the rebuild_issue_indexer run is done
 -- Reacts to:
 --   - code/CommitsPushed(repository, branch_name, ...)   -- default-branch pushes
 --       (including mirror syncs) refresh the code index and language statistics
@@ -1200,7 +1201,7 @@ rule CodeIndexerRecovers {
 -- (they do not).
 -- from: services/indexer/notify.go:117
 rule DefaultBranchPushRefreshesIndexes {
-    when: code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force)
+    when: code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force, deploy_key)
     requires: branch_name = repository.default_branch
     requires: new_sha != null
     ensures: CodeIndexRefreshRequested(repository: repository)
@@ -1401,7 +1402,16 @@ rule ScheduledIssueIndexRebuild {
 rule IssueIndexRebuildTaskRuns {
     when: administration/IssueIndexRebuildDue()
     requires: issue_index_service().status = ready
+    ensures: IssueIndexRebuildTaskFinished()   -- decided: requests 5 (the owner reports the run done)
     ensures: IssueIndexRebuildStarted(service: issue_index_service())
+}
+
+-- When IssueIndexRebuildTaskRuns cannot do its work the run is still reported done, so it never
+-- stays running (decided: requests 5).
+rule IssueIndexRebuildTaskRunsSkipped {
+    when: administration/IssueIndexRebuildDue()
+    requires: not (issue_index_service().status = ready)
+    ensures: IssueIndexRebuildTaskFinished()
 }
 
 -- Newly created repositories (including generated-from-template and forks)
@@ -1516,8 +1526,8 @@ rule CommentEditedReindexesIssue {
 }
 
 rule CommentDeletedReindexesIssue {
-    when: issues/IssueCommentDeleted(comment, doer)
-    ensures: IssueReindexRequested(issue: comment.issue)
+    when: issues/IssueCommentDeleted(comment, issue, doer)
+    ensures: IssueReindexRequested(issue: issue)
 }
 
 rule PullRequestOpenedIsIndexed {

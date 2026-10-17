@@ -660,12 +660,14 @@ journey ATransferredRepositoryJoinsItsTeams {
         stipulate team_covers(devs, tool) = false
         stipulate team_covers(owners, tool) = false
         stipulate has_any_access(alice, tool) = true
+        -- alice is acme's only owner, so nobody else is told it arrived
+        stipulate notifications/organization_owners(org) = {alice}
         alice does OwnerTransfersRepositoryToOrg(alice, tool, org, {devs}) on RepositoryDangerZone
             creating devs_tool: TeamRepository
             creating owners_tool: TeamRepository
         then OwnershipMovesToOrg fires
         then LinkTeamsNamedOnTransfer fires
-        then RelinkTeamsOfTransferredRepository fires
+        then IncludeArrivedRepositoryInAllRepoTeams fires
         then tool.owner_org = org
         then devs_tool.team = devs
         then devs_tool.repository = tool

@@ -176,9 +176,11 @@ journey AnAdminReplacesAdasGroups {
 }
 
 journey SignInGrantsAQuotaGroup {
-    goal: Ada comes back from an OAuth2 provider that says she is in the
-          "sponsors" group, which the source maps to the "supporter" quota group.
-          She links the identity to her account by signing in.
+    goal: Ada comes back from an OAuth2 provider whose quota-group claim says
+          she is in "sponsors", which the source maps to the "supporter" quota
+          group. She links the identity to her account by signing in.
+          (decided: requests 6 — the quota-group claim arrives in its own event,
+          apart from the groups used for team mapping, of which she has none)
 
     cast:
         source:    authentication/AuthSource
@@ -197,13 +199,14 @@ journey SignInGrantsAQuotaGroup {
         login: authentication/UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
 
     1. she links the identity and authentication hands over her groups
-        stipulate s.pending_external_identity.groups = {"sponsors"}
+        stipulate s.pending_external_identity.groups = {}
+        stipulate s.pending_external_identity.quota_groups = {"sponsors"}
         stipulate password_matches(ada, "correct horse battery") = true
         stipulate login.has_second_factor = false
         stipulate quota_groups_mapped_from(source, {"sponsors"}) = {supporter}
         stipulate quota_groups_mapped_from_unclaimed(source, {"sponsors"}) = {}
-        stipulate teams_mapped_from(source, {"sponsors"}) = {}
-        stipulate teams_unmapped_from(source, ada, {"sponsors"}) = {}
+        stipulate teams_mapped_from(source, {}) = {}
+        stipulate teams_unmapped_from(source, ada, {}) = {}
         stipulate is_numeric_id("ada-sub") = false
         s does VisitorLinksPendingIdentityBySignIn(s, ada, "correct horse battery", false) on SignInPage
             creating granted: QuotaGroupMembership

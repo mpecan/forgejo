@@ -585,6 +585,7 @@ journey PosterReopensAClosedPullRequest {
         stipulate branch_exists(repo, "feature") = true
         stipulate is_blocked_by_owner(repo, ada) = false
         stipulate head_commit_of(repo, "feature") = "f00d"
+        stipulate issue_notification_audience(conv, ada) = {bob}
         ada does UserReopensPullRequest(ada, pr) on PullRequestAuthorControls
         then conv.status = open
         then pr.status = checking
@@ -917,6 +918,7 @@ journey ALockedPullRequestStaysOpenForItsPoster {
         stipulate can_read_pulls(bob, repo) = true
         stipulate is_blocked_by_owner(repo, bob) = false
         stipulate has_open_blocking_dependencies(conv) = false
+        stipulate issue_notification_audience(conv, bob) = {ada}
         bob does UserClosesPullRequest(bob, pr) on PullRequestPage
         then UserClosesPullRequest fires
         then conv.status = closed
@@ -948,4 +950,56 @@ journey ReadOnlyModeFreezesPullRequests {
         carol sees pr.status on PullRequestPage in pr
 
     ends: The pull request is exactly as it was.
+}
+
+-- decided: requests 1 — a deploy key's push is recorded as the key's.
+journey ADeployKeyPushOnThePullRequestIsTheKeys {
+    goal: The CI deploy key pushes a fix to the feature branch of ada's pull
+          request. The pull request follows the new head, and its timeline
+          records the push as the ci key's, with no user behind it.
+
+    cast:
+        material: keys/SshKey
+        ci:       keys/DeployKey
+        feature:  code/Branch
+
+    given:
+        material.kind = deploy
+        ci.repository = repo
+        ci.key = material
+        ci.name = "ci"
+        ci.access = read_write
+        feature.repository = repo
+        feature.name = "feature"
+        feature.head_commit_sha = "f00d"
+        feature.status = live
+        repo.status = ready
+
+    1. the key opens a push
+        ci does DeployKeyPushes(ci, repo) on DeployKeyTransport
+            creating ci_push: code/Push
+        then ci_push.deploy_key = ci
+        then ci_push.pusher = null
+
+    2. its update to the head branch lands on the pull request as the key's
+        stipulate protection_for(repo, "feature") = null
+        stipulate may_write_branch(ci, ci_push, "feature") = true
+        stipulate exceeds_git_quota(repo) = false
+        stipulate is_force_push(repo, "f00d", "beef") = false
+        stipulate diff_differs(pr, "f00d", "beef") = true
+        stipulate commits_ahead_of(repo, "feature", repo, "main") = 3
+        stipulate commits_behind_of(repo, "feature", repo, "main") = 0
+        stipulate commits_between_shas(repo, "f00d", "beef") = "beef"
+        -- ada, the poster, hears of the push (no user is its author)
+        stipulate issue_notification_audience(conv, null) = {ada}
+        ci does PusherProposesRefUpdate(ci, ci_push, branch_ref, "feature", "f00d", "beef") on DeployKeyTransport
+            creating entry: issues/Comment
+        then HeadBranchPushUpdatesPullRequests fires
+        then PullRequestHeadMoves fires
+        then pr.head_commit_sha = "beef"
+        then entry.kind = pull_push
+        then entry.deploy_key = ci
+        then entry.poster = null
+
+    ends: The pull request shows the ci key's push; nobody is credited with it.
 }
