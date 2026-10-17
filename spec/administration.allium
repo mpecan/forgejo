@@ -19,8 +19,11 @@
 --     enablement, run-at-start, run-now, last/next run, exec count, last outcome,
 --     and which module owns the work each task performs.
 --   - Dashboard one-off operations (resync all branches / all tags).
---   - Announcement (service message): a site-wide modal banner, and per-user
+--   - Announcement (service message): a site-wide modal or non-blocking banner,
+--     each optionally limited to a start/end window, and per-user
 --     acknowledgement of it.
+--   - Read-only (maintenance) mode: admins switch the instance read-only for
+--     upgrades and backups; writes are refused everywhere, a banner says why.
 --   - Admin management of users: create (optionally forcing a password change),
 --     edit any account field (admin, restricted, prohibit-login, active,
 --     max repo creation, visibility, permissions, login source, password, email),
@@ -33,7 +36,8 @@
 --   - Monitoring as a capability only: processes, queues, stack traces.
 --   - CLI surface: `forgejo admin user …`, `admin regenerate keys`,
 --     `admin auth …` (reference), `admin sendmail`, `admin repo-sync-releases`,
---     `doctor check` (with the full list of checks), `dump`, `manager …`.
+--     `doctor check` (with the full list of checks), `dump`, `restore`,
+--     `manager …`; the report-only doctor checks also from the web admin.
 -- Excludes:
 --   - Auth source CRUD behaviour (LDAP/SMTP/PAM/OAuth2/SSPI) — owned by
 --     authentication; only referenced from the admin surfaces here.
@@ -60,9 +64,11 @@
 --     storage/ORM maintenance tied to the current implementation.
 --   - Deprecated-setting warnings on the dashboard — legacy config migration.
 --   - `--name` (deprecated alias of `--username`) on `admin user create` — legacy.
---   - Maintenance / read-only mode — Forgejo has none (checked); see open question.
---   - A full-instance restore — Forgejo has `dump` but no `restore` (only
---     `restore-repo`, which is migrations' import); see open question.
+--   - Global [cron] ENABLED / RUN_AT_START switches — documented by Forgejo but
+--     ignored by its code; dropped. decided: administration 2 (each task has
+--     its own enabled flag, no global switch)
+--   - Doctor fixes from the web — repairs that change data stay CLI-only
+--     (decided: administration 9).
 --
 -- Emits (domain triggers other modules react to):
 --   InstallationCompleted(instance)
@@ -105,6 +111,10 @@
 --   AllRepositoryBranchesResyncRequested(admin)                     -> code
 --   AllRepositoryTagsResyncRequested(admin)                         -> releases
 --   AnnouncementPublished(announcement) / AnnouncementWithdrawn(kind)
+--   InstanceReadOnlyModeChanged(gate, read_only)      -- the switch lives in access/InstanceWriteGate,
+--                                                       -- which every write path (access, code push,
+--                                                       -- API, web) consults
+--   InstanceRestored(operator, instance)                -- a dump loaded into an empty instance
 --   UserCreatedByAdmin(admin, user, send_notification)  -- notifications sends the
 --                                                       -- "account created for you" mail
 --   UserEditedByAdmin(admin, user)
@@ -128,6 +138,7 @@
 --   AuthSourceConfiguredFromCli(operator, kind, action) -> authentication
 --   AuthorizedIntegrationRequested(operator, user, name) -> authentication
 --   DoctorRunRequested(operator, checks, fix)
+--   DoctorRunRequestedByAdmin(run)                    -- report-only checks started from the web
 --   InstanceDumpProduced(operator, format, contents)
 --   RunningInstanceCommanded(operator, command)
 --   ProcessCancellationRequested(admin, process)
@@ -142,6 +153,10 @@
 --   CronWorkCompleted(task, outcome, message) -- the owning module reporting the end
 --                                             -- of the work it was asked to do
 --   ReleaseFeedAnswered(supported_versions, error)  -- the update-check lookup result
+--   DoctorRunFinished(run, report)            -- a web-started doctor run has its report
+--   accounts/AccountPurgeFailed(purge)        -- a purge stopped short (SystemNotice)
+--   keys/ExternalSshKeyRefused(user, source, fingerprint)  -- a directory key was refused (SystemNotice)
+--   repositories/PullMirrorSyncFailed(mirror, reason)  -- a pull mirror failed to sync (SystemNotice)
 --   InstanceStarted(instance)                 -- process start (run-at-start tasks)
 
 use "./accounts.allium" as accounts
@@ -294,8 +309,11 @@ enum HookCleanupKind { older_than | per_webhook }
 -- from: modules/updatechecker/update_checker.go:139
 enum ReleaseState { unknown | current | minor_update_available | major_unsupported | prerelease }
 
+-- modal: blocks the page until dismissed (Forgejo's only kind); banner: a
+-- non-blocking strip above every page, dismissable the same way.
+-- decided: administration 5 (modal or banner)
 -- from: modules/service_message/service_message.go:17
-enum AnnouncementKind { modal }
+enum AnnouncementKind { modal | banner }
 
 -- `forgejo doctor check` — every registered check. Checks marked (default) run
 -- when no --run/--all is given. Each can report, and with --fix repair.
@@ -419,7 +437,7 @@ entity InstallSettings {
     default_allow_create_organization: Boolean
     default_enable_timetracking: Boolean
     no_reply_address: String
-    enable_update_checker: Boolean
+    enable_update_checker: Boolean   -- unticked by default (decided: administration 8)
     password_hash_algorithm: String?
     admin_name: String?           -- absent: no administrator is created now
     admin_email: String?
@@ -450,6 +468,8 @@ entity SystemNotice {
 -- A scheduled maintenance task. The set of tasks is fixed by the software (see
 -- the defaults below); configuration ([cron.<name>]) only changes enabled,
 -- run_at_start, schedule, notice_on_success and task-specific parameters.
+-- There is no global cron switch: each task's own enabled flag is the only one.
+-- decided: administration 2 (no global switch; the misleading global settings are dropped)
 -- from: services/cron/tasks.go:32
 entity CronTask {
     name: CronTaskName
@@ -464,7 +484,7 @@ entity CronTask {
     run_state: idle | running
     last_outcome: never_run | finished | failed | cancelled
     last_message: String?          -- error / cancellation message of the last run
-    last_doer: accounts/User?      -- administrator who started the last run; null = the scheduler
+    last_doer: accounts/User?      -- administrator who started the last run (web or API); null = the scheduler
     last_run_at: Timestamp?        -- start of the most recent run (scheduled or manual)
     next_run_at: Timestamp?        -- next scheduled start; null when not enabled
     exec_times: Integer            -- runs started since the process started
@@ -477,19 +497,24 @@ entity CronTask {
     is_scheduled: enabled = true
 }
 
--- A site-wide announcement shown to signed-in users as a modal until each user
--- acknowledges it. At most one per kind; publishing again replaces its text and
--- re-shows it to everybody.
+-- A site-wide announcement shown to signed-in users (as a modal or a banner)
+-- until each user acknowledges it, and only inside its optional start/end
+-- window. At most one per kind; publishing again replaces its text and window
+-- and re-shows it to everybody.
+-- decided: administration 5 (modal or banner, each with optional start and end times)
 -- from: models/service_message/service_message.go:21
 entity Announcement {
     kind: AnnouncementKind
     title: String           -- at most 255 bytes; longer titles are cut
-    text: String            -- Markdown, rendered in the modal
+    text: String            -- Markdown, rendered in the modal or banner
+    starts_at: Timestamp?   -- null: shown from publication
+    ends_at: Timestamp?     -- null: shown until withdrawn
     created_at: Timestamp
     updated_at: Timestamp
 
     acknowledgements: AnnouncementAcknowledgement with kind = this.kind
 
+    is_live: (starts_at = null or starts_at <= now) and (ends_at = null or ends_at > now)
     is_pending_for(u): not acknowledgements.any(a => a.user = u and a.acknowledged_at >= updated_at)
 }
 
@@ -500,6 +525,23 @@ entity AnnouncementAcknowledgement {
     user: accounts/User
     kind: AnnouncementKind
     acknowledged_at: Timestamp
+}
+
+-- A doctor run started from the web admin: report-only checks (never --fix),
+-- its report kept for the admin to read.
+-- decided: administration 9 (read-only checks runnable and viewable from the web)
+entity DoctorRun {
+    requested_by: accounts/User?
+    checks: Set<DoctorCheck>
+    state: running | finished
+    report: String?
+    started_at: Timestamp
+    finished_at: Timestamp?
+
+    transitions state {
+        running -> finished
+        terminal: finished
+    }
 }
 
 -- One line of the read-only configuration view. Secrets (passwords, URIs with
@@ -619,8 +661,9 @@ default CronTask delete_missing_repos = { name: delete_missing_repos, owner: rep
 default CronTask delete_generated_repository_avatars = { name: delete_generated_repository_avatars, owner: repositories, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 72h", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
 -- from: services/cron/tasks_extended.go:120
 default CronTask delete_old_actions = { name: delete_old_actions, owner: notifications, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 168h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- decided: administration 8 (off by default; admins opt in — Forgejo has it on)
 -- from: services/cron/tasks_extended.go:139
-default CronTask update_checker = { name: update_checker, owner: administration, requires_feature: always, enabled: true, run_at_start: false, schedule: "@every 168h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+default CronTask update_checker = { name: update_checker, owner: administration, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 168h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
 -- from: services/cron/tasks_extended.go:153
 default CronTask delete_old_system_notices = { name: delete_old_system_notices, owner: administration, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 168h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
 -- from: services/cron/tasks_extended.go:175
@@ -735,7 +778,8 @@ rule ScheduleTasksAtStart {
                 CronTaskRunRequested(task: task, doer: null)
     @guidance
         -- Disabled tasks are registered (listed, runnable by hand) but never
-        -- scheduled.
+        -- scheduled. No global switch overrides the per-task flags
+        -- (decided: administration 2).
 }
 
 -- The update_checker task asks the release feed which versions are supported;
@@ -795,6 +839,32 @@ rule RecordMigrationFailureNotice {
     ensures: SystemNoticeRecorded(kind: kind)
 }
 
+-- A purge that stopped short leaves a notice so an admin resumes it.
+-- from: services/user/user.go:183
+rule RecordAccountPurgeFailureNotice {
+    when: accounts/AccountPurgeFailed(purge)
+    ensures: SystemNotice.created(kind: task, description: purge_failure_notice_text(purge), created_at: now)
+    ensures: SystemNoticeRecorded(kind: task)
+}
+
+-- A directory / OAuth2 key refused by the key policy (decided: keys 2).
+rule RecordRefusedExternalKeyNotice {
+    when: keys/ExternalSshKeyRefused(user, source, fingerprint)
+    ensures: SystemNotice.created(kind: task, description: refused_key_notice_text(user, source, fingerprint), created_at: now)
+    ensures: SystemNoticeRecorded(kind: task)
+}
+
+-- Background repository failures worth an operator's attention.
+-- from: services/mirror/mirror_pull.go:248
+rule RecordPullMirrorFailureNotice {
+    when: repositories/PullMirrorSyncFailed(mirror, reason)
+    ensures: SystemNotice.created(kind: repository, description: reason, created_at: now)
+    ensures: SystemNoticeRecorded(kind: repository)
+}
+-- RepositoryHealthCheckFailed / RepositoryGarbageCollectionFailed are emitted
+-- inside a per-repository loop the cross-module audit cannot see yet; their
+-- notices are left for a later pass (see REQUEST repositories).
+
 -- from: routers/web/admin/notice.go:46
 rule AdminDeletesNotices {
     when: AdminDeletesNotices(admin, notices)
@@ -828,6 +898,8 @@ rule CronTaskFallsDue {
 
 -- An administrator runs a task now — from the dashboard, the cron monitor page,
 -- or POST /api/v1/admin/cron/{task}. Disabled tasks can be run this way.
+-- The admin is the doer on every path (Forgejo's API path records the scheduler).
+-- decided: administration 1 (the admin who triggered it, on every path)
 -- from: routers/web/admin/admin.go:207
 rule AdminRunsCronTask {
     when: AdminRunsCronTask(admin, task)
@@ -844,6 +916,7 @@ rule StartCronTaskRun {
     ensures: task.run_state = running
     ensures: task.exec_times = task.exec_times + 1
     ensures: task.last_run_at = now
+    ensures: task.last_doer = doer
     ensures: CronTaskExecutes(task: task, doer: doer)
 }
 
@@ -1109,6 +1182,37 @@ rule QueryReleaseFeed {
 }
 
 ------------------------------------------------------------
+-- Read-only (maintenance) mode
+------------------------------------------------------------
+-- Forgejo has none. While it is on, every write — web, API, git push — is
+-- refused and every page carries a banner with the admin's message; reads and
+-- the admin pages keep working, so the admin can switch it off again.
+-- The switch is access/InstanceWriteGate, the shared write gate access's
+-- repository write and contribution rules consult; other modules'
+-- non-repository writes are listed as REQUESTs at the end of this file.
+-- decided: administration 3 (admins switch it on; every write refused with a banner)
+
+rule AdminEntersReadOnlyMode {
+    when: AdminEntersReadOnlyMode(admin, gate, message)
+    requires: admin.is_admin = true
+    requires: not gate.read_only
+    ensures: gate.read_only = true
+    ensures: gate.message = message
+    ensures: gate.since = now
+    ensures: InstanceReadOnlyModeChanged(gate: gate, read_only: true)
+}
+
+rule AdminLeavesReadOnlyMode {
+    when: AdminLeavesReadOnlyMode(admin, gate)
+    requires: admin.is_admin = true
+    requires: gate.read_only
+    ensures: gate.read_only = false
+    ensures: gate.message = null
+    ensures: gate.since = null
+    ensures: InstanceReadOnlyModeChanged(gate: gate, read_only: false)
+}
+
+------------------------------------------------------------
 -- Dashboard one-off operations
 ------------------------------------------------------------
 
@@ -1138,24 +1242,29 @@ rule AdminSendsTestMail {
 ------------------------------------------------------------
 
 -- from: routers/web/admin/service_message.go:45
+-- decided: administration 5 (modal or banner, each with optional start and end times)
 rule AdminPublishesAnnouncement {
-    when: AdminPublishesAnnouncement(admin, kind, title, text)
+    when: AdminPublishesAnnouncement(admin, kind, title, text, starts_at, ends_at)
     requires: admin.is_admin = true
     requires: title != ""
     requires: text != ""
+    requires: starts_at = null or ends_at = null or starts_at < ends_at
     let existing = Announcement{kind: kind}
     let stored_title = truncate_bytes(title, config.announcement_title_max_bytes)
     ensures:
         if exists existing:
             existing.title = stored_title
             existing.text = text
+            existing.starts_at = starts_at
+            existing.ends_at = ends_at
             existing.updated_at = now
         else:
-            Announcement.created(kind: kind, title: stored_title, text: text, created_at: now, updated_at: now)
+            Announcement.created(kind: kind, title: stored_title, text: text, starts_at: starts_at, ends_at: ends_at, created_at: now, updated_at: now)
     ensures: AnnouncementPublished(kind: kind)
     @guidance
-        -- The admin page also offers a preview of the rendered modal, which
-        -- changes nothing.
+        -- The admin page also offers a preview of the rendered modal or
+        -- banner, which changes nothing. A modal and a banner may be live at
+        -- the same time (one of each kind).
 }
 
 -- from: routers/web/admin/service_message.go:71
@@ -1229,12 +1338,19 @@ rule AdminCreatesUser {
         -- minus reserved-prefix, cooldown and email-domain checks).
 }
 
+-- Admins weakening themselves: one guard for all of it. A self-edit that
+-- would leave no other active admin — demote, restrict, deactivate, prohibit
+-- sign-in — is refused (has_other_admin counts active administrators who may
+-- sign in).
+-- decided: administration 6 (one guard for every self-weakening edit)
+
 -- Grant or revoke site administration. The last administrator can never be
 -- demoted.
 -- from: services/user/update.go:113
 rule AdminSetsUserAdmin {
     when: AdminSetsUserAdmin(admin, user, value)
     requires: admin.is_admin = true
+    requires: not user.being_purged     -- accounts invariant PurgingAccountStaysDisabled
     -- the last administrator cannot be demoted
     requires: value = true or not user.is_admin or has_other_admin(user)
     ensures: user.is_admin = value
@@ -1242,31 +1358,35 @@ rule AdminSetsUserAdmin {
 }
 
 -- from: routers/web/admin/users.go:451
+-- decided: administration 6 (restricting oneself needs another active admin)
 rule AdminSetsUserRestricted {
     when: AdminSetsUserRestricted(admin, user, value)
     requires: admin.is_admin = true
+    requires: user != admin or value = false or has_other_admin(admin)
     ensures: user.is_restricted = value
     ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
--- Block (or unblock) sign-in. An administrator can never block themselves —
--- on their own account the flag is forced off.
+-- Block (or unblock) sign-in. Blocking oneself is refused unless another
+-- active administrator remains (Forgejo silently forces the flag off instead).
+-- decided: administration 6 (one guard for every self-weakening edit)
 -- from: routers/web/admin/users.go:391
 rule AdminSetsProhibitLogin {
     when: AdminSetsProhibitLogin(admin, user, value)
     requires: admin.is_admin = true
-    ensures:
-        if user = admin:
-            user.prohibit_login = false
-        else:
-            user.prohibit_login = value
+    requires: value = true or not user.being_purged    -- accounts invariant PurgingAccountStaysDisabled
+    requires: user != admin or value = false or has_other_admin(admin)
+    ensures: user.prohibit_login = value
     ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
+-- decided: administration 6 (deactivating oneself needs another active admin)
 -- from: routers/web/admin/users.go:447
 rule AdminSetsUserActive {
     when: AdminSetsUserActive(admin, user, value)
     requires: admin.is_admin = true
+    requires: not user.being_purged     -- accounts invariant PurgingAccountStaysDisabled
+    requires: user != admin or value = true or has_other_admin(admin)
     ensures: user.is_active = value
     ensures: UserEditedByAdmin(admin: admin, user: user)
 }
@@ -1492,9 +1612,11 @@ rule AdminDeletesRepository {
 }
 
 -- Adopting an unadopted directory, or deleting its files, is repositories'
--- UserAdoptsRepository / UserDeletesUnadoptedRepository (site admins always
--- pass their checks); administration only lists the directories (surface
+-- UserAdoptsRepository / UserDeletesUnadoptedRepository, for owners (when the
+-- instance allows it) and site admins alike (site admins always pass their
+-- checks); administration only owns the instance-wide listing (surface
 -- UnadoptedRepositories below).
+-- decided: administration 7 (repositories owns adopt and delete; administration the listing)
 
 ------------------------------------------------------------
 -- Monitoring (infrastructure capability)
@@ -1657,6 +1779,26 @@ rule OperatorRunsDoctor {
     ensures: DoctorRunRequested(operator: operator, checks: checks, fix: fix)
 }
 
+-- Report-only doctor checks from the web admin: never with fix — repairs that
+-- change data stay CLI-only. The report is kept for the admin to read.
+-- decided: administration 9 (read-only checks from the web; fixes CLI-only)
+rule AdminRunsDoctorChecks {
+    when: AdminRunsDoctorChecks(admin, checks)
+    requires: admin.is_admin = true
+    requires: checks != {}
+    ensures:
+        let run = DoctorRun.created(requested_by: admin, checks: checks, state: running, report: null, started_at: now, finished_at: null)
+        DoctorRunRequestedByAdmin(run: run)
+}
+
+rule RecordDoctorReport {
+    when: DoctorRunFinished(run, report)
+    requires: run.state = running
+    ensures: run.state = finished
+    ensures: run.report = report
+    ensures: run.finished_at = now
+}
+
 -- `forgejo dump`: one archive with the configuration file, a database dump
 -- (optionally converted to another SQL dialect), repositories, LFS objects,
 -- attachments, packages, avatars, custom dir, indexes, logs — each
@@ -1666,6 +1808,25 @@ rule OperatorDumpsInstance {
     when: OperatorDumpsInstance(operator, instance, format, contents)
     requires: instance.install_status = installed
     ensures: InstanceDumpProduced(operator: operator, format: format, contents: contents)
+}
+
+-- `forgejo restore <dump>`: load a dump (configuration, database, repositories
+-- and the other stored files) into an empty, not yet installed instance; it
+-- comes up installed exactly as dumped. Restoring over a live instance is
+-- refused. Forgejo has no counterpart (restore is manual).
+-- decided: administration 4 (CLI restore into an empty instance)
+rule OperatorRestoresInstance {
+    when: OperatorRestoresInstance(operator, instance, dump)
+    requires: instance.install_status = awaiting_install
+    requires: instance_storage_is_empty(instance)
+    requires: is_readable_dump(dump)
+    ensures: instance.install_status = installed
+    ensures: InstanceRestored(operator: operator, instance: instance)
+    @guidance
+        -- Any format `forgejo dump` writes is accepted; a database dump in
+        -- another SQL dialect is converted. Parts skipped at dump time stay
+        -- empty. The install wizard is not shown afterwards (the restored
+        -- configuration carries the install lock).
 }
 
 -- `forgejo manager shutdown|restart|reload-templates|flush-queues|processes|logging`
@@ -1892,6 +2053,9 @@ surface InstanceConfiguration {
     @guidance
         -- Web: GET /admin/config, POST /admin/config/test_mail,
         -- POST /admin/config/test_cache (cache round-trip timing).
+        -- Lists among others the [webhook] retry settings (max delivery
+        -- attempts, retry backoff base) and [actions] retention settings
+        -- other modules own.
 }
 
 -- Runtime-changeable settings.
@@ -1916,12 +2080,15 @@ surface AnnouncementAdministration {
     context announcement: Announcement
 
     exposes:
+        announcement.kind
         announcement.title
         announcement.text
+        announcement.starts_at
+        announcement.ends_at
         announcement.updated_at
 
     provides:
-        AdminPublishesAnnouncement(admin, kind, title, text)
+        AdminPublishesAnnouncement(admin, kind, title, text, starts_at, ends_at)
         AdminWithdrawsAnnouncement(admin, announcement)
 
     @guidance
@@ -1929,21 +2096,91 @@ surface AnnouncementAdministration {
         -- POST /admin/service_message/preview, POST /admin/service_message/markup.
 }
 
--- The announcement modal every signed-in user sees until they dismiss it.
+-- The announcement (modal or banner) every signed-in user sees, inside its
+-- start/end window, until they dismiss it.
+-- decided: administration 5 (modal or banner, optional start and end)
 surface AnnouncementBanner {
     facing viewer: access/SignedInUser
     context announcement: Announcement
 
     exposes:
-        announcement.title when announcement.is_pending_for(viewer)
-        announcement.text when announcement.is_pending_for(viewer)
+        announcement.kind when announcement.is_live and announcement.is_pending_for(viewer)
+        announcement.title when announcement.is_live and announcement.is_pending_for(viewer)
+        announcement.text when announcement.is_live and announcement.is_pending_for(viewer)
 
     provides:
         UserAcknowledgesAnnouncement(viewer, announcement)
+            when announcement.is_live
 
     @guidance
-        -- Rendered on every signed-in web page; POST /user/confirm
-        -- (sm_type, redirect_to) records the acknowledgement.
+        -- Rendered on every signed-in web page: a modal blocks the page until
+        -- dismissed, a banner sits above the content. POST /user/confirm
+        -- (sm_type, redirect_to) records the acknowledgement. Dismissing is a
+        -- per-viewer acknowledgement, still accepted in read-only mode.
+}
+
+-- Switching read-only (maintenance) mode.
+-- decided: administration 3
+surface ReadOnlyModeAdministration {
+    facing admin: access/SiteAdmin
+    context gate: access/InstanceWriteGate
+
+    exposes:
+        gate.read_only
+        gate.message
+        gate.since
+
+    provides:
+        AdminEntersReadOnlyMode(admin, gate, message)
+            when not gate.read_only
+        AdminLeavesReadOnlyMode(admin, gate)
+            when gate.read_only
+
+    @guidance
+        -- Web: /-/admin/maintenance (toggle + message); API
+        -- PUT/DELETE /api/v1/admin/read-only. Admin pages stay writable for
+        -- this switch and the rest of the admin console.
+}
+
+-- The banner every visitor sees while the instance is read-only.
+surface ReadOnlyBanner {
+    facing visitor: access/Visitor
+    context gate: access/InstanceWriteGate
+
+    exposes:
+        gate.read_only
+        gate.message when gate.read_only
+
+    @guarantee WritesRefusedWhileReadOnly
+        -- While gate.read_only, every write — web form, API call, git
+        -- push over HTTP or SSH — is refused with the banner message (API: a
+        -- distinct "instance is read-only" error); reads, clones and
+        -- downloads keep working.
+}
+
+-- Doctor checks from the web admin: report-only.
+-- decided: administration 9
+surface DoctorReports {
+    facing admin: access/SiteAdmin
+    context run: DoctorRun
+
+    exposes:
+        run.checks
+        run.state
+        run.report
+        run.started_at
+        run.requested_by
+
+    provides:
+        AdminRunsDoctorChecks(admin, checks)
+
+    @guarantee NoFixesFromTheWeb
+        -- The web never runs a check with fix; repairs are `forgejo doctor
+        -- check --fix` on the host only.
+
+    @guidance
+        -- Web: GET /-/admin/doctor (checks, past runs), POST /-/admin/doctor/run
+        -- (checks[]). Same catalogue and defaults as `forgejo doctor check`.
 }
 
 -- User administration: one account.
@@ -1969,7 +2206,6 @@ surface AdminUserAccount {
         AdminSetsUserAdmin(admin, subject, value)
         AdminSetsUserRestricted(admin, subject, value)
         AdminSetsProhibitLogin(admin, subject, value)
-            when subject != admin
         AdminSetsUserActive(admin, subject, value)
         AdminSetsMaxRepoCreation(admin, subject, limit)
         AdminSetsUserVisibility(admin, subject, visibility)
@@ -2082,6 +2318,8 @@ surface UnadoptedRepositories {
         dir.name
 
     @guidance
+        -- decided: administration 7 (repositories owns adopt and delete; the
+        -- instance-wide listing is administration's).
         -- Adopt and delete are repositories' actions (UserAdoptsRepository,
         -- UserDeletesUnadoptedRepository), offered on repositories/RepositoryAdministration.
         -- Web: GET /admin/repos/unadopted?search=true&q=, POST /admin/repos/unadopted
@@ -2125,7 +2363,10 @@ surface DelegatedAdminConsoles {
         -- authentication: /admin/auths (list, new, edit, delete auth sources);
         --   /admin/applications (instance-wide OAuth2 apps, regenerate secret, delete).
         -- webhooks: /admin/hooks, /admin/{default-hooks|system-hooks}/{type}/new,
-        --   /admin/hooks/{id} (edit, replay); API /api/v1/admin/hooks[/{id}].
+        --   /admin/hooks/{id} (edit, replay); API /api/v1/admin/hooks[/{id}];
+        --   the instance-wide delivery log (webhooks/InstanceDeliveryLog).
+        -- accounts: reserved names (accounts/ReservedNameAdministration) and
+        --   account purges (accounts/AccountPurgeAdministration).
         -- actions: /admin/actions/runners, /admin/actions/variables;
         --   API /api/v1/admin/actions/runners[...], /api/v1/admin/runners/...
         -- packages: /admin/packages (list, delete version, cleanup expired data).
@@ -2157,6 +2398,7 @@ surface OperatorConsole {
         OperatorMailsAllUsers(operator, instance, subject, body)
         OperatorRunsDoctor(operator, checks, fix)
         OperatorDumpsInstance(operator, instance, format, contents)
+        OperatorRestoresInstance(operator, instance, dump)
         OperatorCommandsRunningInstance(operator, command)
 
     @guidance
@@ -2165,7 +2407,7 @@ surface OperatorConsole {
         -- forgejo admin regenerate keys
         -- forgejo admin auth {add,update}-{oauth,ldap,ldap-simple,pam,smtp}, list, delete
         -- forgejo admin sendmail, forgejo admin repo-sync-releases
-        -- forgejo doctor check, forgejo dump, forgejo manager …
+        -- forgejo doctor check, forgejo dump, forgejo restore, forgejo manager …
         -- Commands that need the running server (sendmail, manager) talk to it
         -- over its private, host-local control API; the rest open the database
         -- directly.
@@ -2186,6 +2428,7 @@ surface BackgroundWorkReporting {
         CronWorkCompleted(task, outcome, message)
         SystemFailureReported(kind, description)
         ReleaseFeedAnswered(instance, supported_versions, error)
+        DoctorRunFinished(run, report)
 
     timeout:
         CronTaskFallsDue
@@ -2210,15 +2453,7 @@ deferred instance_statistics       -- see: models/activities/statistic.go — co
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Running a cron task via the API records the scheduler, not the administrator, as the doer (web records the admin). Should a rebuild always record the admin?"
-open question "app.ini documents [cron] ENABLED / RUN_AT_START as global switches but the code ignores them; should a rebuild honour a global cron on/off?"
-open question "There is no maintenance / read-only mode. Should a rebuild provide one (block writes, show banner) for upgrades and backups?"
-open question "`forgejo dump` has no counterpart restore command; should a rebuild offer an instance-level restore, or keep restore manual?"
-open question "Only one announcement kind (modal) exists. Is a non-blocking banner kind, or scheduling (start/end), wanted?"
-open question "Admins may edit their own account in ways that remove their admin status only if another admin exists; may an admin restrict themselves (is_restricted) without that guard?"
-open question "Unadopted-repository listing is instance-wide for admins; users with ALLOW_ADOPTION_OF_UNADOPTED_REPOSITORIES can adopt their own — is that capability repositories' or ours?"
-open question "Should the update checker default to on? It contacts a third-party endpoint (DNS release.forgejo.org) weekly, which offline-minded installs may not expect."
-open question "Should doctor checks also be runnable from the web admin (Forgejo exposes them only via CLI)?"
+-- (none: all decided, see DECISIONS.md "administration")
 
 ------------------------------------------------------------
 -- Requests to other modules
@@ -2244,3 +2479,7 @@ open question "Should doctor checks also be runnable from the web admin (Forgejo
 -- REQUEST actions: react to ZombieActionsTaskStopDue, EndlessActionsTaskStopDue, AbandonedActionsJobCancellationDue, LingeringActionsLogTransferDue, ActionsScheduleStartDue, ActionsCleanupDue, OfflineRunnerCleanupDue, ActionsUserCleanupDue.
 -- REQUEST organizations: react to OrganizationCreatedForUserByAdmin; honour config.disable_regular_org_creation.
 -- REQUEST all modules owning cron work: emit CronWorkCompleted(task, outcome, message) when the work finishes, and, for background failures worth an operator's attention, a failure report of their own (as migrations/MigrationFailureReported(kind, description)) that administration reacts to by recording a SystemNotice; a qualified emission of SystemFailureReported is not applied.
+-- REQUEST all modules with writes outside repository units (accounts, organizations, issues, pulls, releases, wiki, packages, projects, keys, webhooks, actions, moderation, federation, migrations, authentication settings, notifications settings): refuse every user-initiated write while access/InstanceWriteGate.read_only (decided: administration 3); access already gates UserWritesUnit / UserContributesToRepository; code's git push goes through access table C (changes_git_content).
+-- REQUEST code: refuse git push over HTTP and SSH while access/InstanceWriteGate.read_only, with the read-only message on the client's terminal (decided: administration 3).
+-- REQUEST accounts: the self-edit guard of decision administration 6 counts admins via has_other_admin(user) — another active administrator who may sign in (is_admin, is_active, not prohibit_login, not being_purged).
+-- REQUEST repositories: administration records SystemNotices for PullMirrorSyncFailed; for RepositoryHealthCheckFailed / RepositoryGarbageCollectionFailed emit them from a rule level the audit sees (one trigger per failing repository) and administration will add the two notice rules.

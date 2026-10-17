@@ -735,3 +735,29 @@ journey AUnitDefaultLetsEveryoneWrite {
 
     ends: "Everyone may write" is a per-unit setting, no longer the wiki's alone.
 }
+
+-- decided: administration 3 — while the instance is read-only every write is
+-- refused, the owner's and a site admin's included; reads keep working.
+journey ReadOnlyModeRefusesEveryWrite {
+    goal: The site administrator has put the instance into read-only mode for
+          a backup. Olga can still read her repository, but she cannot push,
+          and Sam cannot comment or open a pull request.
+
+    cast:
+        gate: InstanceWriteGate
+
+    given:
+        gate.read_only = true
+        gate.message = "Backup in progress"
+
+    1. reading still works
+        olga does UserReadsUnit(olga, code) on RepositoryUnitAccess
+
+    2. the owner's push is refused
+        olga cannot do UserWritesUnit(olga, code, true) on RepositoryUnitAccess
+
+    3. nor can Sam contribute
+        sam cannot do UserContributesToRepository(sam, code) on RepositoryUnitAccess
+
+    ends: Nothing changes while the instance is read-only.
+}

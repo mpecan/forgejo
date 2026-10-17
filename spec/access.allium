@@ -13,7 +13,7 @@
 --     repositories.
 --   * Denials and reductions: private repositories, owner visibility
 --     (limited/private users and organizations), restricted users,
---     REQUIRE_SIGNIN_VIEW, disabled units, archived repositories (read-only),
+--     REQUIRE_SIGNIN_VIEW, instance read-only mode (administration), disabled units, archived repositories (read-only),
 --     mirrors (code is read-only), blocked users, credential restrictions
 --     (fine-grained tokens / authorized integrations: public-only and
 --     listed-repository reach, admin scope), Actions task tokens (own
@@ -25,7 +25,7 @@
 --     input of the derivation changes (UserLostRepositoryAccess).
 --   * The operation -> required-permission table (see "Authorization table").
 --
--- Includes: AccessMode, OperationClass, GrantBasis, CredentialRestriction,
+-- Includes: AccessMode, OperationClass, GrantBasis, CredentialRestriction, InstanceWriteGate,
 --   AccessDecision, AnonymousVisitor, RequestParty, ForgeComponent,
 --   AuthorizationPolicy contract, and the shared actors Visitor,
 --   SignedInUser, SiteAdmin and RepoAdmin (see "Actor Declarations").
@@ -391,6 +391,19 @@ entity CredentialRestriction {
     allows_site_admin: reach = all_repositories and has_admin_scope
 }
 
+-- The instance-wide write gate: while read_only, every write is refused, for
+-- every party including site administrators; reads are unaffected. There is
+-- one; administration switches it (AdminEntersReadOnlyMode /
+-- AdminLeavesReadOnlyMode) and shows `message` as a banner on every page.
+-- Other modules' writes outside repository units consult it too (see
+-- administration's REQUESTs).
+-- decided: administration 3 (maintenance / read-only mode)
+entity InstanceWriteGate {
+    read_only: Boolean
+    message: String?
+    since: Timestamp?
+}
+
 -- The outcome of evaluating one guarded operation for one party. Only granted
 -- operations produce a decision; a refusal produces nothing, and the party is
 -- told the target does not exist (or, for a visible target, that the operation
@@ -527,7 +540,8 @@ rule ReadUnitAnonymously {
 -- Rules: contributions (open issues/PRs, comment, react, review, fork, star)
 ------------------------------------------------------------
 -- UserContributesToRepository(subject, unit, credential?) is raised by table B.
--- Contribution needs read on the unit, a repository that is not archived, and
+-- Contribution needs an instance that is not read-only (administration 3), read
+-- on the unit, a repository that is not archived, and
 -- an actor the repository owner has not blocked. Pull requests additionally
 -- need a repository that can accept them (not a mirror, not empty, pull
 -- requests enabled) - that gate is owned by pulls (table B2).
@@ -539,6 +553,7 @@ rule ContributeAsSiteAdmin {
     let repository = unit.repository
     let owner_public = repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
     requires: subject.is_admin
+    requires: not exists InstanceWriteGate{read_only: true}   -- decided: administration 3 (read-only mode refuses every write)
     requires: unit.enabled
     requires: not repository.is_archived
     requires: repository.owner_user = null or not (exists accounts/UserBlock{blocker: repository.owner_user, blocked: subject})
@@ -553,6 +568,7 @@ rule ContributeAsRepositoryOwner {
     let repository = unit.repository
     let owner_public = repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
     requires: repository.owner_user = subject
+    requires: not exists InstanceWriteGate{read_only: true}   -- decided: administration 3 (read-only mode refuses every write)
     requires: unit.enabled
     requires: not repository.is_archived
     requires: credential = null or credential?.reach = all_repositories or (credential?.reach = listed_repositories and repository in credential?.listed) or (credential?.reach = public_only and not repository.is_private and owner_public)
@@ -566,6 +582,7 @@ rule ContributeByExplicitGrant {
     let repository = unit.repository
     let owner_public = repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
     requires: explicit_unit_mode(subject, repository, unit.kind) in {read, write, admin, owner}
+    requires: not exists InstanceWriteGate{read_only: true}   -- decided: administration 3 (read-only mode refuses every write)
     requires: unit.enabled
     requires: not repository.is_archived
     requires: repository.owner_user = null or not (exists accounts/UserBlock{blocker: repository.owner_user, blocked: subject})
@@ -585,6 +602,7 @@ rule ContributeByPublicDefault {
     requires: has_default
     requires: not subject.is_restricted
     requires: owner_visible
+    requires: not exists InstanceWriteGate{read_only: true}   -- decided: administration 3 (read-only mode refuses every write)
     requires: unit.enabled
     requires: not repository.is_archived
     requires: repository.owner_user = null or not (exists accounts/UserBlock{blocker: repository.owner_user, blocked: subject})
@@ -597,7 +615,8 @@ rule ContributeByPublicDefault {
 -- Rules: unit writes
 ------------------------------------------------------------
 -- UserWritesUnit(subject, unit, changes_git_content, credential?) is raised by
--- table C. Writes are refused on archived repositories, on units that never
+-- table C. Writes are refused while the instance is read-only (administration
+-- maintenance mode, for site admins too; decided: administration 3), on archived repositories, on units that never
 -- exceed read (external wiki, external tracker), and - when the operation
 -- changes git content - on pull mirrors.
 
@@ -608,6 +627,7 @@ rule WriteUnitAsSiteAdmin {
     let repository = unit.repository
     let owner_public = repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
     requires: subject.is_admin
+    requires: not exists InstanceWriteGate{read_only: true}   -- decided: administration 3 (read-only mode refuses every write)
     requires: unit.enabled
     requires: not unit.is_external
     requires: not repository.is_archived
@@ -622,6 +642,7 @@ rule WriteUnitAsRepositoryOwner {
     let repository = unit.repository
     let owner_public = repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
     requires: repository.owner_user = subject
+    requires: not exists InstanceWriteGate{read_only: true}   -- decided: administration 3 (read-only mode refuses every write)
     requires: unit.enabled
     requires: not unit.is_external
     requires: not repository.is_archived
@@ -637,6 +658,7 @@ rule WriteUnitByExplicitGrant {
     let repository = unit.repository
     let owner_public = repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
     requires: explicit_unit_mode(subject, repository, unit.kind) in {write, admin, owner}
+    requires: not exists InstanceWriteGate{read_only: true}   -- decided: administration 3 (read-only mode refuses every write)
     requires: unit.enabled
     requires: not unit.is_external
     requires: not repository.is_archived
@@ -661,6 +683,7 @@ rule WriteUnitByEveryoneWritable {
     requires: not repository.is_private
     requires: not subject.is_restricted
     requires: owner_visible
+    requires: not exists InstanceWriteGate{read_only: true}   -- decided: administration 3 (read-only mode refuses every write)
     requires: unit.enabled
     requires: not unit.is_external
     requires: not repository.is_archived

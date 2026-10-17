@@ -1920,6 +1920,9 @@ rule RecordLanguageStats {
 
 -- Adopting git storage that has no repository record. Site admins always; owners for their own
 -- namespace (or an organisation they can create in) when adoption is allowed by config.
+-- This module owns adopt and delete for users and admins alike; administration only lists
+-- the unadopted directories instance-wide (administration/UnadoptedRepositories).
+-- decided: administration 7 (repositories owns adopt and delete)
 -- from: services/repository/adopt.go:32
 rule UserAdoptsRepository {
     when: UserAdoptsRepository(user, unadopted, owner)
@@ -1948,6 +1951,7 @@ rule UserAdoptsRepository {
         -- Endpoints: /user/settings/repos (own), /admin/repos/unadopted, API /admin/unadopted.
 }
 
+-- decided: administration 7 (repositories owns delete of unadopted storage, for owners and admins)
 -- from: services/repository/adopt.go:201
 rule UserDeletesUnadoptedRepository {
     when: UserDeletesUnadoptedRepository(user, unadopted)

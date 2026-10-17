@@ -115,6 +115,7 @@ journey InstallRefusesToLockEveryoneOut {
 }
 
 -- Running a maintenance task by hand, and what a failure leaves behind.
+-- decided: administration 1 — the admin who ran it is recorded as the doer.
 journey AdministratorRunsADisabledTaskByHand {
     goal: Root wants to purge never-activated accounts now. The task is
           disabled on the schedule, but the dashboard still offers it. It runs,
@@ -131,6 +132,7 @@ journey AdministratorRunsADisabledTaskByHand {
         then DispatchDeleteInactiveAccounts fires
         then sweep.run_state = running
         then sweep.exec_times = 1
+        then sweep.last_doer = root
 
     2. a second click while it runs does not start it twice
         root does AdminRunsCronTask(root, sweep) on CronTaskMonitor
@@ -265,6 +267,8 @@ journey AnAdministratorStepsDownWhenAnotherRemains {
 }
 
 -- Editing an account's limits and access.
+-- Updated for decision administration 6: blocking one's own sign-in is now
+-- refused (Forgejo silently forced the flag off).
 journey AdministratorRestrictsAnAccount {
     goal: Ada's account is being used to spam repositories. Root restricts it,
           blocks its sign-in and stops it creating repositories. Root cannot
@@ -281,8 +285,9 @@ journey AdministratorRestrictsAnAccount {
         then ada.prohibit_login = true
         root sees ada.prohibit_login on AdminUserAccount in ada
 
-    3. ticking the box on root's own account changes nothing
-        root does AdminSetsProhibitLogin(root, root, true) on AdminUserAccount
+    3. root, the only administrator, cannot lock themselves out
+        stipulate has_other_admin(root) = false
+        root cannot do AdminSetsProhibitLogin(root, root, true) on AdminUserAccount
         then root.prohibit_login = false
 
     ends: Ada can no longer sign in or create repositories; Root still can.
@@ -333,7 +338,7 @@ journey AnAnnouncementIsShownUntilAcknowledged {
 
     1. root publishes
         stipulate truncate_bytes("Maintenance", 255) = "Maintenance"
-        root does AdminPublishesAnnouncement(root, modal, "Maintenance", "Down **Sunday 02:00 UTC**.") on AnnouncementAdministration
+        root does AdminPublishesAnnouncement(root, modal, "Maintenance", "Down **Sunday 02:00 UTC**.", null, null) on AnnouncementAdministration
             creating notice_board: Announcement
         then AdminPublishesAnnouncement fires
         then notice_board.title = "Maintenance"
@@ -345,7 +350,7 @@ journey AnAnnouncementIsShownUntilAcknowledged {
         then ack.user = ada
 
     3. an empty title is refused
-        root cannot do AdminPublishesAnnouncement(root, modal, "", "text") on AnnouncementAdministration
+        root cannot do AdminPublishesAnnouncement(root, modal, "", "text", null, null) on AnnouncementAdministration
 
     4. root withdraws it
         root does AdminWithdrawsAnnouncement(root, notice_board) on AnnouncementAdministration
@@ -473,4 +478,138 @@ journey AnOperatorBootstrapsFromTheShell {
         then OperatorMailsAllUsers fires
 
     ends: The instance has an administrator and its users were told.
+}
+
+-- decided: administration 6 — one guard for every self-weakening edit.
+journey TheOnlyAdministratorCannotWeakenThemselves {
+    goal: Root is the only administrator. Restricting, deactivating or
+          locking their own account would leave nobody to run the instance,
+          so each is refused. Once Ada is an administrator too, Root may
+          restrict their own account.
+
+    1. alone, root can weaken themselves in no way
+        stipulate has_other_admin(root) = false
+        root cannot do AdminSetsUserRestricted(root, root, true) on AdminUserAccount
+        root cannot do AdminSetsUserActive(root, root, false) on AdminUserAccount
+        root cannot do AdminSetsProhibitLogin(root, root, true) on AdminUserAccount
+        root cannot do AdminSetsUserAdmin(root, root, false) on AdminUserAccount
+        then root.is_active = true
+
+    2. with another active administrator, it is allowed
+        stipulate has_other_admin(root) = true
+        root does AdminSetsUserRestricted(root, root, true) on AdminUserAccount
+        then root.is_restricted = true
+
+    ends: The instance never loses its last working administrator.
+}
+
+-- decided: administration 5 — a banner with a start and end time.
+journey ABannerAnnouncementRunsInItsWindow {
+    goal: Root schedules a non-blocking banner for tomorrow's maintenance,
+          shown from now for two hours. Ada sees it; after the window ends
+          it is gone without anyone withdrawing it. A window that ends
+          before it starts is refused.
+
+    1. a window ending before it starts is refused
+        root cannot do AdminPublishesAnnouncement(root, banner, "Maintenance", "Tomorrow 02:00", now + 2.hours, now) on AnnouncementAdministration
+
+    2. root publishes the banner
+        stipulate truncate_bytes("Maintenance", 255) = "Maintenance"
+        root does AdminPublishesAnnouncement(root, banner, "Maintenance", "Tomorrow 02:00", now, now + 2.hours) on AnnouncementAdministration
+            creating strip: Announcement
+        then strip.kind = banner
+
+    3. ada sees it while it is live
+        ada sees strip.title on AnnouncementBanner in strip
+
+    4. three hours later it is no longer shown
+        after 3.hours
+        ada cannot see strip.title on AnnouncementBanner in strip
+
+    ends: The banner showed for its window only.
+}
+
+-- decided: administration 3 — read-only (maintenance) mode.
+journey AdministratorPutsTheInstanceInReadOnlyMode {
+    goal: Root takes a backup. They switch the instance read-only with a
+          message; every visitor sees the banner and writes are refused
+          (see access ReadOnlyModeRefusesEveryWrite). Ada cannot flip the
+          switch. Afterwards root switches it off again.
+
+    cast:
+        gate: access/InstanceWriteGate
+
+    given:
+        gate.read_only = false
+
+    1. ada may not switch it
+        ada cannot do AdminEntersReadOnlyMode(ada, gate, "nope") on ReadOnlyModeAdministration
+
+    2. root switches it on
+        root does AdminEntersReadOnlyMode(root, gate, "Backup in progress") on ReadOnlyModeAdministration
+        then AdminEntersReadOnlyMode fires
+        then gate.read_only = true
+        ada sees gate.message on ReadOnlyBanner in gate
+
+    3. and off again when the backup is done
+        root does AdminLeavesReadOnlyMode(root, gate) on ReadOnlyModeAdministration
+        then gate.read_only = false
+
+    ends: The instance accepted no writes while the backup ran.
+}
+
+-- decided: administration 4 — restoring a dump from the CLI.
+journey AnOperatorRestoresADumpIntoAFreshInstance {
+    goal: After a disk failure the operator installs Forgejo on a new host and
+          restores last night's dump with `forgejo restore`. The instance
+          comes up installed. Restoring over a live instance is refused.
+
+    world: none
+
+    cast:
+        ops:   Operator
+        fresh: Instance
+        live:  Instance
+
+    given:
+        ops.has_host_access = true
+        fresh.install_status = awaiting_install
+        live.install_status = installed
+
+    1. restoring over a live instance is refused
+        stipulate instance_storage_is_empty(live) = false
+        stipulate is_readable_dump("forgejo-dump.zip") = true
+        ops cannot do OperatorRestoresInstance(ops, live, "forgejo-dump.zip") on OperatorConsole
+
+    2. the fresh instance takes the dump
+        stipulate instance_storage_is_empty(fresh) = true
+        ops does OperatorRestoresInstance(ops, fresh, "forgejo-dump.zip") on OperatorConsole
+        then OperatorRestoresInstance fires
+        then fresh.install_status = installed
+
+    ends: The instance is back as it was dumped.
+}
+
+-- decided: administration 9 — report-only doctor checks from the web.
+journey AdministratorRunsDoctorChecksFromTheWeb {
+    goal: Root suspects inconsistent data and runs two doctor checks from the
+          admin pages. The report comes back and Root reads it. Ada cannot
+          run checks.
+
+    1. ada cannot
+        ada cannot do AdminRunsDoctorChecks(ada, {check_db_consistency}) on DoctorReports
+
+    2. root starts the checks
+        root does AdminRunsDoctorChecks(root, {check_db_consistency, check_user_email}) on DoctorReports
+            creating run: DoctorRun
+        then AdminRunsDoctorChecks fires
+        then run.state = running
+
+    3. the report arrives and root reads it
+        proc does DoctorRunFinished(run, "2 orphaned comments found; run `forgejo doctor check --fix` to repair") on BackgroundWorkReporting
+        then RecordDoctorReport fires
+        then run.state = finished
+        root sees run.report on DoctorReports in run
+
+    ends: Root knows what is wrong; fixing it is a job for the shell.
 }

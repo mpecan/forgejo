@@ -271,3 +271,18 @@ invariants or config. Numbers refer to the question's position in its module in
 | 7 | Admin notification and API | **Both.** Site admins are notified (inbox, optional mail) of new reports; reporting, listing and resolving are available through the API. |
 | 8 | Telling reporters the outcome | **Yes, without details:** the reporter learns it was handled, not what was done. |
 | 9 | Purging resolved reports | **On by default:** resolved reports and unreferenced evidence are purged after a retention period (default 180 days); admins can turn it off. |
+
+## federation
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Signer vs actor | **Bound.** The signing key must belong to the activity's actor. |
+| 2 | Visibility of federated actors | **Public only.** Only public users and public repositories are federated actors; anything else is not found. |
+| 3 | Person outbox | **The user's own public activities.** |
+| 4 | Notes and follows | **Followed actors only, follows recorded.** A follow is pending until Accept; notes are accepted only from accepted follows. |
+| 5 | Withdrawing stars | **Undo(Like) both ways:** accepted inbound, sent on local unstar. |
+| 6 | Outbound note delivery | **Once per action per following inbox.** |
+| 7 | Following-repos list | **Limited on write** to `max_following_repos_liked` entries. |
+| 8 | Outbound retries | **One retrying queue with exponential backoff** for every activity, Likes included. |
+| 9 | Replay protection | **Per remote actor.** |
+| 10 | Remote people in counts | **Excluded** from NodeInfo totals and the user explore page; they appear only where they act. |
