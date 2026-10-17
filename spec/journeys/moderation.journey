@@ -8,6 +8,7 @@ world {
         ada:     accounts/User
         bruno:   accounts/User
         root:    accounts/User
+        author:  accounts/User
         thread:  issues/Issue
         remark:  issues/Comment
         item:    ReportableContent
@@ -31,6 +32,7 @@ world {
         item.reported_issue = null
         item.is_deleted = false
         item.has_user_content = true
+        item.poster = author
 }
 
 journey AUserReportsAnAbusiveComment {
@@ -226,31 +228,47 @@ journey AnAdminSuspendsASpammer {
     ends: The spammer can no longer sign in.
 }
 
+-- Decision moderation 9: the purge is on by default with a 180-day
+-- retention. The two journeys below previously asserted Forgejo's defaults
+-- (task off, 7 days) and were updated to the decided ones.
 journey ResolvedReportsArePurged {
-    goal: With the purge task enabled, a report ignored more than the retention
-          period ago is deleted.
+    goal: Out of the box, a report ignored more than 180 days ago is deleted.
 
     after: AnAdminDismissesTheReport
 
-    given:
-        moderation/config.purge_task_enabled = true
-
-    1. a week and a day pass
-        after 8.days
+    1. half a year and a day pass
+        after 181.days
         then PurgeResolvedReport fires
         then report does not exist
 
     ends: Only recent resolutions remain on record.
 }
 
-journey AResolvedReportStaysWhileThePurgeTaskIsOff {
-    goal: The purge task ships disabled. Left that way, a report ignored more
-          than the retention period ago is kept.
+journey AResolvedReportStaysWithinTheRetentionPeriod {
+    goal: A week after it was ignored, the report is still on record: the
+          default retention is 180 days.
 
     after: AnAdminDismissesTheReport
 
     1. a week and a day pass
         after 8.days
+        then PurgeResolvedReport does not fire
+        then report exists
+
+    ends: Recently resolved reports stay for review.
+}
+
+journey AResolvedReportStaysWhileThePurgeTaskIsOff {
+    goal: The admin turned the purge task off. A report ignored more than the
+          retention period ago is kept.
+
+    after: AnAdminDismissesTheReport
+
+    given:
+        moderation/config.purge_task_enabled = false
+
+    1. half a year and a day pass
+        after 181.days
         then PurgeResolvedReport does not fire
         then report exists
 
@@ -275,4 +293,148 @@ journey WithModerationOffNothingCanBeReported {
         root cannot do AdminDeletesReportedComment(root, item, handled) on ModerationQueue
 
     ends: Nothing is reported and nothing is moderated while the feature is off.
+}
+
+-- Decision moderation 4: the server refuses reports on one's own content.
+journey NobodyReportsTheirOwnComment {
+    goal: Ada wrote the comment herself; even with the entry hidden, a
+          hand-made request to report it is refused.
+
+    given:
+        item.poster = ada
+
+    1. she reports her own comment
+        stipulate can_read_conversation(ada, thread) = true
+        stipulate remarks_length("This comment links to a phishing site twice.") = 45
+        ada cannot do UserReportsContent(ada, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
+
+    2. bruno, who did not write it, may
+        stipulate can_read_conversation(bruno, thread) = true
+        bruno does UserReportsContent(bruno, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
+            creating theirs: AbuseReport
+        then theirs.status = open
+
+    ends: Only other people's content enters the queue.
+}
+
+journey NobodyReportsTheirOwnRepository {
+    goal: Ada administers the repository and cannot report it.
+
+    cast:
+        code: repositories/Repository
+        repo_item: ReportableContent
+
+    given:
+        repo_item.kind = repository
+        repo_item.reported_repository = code
+        repo_item.is_deleted = false
+
+    1. she reports her own repository
+        stipulate can_read_any_unit(ada, code) = true
+        stipulate is_repo_admin(ada, code) = true
+        stipulate remarks_length("Nothing wrong here and just trying it out.") = 41
+        ada cannot do UserReportsContent(ada, repo_item, other_violations, "Nothing wrong here and just trying it out.") on ReportAbuse
+
+    ends: Self-reports never enter the queue.
+}
+
+-- Decision moderation 1: only actions for the reported kind apply.
+journey AnActionMustMatchTheReportedKind {
+    goal: The report is about a comment. The admin cannot answer it by deleting
+          a repository or an account; deleting the comment is what is offered.
+
+    after: AUserReportsAnAbusiveComment
+
+    1. a mismatched action is refused
+        root cannot do AdminDeletesReportedRepository(root, item, handled) on ModerationQueue
+        root cannot do AdminDeletesReportedAccount(root, item, handled) on ModerationQueue
+        root cannot do AdminSuspendsReportedAccount(root, item, handled) on ModerationQueue
+        then report.status = open
+
+    2. the matching one goes through
+        root does AdminDeletesReportedComment(root, item, handled) on ModerationQueue
+        then AdminDeletesReportedComment fires
+        then report.status = handled
+
+    ends: Nothing outside the reported item is touched.
+}
+
+-- Decisions moderation 2 and 8: resolving touches only open reports; each
+-- reporter is told theirs was dealt with (CloseReport* emit ReportReviewed).
+journey AnEarlierResolutionIsKept {
+    goal: Ada's report was ignored. Bruno reports the same comment later and the
+          admin marks the item handled: Bruno's report becomes handled, Ada's
+          stays ignored with its original time.
+
+    after: AnAdminDismissesTheReport
+
+    1. bruno reports the comment
+        stipulate can_read_conversation(bruno, thread) = true
+        stipulate remarks_length("This comment links to a phishing site twice.") = 45
+        bruno does UserReportsContent(bruno, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
+            creating later: AbuseReport
+        then later.status = open
+
+    2. the admin handles the item
+        root does AdminResolvesReports(root, item, handled) on ModerationQueue
+        then CloseReportAsHandled fires
+        then CloseReportAsIgnored does not fire
+        then later.status = handled
+        then report.status = ignored
+
+    ends: Each reporter hears once that their report was reviewed; Ada's
+          earlier resolution is not rewritten.
+}
+
+-- Decision moderation 6: organisation deletion keeps evidence, as for users.
+journey ADeletedOrganizationLeavesEvidence {
+    goal: Ada reports an organization; its owner deletes it. The profile is
+          captured for the report before it goes, and the item is a tombstone.
+
+    cast:
+        acme: organizations/Organization
+        org_item: ReportableContent
+
+    given:
+        acme.name = "acme"
+        org_item.kind = organization
+        org_item.reported_organization = acme
+        org_item.reported_user = null
+        org_item.is_deleted = false
+
+    1. ada reports the organization
+        stipulate organization_visible_to(acme, ada) = true
+        stipulate is_org_owner(acme, ada) = false
+        stipulate remarks_length("Their profile advertises stolen accounts.") = 41
+        ada does UserReportsContent(ada, org_item, illegal_content, "Their profile advertises stolen accounts.") on ReportAbuse
+            creating complaint: AbuseReport
+        then complaint.status = open
+
+    2. the owner deletes the organization
+        stipulate is_org_owner(acme, bruno) = true
+        stipulate owned_repository_count(acme) = 0
+        stipulate owned_package_count(acme) = 0
+        bruno does OwnerDeletesOrganization(bruno, acme, "acme") on OrganizationSettings
+        then PreserveEvidenceOnOrganizationDeletion fires
+        then PreserveEvidenceBeforeChange fires
+        then ReportedContentDeleted fires
+        then org_item.is_deleted = true
+        then complaint exists
+
+    ends: The admin still judges the organization as it was when reported.
+}
+
+-- Decision moderation 5: a duplicate is refused with an explanation; the
+-- form shows the reporter their open report.
+journey ADuplicateReportIsExplained {
+    goal: Ada already has an open report on the comment. The form tells her so
+          and a second submission is refused.
+
+    after: AUserReportsAnAbusiveComment
+
+    1. she opens the form again
+        ada sees item.kind on ReportAbuse in item
+        ada cannot do UserReportsContent(ada, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
+
+    ends: Ada knows her first report is still waiting.
 }

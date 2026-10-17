@@ -30,6 +30,9 @@ world {
         bob_doc.host_software = forgejo
         alice.kind = individual
         alice.prohibit_login = false
+        alice.is_active = true
+        alice.visibility = public
+        repo.is_private = false
         federation/config.enabled = true
 }
 
@@ -125,7 +128,10 @@ journey BobStarsARepositoryFromAfar {
     1. bob's Like arrives
         stipulate repository_actor_uri(repo) = "https://forge.local/api/v1/activitypub/repository-id/3"
         peer does RemoteActorLikesRepository(peer, bob, repo, "https://forge.local/api/v1/activitypub/repository-id/3", now) on RepositoryActorEndpoint
+            creating star: repositories/Star
         then AcceptFederatedLike fires
+        then star.user = bob.user
+        then bob.latest_activity != null
         then bob.host.latest_activity != null
 
     2. the same Like is replayed
@@ -134,30 +140,216 @@ journey BobStarsARepositoryFromAfar {
     ends: Bob has starred the repository once; the replay was dropped.
 }
 
+-- Decision federation 5: Undo(Like) is accepted inbound.
+journey BobWithdrawsHisStar {
+    goal: Bob changes his mind and sends Undo(Like); his star goes. Undoing
+          a star he no longer has is refused.
+
+    after: BobStarsARepositoryFromAfar
+
+    1. a moment later, bob's Undo(Like) arrives
+        after 1.second
+        peer does RemoteActorUndoesLike(peer, bob, repo, "https://forge.local/api/v1/activitypub/repository-id/3", now) on RepositoryActorEndpoint
+        then AcceptFederatedUndoLike fires
+        then star does not exist
+
+    2. a later Undo finds nothing to withdraw
+        after 1.second
+        peer cannot do RemoteActorUndoesLike(peer, bob, repo, "https://forge.local/api/v1/activitypub/repository-id/3", now) on RepositoryActorEndpoint
+
+    ends: Bob no longer stars the repository.
+}
+
+-- Decision federation 9: replay protection is per remote actor. Under
+-- Forgejo's per-host check Carol's Like, published at the same moment as
+-- Bob's, would have been dropped.
+journey TwoPeopleOnOneServerStarAtTheSameMoment {
+    goal: Bob and Carol, both on code.example, like our repository at the
+          same moment. Both stars count; each one's replay is still refused.
+
+    after: BobStarsARepositoryFromAfar
+
+    cast:
+        peer2:    RemoteParty
+        carol_doc: RemoteActor
+
+    given:
+        peer2.origin = "https://code.example"
+        peer2.signing_key_id = "https://code.example/api/v1/activitypub/user-id/8#main-key"
+        peer2.signature_valid = true
+        carol_doc.uri = "https://code.example/api/v1/activitypub/user-id/8"
+        carol_doc.canonical_uri = "https://code.example/api/v1/activitypub/user-id/8"
+        carol_doc.scheme = "https"
+        carol_doc.host_fqdn = "code.example"
+        carol_doc.host_port = 443
+        carol_doc.external_id = "8"
+        carol_doc.kind = person
+        carol_doc.preferred_username = "carol"
+        carol_doc.display_name = "Carol"
+        carol_doc.inbox_path = "/api/v1/activitypub/user-id/8/inbox"
+        carol_doc.key_id = "https://code.example/api/v1/activitypub/user-id/8#main-key"
+        carol_doc.public_key = "-----BEGIN PUBLIC KEY-----"
+        carol_doc.host_software = forgejo
+
+    1. carol's server signs a request with carol's key
+        peer2 does RemoteRequestSigned(peer2, carol_doc) on PersonActorEndpoint
+            creating carol: FederatedUser
+        then MaterialiseFederatedUser fires
+        then carol.host = bob.host
+
+    2. carol's Like, published at the same moment as bob's, is accepted
+        peer2 does RemoteActorLikesRepository(peer2, carol, repo, "https://forge.local/api/v1/activitypub/repository-id/3", now) on RepositoryActorEndpoint
+            creating carols_star: repositories/Star
+        then AcceptFederatedLike fires
+        then carols_star.user = carol.user
+
+    3. carol's replay is refused all the same
+        peer2 cannot do RemoteActorLikesRepository(peer2, carol, repo, "https://forge.local/api/v1/activitypub/repository-id/3", now) on RepositoryActorEndpoint
+
+    ends: Two stars from one server; replays of either are dropped.
+}
+
+-- Decision federation 4 changed this journey: Forgejo took a note from any
+-- known remote person; now Alice must follow Bob, and Bob must have
+-- accepted, before his notes reach her. Decision federation 3: the note is
+-- not in Alice's outbox either.
 journey BobSendsAliceANote {
-    goal: Bob's server tells Alice about something Bob did; it appears on
-          Alice's own feed tab and nowhere else.
+    goal: Alice follows Bob; once his server accepts, Bob's server tells
+          Alice about something Bob did; it appears on Alice's own feed tab
+          and nowhere else. Before the Accept, notes are refused.
 
     after: ARemotePersonIsMetForTheFirstTime
 
     cast:
         carol: accounts/User
 
-    1. a Create(Note) arrives in alice's inbox
+    1. alice follows bob; the follow is pending
+        alice does UserFollowsRemoteActor(alice, bob) on FederationForLocalUser
+            creating follow: OutboundFollow
+        then follow.status = pending
+
+    2. a note before bob accepts is refused
+        peer cannot do RemoteActorSendsNote(peer, bob, alice, "bob pushed to main", "https://code.example/api/v1/activitypub/user-id/7/activities/1", "{}") on PersonActorEndpoint
+
+    3. bob's server accepts the follow
+        peer does RemoteActorAcceptsFollow(peer, bob, alice) on PersonActorEndpoint
+        then AcknowledgeFollowAccepted fires
+        then follow.status = accepted
+
+    4. a Create(Note) arrives in alice's inbox
         peer does RemoteActorSendsNote(peer, bob, alice, "bob pushed to main", "https://code.example/api/v1/activitypub/user-id/7/activities/1", "{}") on PersonActorEndpoint
             creating note: FederatedActivity
         then RecordFederatedNote fires
         then note.recipient = alice
         then note.actor = bob
 
-    2. alice reads it on her feed
+    5. alice reads it on her feed
         alice sees note.note_content on FederationForLocalUser
 
-    3. carol, another local user, does not see it
+    6. carol, another local user, does not see it
         carol cannot see note.note_content on FederationForLocalUser
+
+    7. nor does a remote server reading alice's outbox
+        peer cannot see note.note_content on PersonActorEndpoint in alice
 
     ends: The note is in Alice's federated feed only.
 }
+
+-- Decision federation 4: an Accept must answer a follow that was sent.
+journey AnAcceptNobodyAskedForIsRefused {
+    goal: Bob's server sends Alice an Accept(Follow) though she never
+          followed Bob; it is refused, and his notes still are too.
+
+    after: ARemotePersonIsMetForTheFirstTime
+
+    1. the unsolicited Accept is refused
+        peer cannot do RemoteActorAcceptsFollow(peer, bob, alice) on PersonActorEndpoint
+
+    2. and a note from bob is refused
+        peer cannot do RemoteActorSendsNote(peer, bob, alice, "hello", "https://code.example/api/v1/activitypub/user-id/7/activities/2", "{}") on PersonActorEndpoint
+
+    ends: Alice's feed holds nothing from people she does not follow.
+}
+
+-- Decision federation 1: the signing key must belong to the activity's actor.
+journey AnotherActorsKeyCannotSpeakForBob {
+    goal: A request that verifies, but with a key that is not Bob's, cannot
+          make Bob follow Alice or star a repository.
+
+    after: ARemotePersonIsMetForTheFirstTime
+
+    given:
+        peer.signing_key_id = "https://code.example/api/v1/activitypub/user-id/9#main-key"
+
+    1. a Follow on bob's behalf signed by someone else is refused
+        peer cannot do RemoteActorFollowsUser(peer, bob, alice) on PersonActorEndpoint
+
+    2. so is a Like
+        stipulate repository_actor_uri(repo) = "https://forge.local/api/v1/activitypub/repository-id/3"
+        peer cannot do RemoteActorLikesRepository(peer, bob, repo, "https://forge.local/api/v1/activitypub/repository-id/3", now) on RepositoryActorEndpoint
+
+    ends: Only Bob's own key acts for Bob.
+}
+
+-- Decision federation 2: only public people and public repositories are actors.
+journey OnlyPublicPeopleAndRepositoriesAreActors {
+    goal: Alice, who is public, can be fetched and followed from afar; Dave,
+          who is private, and a private repository cannot be reached at all.
+
+    after: ARemotePersonIsMetForTheFirstTime
+
+    cast:
+        dave:   accounts/User
+        secret: repositories/Repository
+
+    given:
+        dave.kind = individual
+        dave.visibility = private
+        secret.is_private = true
+
+    1. alice's actor document is served
+        peer does RemoteFetchesPersonActor(peer, alice) on PersonActorEndpoint
+        then ServePersonActor fires
+
+    2. dave's is not
+        peer cannot do RemoteFetchesPersonActor(peer, dave) on PersonActorEndpoint
+
+    3. nor can bob follow dave
+        peer cannot do RemoteActorFollowsUser(peer, bob, dave) on PersonActorEndpoint
+
+    4. nor star the private repository
+        stipulate repository_actor_uri(secret) = "https://forge.local/api/v1/activitypub/repository-id/4"
+        peer cannot do RemoteActorLikesRepository(peer, bob, secret, "https://forge.local/api/v1/activitypub/repository-id/4", now) on RepositoryActorEndpoint
+
+    ends: Nothing that is not public is visible to, or starrable from, other servers.
+}
+
+-- Decision federation 3: the person outbox lists the user's own public activities.
+journey AlicesOutboxShowsHerOwnPublicActivity {
+    goal: A remote server reading Alice's outbox sees what she did in
+          public, and not what she did in private.
+
+    cast:
+        made:   notifications/Activity
+        hidden: notifications/Activity
+
+    given:
+        made.actor = alice
+        made.content = "created a new repository"
+        hidden.actor = alice
+        hidden.content = "pushed to a private repository"
+        activity_is_public(made) = true
+        activity_is_public(hidden) = false
+
+    1. the public activity is listed
+        peer sees made.content on PersonActorEndpoint in alice
+
+    2. the private one is not
+        peer cannot see hidden.content on PersonActorEndpoint in alice
+
+    ends: The outbox is Alice's public activity, as her followers receive it.
+}
+
 
 journey AliceFollowsSomeoneElsewhere {
     goal: Alice looks up Bob by his actor URI and follows him; a signed
@@ -208,6 +400,40 @@ journey ADeliveryIsEventuallyAbandoned {
     ends: The delivery is abandoned and never retried.
 }
 
+-- Decision federation 8: retries back off exponentially.
+journey RetriesBackOff {
+    goal: Each failed attempt doubles the wait before the next one.
+
+    given:
+        slow: Delivery { sender: alice, inbox_uri: "https://slow.example/inbox", kind: user_activity, attempts: 0, max_attempts: 10, status: queued, next_attempt_at: now, retry_delay: 5.seconds }
+
+    1. the first attempt fails; the next comes 5 seconds later
+        stipulate remote_inbox_accepts(slow, 1) = false
+        after 1.second
+        then AttemptDelivery fires
+        then slow.attempts = 1
+        then slow.retry_delay = 10.seconds
+
+    2. the second attempt fails too; now the wait is 10 seconds
+        stipulate remote_inbox_accepts(slow, 2) = false
+        after 5.seconds
+        then slow.attempts = 2
+        then slow.retry_delay = 20.seconds
+
+    3. five seconds on, it has not been tried again
+        after 5.seconds
+        then slow.attempts = 2
+        then slow.status = queued
+
+    4. ten seconds after the failure, the third attempt goes through
+        stipulate remote_inbox_accepts(slow, 3) = true
+        after 5.seconds
+        then slow.attempts = 3
+        then slow.status = delivered
+
+    ends: The inbox got the activity on the third attempt, after waits of 5 and 10 seconds.
+}
+
 journey ARepositoryAdminFollowsARemoteRepository {
     goal: A repository admin points the repository at a remote repository;
           a non-admin cannot.
@@ -240,6 +466,77 @@ journey ARepositoryAdminFollowsARemoteRepository {
     ends: The repository follows code.example's repository 12; local stars on
           it will be sent there as Likes.
 }
+
+-- Decisions federation 5 and 8: a local star sends a Like through the
+-- retrying queue (Forgejo tried once), and a local unstar sends Undo(Like)
+-- (Forgejo sent nothing).
+journey AliceStarsAndUnstarsAFollowingRepository {
+    goal: Alice stars the repository that follows code.example's repository
+          12; a Like is queued there with the usual retries. When she
+          unstars, an Undo(Like) follows it.
+
+    after: ARepositoryAdminFollowsARemoteRepository
+
+    1. alice stars it
+        stipulate can_see_repository(alice, repo) = true
+        alice does UserStarsRepository(alice, repo) on RepositoryOverview
+            creating star: repositories/Star
+            creating sent_like: Delivery
+        then FederateLocalStar fires
+        then sent_like.kind = like
+        then sent_like.sender = alice
+        then sent_like.max_attempts = 10
+        then sent_like.status = queued
+
+    2. alice unstars it
+        alice does UserUnstarsRepository(alice, star) on MyStarsAndWatches
+            creating undo: Delivery
+        then FederateLocalUnstar fires
+        then undo.kind = undo_like
+        then undo.max_attempts = 10
+
+    ends: Code.example's repository is told of the star and of its withdrawal.
+}
+
+-- Decision federation 7: the following-repos list is limited on write.
+journey TooManyFollowingRepositoriesAreRefused {
+    goal: With room for one following repository, a list of two is refused
+          as a whole; one alone is stored.
+
+    cast:
+        first:  RemoteActor
+        second: RemoteActor
+
+    given:
+        federation/config.max_following_repos_liked = 1
+        first.kind = repository
+        first.uri = "https://code.example/api/v1/activitypub/repository-id/12"
+        first.scheme = "https"
+        first.host_fqdn = "code.example"
+        first.host_port = 443
+        first.external_id = "12"
+        first.host_software = forgejo
+        second.kind = repository
+        second.uri = "https://code.example/api/v1/activitypub/repository-id/13"
+        second.scheme = "https"
+        second.host_fqdn = "code.example"
+        second.host_port = 443
+        second.external_id = "13"
+        second.host_software = forgejo
+        is_repo_admin(alice, repo) = true
+
+    1. two are one too many
+        stipulate following_input_length({first, second}) = 117
+        alice cannot do RepoAdminSetsFollowingRepos(alice, repo, {first, second}) on RepositoryFederationSettings
+
+    2. one fits
+        stipulate following_input_length({first}) = 58
+        alice does RepoAdminSetsFollowingRepos(alice, repo, {first}) on RepositoryFederationSettings
+        then RecordFollowingRepo fires
+
+    ends: The repository follows exactly one remote repository.
+}
+
 
 journey FederationAdminPagesAreForAdminsOnly {
     goal: Site admins can list known hosts; others cannot see them.

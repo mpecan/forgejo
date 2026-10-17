@@ -883,8 +883,11 @@ rule ViewerSearchesRepositories {
 -- Keyword matches (case-insensitively) the login name or full name, and in
 -- the API scope also the email address — but an email only matches when it
 -- is not kept private, or belongs to the viewer, or the viewer is a site
--- admin. Only individual (and remote) accounts are listed; the explore and
+-- admin. Only individual accounts are listed — never remote fediverse
+-- people (kind activitypub), who appear only where they act; the explore and
 -- picker scopes list only activated accounts.
+-- decided: federation 10 (remote people are excluded from the user explore
+-- page and searches; Forgejo listed their materialised accounts).
 -- from: routers/web/explore/user.go:121
 rule ViewerSearchesUsers {
     when: ViewerSearchesUsers(viewer, scope, keyword, sort)
@@ -2127,7 +2130,15 @@ invariant UserSearchShowsOnlyListable {
             listable_account(u, s.viewer)
 }
 
+-- decided: federation 10.
+invariant UserSearchExcludesRemotePeople {
+    for s in UserSearches:
+        for u in s.results:
+            u.kind != activitypub
+}
+
 invariant ExploreAndPickerListOnlyActiveUsers {
+
     for s in UserSearches:
         for u in s.results:
             s.scope != api implies u.is_active

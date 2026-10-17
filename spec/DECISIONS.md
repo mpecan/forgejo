@@ -295,3 +295,7 @@ invariants or config. Numbers refer to the question's position in its module in
 | 2 | Private accounts in user search | **Unified with profile visibility:** search shows exactly the accounts whose profile the searcher may view. |
 | 3 | API user search when the explore users page is off | **Kept for signed-in users;** only the public directory is hidden. |
 | 4 | Indexer not ready at startup | **Degrade:** search reports unavailable until the indexer is ready, and admins get a system notice. |
+| 5 | Admin code search | **Readable repositories only;** search follows normal read access. |
+| 6 | Profile tabs' default sort | **Their own default** (recently updated), independent of the explore setting. |
+| 7 | Review comments in issue search | **Indexed;** they make their pull request findable. |
+| 8 | "Relevant only" heuristic | **Avatar dropped;** relevance comes from activity (repositories, recent sign-in). |

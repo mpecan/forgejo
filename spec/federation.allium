@@ -4,16 +4,17 @@
 -- Scope: everything that lets this instance talk to other fediverse servers.
 --   The instance is exposed as ActivityPub actors (one instance actor, one
 --   Person per local user, one Repository per local repository), accepts a
---   small set of activities into actor inboxes (Like on a repository = remote
---   star; Follow / Undo(Follow) / Accept(Follow) / Create(Note) on a person),
---   sends a small set of activities out (Follow, Accept(Follow), Create(Note)
---   describing a local user's public activity, Like for a local star on a
---   repository that "follows" remote repositories), signs and verifies HTTP
+--   small set of activities into actor inboxes (Like / Undo(Like) on a
+--   repository = remote star / unstar; Follow / Undo(Follow) / Accept(Follow) /
+--   Create(Note) on a person), sends a small set of activities out (Follow,
+--   Accept(Follow), Create(Note) describing a local user's public activity,
+--   Like / Undo(Like) for a local star / unstar on a repository that "follows"
+--   remote repositories), signs and verifies HTTP
 --   signatures, remembers remote servers (FederationHost) and remote people
 --   (FederatedUser, materialised as accounts/User of kind activitypub), and
 --   answers WebFinger and NodeInfo discovery.
--- Includes: FederationHost, FederatedUser, FederatedFollower, FollowingRepo,
---   FederatedActivity (notes received by a local user), ActorKeyPair,
+-- Includes: FederationHost, FederatedUser, FederatedFollower, OutboundFollow,
+--   FollowingRepo, FederatedActivity (notes received by a local user), ActorKeyPair,
 --   InstanceActor, Delivery (outbound delivery queue), NodeInfo; remote actor
 --   documents as the external entity RemoteActor; the signature gate on every
 --   inbound request; host discovery through NodeInfo; key caching and key
@@ -21,9 +22,6 @@
 --   setting; the profile "feed" tab; WebFinger; NodeInfo.
 -- Excludes:
 --   - F3 (Friendly Forge Format): not present in this code base; nothing to specify.
---   - Undo(Like) / federated unstar: a ForgeUndoLike value exists in
---     modules/forgefed but no inbox accepts it and unstarring never sends it.
---     Recorded as an open question rather than invented.
 --   - Host/actor blocklists and allowlists: none exist (only the generic
 --     private/loopback network guard on the outbound client, specified as a
 --     contract). Admin pages are read-only.
@@ -44,6 +42,7 @@
 --   RemoteUserUnfollowedUser(user, federated_user)
 --   RemoteFollowAccepted(user, federated_user)
 --   FederatedStarReceived(federated_user, repository)
+--   FederatedStarWithdrawn(federated_user, repository)
 --   FederatedNoteReceived(activity)                   -- activity: FederatedActivity
 --   ActivityDelivered(delivery) / ActivityDeliveryAbandoned(delivery)
 -- Gating: [federation] ENABLED (config.enabled, default off) decides whether
@@ -53,6 +52,7 @@
 --   star, local activity).
 -- Reacts to:
 --   repositories/Star.created                         -- local star -> outbound Like
+--   repositories/RepositoryUnstarred(user, repository) -- local unstar -> outbound Undo(Like)
 --   notifications/ActivityRecorded(activity)          -- public local activity -> Create(Note) to remote followers
 --   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)  -- forget the federated-user record
 --   repositories/RepositoryDeleted(repository, doer)  -- forget its following repos
@@ -106,11 +106,15 @@ external entity RemoteActor {
 ------------------------------------------------------------
 
 -- Usage figures published through NodeInfo when statistics sharing is on.
+-- The user figures count local people only: remote fediverse people
+-- (accounts of kind activitypub) are never counted.
+-- decided: federation 10 (remote people are excluded from NodeInfo totals;
+-- Forgejo counted their materialised accounts).
 -- from: routers/api/v1/misc/nodeinfo.go:41
 value NodeInfoUsage {
-    users_total: Integer
-    users_active_month: Integer          -- signed in within the last month
-    users_active_halfyear: Integer       -- signed in within the last six months
+    users_total: Integer                 -- local accounts, excluding kind activitypub
+    users_active_month: Integer          -- local accounts signed in within the last month
+    users_active_halfyear: Integer       -- local accounts signed in within the last six months
     local_posts: Integer                 -- number of issues and pull requests
     local_comments: Integer
 }
@@ -152,6 +156,12 @@ contract SignedFederationClient {
 contract SignatureVerifier {
     verify: (request: RemoteParty) -> Boolean
 
+    @invariant SignerIsActor
+        -- decided: federation 1. An inbound activity is accepted only when
+        -- the key that signed it belongs to the activity's actor (the
+        -- FederatedUser's cached key id); a valid signature by any other
+        -- known key is refused. Forgejo accepted any verifying key.
+
     @invariant KeyResolution
         -- The keyId is looked up first among cached FederatedUser keys, then
         -- among cached FederationHost (instance actor) keys. An unknown keyId
@@ -177,7 +187,7 @@ enum RemoteSoftware { forgejo | gitea | mastodon | gotosocial | other }
 enum RemoteActorKind { person | application | repository | other }
 
 -- from: services/federation/delivery_queue.go:19
-enum DeliveryKind { follow | accept_follow | user_activity | like }
+enum DeliveryKind { follow | accept_follow | user_activity | like | undo_like }
 
 ------------------------------------------------------------
 -- Entities
@@ -191,7 +201,7 @@ entity FederationHost {
     host_port: Integer
     host_scheme: String                  -- http | https
     software: RemoteSoftware
-    latest_activity: Timestamp?          -- published time of the newest accepted Like from this host
+    latest_activity: Timestamp?          -- newest accepted Like / Undo(Like) from any actor on this host (informational; replay protection is per actor)
     key_id: String?                      -- the host's instance-actor key, once seen
     public_key: String?
     created_at: Timestamp
@@ -218,8 +228,10 @@ entity FederatedUser {
     inbox_path: String
     key_id: String?
     public_key: String?
+    latest_activity: Timestamp?          -- published time of the newest accepted Like / Undo(Like) from this actor
 
     following: FederatedFollower with follower = this
+    followed_by_locals: OutboundFollow with followed = this
     sent_notes: FederatedActivity with actor = this
 }
 
@@ -229,6 +241,23 @@ entity FederatedUser {
 entity FederatedFollower {
     followed: accounts/User
     follower: FederatedUser
+}
+
+-- A local user following a remote person. Pending from the moment the
+-- Follow is sent until the remote answers Accept(Follow); only accepted
+-- follows let that person's notes into the local user's feed.
+-- decided: federation 4 (follows are recorded; notes only from accepted
+-- follows). Forgejo recorded nothing.
+entity OutboundFollow {
+    follower: accounts/User
+    followed: FederatedUser
+    status: pending | accepted
+    created_at: Timestamp
+
+    transitions status {
+        pending -> accepted
+        terminal: accepted
+    }
 }
 
 -- A remote repository actor that a local repository "follows": local stars
@@ -242,7 +271,7 @@ entity FollowingRepo {
 }
 
 -- A Note a remote actor sent (Create activity) to a local user's inbox,
--- shown on that user's "feed" profile tab and in their person outbox.
+-- shown on that user's own "feed" profile tab only (never in the outbox).
 -- from: models/activities/federated_user_activity.go:20
 entity FederatedActivity {
     recipient: accounts/User
@@ -285,6 +314,7 @@ entity Delivery {
     attempts: Integer
     max_attempts: Integer
     next_attempt_at: Timestamp
+    retry_delay: Duration                -- wait before the next retry; doubles after each failure
     status: queued | delivered | abandoned
 
     transitions status {
@@ -341,7 +371,8 @@ config {
     request_timeout: Duration = 5.seconds
     signature_validity: Duration = 60.seconds
     max_delivery_attempts: Integer = 10
-    delivery_retry_delay: Duration = 5.seconds     -- queue re-push delay for failed items
+    delivery_retry_delay: Duration = 5.seconds     -- first retry delay; doubles after each failure (decided: federation 8)
+
     max_activity_clock_skew: Duration = 10.minutes
     max_following_repos_input_length: Integer = 2048
     max_following_repos_liked: Integer = 10
@@ -442,7 +473,8 @@ rule MaterialiseFederatedUser {
             original_url: remote.canonical_uri,
             inbox_path: remote.inbox_path,
             key_id: remote.key_id,
-            public_key: remote.public_key
+            public_key: remote.public_key,
+            latest_activity: null
         )
         FederatedUserMaterialised(federated_user: federated)
     @guidance
@@ -485,28 +517,61 @@ rule CacheHostInstanceActorKey {
 -- Rules: repository inbox
 ------------------------------------------------------------
 
--- Like on a repository actor = a remote star. Replay protection is per host:
--- a Like whose published time is not newer than the newest one already
--- accepted from that host is refused.
+-- Like on a repository actor = a remote star. Replay protection is per
+-- remote actor: a Like whose published time is not newer than the newest
+-- Like or Undo(Like) already accepted from that actor is refused.
+-- Only public repositories are federated actors (decided: federation 2);
+-- the signer must be the actor (decided: federation 1).
+-- decided: federation 9 (replay protection per remote actor; Forgejo kept
+-- one latest_activity per host, dropping out-of-order Likes of two users).
 -- from: services/federation/repository_inbox_like.go:33
 rule AcceptFederatedLike {
     when: RemoteActorLikesRepository(peer, actor, repository, object_uri, published_at)
     requires: config.enabled
-    requires: not config.signature_enforced or peer.signature_valid
+    requires: not config.signature_enforced or (peer.signature_valid and peer.signing_key_id = actor.key_id)
+    requires: repository.is_private = false
     requires: object_uri = repository_actor_uri(repository)
-    requires: actor.host.latest_activity = null or published_at > actor.host.latest_activity
+    requires: actor.latest_activity = null or published_at > actor.latest_activity
     requires: published_at <= now + config.max_activity_clock_skew
     let already_starred = exists repositories/Star{user: actor.user, repository: repository}
     ensures:
         if not already_starred:
-            repositories/Star.created(user: actor.user, repository: repository)
+            repositories/Star.created(user: actor.user, repository: repository, created_at: now)
             FederatedStarReceived(federated_user: actor, repository: repository)
-    ensures: actor.host.latest_activity = published_at
+    ensures: actor.latest_activity = published_at
+    ensures:
+        if actor.host.latest_activity = null or published_at > actor.host.latest_activity:
+            actor.host.latest_activity = published_at
     ensures: actor.host.updated_at = now
     @guidance
         -- The object must be this repository's own actor URI (a Forgejo
         -- repository actor path whose id equals the inbox's repository id).
         -- Any other activity type on a repository inbox is refused.
+}
+
+-- Undo(Like) on a repository actor withdraws that remote person's star.
+-- Same gates and per-actor replay protection as Like; undoing a star that
+-- does not exist is refused.
+-- decided: federation 5 (Undo(Like) is accepted inbound; Forgejo had no
+-- inbox for it, so remote stars could never be withdrawn).
+-- from: modules/forgefed/activity_undo_like.go:21
+rule AcceptFederatedUndoLike {
+    when: RemoteActorUndoesLike(peer, actor, repository, object_uri, published_at)
+    requires: config.enabled
+    requires: not config.signature_enforced or (peer.signature_valid and peer.signing_key_id = actor.key_id)
+    requires: repository.is_private = false
+    requires: object_uri = repository_actor_uri(repository)
+    requires: actor.latest_activity = null or published_at > actor.latest_activity
+    requires: published_at <= now + config.max_activity_clock_skew
+    let star = repositories/Star{user: actor.user, repository: repository}
+    requires: exists star
+    ensures: not exists star
+    ensures: FederatedStarWithdrawn(federated_user: actor, repository: repository)
+    ensures: actor.latest_activity = published_at
+    ensures:
+        if actor.host.latest_activity = null or published_at > actor.host.latest_activity:
+            actor.host.latest_activity = published_at
+    ensures: actor.host.updated_at = now
 }
 
 ------------------------------------------------------------
@@ -515,11 +580,15 @@ rule AcceptFederatedLike {
 
 -- A remote person follows a local user: record it and answer with an
 -- Accept(Follow) signed by the local user. Following twice is a no-op.
+-- Only public people are federated actors.
+-- decided: federation 1 (the signing key must be the actor's) and
+-- federation 2 (only public users are actors; anyone else is not found).
 -- from: services/federation/person_inbox_follow.go:18
 rule AcceptRemoteFollow {
     when: RemoteActorFollowsUser(peer, actor, user)
     requires: config.enabled
-    requires: not config.signature_enforced or peer.signature_valid
+    requires: not config.signature_enforced or (peer.signature_valid and peer.signing_key_id = actor.key_id)
+    requires: user.kind in {individual, bot} and user.visibility = public
     requires: not exists FederatedFollower{followed: user, follower: actor}
     ensures:
         let follower = FederatedFollower.created(followed: user, follower: actor)
@@ -531,6 +600,7 @@ rule AcceptRemoteFollow {
             attempts: 0,
             max_attempts: config.max_delivery_attempts,
             next_attempt_at: now,
+            retry_delay: config.delivery_retry_delay,
             status: queued
         )
         RemoteUserFollowedUser(follower: follower)
@@ -539,35 +609,54 @@ rule AcceptRemoteFollow {
 
 -- Undo(Follow): stop delivering to that follower. Undo of anything other
 -- than a Follow is refused; undoing a follow that does not exist is a no-op.
+-- decided: federation 1 (the signing key must be the actor's).
 -- from: services/federation/person_inbox_undo.go:15
 rule AcceptRemoteUnfollow {
     when: RemoteActorUndoesFollow(peer, actor, user)
     requires: config.enabled
-    requires: not config.signature_enforced or peer.signature_valid
+    requires: not config.signature_enforced or (peer.signature_valid and peer.signing_key_id = actor.key_id)
+    requires: user.kind in {individual, bot} and user.visibility = public
     let existing = FederatedFollower{followed: user, follower: actor}
     requires: exists existing
     ensures: not exists existing
     ensures: RemoteUserUnfollowedUser(user: user, federated_user: actor)
 }
 
--- Accept(Follow) answering a follow a local user sent: acknowledged and
--- otherwise ignored (nothing records outbound follows).
+-- Accept(Follow) answering a follow a local user sent: the pending follow
+-- becomes accepted. An Accept for a follow nobody sent (or one already
+-- accepted) is refused.
+-- decided: federation 4 (follows are recorded, pending until Accept) and
+-- federation 1 (the signing key must be the actor's). Forgejo only
+-- acknowledged the Accept.
 -- from: services/federation/person_inbox_accept.go:14
 rule AcknowledgeFollowAccepted {
     when: RemoteActorAcceptsFollow(peer, actor, user)
     requires: config.enabled
-    requires: not config.signature_enforced or peer.signature_valid
+    requires: not config.signature_enforced or (peer.signature_valid and peer.signing_key_id = actor.key_id)
+    requires: user.kind in {individual, bot} and user.visibility = public
+    let follow = OutboundFollow{follower: user, followed: actor}
+    requires: exists follow
+    requires: follow.status = pending
+    ensures: follow.status = accepted
     ensures: RemoteFollowAccepted(user: user, federated_user: actor)
 }
 
 -- Create(Note) addressed to a local user: kept in that user's federated
--- feed. The sender must already be a known FederatedUser.
+-- feed. The sender must be someone the user follows, with the follow
+-- accepted; notes from anyone else are refused.
+-- decided: federation 4 (notes only from accepted follows; Forgejo took
+-- them from any known federated user) and federation 1 (signer is actor).
 -- from: services/federation/person_inbox_create.go:17
 rule RecordFederatedNote {
     when: RemoteActorSendsNote(peer, actor, user, note_content, note_url, original)
     requires: config.enabled
-    requires: not config.signature_enforced or peer.signature_valid
+    requires: not config.signature_enforced or (peer.signature_valid and peer.signing_key_id = actor.key_id)
+    requires: user.kind in {individual, bot} and user.visibility = public
+    let follow = OutboundFollow{follower: user, followed: actor}
+    requires: exists follow
+    requires: follow.status = accepted
     requires: note_content != ""
+
     requires: note_url != ""
     ensures:
         let activity = FederatedActivity.created(
@@ -625,12 +714,15 @@ rule ServeInstanceActor {
 }
 
 -- Fetching a local Person actor (signed request) publishes the user's
--- public key, generating the pair on first use.
+-- public key, generating the pair on first use. Only public people are
+-- actors; anyone else (private or limited users, organisations) is not found.
+-- decided: federation 2 (Forgejo served every account by id, unchecked).
 -- from: routers/api/v1/activitypub/person.go:23
 rule ServePersonActor {
     when: RemoteFetchesPersonActor(peer, user)
     requires: config.enabled
     requires: not config.signature_enforced or peer.signature_valid
+    requires: user.kind in {individual, bot} and user.visibility = public
     ensures: ActorKeyPairNeeded(user: user)
 }
 
@@ -648,14 +740,19 @@ rule UserLooksUpRemoteActor {
     ensures: RemoteActorReferenced(remote: remote)
 }
 
--- A local user follows a remote person: a Follow is queued to the remote
--- inbox, signed by the user. Nothing is recorded locally; an Accept that
--- comes back is merely acknowledged.
+-- A local user follows a remote person: the follow is recorded as pending
+-- and a Follow is queued to the remote inbox, signed by the user. Following
+-- someone already followed (pending or accepted) is refused. Only a public
+-- person can follow out: anyone else is no actor the remote could verify.
+-- decided: federation 4 (outbound follows are recorded, pending until
+-- Accept; Forgejo recorded nothing) and federation 2 (public users only).
 -- from: services/federation/person_service.go:36
 rule UserFollowsRemoteActor {
     when: UserFollowsRemoteActor(user, target)
     requires: config.enabled
-    requires: user.kind != activitypub
+    requires: user.kind in {individual, bot} and user.visibility = public
+    requires: not exists OutboundFollow{follower: user, followed: target}
+    ensures: OutboundFollow.created(follower: user, followed: target, status: pending, created_at: now)
     ensures: ActorKeyPairNeeded(user: user)
     ensures: Delivery.created(
         sender: user,
@@ -665,6 +762,7 @@ rule UserFollowsRemoteActor {
         attempts: 0,
         max_attempts: config.max_delivery_attempts,
         next_attempt_at: now,
+        retry_delay: config.delivery_retry_delay,
         status: queued
     )
 }
@@ -674,12 +772,14 @@ rule UserFollowsRemoteActor {
 -- An activity is public only when the action is not private, its repository
 -- is public, and neither the repository owner nor the acting user is
 -- non-public or hides their activity.
+-- decided: federation 6 (one delivery per action per following inbox;
+-- Forgejo pushed once per watcher copy of the action, duplicating notes).
 -- from: services/federation/user_activity.go:62
 rule FederateLocalActivity {
     when: notifications/ActivityRecorded(activity)
     requires: config.enabled
     requires: activity_is_public(activity)
-    let actor = activity.act_user
+    let actor = activity.actor
     ensures:
         for f in FederatedFollowers where followed = actor:
             Delivery.created(
@@ -690,6 +790,7 @@ rule FederateLocalActivity {
                 attempts: 0,
                 max_attempts: config.max_delivery_attempts,
                 next_attempt_at: now,
+                retry_delay: config.delivery_retry_delay,
                 status: queued
             )
     @guidance
@@ -705,13 +806,19 @@ rule FederateLocalActivity {
 }
 
 -- A local star on a repository that follows remote repositories sends a
--- Like to each of them (at most config.max_following_repos_liked), signed
--- by the starring user. Stars by remote users never echo outwards.
+-- Like to each of them, signed by the starring user, through the same
+-- retrying queue as every other activity. Stars by remote users never echo
+-- outwards; a person or repository that is not public is no federated actor
+-- and sends nothing.
+-- decided: federation 8 (Likes use the retrying queue with backoff;
+-- Forgejo posted them once, synchronously, never retried). The list is
+-- bounded on write (federation 7), so every following repository is sent one.
 -- from: services/repository/star.go:15
 rule FederateLocalStar {
     when: star: repositories/Star.created
     requires: config.enabled
-    requires: star.user.kind != activitypub
+    requires: star.user.kind in {individual, bot} and star.user.visibility = public
+    requires: star.repository.is_private = false
     ensures: ActorKeyPairNeeded(user: star.user)
     ensures:
         for target in FollowingRepos where repository = star.repository:
@@ -721,26 +828,60 @@ rule FederateLocalStar {
                 kind: like,
                 published_at: now,
                 attempts: 0,
-                max_attempts: 1,
+                max_attempts: config.max_delivery_attempts,
                 next_attempt_at: now,
+                retry_delay: config.delivery_retry_delay,
                 status: queued
             )
     @guidance
-        -- Forgejo posts these Likes immediately, once, best-effort (failures
-        -- are logged, never retried), and staggers their published times by
-        -- one second each so a host that receives several sees them as
-        -- strictly newer. Unstarring sends nothing.
+        -- Forgejo staggers the published times of several Likes by one
+        -- second each so a host that receives several sees them as
+        -- strictly newer; with per-actor replay protection (federation 9)
+        -- each Like's published time need only be its own action's time.
+}
+
+-- A local unstar on a repository that follows remote repositories sends
+-- Undo(Like) to each of them, signed by the user who unstarred, so the
+-- remote star they caused is withdrawn.
+-- decided: federation 5 (Undo(Like) is sent on local unstar; Forgejo sent
+-- nothing).
+-- from: modules/forgefed/activity_undo_like.go:21
+rule FederateLocalUnstar {
+    when: repositories/RepositoryUnstarred(user, repository)
+    requires: config.enabled
+    requires: user.kind in {individual, bot}
+    ensures: ActorKeyPairNeeded(user: user)
+    ensures:
+        for target in FollowingRepos where repository = repository:
+            Delivery.created(
+                sender: user,
+                inbox_uri: repository_inbox_uri(target),
+                kind: undo_like,
+                published_at: now,
+                attempts: 0,
+                max_attempts: config.max_delivery_attempts,
+                next_attempt_at: now,
+                retry_delay: config.delivery_retry_delay,
+                status: queued
+            )
+    @guidance
+        -- Sent also when the star went because the user lost access (the
+        -- repository went private): the Like it withdraws was public.
 }
 
 -- The delivery worker: POST the activity, signed by the sender. A 2xx/3xx
--- answer delivers it; otherwise it is retried (after
--- config.delivery_retry_delay) until max_attempts.
+-- answer delivers it; otherwise it is retried with exponential backoff —
+-- first after config.delivery_retry_delay, then twice as long after each
+-- further failure — until max_attempts.
+-- decided: federation 8 (one retrying queue with exponential backoff for
+-- every activity; Forgejo re-pushed failures after a fixed delay).
 -- from: services/federation/delivery_queue.go:39
 rule AttemptDelivery {
     when: delivery: Delivery.next_attempt_at <= now
     requires: delivery.status = queued
     let attempt = delivery.attempts + 1
     let accepted = remote_inbox_accepts(delivery, attempt)
+    let wait = delivery.retry_delay
     ensures: delivery.attempts = attempt
     ensures:
         if accepted:
@@ -751,7 +892,8 @@ rule AttemptDelivery {
                 delivery.status = abandoned
                 ActivityDeliveryAbandoned(delivery: delivery)
             else:
-                delivery.next_attempt_at = now + config.delivery_retry_delay
+                delivery.next_attempt_at = now + wait
+                delivery.retry_delay = wait + wait
 }
 
 ------------------------------------------------------------
@@ -760,15 +902,20 @@ rule AttemptDelivery {
 
 -- A repository admin replaces the list of remote repositories this
 -- repository follows (";"-separated in the UI, at most
--- config.max_following_repos_input_length characters). Every entry must be
+-- config.max_following_repos_input_length characters and at most
+-- config.max_following_repos_liked entries). Every entry must be
 -- a repository actor on a Forgejo or Gitea host; the whole list is rejected
 -- if one is not. An empty list clears it.
+-- decided: federation 7 (the list is limited on write to
+-- max_following_repos_liked entries; Forgejo stored any number and Liked
+-- only the first ten).
 -- from: routers/web/repo/setting/setting.go:397
 rule RepoAdminSetsFollowingRepos {
     when: RepoAdminSetsFollowingRepos(admin, target, remotes)
     requires: config.enabled
     requires: is_repo_admin(admin, target)
     requires: following_input_length(remotes) <= config.max_following_repos_input_length
+    requires: remotes.count <= config.max_following_repos_liked
     requires: remotes.all(r => r.kind = repository)
     requires: remotes.all(r => r.host_software in {forgejo, gitea})
     let previous = FollowingRepos where repository = target
@@ -818,6 +965,9 @@ rule ForgetFederatedUserOfDeletedAccount {
         for f in federated.following:
             not exists f
     ensures:
+        for o in federated.followed_by_locals:
+            not exists o
+    ensures:
         for n in federated.sent_notes:
             not exists n
     ensures: not exists federated
@@ -829,10 +979,14 @@ rule ForgetFederationStateOfDeletedLocalUser {
     when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
     requires: kind != activitypub
     let followers = FederatedFollowers where followed = user
+    let followed = OutboundFollows where follower = user
     let notes = FederatedActivities where recipient = user
     ensures:
         for f in followers:
             not exists f
+    ensures:
+        for o in followed:
+            not exists o
     ensures:
         for n in notes:
             not exists n
@@ -840,12 +994,17 @@ rule ForgetFederationStateOfDeletedLocalUser {
 
 -- NodeInfo usage figures are recomputed at most every
 -- config.nodeinfo_usage_cache; viewers may see figures that old.
+-- decided: federation 10 (remote people are excluded from the totals).
 -- from: routers/api/v1/misc/nodeinfo.go:29
 rule RefreshNodeInfoUsage {
     when: info: NodeInfo.usage_computed_at + config.nodeinfo_usage_cache <= now
     requires: config.share_user_statistics
     ensures: info.usage = current_usage()
     ensures: info.usage_computed_at = now
+    @guidance
+        -- current_usage() counts accounts of kind individual and bot only:
+        -- materialised remote people (kind activitypub) appear only where
+        -- they act (stars, followers, feeds), never in the user figures.
 }
 
 ------------------------------------------------------------
@@ -880,8 +1039,21 @@ invariant FederatedAccountsCannotSignIn {
         f.user.kind = activitypub and f.user.prohibit_login and not f.user.is_admin
 }
 
+invariant UniqueOutboundFollow {
+    for a in OutboundFollows:
+        for b in OutboundFollows:
+            a != b and a.follower = b.follower implies a.followed != b.followed
+}
+
+-- decided: federation 7 (following repos are bounded on write).
+invariant FollowingReposWithinLimit {
+    for r in repositories/Repositories:
+        (FollowingRepos where repository = r).count <= config.max_following_repos_liked
+}
+
 -- from: models/user/federated_user_follower.go:10
 invariant UniqueFederatedFollower {
+
     for a in FederatedFollowers:
         for b in FederatedFollowers:
             a != b and a.followed = b.followed implies a.follower != b.follower
@@ -954,21 +1126,26 @@ surface InstanceActorEndpoint {
         -- activitypub scope (authentication module).
 }
 
--- A local user as an ActivityPub Person, and its inbox.
+-- A local user as an ActivityPub Person, and its inbox. Only public people
+-- (individuals and bots with public visibility) are actors; any other
+-- account id answers not found.
+-- decided: federation 2 (public users only) and federation 3 (the outbox
+-- lists the user's own public activities; Forgejo listed the notes the user
+-- had received).
 -- from: routers/api/v1/activitypub/person.go:23
 surface PersonActorEndpoint {
     facing peer: RemoteParty
-    context user: accounts/User where kind != activitypub
+    context user: accounts/User where kind in {individual, bot} and visibility = public
 
     exposes:
         user.name
         user.full_name
         person_actor_uri(user)
         user_public_key(user)
-        for n in FederatedActivities where recipient = user:
-            n.actor_uri
-            n.note_content
-            n.note_url
+        for a in notifications/Activities where actor = user:
+            a.kind when activity_is_public(a)
+            a.content when activity_is_public(a)
+            a.created_at when activity_is_public(a)
 
     provides:
         RemoteFetchesPersonActor(peer, user)
@@ -988,12 +1165,13 @@ surface PersonActorEndpoint {
 
     @guarantee SignedAccessOnly
         -- Every endpoint here answers only requests whose HTTP signature
-        -- verifies (unless signature enforcement is off).
+        -- verifies (unless signature enforcement is off), and inbox
+        -- activities only when the signing key is the activity actor's.
 
     @guidance
         -- GET  /api/v1/activitypub/user-id/{id}                         Person (name, preferredUsername, url, avatar icon, inbox, outbox, publicKey)
         -- POST /api/v1/activitypub/user-id/{id}/inbox                   Follow | Undo(Follow) | Accept(Follow) | Create(Note); anything else refused
-        -- GET  /api/v1/activitypub/user-id/{id}/outbox                  OrderedCollection of the Notes this user *received* (paginated)
+        -- GET  /api/v1/activitypub/user-id/{id}/outbox                  OrderedCollection of this user's own public activities as Create(Note) (paginated)
         -- GET  /api/v1/activitypub/user-id/{id}/activities/{aid}        the Note of one public action by this user
         -- GET  /api/v1/activitypub/user-id/{id}/activities/{aid}/activity  the Create activity wrapping it
         -- The activity endpoints answer not-found unless the action was
@@ -1003,11 +1181,13 @@ surface PersonActorEndpoint {
         -- activities 204; malformed or unsupported ones "not acceptable".
 }
 
--- A local repository as a ForgeFed Repository actor, and its inbox.
+-- A local repository as a ForgeFed Repository actor, and its inbox. Only
+-- public repositories are actors; a private one answers not found.
+-- decided: federation 2 (public repositories only).
 -- from: routers/api/v1/activitypub/repository.go:24
 surface RepositoryActorEndpoint {
     facing peer: RemoteParty
-    context repository: repositories/Repository
+    context repository: repositories/Repository where is_private = false
 
     exposes:
         repository.name
@@ -1017,10 +1197,12 @@ surface RepositoryActorEndpoint {
         RemoteRequestSigned(peer, signer)
         RemoteActorLikesRepository(peer, actor, repository, object_uri, published_at)
             when not config.signature_enforced or peer.signature_valid
+        RemoteActorUndoesLike(peer, actor, repository, object_uri, published_at)
+            when not config.signature_enforced or peer.signature_valid
 
     @guidance
         -- GET  /api/v1/activitypub/repository-id/{id}          Repository (name, inbox, outbox)
-        -- POST /api/v1/activitypub/repository-id/{id}/inbox    Like only
+        -- POST /api/v1/activitypub/repository-id/{id}/inbox    Like | Undo(Like)
         -- GET  /api/v1/activitypub/repository-id/{id}/outbox   always an empty OrderedCollection
 }
 
@@ -1095,6 +1277,9 @@ surface FederationForLocalUser {
             n.note_content
             n.note_url
             n.created_at
+        for o in OutboundFollows where follower = viewer:
+            o.followed.user.name
+            o.status
 
     provides:
         UserLooksUpRemoteActor(viewer, remote)
@@ -1149,6 +1334,7 @@ surface FederationAdministration {
             f.host.host_fqdn
             f.original_url
             f.inbox_path
+            f.latest_activity
 
     @guidance
         -- GET /-/admin/federation/hosts        (paged by config.admin_host_page_size)
@@ -1165,21 +1351,6 @@ surface FederationAdministration {
 deferred ActorIdParsing.rules    -- see: modules/forgefed/actor.go, actor_person.go, actor_repository.go
 
 ------------------------------------------------------------
--- Open questions
-------------------------------------------------------------
-
-open question "Signer vs actor: inbound activities are accepted when the HTTP signature verifies with ANY known key; Forgejo never checks that the signer is the activity's actor (or that actor's host). Should the rebuild bind them?"
-open question "Visibility: Person and Repository actors (and the repository Like inbox) are served by numeric id with no visibility check, so private users, organisations and private repositories are exposed and can be starred remotely. Should these require public visibility?"
-open question "Person outbox exposes the notes a user RECEIVED (their federated feed) to any signed peer. Should the outbox instead list the user's own public activities (which are already fetchable individually)?"
-open question "Create(Note) is accepted from any known federated user, whether or not the recipient follows them, and outbound follows are never recorded. Should notes be limited to actors the recipient follows (and follows be recorded, Accept moving them to accepted)?"
-open question "Federated unstar: a remote Undo(Like) is not accepted and a local unstar sends nothing; remote stars can therefore never be withdrawn. Implement Undo(Like) both ways?"
-open question "Outbound Create(Note) is pushed once per watcher copy of an activity in Forgejo (duplicates). The spec delivers once per action per follower; confirm."
-open question "Only the first max_following_repos_liked (10) following repos receive Likes, but the settings form stores any number up to the 2048-character limit. Limit the list on write instead?"
-open question "Outbound Likes are sent synchronously once (max_attempts 1) while other activities retry up to 10 times through the queue. Should Likes use the retrying queue too, and should retries back off?"
-open question "Per-host replay protection (latest_activity) is shared by all actors on a host, so out-of-order Likes from two different users of one host are dropped. Track per actor instead?"
-open question "Remote people are materialised as full accounts/User rows (kind activitypub). Should they be excluded from user counts such as NodeInfo users_total and the user explore page?"
-
-------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
 -- REQUEST accounts/User.full_name: display name copied from the remote Person.
@@ -1187,7 +1358,8 @@ open question "Remote people are materialised as full accounts/User rows (kind a
 -- REQUEST accounts/User.email_notifications: materialised remote users have e-mail notifications disabled.
 -- REQUEST accounts/User: creation of kind activitypub must accept fediverse handles ("@name@host[:port]") that local name rules would reject, and reserve the name "actor" for the instance actor.
 -- REQUEST repositories/Star.user, repositories/Star.repository: federated Like creates a Star; local Star creation triggers outbound Like.
--- REQUEST notifications/Activity.act_user: the user who performed a feed activity.
 -- REQUEST notifications/ActivityRecorded(activity): must fire once per action (not per watcher copy) for federation fan-out.
 -- REQUEST access/is_repo_admin(user, repository): repository settings gate.
 -- REQUEST authentication: activitypub routes accept tokens only with read:activitypub / write:activitypub scope; user-id routes honour public-only tokens.
+-- REQUEST repositories/RepositoryUnstarred(user, repository): local unstar triggers outbound Undo(Like) (decided: federation 5); a federated Undo(Like) deletes the remote person's Star directly.
+

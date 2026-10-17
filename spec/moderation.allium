@@ -13,8 +13,9 @@
 --   preserved as a shadow copy so the evidence survives. Site admins review
 --   the queue of open reports and resolve them (handled / ignored), optionally
 --   acting on the content (suspend or delete the account, delete the
---   repository, issue or comment). Resolved reports are purged after a
---   retention period by a cron task.
+--   repository, issue or comment). Admins are told of new reports; reporters
+--   learn that their report was dealt with, not how. Resolved reports are
+--   purged after a retention period (180 days by default) by a cron task.
 -- Includes: ReportableContent (the reported item, a tombstone that outlives
 --   it), AbuseReport, ShadowCopy and its per-kind snapshots, AbuseCategory,
 --   moderation actions, retention purge, the moderation feature switch.
@@ -29,10 +30,12 @@
 --     lists, new users restricted by default, manual activation): owned by
 --     authentication/accounts. Forgejo has no automatic spam detection; "spam"
 --     exists only as a report category.
---   - No REST API: reporting and moderation are web-only in Forgejo.
+--   - Delivering the admin and reporter notifications (inbox entry, mail):
+--     owned by notifications, which reacts to AbuseReported / ReportReviewed.
 --   - htmx partial-swap and flash wording of the admin page: presentation.
 -- Emits:
---   AbuseReported(content, reporter, category)         -- a new report entered the queue
+--   AbuseReported(content, reporter, category)         -- a new report entered the queue; notifications tells site admins
+--   ReportReviewed(report, reporter)                   -- a report was closed; notifications tells its reporter, without the outcome
 --   ReportsResolved(content, resolution, admin)        -- open reports on an item were closed
 --   ReportClosed(report, resolution)                   -- (internal chain) one report closed
 --   ShadowCopyPreserved(copy)                          -- evidence was snapshotted
@@ -47,6 +50,9 @@
 --       -- raised by accounts, organizations, repositories and issues
 --          immediately BEFORE a moderation-relevant edit or a deletion of a
 --          user/org profile, repository, issue/PR or comment.
+--   organizations/OrganizationDeleted(organization)
+--       -- an organization was deleted (by its owners, a purge or moderation):
+--          its reports keep a shadow copy, as for users.
 --   administration/ResolvedReportRemovalDue(keep_for)
 --       -- the remove_resolved_reports cron task ran (on schedule or "run now").
 
@@ -228,10 +234,12 @@ config {
     enabled: Boolean = false
     -- [moderation] KEEP_RESOLVED_REPORTS_FOR: how long handled/ignored reports
     -- are kept before the purge task deletes them. 0 or less keeps them forever.
-    keep_resolved_reports_for: Duration = 7.days
+    -- decided (moderation 9): 180 days by default (Forgejo: 7 days).
+    keep_resolved_reports_for: Duration = 180.days
     -- [cron.remove_resolved_reports] ENABLED: the purge task is registered when
-    -- moderation is enabled but is itself OFF by default.
-    purge_task_enabled: Boolean = false
+    -- moderation is enabled.
+    -- decided (moderation 9): on by default (Forgejo ships it off); admins may turn it off.
+    purge_task_enabled: Boolean = true
     -- [cron.remove_resolved_reports] SCHEDULE
     purge_task_interval: Duration = 24.hours
     remarks_min_length: Integer = 20
@@ -245,17 +253,23 @@ config {
 -- ---- Reporting --------------------------------------------------------
 
 -- A signed-in user files a report. Server-side checks:
---   * reporting your own user profile is refused;
+--   * reporting your own content is refused: your own profile, an issue,
+--     pull request or comment you posted, a repository you administer, an
+--     organization you own;
 --   * the reporter must be able to see the item: a user/org profile visible
 --     to them; any readable unit of a repository; read access to the issues
 --     unit (pull requests unit for a PR) of the repository holding an issue,
 --     PR or comment;
 --   * a comment must carry user content;
 --   * the item must still exist;
---   * a reporter with an OPEN report on the same item cannot file another
---     (Forgejo silently accepts and drops the duplicate; the form already
---     says "you have already reported this").
+--   * a reporter with an OPEN report on the same item cannot file another,
+--     and is told they already have an open report on it.
 -- from: routers/web/moderation/report.go:76
+-- decided (moderation 4): the server refuses reports on one's own content,
+--   not only the UI (Forgejo refused only one's own profile).
+-- decided (moderation 5): a duplicate is refused and the reporter told so
+--   (Forgejo silently dropped it with a "thank you").
+-- decided (moderation 7): a new report notifies site admins (AbuseReported).
 rule UserReportsContent {
     when: UserReportsContent(reporter, content, category, remarks)
     requires: config.enabled
@@ -264,6 +278,9 @@ rule UserReportsContent {
     requires: remarks_length(remarks) >= config.remarks_min_length
     requires: remarks_length(remarks) <= config.remarks_max_length
     requires: content.kind = user implies content.reported_user != reporter
+    requires: content.kind = organization implies not is_org_owner(content.reported_organization, reporter)
+    requires: content.kind = repository implies not is_repo_admin(reporter, content.reported_repository)
+    requires: (content.kind = issue or content.kind = comment) implies content.poster != reporter
     requires: content.kind = user implies profile_visible_to(content.reported_user, reporter)
     requires: content.kind = organization implies organization_visible_to(content.reported_organization, reporter)
     requires: content.kind = repository implies can_read_any_unit(reporter, content.reported_repository)
@@ -316,6 +333,18 @@ rule PreserveEvidenceBeforeChange {
         ShadowCopyPreserved(copy: copy)
 }
 
+-- An organization's deletion is fed into the same evidence path, so its
+-- reports keep a shadow copy of the profile as it was.
+-- decided (moderation 6): org deletion preserves evidence, as user deletion does.
+--   organizations emits OrganizationDeleted in the same atomic step as the
+--   deletion; the snapshot is of the organization as that step found it.
+rule PreserveEvidenceOnOrganizationDeletion {
+    when: organizations/OrganizationDeleted(organization)
+    ensures:
+        for content in ReportableContents where reported_organization = organization:
+            ReportableContentChanging(content: content, change: deletion)
+}
+
 -- The item is gone; reports and evidence stay, keyed by the tombstone.
 -- from: routers/web/admin/reports.go:94
 rule ReportedContentDeleted {
@@ -329,6 +358,8 @@ rule ReportedContentDeleted {
 
 -- Close every open report on the item without touching the item.
 -- from: routers/web/admin/reports.go:237
+-- decided (moderation 2): only open reports are closed; earlier resolutions
+--   keep their resolved_at and resolver (Forgejo re-stamped them all).
 rule AdminResolvesReports {
     when: AdminResolvesReports(admin, content, resolution)
     let pending = content.open_reports
@@ -343,24 +374,35 @@ rule AdminResolvesReports {
 }
 
 -- Each open report on an item is closed individually with the admin's
--- resolution and the time of resolution.
+-- resolution and the time of resolution. The reporter is told it was dealt
+-- with, never which resolution or what was done to the content.
 -- from: models/moderation/abuse_report.go:197
+-- decided (moderation 8): reporters learn their report was handled, without details.
 rule CloseReportAsHandled {
     when: ReportClosed(report, resolution)
     requires: report.status = open
     requires: resolution = handled
     ensures: report.status = handled
     ensures: report.resolved_at = now
+    ensures: ReportReviewed(report: report, reporter: report.reporter)
 }
 
 -- from: models/moderation/abuse_report.go:192
+-- decided (moderation 8): as above; an ignored report is announced the same way.
 rule CloseReportAsIgnored {
     when: ReportClosed(report, resolution)
     requires: report.status = open
     requires: resolution = ignored
     ensures: report.status = ignored
     ensures: report.resolved_at = now
+    ensures: ReportReviewed(report: report, reporter: report.reporter)
 }
+
+-- Content actions (this rule and the five below) apply only to the reported
+-- item's own kind; the queue offers only those.
+-- decided (moderation 1): the action must match the reported kind (Forgejo did
+--   not check, so "delete repository" on a user report hit the repository
+--   with the same numeric id).
 
 -- Suspend (prohibit sign-in for) a reported individual. Never the admin
 -- themself, another admin, an organization, or someone already suspended.
@@ -478,9 +520,10 @@ rule AdminDeletesReportedComment {
 
 -- Daily (by default) purge of reports resolved longer ago than the retention
 -- period; a retention of zero or less keeps resolved reports forever. The
--- cron task carrying this is registered only when moderation is enabled and
--- is itself disabled by default (config.purge_task_enabled; see open question).
+-- cron task carrying this is registered only when moderation is enabled.
 -- from: services/moderation/reporting.go:135
+-- decided (moderation 9): purging is on by default with a 180-day retention;
+--   admins can turn it off (config.purge_task_enabled).
 rule PurgeResolvedReport {
     when: report: AbuseReport.resolved_at + config.keep_resolved_reports_for <= now
     requires: config.enabled
@@ -508,8 +551,11 @@ rule RemoveResolvedReport {
     ensures: not exists report
 }
 
--- Evidence no longer referenced by any report is discarded with it.
+-- Evidence no longer referenced by any report is discarded with it; a copy
+-- shared with a report still on record stays.
 -- from: services/moderation/reporting.go:154
+-- decided (moderation 3): a shared shadow copy is kept while any report
+--   references it (Forgejo's purge deleted it with the resolved report).
 rule DiscardOrphanedShadowCopy {
     when: copy: ShadowCopy.is_orphaned
     requires: copy.is_orphaned
@@ -527,10 +573,11 @@ invariant OneOpenReportPerReporterAndItem {
             (a.status = open and b.status = open and a.content = b.content and a.reporter = b.reporter) implies a = b
 }
 
--- Nobody reports their own profile.
+-- Nobody reports their own profile or what they posted.
 invariant NoSelfReport {
     for r in AbuseReports:
-        r.content.kind = user implies r.content.reported_user != r.reporter
+        (r.content.kind = user implies r.content.reported_user != r.reporter)
+        and ((r.content.kind = issue or r.content.kind = comment) implies r.content.poster != r.reporter)
 }
 
 -- A shadow copy belongs to the item its reports point at.
@@ -566,19 +613,29 @@ surface ReportAbuse {
 
     @guarantee ReportersSeeNoOneElsesReports
         -- A reporter learns only whether they themself already have an open
-        -- report on the item; other reports, reporters, remarks and the
-        -- moderation outcome are never shown to them.
+        -- report on the item, and later that their report was dealt with
+        -- (ReportReviewed); other reports, reporters, remarks, the resolution
+        -- and any action taken on the content are never shown to them.
 
     @guarantee EntryHiddenWhereMeaningless
         -- The entry is not offered on the reporter's own profile, on comments
-        -- or issues they posted, or on a repository they administer.
+        -- or issues they posted, on a repository they administer or an
+        -- organization they own; the server refuses those reports too.
+
+    @guarantee DuplicateIsExplained
+        -- A second report while the reporter's first on the item is still
+        -- open is refused with "you already have an open report on this
+        -- item", not accepted and dropped.
 
     @guidance
-        -- Web only: GET /report_abuse?type={user|org|repo|issue|pull|comment}&id=N
+        -- Web: GET /report_abuse?type={user|org|repo|issue|pull|comment}&id=N
         -- renders the form (categories in the order spam, malware, illegal
         -- content, other violations; remarks 20–500 chars); POST /report_abuse
         -- submits; success and failure both return to the reporter's dashboard
         -- with a flash. Unknown type or non-positive id: "invalid" form.
+        -- API (decided moderation 7; not in Forgejo):
+        --   POST /api/v1/moderation/reports {type, id, category, remarks}
+        --   (422 on own content or invalid remarks, 409 on a duplicate).
 }
 
 -- The admin moderation queue and the per-item detail page.
@@ -628,15 +685,26 @@ surface ModerationQueue {
         -- open report with its shadow copy, and for issues/comments the poster
         -- recovered from the copy.
 
+    @guarantee AdminsAreToldOfNewReports
+        -- Every new report notifies the site admins (AbuseReported), in the
+        -- inbox and, if they take mail, by mail.
+
     @guidance
-        -- Web only, site admins:
+        -- API (decided moderation 7; not in Forgejo), site admins:
+        --   GET  /api/v1/admin/moderation/reports                    (queue)
+        --   GET  /api/v1/admin/moderation/reports/{type}/{id}        (detail)
+        --   POST /api/v1/admin/moderation/reports/{type}/{id}/actions
+        --        {resolution, content_action}; a content action for another
+        --        kind is refused (422).
+        -- Web, site admins:
         --   GET  /-/admin/moderation/reports                         (queue)
         --   GET  /-/admin/moderation/reports/type/{1-4}/id/{id}      (detail)
         --   POST /-/admin/abuse_reports/act  content_type, content_id,
         --        report_action {0 none,1 handled,2 ignored},
         --        content_action {0 none,1 suspend,2 delete account,
         --        3 delete repo,4 delete issue,5 delete comment}
-        --        (both none is rejected).
+        --        (both none is rejected; a content action that does
+        --        not match content_type is rejected).
         -- Account deletion from moderation always purges.
 }
 
@@ -663,20 +731,6 @@ deferred snapshot_repository    -- see: models/repo/moderation.go:50
 deferred snapshot_issue         -- see: models/issues/moderation.go:45
 deferred snapshot_comment       -- see: models/issues/moderation.go:90
 
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Forgejo does not check that the admin's content action matches the reported kind (e.g. 'delete repository' on a user report deletes the repository with the same numeric id). The spec requires the kind to match; confirm."
-open question "Resolving marks ALL reports on the item (including already-resolved ones, re-stamping resolved_at). The spec resolves only open reports; confirm."
-open question "The purge deletes a shadow copy together with any resolved report linked to it, even when open reports still share that copy. The spec keeps a copy while any report references it; confirm."
-open question "Reporting is allowed server-side for one's own repository, issue or comment (only the UI hides the entry). Should the server refuse these too?"
-open question "Duplicate reports by the same reporter on the same open item are silently dropped with a 'thank you' message. Should the reporter be told instead?"
-open question "Organizations get no shadow copy before deletion (only user deletion snapshots). Should org deletion preserve evidence too?"
-open question "There is no notification to admins when a report arrives and no API. Should a rebuild add either?"
-open question "Should reporters be told when their report is resolved?"
-open question "Forgejo ships the purge task disabled ([cron.remove_resolved_reports] ENABLED=false), so resolved reports and their evidence are kept forever unless an admin turns it on. The spec keeps that switch (config.purge_task_enabled); should a rebuild purge by default instead?"
-
 -- Requests to other modules
 -- REQUEST accounts/User: raise moderation/ReportableContentChanging(content, update) before changing any of name, full_name, email (incl. primary-email switch), login_name, location, website, pronouns, description, avatar, avatar_email; and (content, deletion) before deleting a user.
 -- REQUEST accounts: react to moderation/ModeratorSuspendsAccount (prohibit login) and moderation/ModeratorDeletesAccount (delete with purge).
@@ -686,4 +740,8 @@ open question "Forgejo ships the purge task disabled ([cron.remove_resolved_repo
 -- REQUEST access: can_read_any_unit(user, repository); can_read_conversation(user, issue) = can_read(user, issue.repository, pull_requests if issue.is_pull else issues).
 -- REQUEST issues/Issue: raise ReportableContentChanging before title change, content change, deletion; react to moderation/ModeratorDeletesIssue.
 -- REQUEST issues/Comment: has_user_content (comment kinds that carry text/attachments); raise ReportableContentChanging before content change and deletion; react to moderation/ModeratorDeletesComment.
--- REQUEST administration/CronTask: register "remove_resolved_reports" (default disabled, @every 24h) only when moderation is enabled.
+-- REQUEST administration/CronTask: register "remove_resolved_reports" (@every 24h) only when moderation is enabled, now ENABLED by default, and default remove_resolved_reports_keep_for to 180 days (decided: moderation 9).
+-- REQUEST notifications: react to moderation/AbuseReported(content, reporter, category) by notifying every site admin (inbox entry; mail per their mail preference) of the new report, linking the moderation queue (decided: moderation 7).
+-- REQUEST notifications: react to moderation/ReportReviewed(report, reporter) by telling the reporter (inbox; mail per preference) that their report on report.content.reference was reviewed, with no resolution or action named (decided: moderation 8).
+-- REQUEST organizations: drop the REQUEST to moderation about deletion (moderation now reacts to OrganizationDeleted for evidence); profile edits should still raise ReportableContentChanging(content, update). moderation now reads is_org_owner(org, user) to refuse reports on one's own organization.
+-- REQUEST access: is_repo_admin(user, repository) is used by moderation to refuse reports on a repository the reporter administers.
