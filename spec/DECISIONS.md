@@ -186,3 +186,16 @@ invariants or config. Numbers refer to the question's position in its module in
 | 6 | Artifact protocols | **v1–v4 all supported.** |
 | 7 | Pruning old run records | **Admin config, off by default.** When set, finished runs older than the retention age are deleted with their logs and artifacts. |
 | 8 | Disabling schedules for inactivity | **Admin config, off by default.** When set, a repository with no activity for that period has its scheduled workflows disabled and its admins are notified. |
+
+## packages
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Linking a package to a repository | **The API's checks everywhere:** package write plus write on the repository, and a linked package must be unlinked before relinking. |
+| 2 | Unlinking permission | **Symmetric with linking:** package write plus write on the linked repository. |
+| 3 | Download-age conditions on cleanup rules | **User-editable** by package managers. |
+| 4 | "Public only" tokens and limited owners | **Limited owners excluded too.** Public only means visible to anonymous visitors. |
+| 5 | Actions job tokens and packages | **Own repository's packages only.** A job token may publish new packages (linked to its repository) and write packages linked to its repository; everything else is read-only to it. |
+| 6 | `LIMIT_TOTAL_OWNER_*` vs quota | **Folded into quota.** The per-type limits are dropped; package limits are expressed as default quota rules. |
+| 7 | Dangling container digests | **Keep the split.** Instance cleanup purges dangling digests; user cleanup rules never touch them or `latest`. |
+| 8 | Organisation deletion with packages | **Purge option,** as for users. |
