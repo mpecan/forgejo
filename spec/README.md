@@ -30,7 +30,7 @@ allium-inspect                              # browse it (reads .allium-inspect.t
 | Invariants | 214 |
 | Config parameters | every `app.ini` setting that changes behaviour, with Forgejo's default |
 | Open questions | 201 ([`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md)) |
-| Journeys | 319 in 22 files: **702 of 703 steps hold** with allium-journey 0.1.3; the one remaining step is a walker limitation, described below |
+| Journeys | 319 in 22 files: **all 703 steps hold** with allium-journey 0.1.4, with no walker diagnostics |
 | Cross-module reactions | 306; every one matches its emitter's trigger name and argument names |
 | `allium check .` | 0 errors |
 
@@ -107,8 +107,8 @@ the Forgejo code it was distilled from.
 ## Conventions forced by the tooling
 
 These shape how the spec is written. They are not domain decisions. They are
-written for allium-journey 0.1.3. Releases 0.1.2 and 0.1.3 closed allium-inspect
-[#6](https://github.com/mpecan/allium-inspect/issues/6)–[#13](https://github.com/mpecan/allium-inspect/issues/13) and [#16](https://github.com/mpecan/allium-inspect/issues/16)–[#27](https://github.com/mpecan/allium-inspect/issues/27).
+written for allium-journey 0.1.4. Releases 0.1.2–0.1.4 closed allium-inspect
+[#6](https://github.com/mpecan/allium-inspect/issues/6)–[#13](https://github.com/mpecan/allium-inspect/issues/13), [#16](https://github.com/mpecan/allium-inspect/issues/16)–[#27](https://github.com/mpecan/allium-inspect/issues/27) and [#31](https://github.com/mpecan/allium-inspect/issues/31)–[#33](https://github.com/mpecan/allium-inspect/issues/33).
 
 - **Permission checks are local predicates.** A rule says
   `requires: can_write_code(user, repository)`, not `access/can_write(...)`,
@@ -129,7 +129,7 @@ written for allium-journey 0.1.3. Releases 0.1.2 and 0.1.3 closed allium-inspect
 - **A deletion event carries what its listeners need, read with `let`.** An
   emission's arguments see the state *after* the rule, so a rule that deletes a
   record binds the fields it reports with `let` first.
-  (The walker's verdict here currently depends on line order: [#33](https://github.com/mpecan/allium-inspect/issues/33).) A listener reads nothing
+  The walker enforces this, and names the `let` to add. A listener reads nothing
   from a deleted record but its identity.
   For example, `UserAccountDeleted` carries the user's `kind`, and
   `PackageVersionDeleted` carries its `package`.
@@ -146,7 +146,8 @@ written for allium-journey 0.1.3. Releases 0.1.2 and 0.1.3 closed allium-inspect
 - **Black boxes are answered where the story is told.** A call about something
   that already exists is stipulated in `given` or the file's `world`. A call
   about something the act creates is answered on the act's `creating` line
-  (`creating issue: issues/Issue where audience(issue) = {}`). Every answer is
+  (`creating issue: issues/Issue where audience(issue) = {}`). An act that
+  creates several things has one `creating` line for each. Every answer is
   listed in the journey's stipulation ledger.
 - **Off-by-default features are gated in their rules and walked switched on.**
   Federation, quota, moderation and LFS each check `config.enabled` in `requires`.
@@ -170,11 +171,12 @@ this), **refused**, **unspecified** (the spec has no such thing yet),
 **unexposed**, and **undecided** (the tool could not tell). The undecided steps
 that remain are listed below with their reasons.
 
-### The step that does not hold
+### Verdicts
 
-| Step | Why |
-|---|---|
-| pulls: *Draft Review Stays Private* (3) | Submitting a draft review creates both the review and its code comment. Notifications then asks `code_comment_mentions(comment)` of the comment. An act can catch only one creation with `creating` (a second `creating` line is merged into the first), so the comment's black box can't be answered. A related problem: a module-qualified `where` answer (`where notifications/mentions(x) = {}`) appears in the ledger but answers nothing ([#31](https://github.com/mpecan/allium-inspect/issues/31), [#32](https://github.com/mpecan/allium-inspect/issues/32)). |
+Every step holds. The walk reports no `undecided`, `refused`, `unspecified` or
+`unexposed` step, and no diagnostic. Each journey's stipulation ledger lists
+everything it took as given: cast fields, config switched on, and black-box
+answers. That ledger is the place to look when a verdict seems too easy.
 
 ## How this was produced
 
@@ -202,4 +204,9 @@ The Allium `distill` process, run as a fan-out:
    hold. They also removed the workarounds the earlier walker had needed:
    restated defaults, unrolled loops, `if` in place of `??`, and stipulations
    repeated in every journey.
+6. A last pass adapted the set to allium-journey 0.1.4, which reads a removed
+   record the same way whichever `ensures` line comes first (strictly: not at
+   all), catches several creations per act, and answers module-qualified
+   calls. It turned up eight more rules that reported fields of a record they
+   had just deleted. After fixing those, all 703 steps hold.
 

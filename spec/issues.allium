@@ -1526,11 +1526,15 @@ rule UserStopsStopwatch {
 -- from: models/issues/stopwatch.go:154
 rule FinishStopwatch {
     when: StopwatchFinished(stopwatch)
+    -- read before the stopwatch goes (postconditions see the resulting state)
+    let issue = stopwatch.issue
+    let tracker = stopwatch.user
+    let spent = now - stopwatch.started_at
     ensures:
-        let t = TrackedTime.created(issue: stopwatch.issue, user: stopwatch.user,
-                                    amount: now - stopwatch.started_at, created_at: now, is_deleted: false)
-        Comment.created(issue: stopwatch.issue, poster: stopwatch.user, kind: stop_tracking, tracked_time: t,
-                        content: format_duration(now - stopwatch.started_at), content_version: 0,
+        let t = TrackedTime.created(issue: issue, user: tracker,
+                                    amount: spent, created_at: now, is_deleted: false)
+        Comment.created(issue: issue, poster: tracker, kind: stop_tracking, tracked_time: t,
+                        content: format_duration(spent), content_version: 0,
                         created_at: now, updated_at: now)
         not exists stopwatch
 }

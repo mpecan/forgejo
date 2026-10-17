@@ -412,6 +412,7 @@ journey DraftReviewStaysPrivate {
         stipulate diff_hunk_around(pr, "widgets.go", 12, proposed, 0) = "@@ -10,4 +10,4 @@"
         carol does UserAddsPendingCodeComment(carol, pr, "widgets.go", 12, proposed, 0, "Off by one?") on PullRequestPage
             creating draft: Review
+            creating line_comment: ReviewComment
         then UserStartsDraftReview fires
         then draft.status = pending
 
@@ -425,6 +426,9 @@ journey DraftReviewStaysPrivate {
         stipulate can_write_code(carol, repo) = true
         stipulate review_mentions(draft) = {}
         stipulate issue_notification_audience(conv, carol) = {ada, bob}
+        -- "Off by one?" mentions nobody, so the line comment reaches no one by mention
+        stipulate notifications/code_comment_mentions(line_comment) = {}
+        stipulate notifications/mail_mention_recipients(conv, carol, {}, false) = {}
         carol does UserSubmitsDraftReview(carol, draft, request_changes, "Please fix the loop", "f00d") on DraftReviewPanel
         then UserSubmitsDraftReview fires
         then draft.status = submitted

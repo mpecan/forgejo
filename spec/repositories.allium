@@ -1756,12 +1756,14 @@ rule RecordLanguageStats {
 -- from: services/repository/adopt.go:32
 rule UserAdoptsRepository {
     when: UserAdoptsRepository(user, unadopted, owner)
+    -- read before the unadopted record goes (postconditions see the resulting state)
+    let adopted_name = unadopted.name
     requires: owner.name = unadopted.owner_name
     requires: user.is_admin or (config.allow_adoption_of_unadopted and user = owner)
     requires: user.is_admin or within_creation_limit(owner)
     ensures:
         let repo = Repository.created(
-            name: unadopted.name, owner_user: owner, owner_org: null, description: "", website: "",
+            name: adopted_name, owner_user: owner, owner_org: null, description: "", website: "",
             is_private: config.force_private or default_private_for(owner),
             is_archived: false, is_mirror: false, is_fork: false, fork_of: null,
             is_template: false, generated_from: null, is_empty: storage_is_empty(unadopted), is_fsck_enabled: true,

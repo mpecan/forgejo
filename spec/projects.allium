@@ -537,8 +537,10 @@ rule UserRemovesIssueFromProject {
     requires: may_write_issue(user, issue)
     let existing = ProjectCard{issue: issue}
     requires: exists existing
+    -- read before the card goes (postconditions see the resulting state)
+    let old_project = existing.project
     ensures: not exists existing
-    ensures: IssueProjectChanged(issue: issue, actor: user, old_project: existing.project, new_project: null)
+    ensures: IssueProjectChanged(issue: issue, actor: user, old_project: old_project, new_project: null)
 }
 
 -- The new-issue / new-pull-request form may name a board; the same checks as

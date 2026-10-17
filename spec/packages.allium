@@ -1100,8 +1100,17 @@ rule AttachManifestLayers {
     ensures:
         for staged in registry.container_uploads:
             if staged.image = image and manifest_references_blob(manifest_sha256, staged.blob.hash_sha256):
-                not exists staged
-                PackageFile.created(version: version, blob: staged.blob, name: manifest_file_name(staged.blob.hash_sha256), composite_key: null, is_lead: false, created_at: now, properties: {})
+                StagedLayerClaimed(version: version, staged: staged)
+}
+
+-- A staged upload the manifest references becomes one of the version's files.
+-- The blob is read before the staging record goes.
+-- from: services/packages/container/common.go:213
+rule ClaimStagedLayer {
+    when: StagedLayerClaimed(version, staged)
+    let blob = staged.blob
+    ensures: not exists staged
+    ensures: PackageFile.created(version: version, blob: blob, name: manifest_file_name(blob.hash_sha256), composite_key: null, is_lead: false, created_at: now, properties: {})
 }
 
 -- Auto-link a new image to a repository: by the

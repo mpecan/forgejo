@@ -682,10 +682,18 @@ rule RemoveWithdrawnExternalSshKeys {
     requires: source.provides_ssh_keys
 
     ensures:
-        for key in SshKeys where owner = user and auth_source = source:
-            if key.public_line not in still_published:
-                not exists key
-                SshKeyDeleted(owner: user, fingerprint: key.fingerprint, actor: user)
+        for key in SshKeys where owner = user and auth_source = source and public_line not in still_published:
+            ExternalSshKeyWithdrawn(key: key, user: user)
+}
+
+-- One withdrawn key goes. Its fingerprint is read before it does: the
+-- deletion event is about a key that no longer exists.
+-- from: services/asymkey/ssh_key_authorized_keys.go:142
+rule RemoveWithdrawnExternalSshKey {
+    when: ExternalSshKeyWithdrawn(key, user)
+    let withdrawn_fingerprint = key.fingerprint
+    ensures: not exists key
+    ensures: SshKeyDeleted(owner: user, fingerprint: withdrawn_fingerprint, actor: user)
 }
 
 ------------------------------------------------------------

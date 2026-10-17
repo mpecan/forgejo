@@ -1140,6 +1140,8 @@ rule InviteeAcceptsTeamInvite {
 
     let team = invite.team
     let org = invite.organization
+    -- read before the invitation goes (postconditions see the resulting state)
+    let inviter = invite.inviter
     let membership = OrgMembership{organization: org, user: user}
 
     ensures:
@@ -1158,7 +1160,7 @@ rule InviteeAcceptsTeamInvite {
             organization: org,
             user: user,
             reason: added_by_user,
-            added_by: invite.inviter,
+            added_by: inviter,
             added_at: now
         )
         TeamMemberAdded(team: team, user: user)

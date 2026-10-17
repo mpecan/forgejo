@@ -1226,6 +1226,11 @@ rule UserCancelsAutoMerge {
 rule AutoMergeExecutes {
     when: scheduled: AutoMerge.is_ready
     let pr = scheduled.pull_request
+    -- read before the schedule goes (postconditions see the resulting state)
+    let style = scheduled.style
+    let scheduler = scheduled.scheduled_by
+    let message = scheduled.message
+    let delete_after = scheduled.delete_branch_after_merge
     requires: pr.status = mergeable
     requires: pr.may_merge(scheduled.scheduled_by)
     requires: pr.allows_style(scheduled.style)
@@ -1235,18 +1240,17 @@ rule AutoMergeExecutes {
     requires: not has_open_blocking_dependencies(pr.issue)
     ensures:
         pr.status = merged
-        pr.merge_style = scheduled.style
-        pr.merged_commit_sha = merge_result_commit(pr, scheduled.style, scheduled.message)
-        pr.merger = scheduled.scheduled_by
+        pr.merge_style = style
+        pr.merged_commit_sha = merge_result_commit(pr, style, message)
+        pr.merger = scheduler
         pr.merged_at = now
         pr.check_requested_at = null
         pr.conflicted_files = {}
         pr.merged_automatically = true
-        PullRequestAutoMerged(pull_request: pr, merger: scheduled.scheduled_by)
-        PullRequestMerged(pull_request: pr, merger: scheduled.scheduled_by)
-        if scheduled.delete_branch_after_merge:
-            PullRequestHeadBranchDeletionRequested(pull_request: pr, doer: scheduled.scheduled_by)
-        -- the schedule is removed last: everything above reads it
+        PullRequestAutoMerged(pull_request: pr, merger: scheduler)
+        PullRequestMerged(pull_request: pr, merger: scheduler)
+        if delete_after:
+            PullRequestHeadBranchDeletionRequested(pull_request: pr, doer: scheduler)
         not exists scheduled
     @guidance
         -- Triggered in Forgejo by: a commit status on the head commit
