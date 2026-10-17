@@ -199,3 +199,19 @@ invariants or config. Numbers refer to the question's position in its module in
 | 6 | `LIMIT_TOTAL_OWNER_*` vs quota | **Folded into quota.** The per-type limits are dropped; package limits are expressed as default quota rules. |
 | 7 | Dangling container digests | **Keep the split.** Instance cleanup purges dangling digests; user cleanup rules never touch them or `latest`. |
 | 8 | Organisation deletion with packages | **Purge option,** as for users. |
+
+## webhooks
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Inactive hooks and globally disabled webhooks | **No delivery is created;** `last_status` is untouched. |
+| 2 | Kinds that can't render an event | **Dropped at queue time,** and the hook form offers only the events the kind supports. |
+| 3 | Gate for review comments | **`pull_request_review`** gates approve, reject and comment reviews. |
+| 4 | API create/edit | **Full config via the API.** API and web set the same fields; an edit changes only the fields given. |
+| 5 | Copying default/template hooks | **The Authorization header is dropped;** the copy must be re-authorised. The rest of the config is copied. |
+| 6 | Hooks of a deleted owner | **Removed,** with their delivery history. |
+| 7 | Authorization header visibility | **Write-only,** like the secret: managers can replace or clear it, never read it. |
+| 8 | Instance-wide delivery log | **Yes.** Site admins can browse all deliveries, filterable by hook and status. |
+| 9 | Automatic retries | **Retry with backoff.** A configurable number of attempts (default 3) with exponential backoff on network errors and 5xx responses; manual redelivery stays. |
+| 10 | `gitea` and `gogs` kinds | **Dropped.** One native kind plus the chat/CI integrations; the import addon maps old hooks. |
+| 11 | Test deliveries | **Every level:** repository, organisation, user and system hooks. |
