@@ -20,7 +20,10 @@
 --   AccessToken (+ TokenScope taxonomy and repository-specific tokens), AuthSource,
 --   DirectoryEntry (external), ExternalLogin, OpenIDIdentity, OAuth2Application,
 --   OAuth2Grant, OAuth2AuthorizationCode, OAuth2TokenIssuance, AuthorizedIntegration,
---   ExternalUserSyncJob.
+--   the CredentialPolicy contract other modules call (password policy, second-factor
+--   facts, token scope categories, external-identity lookups).
+--   The sync_external_users schedule is administration's CronTask; this module only
+--   does the work (ScheduledExternalUserSync).
 --
 -- Excludes:
 --   - SSPI (Windows integrated auth): removed from Forgejo; the source kind number is a
@@ -67,6 +70,8 @@
 --   RequestAuthenticated(user, method)                   -> access (scope/repository reducers), accounts (token last use)
 --   PasswordBasicAuthRefused(request)                    -> (web layer: 401 "use a token")
 --   AuthSourceDeleted(source)                            -> organizations (clear team-membership provenance)
+--   (PasswordChanged(user) is also emitted when an administrator or the operator sets
+--    a password: administration/UserPasswordSetByAdmin, UserPasswordSetByOperator)
 --   OAuth2ProviderRedirectRequested(session, source, prompt_none) -> (web layer: redirect to IdP)
 --   ConsentRequested(user, app, redirect_uri, scopes)    -> (web layer: render the consent page)
 --   AuthorizationDenied(user, app)                       -> (web layer: redirect with error=access_denied)
@@ -82,6 +87,20 @@
 --   accounts/UserAccountDeleted(user, kind, purge, delete_contributions) -- drop every credential
 --   administration/InstanceStarted(instance)   -- reconcile the built-in OAuth2 applications
 --   administration/ExternalUserSyncDue(update_existing) -- the sync_external_users cron task
+--   administration/UserTwoFactorResetByAdmin(admin, user)  -- drop every second factor
+--   administration/UserPasswordSetByAdmin(admin, user, password),
+--   administration/UserPasswordSetByOperator(operator, user, password) -- remember-me dies, security mail
+--   administration/AccessTokenRequestedForUser(requester, user, token_name, scopes) -- admin API / CLI token
+--   administration/AuthorizedIntegrationRequested(operator, user, name, description, issuer, claim_rules, scopes, all_repositories, repositories)
+--   administration/AuthSourceConfiguredFromCli(operator, kind, action, source, name, is_active, sync_enabled, settings)
+--
+-- Read-only mode: every user-initiated write of this module (registration, activation,
+--   linking, password, second-factor, token, integration and application management)
+--   is refused while access/InstanceWriteGate.read_only (decided: administration 3).
+--   Signing in and out, remember-me, request authentication and the OAuth2 provider's
+--   authorize / consent / token flow keep working: they are how people reach the
+--   instance to read it. Site-admin and operator actions are not gated (the admin
+--   console stays writable).
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -224,9 +243,84 @@ contract TrustedIssuer {
         -- so a change of the instance URL does not break stored integrations.
 }
 
+-- What other modules ask of authentication. Each module calls these as local
+-- black boxes (password_acceptable(password), has_two_factor(user), ...) and maps
+-- them in its header to the function here, as with access/AuthorizationPolicy.
+contract CredentialPolicy {
+    -- The password policy every path that sets a password applies (sign-up,
+    -- reset, change, admin create / set, CLI): at least config.min_password_length
+    -- characters, one of each class in config.password_complexity, and, when
+    -- config.password_check_pwned is on, not in the HaveIBeenPwned list
+    -- (k-anonymity range query; a failing lookup refuses the password).
+    -- from: modules/auth/password/password.go:60, services/user/update.go:172
+    password_acceptable: (password: String) -> Boolean
+    -- The length part alone (the install wizard's first administrator).
+    password_long_enough: (password: String) -> Boolean
+    -- The password authenticates the account through its UserLogin source (local
+    -- store, LDAP, SMTP, PAM); false when the account has no password. Used for
+    -- re-entering the password before a sensitive act (accounts' own deletion).
+    -- from: routers/web/user/setting/account.go:277
+    password_matches: (user: accounts/User, password: String) -> Boolean
+    -- UserLogin{user}.has_second_factor: TOTP or any WebAuthn credential enrolled.
+    has_two_factor: (user: accounts/User) -> Boolean
+    -- UserLogin{user}.requires_two_factor (config.global_two_factor_requirement).
+    must_have_two_factor: (user: accounts/User) -> Boolean
+    -- The request was authenticated with the account password. Never true:
+    -- password Basic auth is refused everywhere (decided: authentication 4,
+    -- ClientPasswordBasicAuthRefused), so callers may keep the check as a guard.
+    authenticated_by_password: (user: accounts/User) -> Boolean
+    -- Does a credential's scope set admit a request of this category and level?
+    -- Write implies read in the same category; no scope of the category refuses.
+    -- Only tokens, OAuth2 grants with token scopes and authorized integrations
+    -- are scoped; a session is never scope-checked.
+    -- from: models/auth/access_token_scope.go:300
+    scope_allows: (scopes: Set<TokenScope>, category: ScopeCategory, level: ScopeLevel) -> Boolean
+    -- The local account holding an ExternalLogin whose provider speaks
+    -- `source_kind`, whose source authenticates against `host` (provider_host)
+    -- and whose external_id equals `external_id` as a string; null when none.
+    -- The OAuth2 source's name plays no part (migrations' re-attribution).
+    linked_account_for: (source_kind: String, host: String, external_id: String) -> accounts/User?
+    -- The forge kind an OAuth2 provider type speaks (migrations' source kinds:
+    -- github, gitlab, gitea, forgejo, ...); null for providers that are not a
+    -- forge (Google, Discord, generic OpenID Connect, ...).
+    source_kind_for_provider: (provider: String) -> String?
+    -- The host an OAuth2 source authenticates against: the host of its custom
+    -- URLs when set (self-hosted), otherwise the provider's public host
+    -- (github.com, gitlab.com, ...).
+    provider_host: (source: AuthSource) -> String
+    -- Teams a source's group mapping puts a user in: settings.group_team_map
+    -- ({group: {org: [team...]}}) plus settings.dynamic_group_maps, for the
+    -- groups the user is in. Mapped organizations or teams that do not exist
+    -- are skipped.
+    teams_mapped_from: (source: AuthSource, groups: Set<String>) -> Set<organizations/Team>
+    -- Teams mapped from groups the user is NOT in, which they leave; empty
+    -- unless settings.group_team_map_removal (or dynamic_group_maps_removal).
+    teams_unmapped_from: (source: AuthSource, user: accounts/User, groups: Set<String>) -> Set<organizations/Team>
+
+    @invariant ActivityPubNeedsItsScope
+        -- Federation's activitypub routes accept a scoped credential only with
+        -- read_activitypub (GET) or write_activitypub (POST to an inbox).
+        -- Routes addressed by user id honour a public_only credential: a
+        -- private or limited user answers as not found.
+
+    @invariant RouteFamiliesNameTheirCategory
+        -- Each API route family names one category: /admin -> admin,
+        -- /activitypub -> activitypub, /notifications -> notification,
+        -- /orgs and /teams -> organization, /packages -> package,
+        -- /repos/../issues and /pulls conversation routes -> issue, other /repos
+        -- -> repository, /user and /users -> user, everything else -> misc.
+        -- GET / HEAD need read, every other method needs write
+        -- (access.allium's authorization table column "scope").
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
+
+-- The category part of a TokenScope; the level is ScopeLevel.
+-- from: models/auth/access_token_scope.go:18
+enum ScopeCategory { activitypub | admin | misc | notification | organization | package | issue | repository | user }
+enum ScopeLevel { read | write }
 
 -- from: models/auth/source.go:21
 enum AuthSourceKind { ldap_bind_dn | ldap_simple | smtp | pam | oauth2 | remote }
@@ -467,7 +561,12 @@ entity AuthSource {
     is_ldap: kind in {ldap_bind_dn, ldap_simple}
     provides_ssh_keys: (is_ldap or kind = oauth2) and settings.attribute_ssh_public_key != null
     allows_username_change: kind = oauth2 and settings.allow_username_change
+    -- Quota-group mapping (quota.allium reads these). The map and its removal flag
+    -- apply to every group-capable source, LDAP included (decided: quota 8); the
+    -- claim name is OAuth2 only, LDAP groups come from the directory entry.
     quota_group_claim_name: settings.quota_group_claim_name
+    quota_group_map: settings.quota_group_map
+    quota_group_map_removal: settings.quota_group_map_removal
     verifies_passwords: kind in {ldap_bind_dn, ldap_simple, smtp, pam}
     logins: UserLogin with source = this
     external_logins: ExternalLogin with source = this
@@ -596,14 +695,9 @@ entity AuthorizedIntegration {
     created_at: Timestamp
 }
 
--- The scheduled "synchronise external user data" job.
--- from: services/cron/tasks_basic.go:90
-entity ExternalUserSyncJob {
-    enabled: Boolean
-    update_existing: Boolean
-    next_run_at: Timestamp
-    last_run_at: Timestamp?
-}
+-- The scheduled "synchronise external user data" job is administration's CronTask
+-- sync_external_users (schedule, enablement, last run); this module keeps no copy
+-- of it and reacts to its ExternalUserSyncDue.
 
 ------------------------------------------------------------
 -- Config
@@ -663,9 +757,9 @@ config {
     session_lifetime: Duration = 86400.seconds                  -- SESSION_LIFE_TIME
     session_gc_interval: Duration = 86400.seconds               -- GC_INTERVAL_TIME
 
-    -- [admin]
-    password_change_disabled: Boolean = false                   -- USER_DISABLED_FEATURES contains manage_password
-    external_password_change_disabled: Boolean = false          -- EXTERNAL_USER_DISABLE_FEATURES contains manage_password
+    -- [admin] USER_DISABLED_FEATURES / EXTERNAL_USER_DISABLE_FEATURES live in accounts'
+    -- config; the manage_password feature is read as
+    -- user.has_feature_disabled(manage_password).
 
     -- [oauth2] provider
     oauth2_enabled: Boolean = true                              -- ENABLED
@@ -691,9 +785,11 @@ config {
     integration_request_timeout: Duration = 10.seconds          -- REQUEST_TIMEOUT
     integration_cache_ttl: Duration = 10.minutes                -- CACHE_TTL
 
-    -- [cron.sync_external_users]
-    sync_external_users_interval: Duration = 24.hours           -- SCHEDULE @midnight
-    sync_external_users_update_existing: Boolean = true         -- UPDATE_EXISTING
+    -- [cron.sync_external_users] UPDATE_EXISTING; the schedule is administration's
+    -- CronTask sync_external_users (one schedule, kept there).
+    -- The same setting as administration's config.sync_external_users_update_existing
+    -- (one [cron.sync_external_users] UPDATE_EXISTING), used by the dashboard button.
+    sync_external_users_update_existing: Boolean = true
 
     -- [ssh]
     ssh_trusted_user_ca_keys_configured: Boolean = false        -- TRUSTED_USER_CA_KEYS (HTTP-signature certificates)
@@ -707,6 +803,8 @@ config {
 -- from: routers/web/auth/auth.go:484
 rule VisitorRegisters {
     when: VisitorRegisters(session, name, email, password)
+    requires: not (exists accounts/ReservedName{name: name})   -- accounts: a reserved name is refused until an admin releases it
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: session.status = anonymous
     requires: not config.disable_registration
@@ -753,6 +851,7 @@ rule VisitorRegisters {
 -- from: routers/web/auth/auth.go:697
 rule InactiveUserRequestsActivationMail {
     when: InactiveUserRequestsActivationMail(user)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: not user.is_active
     requires: config.register_email_confirm
@@ -771,6 +870,7 @@ rule InactiveUserRequestsActivationMail {
 -- from: routers/web/auth/auth.go:767
 rule InactiveUserReplacesUnconfirmedEmail {
     when: InactiveUserReplacesUnconfirmedEmail(user, email)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: not user.is_active
     requires: config.register_email_confirm
@@ -796,11 +896,13 @@ rule InactiveUserReplacesUnconfirmedEmail {
 -- from: routers/web/auth/auth.go:767
 rule UserActivatesAccount {
     when: UserActivatesAccount(session, code, password)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: code.purpose = user_activation
     requires: code.is_valid
     let login = UserLogin{user: code.user}
     requires: login.is_local = false or password_matches(code.user, password)
+    requires: not code.user.being_purged         -- accounts: a purge disabled the account; a stale link must not revive it
 
     ensures: code.status = used
     ensures: code.user.is_active = true
@@ -824,6 +926,7 @@ rule UserActivatesAccount {
 -- from: routers/web/auth/auth.go:897
 rule UserConfirmsEmailAddress {
     when: UserConfirmsEmailAddress(code, email)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: code.purpose = email_activation
     requires: code.is_valid
@@ -929,6 +1032,16 @@ rule VisitorSignsInWithPassword {
 
     let needs_second_factor = login.has_second_factor and not login.skips_local_two_factor
 
+    -- An LDAP bind refreshes what the directory says about the account on every
+    -- sign-in, before any second factor: its groups (team and quota-group
+    -- mapping, decided: quota 8) and its SSH keys.
+    -- from: services/auth/source/ldap/source_authenticate.go:30
+    ensures:
+        if login.source != null and login.source.is_ldap and login.source.settings.groups_enabled:
+            ExternalGroupsAsserted(user: user, source: login.source, groups: DirectoryEntry{source: login.source, username: login.login_name}.groups)
+    ensures:
+        if login.source != null and login.source.is_ldap:
+            ExternalSshKeysAsserted(user: user, source: login.source, keys: DirectoryEntry{source: login.source, username: login.login_name}.ssh_public_keys)
     ensures:
         if needs_second_factor:
             session.status = pending_second_factor
@@ -960,6 +1073,8 @@ rule VisitorSignsInWithPassword {
 -- from: services/auth/source/ldap/source_authenticate.go:30
 rule ExternalPasswordSourceProvisionsUser {
     when: VisitorSignsInWithExternalPassword(session, source, entry, password)
+    requires: not (exists accounts/ReservedName{name: entry.username})   -- accounts: a reserved name is refused until an admin releases it
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: session.status = anonymous
     requires: config.enable_internal_signin
@@ -1004,6 +1119,7 @@ rule VisitorCompletesTotpChallenge {
 
     requires: session.status = pending_second_factor
     let user = session.pending_user
+    requires: not user.being_purged              -- a purge may have started since the first factor
     let twofa = TwoFactor{user: user}
     requires: exists twofa
     requires: totp_valid(twofa, passcode)
@@ -1038,6 +1154,7 @@ rule VisitorUsesScratchCode {
 
     requires: session.status = pending_second_factor
     let user = session.pending_user
+    requires: not user.being_purged              -- a purge may have started since the first factor
     let twofa = TwoFactor{user: user}
     requires: exists twofa
     requires: scratch_code_valid(twofa, scratch_code)
@@ -1068,6 +1185,7 @@ rule VisitorCompletesWebAuthnChallenge {
 
     requires: session.status = pending_second_factor
     let user = session.pending_user
+    requires: not user.being_purged              -- a purge may have started since the first factor
     requires: credential.user = user
     requires: webauthn_assertion_valid(credential)
     requires: sign_count > credential.sign_count or (sign_count = 0 and credential.sign_count = 0)
@@ -1291,6 +1409,7 @@ rule ProviderReturnsKnownIdentity {
 -- from: routers/web/auth/oauth.go:1096
 rule ProviderIdentityLinkedToSignedInUser {
     when: ProviderReturnsIdentity(session, identity)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let source = identity.source
     requires: source.is_active
@@ -1328,6 +1447,7 @@ rule ProviderIdentityClaimsRemotePlaceholder {
 
 rule ProviderIdentityAutoRegisters {
     when: ProviderReturnsIdentity(session, identity)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let source = identity.source
     let name = external_username(identity, config.oauth2_client_username_source)
@@ -1340,6 +1460,7 @@ rule ProviderIdentityAutoRegisters {
     requires: identity.email != null
     requires: name != null
     requires: username_available(name)
+    requires: not (exists accounts/ReservedName{name: name})   -- accounts: a reserved name is refused until an admin releases it
     requires: email_available(identity.email)
 
     let needs_confirmation = config.oauth2_client_register_email_confirm or config.register_manual_confirm
@@ -1383,6 +1504,7 @@ rule ProviderIdentityAutoRegisters {
 -- from: routers/web/auth/auth.go:581
 rule ProviderIdentityAutoLinksExistingAccount {
     when: ProviderReturnsIdentity(session, identity)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let source = identity.source
     let existing = user_by_email(identity.email)
@@ -1437,6 +1559,7 @@ rule ProviderIdentityNeedsLinking {
 -- from: routers/web/auth/linkaccount.go:102
 rule VisitorLinksPendingIdentityBySignIn {
     when: VisitorLinksPendingIdentityBySignIn(session, user, password, remember)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: session.status = anonymous
     requires: session.pending_external_identity != null
@@ -1472,6 +1595,8 @@ rule VisitorLinksPendingIdentityBySignIn {
 -- from: routers/web/auth/linkaccount.go:182
 rule VisitorRegistersFromPendingIdentity {
     when: VisitorRegistersFromPendingIdentity(session, name, email, password)
+    requires: not (exists accounts/ReservedName{name: name})   -- accounts: a reserved name is refused until an admin releases it
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: session.status = anonymous
     requires: session.pending_external_identity != null
@@ -1516,6 +1641,7 @@ rule VisitorRegistersFromPendingIdentity {
 -- from: routers/web/user/setting/security/security.go:42
 rule UserUnlinksExternalLogin {
     when: UserUnlinksExternalLogin(user, link)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: link.user = user
     requires: config.oauth2_enabled or config.enable_openid_signin or config.enable_openid_signup
@@ -1565,6 +1691,7 @@ rule VisitorSignsInWithOpenID {
 -- from: routers/web/auth/openid.go:256
 rule VisitorConnectsOpenIDToAccount {
     when: VisitorConnectsOpenIDToAccount(session, user, password)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: session.status = anonymous
     requires: session.pending_openid_uri != null
@@ -1588,6 +1715,7 @@ rule VisitorConnectsOpenIDToAccount {
 -- from: routers/web/user/setting/security/openid.go:22
 rule UserAddsOpenID {
     when: UserAddsOpenID(user, uri)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.enable_openid_signin
     requires: openid_uri_allowed(uri)
     requires: openid_assertion_verified(uri)
@@ -1598,6 +1726,7 @@ rule UserAddsOpenID {
 -- from: models/user/openid.go:85
 rule UserRemovesOpenID {
     when: UserRemovesOpenID(user, identity)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: identity.user = user
     ensures: not exists identity
 }
@@ -1605,6 +1734,7 @@ rule UserRemovesOpenID {
 -- from: models/user/openid.go:108
 rule UserTogglesOpenIDVisibility {
     when: UserTogglesOpenIDVisibility(user, identity)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: identity.user = user
     ensures: identity.show_publicly = not identity.show_publicly
 }
@@ -1621,6 +1751,7 @@ rule UserTogglesOpenIDVisibility {
 -- from: routers/web/auth/password.go:52
 rule VisitorRequestsPasswordReset {
     when: VisitorRequestsPasswordReset(session, user)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let login = UserLogin{user: user}
     requires: config.mail_service_configured
@@ -1645,6 +1776,7 @@ rule VisitorRequestsPasswordReset {
 -- from: routers/web/auth/password.go:177
 rule VisitorResetsPassword {
     when: VisitorResetsPassword(session, code, new_password, passcode, scratch_code)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: code.purpose = password_reset
     requires: code.is_valid
@@ -1653,6 +1785,7 @@ rule VisitorResetsPassword {
     let login = UserLogin{user: user}
     let twofa = TwoFactor{user: user}
     requires: login.may_reset_password
+    requires: not user.being_purged              -- accounts: no session for an account being purged
     requires: password_acceptable(new_password)
     requires: not exists twofa or (passcode != null and totp_valid(twofa, passcode) and twofa.last_used_passcode != passcode) or (scratch_code != null and scratch_code_valid(twofa, scratch_code))
 
@@ -1684,10 +1817,10 @@ rule VisitorResetsPassword {
 -- from: routers/web/user/setting/account.go:48
 rule UserChangesPassword {
     when: UserChangesPassword(user, old_password, new_password)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let login = UserLogin{user: user}
-    requires: not config.password_change_disabled
-    requires: login.is_local or not config.external_password_change_disabled
+    requires: not user.has_feature_disabled(manage_password)   -- accounts' USER_DISABLED_FEATURES / EXTERNAL_USER_DISABLE_FEATURES
     requires: login.is_local or login.source.kind = oauth2
     requires: login.has_password = false or password_matches(user, old_password)
     requires: password_acceptable(new_password)
@@ -1710,6 +1843,7 @@ rule UserChangesPassword {
 -- from: routers/web/auth/password.go:278
 rule UserChangesForcedPassword {
     when: UserChangesForcedPassword(user, new_password)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let login = UserLogin{user: user}
     requires: login.must_change_password
@@ -1736,6 +1870,7 @@ rule UserChangesForcedPassword {
 -- from: routers/web/user/setting/security/2fa.go:205
 rule UserEnrolsTotp {
     when: UserEnrolsTotp(user, passcode)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: not exists TwoFactor{user: user}
     requires: enrolment_passcode_valid(user, passcode)
@@ -1752,6 +1887,7 @@ rule UserEnrolsTotp {
 -- from: routers/web/user/setting/security/2fa.go:294
 rule UserReenrolsTotp {
     when: UserReenrolsTotp(user, passcode)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let twofa = TwoFactor{user: user}
     requires: exists twofa
@@ -1766,6 +1902,7 @@ rule UserReenrolsTotp {
 -- from: routers/web/user/setting/security/2fa.go:28
 rule UserRegeneratesScratchCode {
     when: UserRegeneratesScratchCode(user)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let twofa = TwoFactor{user: user}
     requires: exists twofa
     ensures: twofa.scratch_code_generation = twofa.scratch_code_generation + 1
@@ -1778,6 +1915,7 @@ rule UserRegeneratesScratchCode {
 -- from: routers/web/user/setting/security/2fa.go:55
 rule UserDisablesTotp {
     when: UserDisablesTotp(user)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let twofa = TwoFactor{user: user}
     let login = UserLogin{user: user}
@@ -1791,6 +1929,7 @@ rule UserDisablesTotp {
 -- from: routers/web/user/setting/security/webauthn.go:65
 rule UserRegistersSecurityKey {
     when: UserRegistersSecurityKey(user, name, attestation)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: not exists WebAuthnCredential{user: user, name: name}
     requires: webauthn_attestation_valid(user, attestation)
@@ -1807,6 +1946,7 @@ rule UserRegistersSecurityKey {
 -- decided: passkeys (discoverable credentials) may be registered for passwordless sign-in.
 rule UserRegistersPasskey {
     when: UserRegistersPasskey(user, name, attestation)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: not exists WebAuthnCredential{user: user, name: name}
     requires: webauthn_attestation_valid(user, attestation)
@@ -1824,6 +1964,7 @@ rule UserRegistersPasskey {
 -- from: routers/web/user/setting/security/webauthn.go:114
 rule UserRemovesSecurityKey {
     when: UserRemovesSecurityKey(user, credential)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     -- read before the record goes: an emission sees the resulting state
     let key_name = credential.name
     let login = UserLogin{user: user}
@@ -1845,6 +1986,7 @@ rule UserRemovesSecurityKey {
 -- from: routers/api/v1/utils/access_token.go:136
 rule UserCreatesAccessToken {
     when: UserCreatesAccessToken(actor, owner, name, scopes, public_only, all_repositories, repositories, via)
+    requires: actor != owner or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3; a site admin's token for someone else is admin console
 
     requires: actor = owner or actor.is_admin
     -- decided: with password Basic auth gone, a user mints their own tokens from a web
@@ -1885,6 +2027,7 @@ rule UserCreatesAccessToken {
 -- from: models/auth/access_token.go:246
 rule UserRegeneratesAccessToken {
     when: UserRegeneratesAccessToken(user, token)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: token.owner = user
     ensures: token.last_eight = secret_suffix()
     ensures: token.last_used_at = null
@@ -1893,10 +2036,15 @@ rule UserRegeneratesAccessToken {
 -- from: routers/api/v1/utils/access_token.go:29
 rule UserDeletesAccessToken {
     when: UserDeletesAccessToken(actor, token, via)
+    requires: actor != token.owner or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3; admin console stays writable
 
     requires: actor = token.owner or actor.is_admin
     requires: actor != token.owner or via in {session, reverse_proxy}
 
+    let doomed = token
+    ensures:
+        for r in access/CredentialRestrictions where r.token = doomed:
+            not exists r
     ensures: not exists token
 
     @guidance
@@ -2003,6 +2151,8 @@ rule TrustedProxyAssertsUser {
 -- from: services/auth/method/reverseproxy.go:145
 rule TrustedProxyRegistersUser {
     when: TrustedProxyRegistersUser(request, name, email, full_name)
+    requires: not (exists accounts/ReservedName{name: name})   -- accounts: a reserved name is refused until an admin releases it
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: config.enable_reverse_proxy_auth
     requires: config.enable_reverse_proxy_auto_registration
@@ -2064,6 +2214,7 @@ rule AdminSudoes {
 -- from: services/auth/authorized_integration.go:223
 rule UserCreatesAuthorizedIntegration {
     when: UserCreatesAuthorizedIntegration(user, name, ui, issuer, audience, claim_rules, scopes, public_only, all_repositories, repositories)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: not exists AuthorizedIntegration{issuer: issuer, audience: audience}
     requires: issuer_trustworthy(issuer)
@@ -2085,6 +2236,7 @@ rule UserCreatesAuthorizedIntegration {
 -- from: routers/web/user/setting/authorized_integrations.go:182
 rule UserUpdatesAuthorizedIntegration {
     when: UserUpdatesAuthorizedIntegration(user, integration, claim_rules, scopes, public_only, all_repositories, repositories)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: integration.owner = user
     requires: claim_rules_well_formed(claim_rules)
     requires: all_repositories or public_only = false
@@ -2099,6 +2251,7 @@ rule UserUpdatesAuthorizedIntegration {
 -- from: routers/web/user/setting/authorized_integrations.go:418
 rule UserDeletesAuthorizedIntegration {
     when: UserDeletesAuthorizedIntegration(user, integration)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: integration.owner = user
     ensures: not exists integration
 }
@@ -2111,6 +2264,7 @@ rule UserDeletesAuthorizedIntegration {
 -- from: models/auth/oauth2.go:265
 rule OwnerRegistersOAuth2Application {
     when: OwnerRegistersOAuth2Application(actor, owner_user, owner_org, name, redirect_uris, confidential)
+    requires: (owner_user = null and owner_org = null) or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3; instance-wide apps are admin console
 
     requires: config.oauth2_enabled
     requires: owner_user = null or owner_org = null
@@ -2132,6 +2286,7 @@ rule OwnerRegistersOAuth2Application {
 -- from: models/auth/oauth2.go:290
 rule OwnerUpdatesOAuth2Application {
     when: OwnerUpdatesOAuth2Application(actor, app, name, redirect_uris, confidential)
+    requires: app.is_instance_wide or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3; instance-wide apps are admin console
 
     requires: may_manage_application(actor, app)
     requires: not app.is_builtin
@@ -2148,6 +2303,7 @@ rule OwnerUpdatesOAuth2Application {
 -- from: routers/web/user/setting/oauth2_common.go:132
 rule OwnerRegeneratesClientSecret {
     when: OwnerRegeneratesClientSecret(actor, app)
+    requires: app.is_instance_wide or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3; instance-wide apps are admin console
     requires: may_manage_application(actor, app)
     requires: not app.is_builtin
     ensures: ClientSecretRegenerated(app)
@@ -2157,6 +2313,7 @@ rule OwnerRegeneratesClientSecret {
 -- from: models/auth/oauth2.go:358
 rule OwnerDeletesOAuth2Application {
     when: OwnerDeletesOAuth2Application(actor, app)
+    requires: app.is_instance_wide or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3; instance-wide apps are admin console
 
     requires: may_manage_application(actor, app)
     requires: not app.is_builtin
@@ -2307,6 +2464,7 @@ rule ClientRefreshesToken {
 -- from: routers/web/user/setting/oauth2_common.go:168
 rule UserRevokesGrant {
     when: UserRevokesGrant(user, grant)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: grant.user = user
 
@@ -2389,33 +2547,10 @@ rule AdminDeletesAuthSource {
 -- Rules: scheduled directory synchronisation
 ------------------------------------------------------------
 
--- The sync_external_users schedule. Both this temporal rule and the reaction to
--- administration's cron dispatch (ScheduledExternalUserSync) end in the same
--- per-source AuthSourceSyncRequested.
--- from: services/cron/tasks_basic.go:90
-rule ExternalUserSyncJobFallsDue {
-    when: job: ExternalUserSyncJob.next_run_at <= now
-
-    requires: job.enabled
-
-    ensures: job.last_run_at = now
-    ensures: job.next_run_at = now + config.sync_external_users_interval
-    ensures:
-        for source in AuthSources where is_active = true and sync_enabled = true:
-            AuthSourceSyncRequested(source: source, update_existing: job.update_existing)
-
-    @guidance
-        -- Cron task `sync_external_users`, @midnight by default. Cancelling stops between
-        -- sources.
-}
-
 -- administration's sync_external_users cron task ran (on its schedule or "run now").
 -- from: services/cron/tasks_basic.go:90
 rule ScheduledExternalUserSync {
     when: administration/ExternalUserSyncDue(update_existing)
-    ensures:
-        for job in ExternalUserSyncJobs:
-            job.last_run_at = now
     ensures:
         for source in AuthSources where is_active = true and sync_enabled = true:
             AuthSourceSyncRequested(source: source, update_existing: update_existing)
@@ -2446,7 +2581,7 @@ rule LdapSourceSynchronised {
 
     ensures:
         for e in entries:
-            if not exists UserLogin{source: src, login_name: e.username}:
+            if not exists UserLogin{source: src, login_name: e.username} and not (exists accounts/ReservedName{name: e.username}):
                 let user = accounts/User.created(
                     name: e.username,
                     primary_email: e.email,
@@ -2480,6 +2615,134 @@ rule LdapSourceSynchronised {
 }
 
 ------------------------------------------------------------
+-- Rules: what a token's restriction is (access reduces permissions by it)
+------------------------------------------------------------
+
+-- Every access token carries the reach access/CredentialRestriction describes:
+-- a repository-specific token reaches its listed repositories, a public-only
+-- token public things, any other token everything; the admin scope category
+-- (read:admin / write:admin, or `all`) is what lets a site administrator act as
+-- one through it (decided: access 5). Tokens are never edited, only
+-- regenerated (same restriction) or deleted (restriction removed with them).
+-- from: services/authz/authorization_reducer.go:11
+rule AccessTokenRestrictionDerived {
+    when: token: AccessToken.created
+    ensures: access/CredentialRestriction.created(
+        token: token,
+        reach: if not token.all_repositories: listed_repositories else if token.public_only: public_only else: all_repositories,
+        listed: token.repositories,
+        has_admin_scope: read_admin in token.scopes or write_admin in token.scopes
+    )
+}
+
+------------------------------------------------------------
+-- Rules: acts administration asks for (admin console and CLI)
+------------------------------------------------------------
+
+-- `forgejo admin user reset-mfa` and the admin edit form's "reset 2FA": every
+-- second factor goes, TOTP, security keys and passkeys alike.
+-- from: routers/web/admin/users.go:466
+rule AdminResetRemovesSecondFactors {
+    when: administration/UserTwoFactorResetByAdmin(admin, user)
+    ensures:
+        for t in TwoFactors where user = user:
+            not exists t
+        for c in WebAuthnCredentials where user = user:
+            not exists c
+}
+
+-- A password set by an administrator or the operator is stored like any other:
+-- every remember-me record dies with the old password, and the user gets the
+-- password-changed security mail.
+-- from: models/user/user.go:452, services/user/update.go:202
+rule AdminSetPasswordRetiresOldDevices {
+    when: administration/UserPasswordSetByAdmin(admin, user, password)
+    ensures:
+        for t in LongTermAuthorizations where user = user and status = active:
+            t.status = revoked
+    ensures: PasswordChanged(user: user)
+}
+
+-- from: cmd/admin_user_change_password.go:114
+rule OperatorSetPasswordRetiresOldDevices {
+    when: administration/UserPasswordSetByOperator(operator, user, password)
+    ensures:
+        for t in LongTermAuthorizations where user = user and status = active:
+            t.status = revoked
+    ensures: PasswordChanged(user: user)
+}
+
+-- A token minted for a user by a site admin (API) or the operator (CLI
+-- `generate-access-token`, `user create --access-token`): every repository,
+-- not public-only.
+-- from: routers/api/v1/admin/user_token.go:46, cmd/admin_user_generate_access_token.go:48
+rule AccessTokenIssuedForUser {
+    when: administration/AccessTokenRequestedForUser(requester, user, token_name, scopes)
+    requires: token_name != ""
+    requires: scopes.count > 0
+    requires: not exists AccessToken{owner: user, name: token_name}
+    ensures: AccessToken.created(owner: user, name: token_name, scopes: scopes, public_only: false, all_repositories: true, repositories: {}, last_eight: secret_suffix(), created_at: now, last_used_at: null)
+    @guidance
+        -- The secret is printed once on the operator's terminal or returned once
+        -- by the API. `all` expands to every write scope.
+}
+
+-- `forgejo admin user create-authorized-integration`: the same checks as the
+-- settings page; the audience is generated and printed.
+-- from: cmd/admin_user_generate_authorized_integration.go:102
+rule AuthorizedIntegrationCreatedFromCli {
+    when: administration/AuthorizedIntegrationRequested(operator, user, name, description, issuer, claim_rules, scopes, all_repositories, repositories)
+    let audience = new_integration_audience()
+    requires: name != ""
+    requires: issuer_trustworthy(issuer)
+    requires: claim_rules_well_formed(claim_rules)
+    requires: all_repositories or repositories.count > 0
+    requires: all_repositories or scopes.all(sc => sc in {read_issue, write_issue, read_repository, write_repository})
+    requires: not exists AuthorizedIntegration{issuer: issuer, audience: audience}
+    ensures: AuthorizedIntegration.created(owner: user, name: name, description: description, ui: generic, issuer: issuer, audience: audience, claim_rules: claim_rules, scopes: scopes, public_only: false, all_repositories: all_repositories, repositories: repositories, created_at: now)
+}
+
+-- `forgejo admin auth add-oauth|add-ldap|add-ldap-simple|add-pam|add-smtp`:
+-- the same validation as the admin form.
+-- from: cmd/admin_auth_oauth.go, cmd/admin_auth_ldap.go, services/auth/source.go:14
+rule AuthSourceAddedFromCli {
+    when: administration/AuthSourceConfiguredFromCli(operator, kind, action, source, name, is_active, sync_enabled, settings)
+    requires: action = add
+    requires: name != ""
+    requires: not exists AuthSource{name: name}
+    requires: kind != oauth2 or settings.provider != "openidConnect" or http_url(settings.openid_discovery_url)
+    requires: kind != oauth2 or is_active = false or provider_initialisable(settings)
+    ensures: AuthSource.created(name: name, kind: kind, is_active: is_active, sync_enabled: sync_enabled and kind in {ldap_bind_dn, ldap_simple}, settings: settings, created_at: now)
+}
+
+-- `forgejo admin auth update-oauth|update-ldap|...` (by source id).
+rule AuthSourceUpdatedFromCli {
+    when: administration/AuthSourceConfiguredFromCli(operator, kind, action, source, name, is_active, sync_enabled, settings)
+    requires: action = update
+    requires: source != null
+    requires: source.kind = kind
+    requires: name = source.name or not exists AuthSource{name: name}
+    requires: kind != oauth2 or is_active = false or provider_initialisable(settings)
+    ensures: source.name = name
+    ensures: source.is_active = is_active
+    ensures: source.sync_enabled = (sync_enabled and source.is_ldap)
+    ensures: source.settings = settings
+}
+
+-- `forgejo admin auth delete --id`: refused while the source is in use.
+rule AuthSourceDeletedFromCli {
+    when: administration/AuthSourceConfiguredFromCli(operator, kind, action, source, name, is_active, sync_enabled, settings)
+    requires: action = delete
+    requires: source != null
+    requires: not source.in_use
+    ensures:
+        for t in LongTermAuthorizations where sso_source = source:
+            not exists t
+    ensures: AuthSourceDeleted(source: source)
+    ensures: not exists source
+}
+
+------------------------------------------------------------
 -- Rules: account removal
 ------------------------------------------------------------
 
@@ -2501,6 +2764,8 @@ rule DeletedUserLosesCredentials {
     when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
 
     ensures:
+        for r in access/CredentialRestrictions where r.token != null and r.token.owner = user:
+            not exists r
         for t in AccessTokens where owner = user:
             not exists t
         for t in TwoFactors where user = user:
@@ -2801,7 +3066,7 @@ surface SecuritySettings {
 
     provides:
         UserChangesPassword(user, old_password, new_password)
-            when not config.password_change_disabled
+            when not user.has_feature_disabled(manage_password)
         UserChangesForcedPassword(user, new_password)
             when login.must_change_password
         UserEnrolsTotp(user, passcode)
@@ -3061,6 +3326,26 @@ surface AuthSourceAdministration {
         -- user data" runs ExternalUserSyncDue now. API: /admin/users/{username}/tokens.
 }
 
+-- The credential facts offered to every other module (password policy,
+-- second factors, token scope categories, external-identity lookups).
+surface AuthenticationService {
+    facing component: access/ForgeInternals
+
+    exposes:
+        component.name
+        config.min_password_length
+        config.password_complexity
+        config.password_check_pwned
+        config.global_two_factor_requirement
+
+    contracts:
+        fulfils CredentialPolicy
+
+    @guarantee AnswersFollowCurrentState
+        -- has_two_factor, must_have_two_factor and the lookups reflect every
+        -- enrolment, removal and link committed before the request.
+}
+
 ------------------------------------------------------------
 -- Deferred Specifications
 ------------------------------------------------------------
@@ -3086,4 +3371,3 @@ deferred ExternalGroupsAsserted.quota_mapping -- see: quota.allium (quota_group_
 -- REQUEST keys/SshKey.owner: accounts/User — the key an HTTP signature is verified against; react to ExternalSshKeysAsserted(user, source, keys) (source-managed keys).
 -- REQUEST access: consume RequestAuthenticated(user, method) and the token's scopes / public_only / repositories to reduce permissions; access/can_read(user, repository, unit).
 -- REQUEST notifications: send mail for ActivationEmailRequested, EmailConfirmationRequested, PasswordResetRequested, PasswordChanged, TotpEnrolled, TotpDisabled, SecurityKeyRemoved; push "logout" on UserSignedOut.
--- REQUEST administration: the sync_external_users cron task and ExternalUserSyncJob describe one schedule; a rebuild keeps one.

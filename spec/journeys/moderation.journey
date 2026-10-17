@@ -24,6 +24,8 @@ world {
         root.is_active = true
         root.prohibit_login = false
         remark.issue = thread
+        remark.ref_comment = null
+        thread.is_pull = false
         item.kind = comment
         item.reported_comment = remark
         item.reported_user = null
@@ -437,4 +439,24 @@ journey ADuplicateReportIsExplained {
         ada cannot do UserReportsContent(ada, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
 
     ends: Ada knows her first report is still waiting.
+}
+
+-- decided: administration 3. Filing a report is a write.
+journey NoReportsWhileTheInstanceIsReadOnly {
+    goal: The instance is in maintenance. Ada's report on the spam comment is
+          refused until read-only mode is switched off.
+
+    cast:
+        gate: access/InstanceWriteGate
+
+    given:
+        gate.read_only = true
+
+    1. ada tries to report the comment
+        stipulate can_read_conversation(ada, thread) = true
+        stipulate remarks_length("This comment links to a phishing site twice.") = 45
+        ada cannot do UserReportsContent(ada, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
+        then item.is_in_queue = false
+
+    ends: Nothing entered the queue.
 }

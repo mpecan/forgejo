@@ -888,3 +888,121 @@ journey TheLastSecondFactorStaysWhileTwoFactorIsRequired {
 
     ends: Ada always holds at least one second factor.
 }
+
+-- accounts asked: a name a site admin reserved cannot be registered.
+journey AReservedNameCannotBeRegistered {
+    goal: An admin reserved the name "ada" when her old account was deleted.
+          Somebody trying to sign up as "ada" is refused, even though every other
+          check passes.
+
+    cast:
+        s: Session
+
+    given:
+        s.status = anonymous
+        held: accounts/ReservedName { name: "ada" }
+
+    1. the sign-up is refused
+        stipulate email_domain_allowed("ada@example.com") = true
+        stipulate password_acceptable("correct horse battery") = true
+        stipulate username_available("ada") = true
+        stipulate email_available("ada@example.com") = true
+        s cannot do VisitorRegisters(s, "ada", "ada@example.com", "correct horse battery") on SignInPage
+        then s.status = anonymous
+
+    ends: No account took the reserved name.
+}
+
+-- decided: administration 3. Signing in keeps working in read-only mode; making a
+-- new credential does not.
+journey ReadOnlyModeKeepsSignInButRefusesANewToken {
+    goal: The instance is in maintenance. Ada can still sign in to read, but her
+          attempt to create an access token is refused until the admin switches
+          read-only mode off.
+
+    cast:
+        s:    Session
+        ada:  accounts/User
+        gate: access/InstanceWriteGate
+
+    given:
+        s.status = anonymous
+        gate.read_only = true
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.is_admin = false
+        ada.kind = individual
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+
+    1. she signs in
+        stipulate password_matches(ada, "correct horse battery") = true
+        stipulate ada.being_purged = false
+        stipulate login.has_second_factor = false
+        s does VisitorSignsInWithPassword(s, ada, "correct horse battery", false) on SignInPage
+        then VisitorSignsInWithPassword fires
+        then s.status = authenticated
+
+    2. a new token is refused
+        ada cannot do UserCreatesAccessToken(ada, ada, "ci", {read_repository}, false, true, {}, session) on ApplicationSettings
+
+    3. so is enrolling a security key
+        stipulate webauthn_attestation_valid(ada, "att") = true
+        ada cannot do UserRegistersSecurityKey(ada, "yubikey", "att") on SecuritySettings
+
+    ends: Ada reads the instance; nothing she owns changed.
+}
+
+-- administration asked: an admin's 2FA reset removes every second factor.
+journey AnAdministratorResetsTwoFactor {
+    goal: Ada lost her phone and her security key. Root resets her second
+          factors from the admin edit page; her TOTP and her key are gone.
+
+    cast:
+        root: accounts/User
+        ada:  accounts/User
+
+    given:
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+        ada.is_active = true
+        ada.prohibit_login = false
+        totp: TwoFactor { user: ada, last_used_passcode: null, scratch_code_generation: 1 }
+        key: WebAuthnCredential { user: ada, name: "yubikey", discoverable: false, sign_count: 3 }
+
+    1. root resets her two-factor authentication
+        root does AdminResetsUserTwoFactor(root, ada) on AdminUserAccount
+        then AdminResetRemovesSecondFactors fires
+        then totp does not exist
+        then key does not exist
+
+    ends: Ada signs in with her password alone and may enrol again.
+}
+
+-- An administrator's password reset is stored like any other change.
+journey AnAdminSetPasswordForgetsOldDevices {
+    goal: Root sets a new password for Ada. Every device she had ticked
+          "remember me" on is forgotten and she is told by mail.
+
+    cast:
+        root: accounts/User
+        ada:  accounts/User
+
+    given:
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+        ada.is_active = true
+        ada.prohibit_login = false
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+        laptop: LongTermAuthorization { user: ada, sso_source: null, status: active }
+
+    1. root sets the password and asks for a change at next sign-in
+        stipulate password_acceptable("temporary pass 1") = true
+        root does AdminSetsUserPassword(root, ada, "temporary pass 1", true) on AdminUserAccount
+        then AdminSetPasswordRetiresOldDevices fires
+        then laptop.status = revoked
+        then login.must_change_password = true
+
+    ends: Only the new password signs Ada in, and she must change it first.
+}

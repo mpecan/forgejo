@@ -108,6 +108,7 @@
 --     ActionsCleanupDue()                                           -> actions
 --     OfflineRunnerCleanupDue(older_than, global_scope_only)        -> actions
 --     ActionsUserCleanupDue()                                       -> actions
+--     OrphanedUploadCleanupDue(older_than)                          -> issues
 --   AllRepositoryBranchesResyncRequested(admin)                     -> code
 --   AllRepositoryTagsResyncRequested(admin)                         -> releases
 --   AnnouncementPublished(announcement) / AnnouncementWithdrawn(kind)
@@ -135,8 +136,9 @@
 --   MassMailRequested(subject, body, recipients)        -> notifications
 --   AuthorizedKeysRegenerationRequested(operator)       -> keys
 --   ReleasesSyncWithTagsRequested(operator)             -> releases
---   AuthSourceConfiguredFromCli(operator, kind, action) -> authentication
---   AuthorizedIntegrationRequested(operator, user, name) -> authentication
+--   AuthSourceConfiguredFromCli(operator, kind, action, source, name, is_active, sync_enabled, settings) -> authentication
+--   AuthorizedIntegrationRequested(operator, user, name, description, issuer, claim_rules, scopes, all_repositories, repositories) -> authentication
+--   UserPrimaryEmailSetByAdmin(admin, user, old_address, new_address) -> accounts (announces PrimaryEmailChanged)
 --   DoctorRunRequested(operator, checks, fix)
 --   DoctorRunRequestedByAdmin(run)                    -- report-only checks started from the web
 --   InstanceDumpProduced(operator, format, contents)
@@ -157,6 +159,13 @@
 --   accounts/AccountPurgeFailed(purge)        -- a purge stopped short (SystemNotice)
 --   keys/ExternalSshKeyRefused(user, source, fingerprint)  -- a directory key was refused (SystemNotice)
 --   repositories/PullMirrorSyncFailed(mirror, reason)  -- a pull mirror failed to sync (SystemNotice)
+--   repositories/RepositoryHealthCheckFailed(repository, reason)       -- git fsck failed (SystemNotice)
+--   repositories/RepositoryGarbageCollectionFailed(repository, reason) -- git gc failed (SystemNotice)
+--   discovery/IndexerStartupFailed(kind)      -- an indexer did not start in time (SystemNotice)
+--   accounts/AccountFilesLeftBehind(user_name, description)  -- a deleted account's files stayed (SystemNotice)
+--   accounts/InactiveAccountCleanupFinished(older_than)      -- the delete_inactive_accounts run is done
+--   keys/KeyFilesRewritten(kind)              -- the resync_all_sshkeys / resync_all_sshprincipals run is done
+--   migrations/RelinkSweepCompleted(outcome, message) -- the update_migration_poster_id run is done
 --   InstanceStarted(instance)                 -- process start (run-at-start tasks)
 
 use "./accounts.allium" as accounts
@@ -176,6 +185,7 @@ use "./moderation.allium" as moderation
 use "./federation.allium" as federation
 use "./discovery.allium" as discovery
 use "./migrations.allium" as migrations
+use "./issues.allium" as issues
 
 ------------------------------------------------------------
 -- Given
@@ -256,7 +266,7 @@ enum CronOutcome { finished | failed | cancelled }
 enum OwningModule {
     administration | accounts | authentication | repositories | keys | code
     | releases | webhooks | actions | packages | notifications | moderation
-    | discovery | migrations
+    | discovery | migrations | issues
 }
 
 -- A feature switch a task's registration depends on. Tasks whose feature is
@@ -299,6 +309,7 @@ enum CronTaskName {
     | cleanup_actions
     | cleanup_offline_runners
     | actions_action_user
+    | delete_orphaned_attachments
 }
 
 -- How the hook delivery cleanup task chooses what to delete.
@@ -571,8 +582,8 @@ config {
     -- (organizations/config.disable_regular_org_creation).
     default_email_notifications: String = "enabled"    -- enabled | onmention | disabled; new accounts' default (notifications)
     notify_admins_on_new_user: Boolean = false         -- SEND_NOTIFICATION_EMAIL_ON_NEW_USER (notifications)
-    user_disabled_features: Set<String> = {}           -- deletion, manage_ssh_keys, manage_gpg_keys, manage_password
-    external_user_disabled_features: Set<String> = {}  -- same list, for accounts from external auth sources
+    -- USER_DISABLED_FEATURES / EXTERNAL_USER_DISABLE_FEATURES live in accounts'
+    -- config (accounts/config.user_disabled_features, external_user_disabled_features).
 
     -- [ui.admin] page sizes of the admin lists
     -- from: modules/setting/ui.go:133
@@ -610,7 +621,8 @@ config {
     gc_lfs_last_updated_more_than_ago: Duration = 3.days
     gc_lfs_number_to_check_per_repo: Integer = 100
     gc_lfs_proportion_to_check_per_repo: Decimal = 0.6
-    remove_resolved_reports_keep_for: Duration = 168.hours  -- [moderation] KEEP_RESOLVED_REPORTS_FOR
+    remove_resolved_reports_keep_for: Duration = moderation/config.keep_resolved_reports_for  -- [moderation] KEEP_RESOLVED_REPORTS_FOR, 180 days (decided: moderation 9)
+    delete_orphaned_attachments_older_than: Duration = issues/config.orphan_attachment_expiry
     cleanup_offline_runners_older_than: Duration = 24.hours
     cleanup_offline_runners_global_scope_only: Boolean = true
 }
@@ -671,7 +683,13 @@ default CronTask gc_lfs = { name: gc_lfs, owner: code, requires_feature: lfs_ser
 -- from: services/cron/tasks_extended.go:206
 default CronTask rebuild_issue_indexer = { name: rebuild_issue_indexer, owner: discovery, requires_feature: always, enabled: false, run_at_start: false, schedule: "@annually", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
 -- from: services/cron/tasks_extended.go:220
-default CronTask remove_resolved_reports = { name: remove_resolved_reports, owner: moderation, requires_feature: moderation, enabled: false, run_at_start: false, schedule: "@every 24h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- decided: moderation 9 (on by default; registered only while moderation is enabled)
+default CronTask remove_resolved_reports = { name: remove_resolved_reports, owner: moderation, requires_feature: moderation, enabled: true, run_at_start: false, schedule: "@every 24h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+
+-- Unlinked uploads (issue / comment / release attachments never saved into
+-- their item) expire after issues' orphan_attachment_expiry. Not in Forgejo,
+-- which keeps them indefinitely (decided by issues).
+default CronTask delete_orphaned_attachments = { name: delete_orphaned_attachments, owner: issues, requires_feature: always, enabled: true, run_at_start: false, schedule: "@every 1h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
 
 -- Actions tasks (registered only when Actions is enabled)
 -- from: services/cron/tasks_actions.go:30
@@ -861,9 +879,41 @@ rule RecordPullMirrorFailureNotice {
     ensures: SystemNotice.created(kind: repository, description: reason, created_at: now)
     ensures: SystemNoticeRecorded(kind: repository)
 }
--- RepositoryHealthCheckFailed / RepositoryGarbageCollectionFailed are emitted
--- inside a per-repository loop the cross-module audit cannot see yet; their
--- notices are left for a later pass (see REQUEST repositories).
+
+-- git fsck found a broken repository (repo_health_check).
+-- from: services/repository/check.go:24
+rule RecordHealthCheckFailureNotice {
+    when: repositories/RepositoryHealthCheckFailed(repository, reason)
+    ensures: SystemNotice.created(kind: repository, description: reason, created_at: now)
+    ensures: SystemNoticeRecorded(kind: repository)
+}
+
+-- git gc failed on a repository (git_gc_repos).
+-- from: services/repository/check.go:61
+rule RecordGarbageCollectionFailureNotice {
+    when: repositories/RepositoryGarbageCollectionFailed(repository, reason)
+    ensures: SystemNotice.created(kind: repository, description: reason, created_at: now)
+    ensures: SystemNoticeRecorded(kind: repository)
+}
+
+-- An indexer did not start in time: search is unavailable until it is ready
+-- (decided: discovery 4).
+rule RecordIndexerStartupFailureNotice {
+    when: discovery/IndexerStartupFailed(kind)
+    ensures: SystemNotice.created(kind: task, description: indexer_notice_text(kind), created_at: now)
+    ensures: SystemNoticeRecorded(kind: task)
+    @guidance
+        -- indexer_notice_text: "<kind> indexer did not start in time; search
+        -- is unavailable until it is ready".
+}
+
+-- Removing a deleted account's stored files (avatar, user directory) failed.
+-- from: services/user/user.go:300
+rule RecordAccountFilesLeftBehindNotice {
+    when: accounts/AccountFilesLeftBehind(user_name, description)
+    ensures: SystemNotice.created(kind: task, description: description, created_at: now)
+    ensures: SystemNoticeRecorded(kind: task)
+}
 
 -- from: routers/web/admin/notice.go:46
 rule AdminDeletesNotices {
@@ -935,8 +985,36 @@ rule FinishCronTaskRun {
             SystemNotice.created(kind: task, description: cron_notice_text(job, outcome, message), created_at: now)
     ensures: CronTaskRunFinished(task: job, outcome: outcome)
     @guidance
-        -- A panic/crash inside the work is caught and logged; the task returns
+        -- A panic/crash inside the work is caught and logged; the job returns
         -- to idle so the next schedule still fires.
+}
+
+-- accounts reports the end of the delete_inactive_accounts sweep with a
+-- trigger of its own (it is not handed the task); the run finishes here.
+rule FinishInactiveAccountCleanupRun {
+    when: accounts/InactiveAccountCleanupFinished(older_than)
+    ensures:
+        for task in CronTasks where name = delete_inactive_accounts and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+-- keys reports that the authorized_keys / authorized_principals rewrite is
+-- done (resync_all_sshkeys / resync_all_sshprincipals, or the operator's
+-- regenerate command, which runs no task: then nothing is running).
+rule FinishKeyFilesRewriteRun {
+    when: keys/KeyFilesRewritten(kind)
+    ensures:
+        for task in CronTasks where run_state = running and ((kind = authorized_keys and name = resync_all_sshkeys) or (kind = authorized_principals and name = resync_all_sshprincipals)):
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+-- migrations reports the end of its nightly re-attribution sweep
+-- (update_migration_poster_id).
+rule FinishRelinkSweepRun {
+    when: migrations/RelinkSweepCompleted(outcome, message)
+    ensures:
+        for task in CronTasks where name = update_migration_poster_id and run_state = running:
+            CronWorkCompleted(job: task, outcome: outcome, message: message)
 }
 
 ------------------------------------------------------------
@@ -1103,6 +1181,12 @@ rule DispatchRemoveResolvedReports {
     when: CronTaskExecutes(task, doer)
     requires: task.name = remove_resolved_reports
     ensures: ResolvedReportRemovalDue(keep_for: config.remove_resolved_reports_keep_for)
+}
+
+rule DispatchDeleteOrphanedAttachments {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = delete_orphaned_attachments
+    ensures: OrphanedUploadCleanupDue(older_than: config.delete_orphaned_attachments_older_than)
 }
 
 -- from: services/cron/tasks_actions.go:30
@@ -1301,6 +1385,7 @@ rule AdminCreatesUser {
     when: AdminCreatesUser(admin, name, email, password, login_source, login_name, visibility, must_change_password, restricted, send_notification)
     requires: admin.is_admin = true
     requires: is_usable_username(name)
+    requires: not (exists accounts/ReservedName{name: name})   -- accounts: reserved until AdminReleasesName
     requires: not username_taken(name)
     requires: is_valid_email(email)
     requires: not email_in_use(email)
@@ -1473,7 +1558,20 @@ rule AdminSetsUserPrimaryEmail {
     requires: admin.is_admin = true
     requires: is_valid_email(address)
     requires: not email_used_by_other(address, user)
+    let old_primary = user.primary_email
+    let existing = accounts/EmailAddress{user: user, address: address}
+    -- the old primary stays as a secondary address
+    ensures:
+        for e in user.email_addresses where is_primary:
+            e.is_primary = false
+    ensures:
+        if exists existing:
+            existing.is_primary = true
+            existing.is_activated = true
+        else:
+            accounts/EmailAddress.created(user: user, address: address, is_activated: true, is_primary: true)
     ensures: user.primary_email = address
+    ensures: UserPrimaryEmailSetByAdmin(admin: admin, user: user, old_address: old_primary, new_address: address)
     ensures: UserEditedByAdmin(admin: admin, user: user)
 }
 
@@ -1485,6 +1583,7 @@ rule AdminRenamesUser {
     requires: admin.is_admin = true
     requires: is_usable_username(new_name)
     requires: not username_taken(new_name) or lower(new_name) = lower(user.name)
+    requires: lower(new_name) = lower(user.name) or not (exists accounts/ReservedName{name: new_name})   -- accounts: reserved until AdminReleasesName
     let old_name = user.name
     ensures: user.name = new_name
     ensures: UserRenamedByAdmin(admin: admin, user: user, old_name: old_name, new_name: new_name)
@@ -1558,6 +1657,7 @@ rule AdminCreatesOrganizationForUser {
     when: AdminCreatesOrganizationForUser(admin, user, name, visibility)
     requires: admin.is_admin = true
     requires: is_usable_username(name)
+    requires: not (exists accounts/ReservedName{name: name})   -- accounts: reserved until AdminReleasesName
     requires: not username_taken(name)
     ensures: OrganizationCreatedForUserByAdmin(admin: admin, user: user, name: name, visibility: visibility)
 }
@@ -1658,6 +1758,7 @@ rule OperatorCreatesUser {
     when: OperatorCreatesUser(operator, instance, name, email, password, is_admin, must_change_password, restricted, access_token_name, access_token_scopes)
     requires: instance.install_status = installed
     requires: is_usable_username(name)
+    requires: not (exists accounts/ReservedName{name: name})   -- accounts: reserved until AdminReleasesName
     requires: not username_taken(name)
     requires: not email_in_use(email)
     let first_account = not any_account_exists()
@@ -1734,8 +1835,13 @@ rule OperatorGeneratesAccessToken {
 -- `forgejo admin user create-authorized-integration` (JWT-trusting token)
 -- from: cmd/admin_user_generate_authorized_integration.go:102
 rule OperatorCreatesAuthorizedIntegration {
-    when: OperatorCreatesAuthorizedIntegration(operator, user, name)
-    ensures: AuthorizedIntegrationRequested(operator: operator, user: user, name: name)
+    when: OperatorCreatesAuthorizedIntegration(operator, user, name, description, issuer, claim_rules, scopes, all_repositories, repositories)
+    -- authentication checks the issuer and the claim rules and generates the audience.
+    ensures: AuthorizedIntegrationRequested(operator: operator, user: user, name: name, description: description, issuer: issuer, claim_rules: claim_rules, scopes: scopes, all_repositories: all_repositories, repositories: repositories)
+    @guidance
+        -- Flags: --username, --name, --description, --issuer, --claim-eq,
+        -- --claim-in, --claim-glob, --claim-glob-in (claim=value[,value...]),
+        -- --scope (repeatable), --repo owner/name or "all".
 }
 
 -- `forgejo admin regenerate keys`
@@ -1757,8 +1863,11 @@ rule OperatorSyncsReleases {
 -- list|delete`
 -- from: cmd/admin.go:55
 rule OperatorConfiguresAuthSource {
-    when: OperatorConfiguresAuthSource(operator, kind, action)
-    ensures: AuthSourceConfiguredFromCli(operator: operator, kind: kind, action: action)
+    when: OperatorConfiguresAuthSource(operator, kind, action, source, name, is_active, sync_enabled, settings)
+    -- source: the --id of the source for update / delete, null for add and list.
+    -- authentication creates, updates or deletes the source with the admin
+    -- form's validation; `list` changes nothing.
+    ensures: AuthSourceConfiguredFromCli(operator: operator, kind: kind, action: action, source: source, name: name, is_active: is_active, sync_enabled: sync_enabled, settings: settings)
 }
 
 -- `forgejo admin sendmail --title --content [--force]`: mail every active
@@ -2023,6 +2132,14 @@ surface SystemNoticeLog {
         notice.kind
         notice.description
         notice.created_at
+        -- the audit trail access keeps of site admins opening private
+        -- repositories they hold no role in (decided: follow-up 1); shown
+        -- next to the notices, never edited, no retention of its own
+        for record in access/AdminAccessRecords:
+            record.admin
+            record.repository
+            record.unit_kind
+            record.accessed_at
 
     provides:
         AdminDeletesNotices(admin, notices)
@@ -2054,8 +2171,11 @@ surface InstanceConfiguration {
         -- Web: GET /admin/config, POST /admin/config/test_mail,
         -- POST /admin/config/test_cache (cache round-trip timing).
         -- Lists among others the [webhook] retry settings (max delivery
-        -- attempts, retry backoff base) and [actions] retention settings
-        -- other modules own.
+        -- attempts, retry backoff base) and the [actions] settings other
+        -- modules own: registration_token_lifetime (1h), run_pruning_enabled /
+        -- run_retention, schedule_inactivity_disable_enabled /
+        -- schedule_inactivity_period. Instance-wide merge-message templates
+        -- are files under the custom path (pulls), with no admin UI.
 }
 
 -- Runtime-changeable settings.
@@ -2239,6 +2359,9 @@ surface AdminUserAccount {
         -- GET/POST/DELETE /api/v1/admin/users/{username}/tokens[/{id}],
         -- GET /api/v1/admin/users/{username}/quota, POST …/quota/groups (quota).
         -- Any API call: ?sudo=<user> or Sudo header — access/SiteAdminActsAs.
+        -- The delete form offers "reserve this name": it first issues
+        -- accounts' AdminReservesName (accounts/ReservedNameAdministration)
+        -- for the account's name, then AdminDeletesUser.
         -- The edit form applies all fields in one submit, in this order:
         -- rename, login source/password/prohibit-login, email, profile+flags, 2FA reset.
 }
@@ -2367,7 +2490,8 @@ surface DelegatedAdminConsoles {
         --   the instance-wide delivery log (webhooks/InstanceDeliveryLog).
         -- accounts: reserved names (accounts/ReservedNameAdministration) and
         --   account purges (accounts/AccountPurgeAdministration).
-        -- actions: /admin/actions/runners, /admin/actions/variables;
+        -- actions: /-/admin/actions/runners, /-/admin/actions/variables
+        --   (actions' ActionsSettings at the instance scope);
         --   API /api/v1/admin/actions/runners[...], /api/v1/admin/runners/...
         -- packages: /admin/packages (list, delete version, cleanup expired data).
         -- moderation: /admin/moderation/reports, /admin/abuse_reports/act.
@@ -2391,10 +2515,10 @@ surface OperatorConsole {
         OperatorResetsTwoFactor(operator, user)
         OperatorDeletesUser(operator, user, purge)
         OperatorGeneratesAccessToken(operator, user, token_name, scopes)
-        OperatorCreatesAuthorizedIntegration(operator, user, name)
+        OperatorCreatesAuthorizedIntegration(operator, user, name, description, issuer, claim_rules, scopes, all_repositories, repositories)
         OperatorRegeneratesAuthorizedKeys(operator)
         OperatorSyncsReleases(operator)
-        OperatorConfiguresAuthSource(operator, kind, action)
+        OperatorConfiguresAuthSource(operator, kind, action, source, name, is_active, sync_enabled, settings)
         OperatorMailsAllUsers(operator, instance, subject, body)
         OperatorRunsDoctor(operator, checks, fix)
         OperatorDumpsInstance(operator, instance, format, contents)
@@ -2437,7 +2561,11 @@ surface BackgroundWorkReporting {
         -- In-process contract, not a network API. Each module that owns cron
         -- work answers a *Due trigger by doing the work and then reporting
         -- CronWorkCompleted with finished / failed (error text) / cancelled
-        -- (shutdown or explicit cancel).
+        -- (shutdown or explicit cancel). An owner that reports completion
+        -- with a trigger of its own (accounts/InactiveAccountCleanupFinished,
+        -- keys/KeyFilesRewritten) has it mapped to its task here. Background
+        -- failures worth an operator's attention are owners' own triggers
+        -- that this module turns into SystemNotices (Reacts to).
 }
 
 ------------------------------------------------------------
@@ -2459,12 +2587,9 @@ deferred instance_statistics       -- see: models/activities/statistic.go — co
 -- Requests to other modules
 ------------------------------------------------------------
 -- REQUEST accounts/User: fields used here already exist (max_repo_creation with null = default, allow_git_hook, allow_import_local, allow_create_organization, login_source, profile fields); config.disable_regular_org_creation now lives in organizations' config.
--- REQUEST authentication/UserLogin { user, source, login_name, has_password, must_change_password, password_changed_at }: administration creates it on admin/CLI account creation and sets must_change_password / source / login_name on admin edit and CLI.
 -- REQUEST accounts: react to UserDeletedByAdmin(admin, user, purge) with the cascade (purge: disable first, delete repos, leave orgs and delete sole-owned orgs, delete packages and federated identity; remove user dir and avatar, report a file-removal failure for a system notice (see the last request)).
 -- REQUEST accounts: react to UserRenamedByAdmin with the same redirect/ownership handling as a self rename; react to UserAvatarChangedByAdmin / UserAvatarRemovedByAdmin.
 -- REQUEST accounts: own InactiveAccountCleanupDue(older_than) — delete never-activated accounts older than that and report CronWorkCompleted.
--- REQUEST authentication: react to UserTwoFactorResetByAdmin (delete TOTP + WebAuthn), AccessTokenRequestedForUser, AuthorizedIntegrationRequested, AuthSourceConfiguredFromCli, ExternalUserSyncDue(update_existing), UserPasswordSetByAdmin / UserPasswordSetByOperator (hash + store).
--- REQUEST authentication: expose the password policy as password_acceptable(password) (MIN_PASSWORD_LENGTH default 8, PASSWORD_COMPLEXITY, PASSWORD_CHECK_PWN) and password_long_enough(password).
 -- REQUEST repositories: react to MirrorUpdateDue, RepositoryHealthCheckDue, RepositoryStatsCheckDue, RepositoryArchiveCleanupDue, AllRepositoryArchivesDeletionDue, RepositoryGarbageCollectionDue, MissingRepositoryReinitDue, MissingRepositoryDeletionDue, GeneratedRepositoryAvatarDeletionDue. (Done in integration: all nine have reactions.)
 -- REQUEST repositories: react to RepositoryCreationRequestedByAdmin(admin, user, name) by creating the repository with instance defaults as UserCreatesRepository does (a site admin bypasses the creation limit), and to RepositoryDeletionRequestedByAdmin(admin, repository) with the OwnerDeletesRepository cascade, ending in RepositoryDeleted(repository, doer: admin).
 -- REQUEST code: react to DeletedBranchCleanupDue, LfsGarbageCollectionDue, AllRepositoryBranchesResyncRequested.
@@ -2474,7 +2599,6 @@ deferred instance_statistics       -- see: models/activities/statistic.go — co
 -- REQUEST packages: react to PackageCleanupDue(older_than).
 -- REQUEST notifications: notifications reacts to the AdminSendsTestMail stimulus directly (fine); also react to OldActivityDeletionDue, MassMailRequested, UserCreatedByAdmin (send "account created" mail when send_notification); honour config.notify_admins_on_new_user and config.default_email_notifications.
 -- REQUEST discovery: react to IssueIndexRebuildDue.
--- REQUEST moderation: react to ResolvedReportRemovalDue(keep_for).
 -- REQUEST migrations: react to MigrationPosterIdUpdateDue; emit MigrationFailureReported(kind, description) (local) for every failure or dropped source data that merits a repository notice — administration records it.
 -- REQUEST actions: react to ZombieActionsTaskStopDue, EndlessActionsTaskStopDue, AbandonedActionsJobCancellationDue, LingeringActionsLogTransferDue, ActionsScheduleStartDue, ActionsCleanupDue, OfflineRunnerCleanupDue, ActionsUserCleanupDue.
 -- REQUEST organizations: react to OrganizationCreatedForUserByAdmin; honour config.disable_regular_org_creation.

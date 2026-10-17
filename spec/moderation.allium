@@ -6,6 +6,9 @@
 --   exposures are guarded by it) and the purge task. Reporting, every
 --   moderation action and the purge require it. Evidence capture does not:
 --   Forgejo snapshots a reported item whenever reports on it lack a copy.
+-- Read-only mode: filing a report is refused while access/InstanceWriteGate
+--   is read-only (decided: administration 3); the admin queue and its actions
+--   are admin console and keep working.
 -- Scope: Signed-in users report abusive content (a user or organization
 --   profile, a repository, an issue or pull request, a comment) under a
 --   category with remarks. Reports on the same item are grouped; the item's
@@ -47,9 +50,18 @@
 --   ModeratorDeletesComment(admin, comment)            -- issues: delete comment
 -- Reacts to:
 --   ReportableContentChanging(content, change)
---       -- raised by accounts, organizations, repositories and issues
---          immediately BEFORE a moderation-relevant edit or a deletion of a
---          user/org profile, repository, issue/PR or comment.
+--       -- internal: raised by this module's reactions to the owners' events
+--          below, in the same step as a moderation-relevant edit or a
+--          deletion of a user/org profile, repository, issue/PR or comment.
+--   accounts/ReportableUserChanging(user, change)
+--   organizations/OrganizationProfileUpdated(organization),
+--     OrganizationRenamed(organization, old_name, new_name),
+--     OrganizationAvatarChanged(organization)
+--   repositories/RepositoryProfileChanging(repository, doer),
+--     RepositoryDeleted(repository, doer)
+--   issues/IssueTitleChanged(issue, doer, old_title),
+--     IssueContentChanged(issue, doer, old_content), IssueDeleted(issue, doer),
+--     IssueCommentEdited(comment, doer, old_content), IssueCommentDeleted(comment, doer)
 --   organizations/OrganizationDeleted(organization)
 --       -- an organization was deleted (by its owners, a purge or moderation):
 --          its reports keep a shadow copy, as for users.
@@ -273,6 +285,7 @@ config {
 rule UserReportsContent {
     when: UserReportsContent(reporter, content, category, remarks)
     requires: config.enabled
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not reporter.prohibit_login
     requires: not content.is_deleted
     requires: remarks_length(remarks) >= config.remarks_min_length
@@ -342,6 +355,91 @@ rule PreserveEvidenceOnOrganizationDeletion {
     when: organizations/OrganizationDeleted(organization)
     ensures:
         for content in ReportableContents where reported_organization = organization:
+            ReportableContentChanging(content: content, change: deletion)
+}
+
+-- The owning modules' own change and deletion events feed the same evidence
+-- path. Each reaction runs in the owner's atomic step; the snapshot takes the
+-- item as that step found it, with the pre-change values the event carries
+-- (old_title, old_content, old_name) where it carries them.
+-- accounts announces moderation-relevant profile edits and account deletion
+-- with ReportableUserChanging (change: update | deletion).
+rule PreserveEvidenceOnUserChange {
+    when: accounts/ReportableUserChanging(user, change)
+    ensures:
+        for content in ReportableContents where reported_user = user:
+            ReportableContentChanging(content: content, change: change)
+}
+
+rule PreserveEvidenceOnOrganizationProfileUpdate {
+    when: organizations/OrganizationProfileUpdated(organization)
+    ensures:
+        for content in ReportableContents where reported_organization = organization:
+            ReportableContentChanging(content: content, change: update)
+}
+
+rule PreserveEvidenceOnOrganizationRename {
+    when: organizations/OrganizationRenamed(organization, old_name, new_name)
+    ensures:
+        for content in ReportableContents where reported_organization = organization:
+            ReportableContentChanging(content: content, change: update)
+}
+
+rule PreserveEvidenceOnOrganizationAvatarChange {
+    when: organizations/OrganizationAvatarChanged(organization)
+    ensures:
+        for content in ReportableContents where reported_organization = organization:
+            ReportableContentChanging(content: content, change: update)
+}
+
+-- repositories raises RepositoryProfileChanging in the same step as a
+-- settings update, rename or transfer of the repository.
+rule PreserveEvidenceOnRepositoryProfileChange {
+    when: repositories/RepositoryProfileChanging(repository, doer)
+    ensures:
+        for content in ReportableContents where reported_repository = repository:
+            ReportableContentChanging(content: content, change: update)
+}
+
+rule PreserveEvidenceOnRepositoryDeletion {
+    when: repositories/RepositoryDeleted(repository, doer)
+    ensures:
+        for content in ReportableContents where reported_repository = repository:
+            ReportableContentChanging(content: content, change: deletion)
+}
+
+rule PreserveEvidenceOnIssueTitleChange {
+    when: issues/IssueTitleChanged(issue, doer, old_title)
+    ensures:
+        for content in ReportableContents where reported_issue = issue:
+            ReportableContentChanging(content: content, change: update)
+}
+
+rule PreserveEvidenceOnIssueContentChange {
+    when: issues/IssueContentChanged(issue, doer, old_content)
+    ensures:
+        for content in ReportableContents where reported_issue = issue:
+            ReportableContentChanging(content: content, change: update)
+}
+
+rule PreserveEvidenceOnIssueDeletion {
+    when: issues/IssueDeleted(issue, doer)
+    ensures:
+        for content in ReportableContents where reported_issue = issue:
+            ReportableContentChanging(content: content, change: deletion)
+}
+
+rule PreserveEvidenceOnCommentEdit {
+    when: issues/IssueCommentEdited(comment, doer, old_content)
+    ensures:
+        for content in ReportableContents where reported_comment = comment:
+            ReportableContentChanging(content: content, change: update)
+}
+
+rule PreserveEvidenceOnCommentDeletion {
+    when: issues/IssueCommentDeleted(comment, doer)
+    ensures:
+        for content in ReportableContents where reported_comment = comment:
             ReportableContentChanging(content: content, change: deletion)
 }
 
@@ -716,6 +814,11 @@ surface ReportedContentLifecycle {
     provides:
         ReportableContentChanging(content, change)
 
+    @guidance
+        -- The owning modules do not raise this themselves: this module's
+        -- PreserveEvidenceOn* reactions raise it from their change and
+        -- deletion events. The surface names the in-process hook.
+
     @guarantee CopyBeforeChange
         -- The snapshot is taken from the item's state BEFORE the edit or
         -- deletion is applied, in the same atomic step as the change.
@@ -740,7 +843,6 @@ deferred snapshot_comment       -- see: models/issues/moderation.go:90
 -- REQUEST access: can_read_any_unit(user, repository); can_read_conversation(user, issue) = can_read(user, issue.repository, pull_requests if issue.is_pull else issues).
 -- REQUEST issues/Issue: raise ReportableContentChanging before title change, content change, deletion; react to moderation/ModeratorDeletesIssue.
 -- REQUEST issues/Comment: has_user_content (comment kinds that carry text/attachments); raise ReportableContentChanging before content change and deletion; react to moderation/ModeratorDeletesComment.
--- REQUEST administration/CronTask: register "remove_resolved_reports" (@every 24h) only when moderation is enabled, now ENABLED by default, and default remove_resolved_reports_keep_for to 180 days (decided: moderation 9).
 -- REQUEST notifications: react to moderation/AbuseReported(content, reporter, category) by notifying every site admin (inbox entry; mail per their mail preference) of the new report, linking the moderation queue (decided: moderation 7).
 -- REQUEST notifications: react to moderation/ReportReviewed(report, reporter) by telling the reporter (inbox; mail per preference) that their report on report.content.reference was reviewed, with no resolution or action named (decided: moderation 8).
 -- REQUEST organizations: drop the REQUEST to moderation about deletion (moderation now reacts to OrganizationDeleted for evidence); profile edits should still raise ReportableContentChanging(content, update). moderation now reads is_org_owner(org, user) to refuse reports on one's own organization.

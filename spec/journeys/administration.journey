@@ -117,19 +117,19 @@ journey InstallRefusesToLockEveryoneOut {
 -- Running a maintenance task by hand, and what a failure leaves behind.
 -- decided: administration 1 — the admin who ran it is recorded as the doer.
 journey AdministratorRunsADisabledTaskByHand {
-    goal: Root wants to purge never-activated accounts now. The task is
+    goal: Root wants to garbage-collect every repository now. The task is
           disabled on the schedule, but the dashboard still offers it. It runs,
-          the accounts module reports a failure, and the failure is waiting in
-          the system notices.
+          the run reports a failure, and the failure is waiting in the system
+          notices.
 
     given:
-        sweep: CronTask { name: delete_inactive_accounts, owner: accounts, requires_feature: always, enabled: false, run_at_start: false, schedule: "@annually", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+        sweep: CronTask { name: git_gc_repos, owner: repositories, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 72h", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
 
     1. root runs it from the dashboard
         root does AdminRunsCronTask(root, sweep) on AdminDashboard
         then AdminRunsCronTask fires
         then StartCronTaskRun fires
-        then DispatchDeleteInactiveAccounts fires
+        then DispatchGitGcRepos fires
         then sweep.run_state = running
         then sweep.exec_times = 1
         then sweep.last_doer = root
@@ -139,7 +139,7 @@ journey AdministratorRunsADisabledTaskByHand {
         then StartCronTaskRun does not fire
         then sweep.exec_times = 1
 
-    3. the accounts module reports it failed
+    3. the run reports it failed
         proc does CronWorkCompleted(sweep, failed, "database is locked") on BackgroundWorkReporting
             creating notice: SystemNotice
         then FinishCronTaskRun fires
@@ -152,6 +152,33 @@ journey AdministratorRunsADisabledTaskByHand {
         root sees sweep.last_message on CronTaskMonitor in sweep
 
     ends: The failure is recorded on the task and in the notice log.
+}
+
+-- accounts reports the end of its sweep itself (InactiveAccountCleanupFinished);
+-- the run is finished from that report, not left running.
+journey TheInactiveAccountSweepFinishesItsRun {
+    goal: Root runs the never-activated-accounts cleanup by hand. The accounts
+          module sweeps and says it is done; the task is idle again with a
+          clean outcome, ready for the next click.
+
+    given:
+        sweep: CronTask { name: delete_inactive_accounts, owner: accounts, requires_feature: always, enabled: false, run_at_start: false, schedule: "@annually", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+
+    1. root runs it from the dashboard
+        root does AdminRunsCronTask(root, sweep) on AdminDashboard
+        then DispatchDeleteInactiveAccounts fires
+        then FinishInactiveAccountCleanupRun fires
+        then FinishCronTaskRun fires
+        then sweep.run_state = idle
+        then sweep.last_outcome = finished
+        then sweep.exec_times = 1
+
+    2. a second click starts it again
+        root does AdminRunsCronTask(root, sweep) on CronTaskMonitor
+        then StartCronTaskRun fires
+        then sweep.exec_times = 2
+
+    ends: Each run is started and finished; none is left hanging.
 }
 
 -- Only administrators run maintenance.
@@ -612,4 +639,52 @@ journey AdministratorRunsDoctorChecksFromTheWeb {
         root sees run.report on DoctorReports in run
 
     ends: Root knows what is wrong; fixing it is a job for the shell.
+}
+
+-- accounts asked: a reserved name stays reserved for admin acts too.
+journey AnAdminCannotRenameOntoAReservedName {
+    goal: Root reserved "ops" for the team's future account. Renaming Ada to
+          "ops", or creating an organization of that name for her, is refused
+          until the reservation is released.
+
+    given:
+        held: accounts/ReservedName { name: "ops" }
+
+    1. the rename is refused
+        stipulate is_usable_username("ops") = true
+        stipulate username_taken("ops") = false
+        stipulate lower("ops") = "ops"
+        stipulate lower("ada") = "ada"
+        root cannot do AdminRenamesUser(root, ada, "ops") on AdminUserAccount
+        then ada.name = "ada"
+
+    2. so is an organization of that name
+        root cannot do AdminCreatesOrganizationForUser(root, ada, "ops", public) on AdminUserAccount
+
+    ends: The name stays free for whoever the reservation is released to.
+}
+
+-- accounts asked: the admin's primary-email change keeps the address rows straight.
+journey AnAdminMovesAdaToANewAddress {
+    goal: Ada's company address changed. Root makes the new address her primary
+          one; it is stored activated and primary, and her old address stays on
+          the account as a secondary one.
+
+    given:
+        old: accounts/EmailAddress { user: ada, address: "ada@old.example", is_activated: true, is_primary: true }
+        ada.primary_email = "ada@old.example"
+
+    1. root sets the new address
+        stipulate is_valid_email("ada@new.example") = true
+        stipulate email_used_by_other("ada@new.example", ada) = false
+        root does AdminSetsUserPrimaryEmail(root, ada, "ada@new.example") on AdminUserAccount
+            creating fresh: accounts/EmailAddress
+        then AdminSetsUserPrimaryEmail fires
+        then ada.primary_email = "ada@new.example"
+        then fresh.is_primary = true
+        then fresh.is_activated = true
+        then old.is_primary = false
+        then old exists
+
+    ends: Ada has one primary, activated address and keeps the old one.
 }
