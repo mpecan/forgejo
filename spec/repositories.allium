@@ -87,7 +87,7 @@
 --                                                              releases, projects, wiki, webhooks + deliveries, actions (runs/tasks/runners/secrets/variables/artifacts),
 --                                                              packages (unlink), code (branches, protected rules, LFS), keys (deploy keys), notifications, access tokens scoped to it,
 --                                                              moderation (shadow copy if reported)
---   CollaboratorInvited(repository, user, doer)             -- notifications (mail to the invitee, see REQUEST)
+--   CollaboratorInvited(repository, user, doer)             -- notifications (mail to the invitee, MailOnCollaboratorInvited)
 --   CollaboratorInvitationDeclined(repository, user, doer)  -- notifications (optional: tell the inviter)
 --   CollaboratorAdded(repository, user, doer)               -- the access grant starts: an invitation was accepted
 --                                                              (doer = the inviter) or a site admin added directly; notifications, access
@@ -1647,7 +1647,7 @@ rule OwnerTransfersRepositoryToUser {
 -- Transfer to an organisation, optionally naming teams that receive the repository.
 -- Completes immediately when the doer is a site admin or may create repositories there; the
 -- organisation's owners are told of the arrival (notifications reacts to RepositoryTransferred,
--- see REQUEST). A private organisation the doer is not a member of is treated as non-existent.
+-- MailOnRepositoryArrived). A private organisation the doer is not a member of is treated as non-existent.
 -- decided: repositories decision 10 (immediate when the doer may create repositories there,
 -- like Forgejo; the org owners are notified); decision 8 (the organisation's repository limit
 -- is checked; site admins exempt)
@@ -1840,7 +1840,7 @@ rule AdminInvitesCollaborator {
             CollaboratorInvitation.created(repository: repository, invitee: collaborator, inviter: user, access_mode: write, created_at: now)
             CollaboratorInvited(repository: repository, user: collaborator, doer: user)
     @guidance
-        -- The invitee is mailed with links to accept or decline (notifications, see REQUEST).
+        -- The invitee is mailed with links to accept or decline (notifications, MailOnCollaboratorInvited).
         -- API PUT .../collaborators/{user} invites the same way; a permission passed there is
         -- applied after acceptance (AdminChangesCollaboratorAccess).
 }
@@ -2014,13 +2014,14 @@ rule AutoWatch {
 }
 
 -- A push may make the pusher an automatic watcher, refreshes the size and triggers
--- push mirrors configured to sync on commit.
+-- push mirrors configured to sync on commit. A deploy-key push has no user pusher
+-- (push.pusher null, decided code 4), so nobody starts watching.
 -- from: services/repository/push.go:276
 rule PushTouchesRepository {
     when: code/PushReceived(push)
     let repository = push.repository
     ensures:
-        if config.auto_watch_on_changes:
+        if config.auto_watch_on_changes and push.pusher != null:
             AutoWatchRequested(user: push.pusher, repository: repository)
     ensures: repository.git_size = measured_git_size(repository)
     ensures: repository.updated_at = now
@@ -3474,35 +3475,3 @@ surface RepositoryIntegrations {
 deferred TemplateExpansion.expand           -- see: services/repository/generate.go (variables, transformers, .forgejo/template globs)
 deferred InitialContent.render              -- see: services/repository/create.go:51 (README/.gitignore/LICENSE templates)
 deferred LanguageDetection.classify         -- see: modules/analyze (linguist-style detection)
-
-------------------------------------------------------------
--- Requests to other modules
-------------------------------------------------------------
-
--- REQUEST accounts/User.max_repo_creation: per-user repository limit (-1 = instance default), needed by within_creation_limit
--- REQUEST accounts/User.num_repos (or a derived count): repositories owned, needed by within_creation_limit
--- REQUEST accounts/User.last_repo_visibility: remembered privacy of the user's last created repository (config.default_private = last)
--- REQUEST accounts/UserBlock lookup (is_blocked(blocker, blocked)): collaborator add and transfer refuse blocked pairs
--- REQUEST organizations/Organization.max_repo_creation: organisations have their own repository limit
--- REQUEST organizations: can_create_in_org(user, org) — owners and members of teams with "can create repositories"
--- REQUEST organizations/Team.name and Team.organization: shown on org transfers / checked to belong to the recipient org
--- REQUEST organizations: react to TeamsReceiveTransferredRepository(repository, teams) and to RepositoryCreated/RepositoryTransferred for teams including all repositories
--- REQUEST access: expose can_see_repository / can_read_code / can_write_code / is_repo_admin / is_repo_owner as callable predicates; owner-level access = owning user, org owners, site admins
--- REQUEST access: an anonymous actor so RepositoryOverview can face anonymous visitors on public repositories
--- REQUEST code/PushReceived(push) with push.repository and push.pusher
--- REQUEST code: owns changing the default branch (AdminChangesDefaultBranch, DefaultBranchChanged); reacts to ForkBranchFastForwarded, RepositoryGeneratedFromTemplate (git content, git hooks, protected branches)
--- REQUEST code: report RepositoryStorageUnreadable / RepositoryStorageRestored / RepositoryStorageRecreated around git storage, and fork_branch_can_fast_forward(repository, branch)
--- REQUEST pulls/MergeStyle (incl. manually_merged, fast_forward_only) and pulls/UpdateStyle = merge | rebase
--- REQUEST releases/Release.repository and a way to find the release of a tag, so ReaderDownloadsArchive can count release archive downloads
--- REQUEST issues: react to LabelTemplateApplied(repository, template_name) and RepositoryGeneratedFromTemplate(labels) to create labels; CollaboratorRemoved unassigns
--- NOTE for integration: webhooks listens for repositories/RepositoryMigrated(repository, doer) but migrations emits its own RepositoryMigrated; one of them should own it (this module would need the doer in ImportCompleted)
--- NOTE for integration: siblings call some of this module's triggers with other shapes — RepositoryDeleted(repository) (here: repository, doer), RepositoryForked(fork, source, doer) (here: source, fork, doer), RepositoryGeneratedFromTemplate(repository, template, include_webhooks) (here: template, repository, doer, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches), RepositoryTransferred(repository, old_owner)
--- REQUEST administration/CronTask: schedule this module's tasks and emit their *Due triggers with named arguments (see Reacts to); create SystemNotice on PullMirrorSyncFailed / RepositoryHealthCheckFailed / RepositoryGarbageCollectionFailed
--- REQUEST quota: within_repo_quota(owner) for the repository-size subject
--- REQUEST quota: decided (follow-up 2): within_creation_limit(owner) includes quota_allows(owner, count_repos, 1) (gates gate_*_repository_count, charged to the new owner / transfer recipient) and QuotaUsage.repos_count = repositories owned (accounts/User.num_repos, organisations alike) - done in quota.allium.
--- REQUEST discovery: emit LanguageStatsComputed(repository, commit_sha, sizes) from the stats indexer
--- REQUEST keys: initial-commit signing policy (config.initial_commit_signing) and TrustModel semantics
--- REQUEST webhooks: copy default/system webhooks on RepositoryCreated; copy template webhooks on RepositoryGeneratedFromTemplate(webhooks)
--- REQUEST notifications: mail the invitee on repositories/CollaboratorInvited(repository, user, doer) (who invited them, to which repository, with accept / decline links to IncomingCollaboratorInvitation); MailOnCollaboratorAdded then needs to mail only for a site admin's direct add (CollaboratorAdded after acceptance has doer = the inviter, and the invitee already knows) — optionally tell the inviter on CollaboratorAdded / CollaboratorInvitationDeclined(repository, user, doer) (decision 4)
--- REQUEST notifications: on repositories/RepositoryTransferred(repository, doer, old_owner_name) into an organisation, notify that organisation's owners (inbox and mail) that the repository arrived and who moved it (decision 10)
--- REQUEST access: AnnounceLostAccessAcrossRepository also announces stargazers who lost read access - done (stars loop added; repositories/UnstarOnLostAccess reacts; decision 3)

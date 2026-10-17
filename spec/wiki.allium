@@ -680,24 +680,7 @@ deferred page_name_for    -- see: services/wiki/wiki_path.go (title -> page name
 ------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
--- REQUEST repositories/RepositoryCreated(repository, doer): emit on every creation path
---   (new, fork, template, migration, adoption) so the Wiki record exists.
--- REQUEST repositories/Repository.wiki_branch: changed only through wiki/AdminChangesWikiBranch.
--- REQUEST repositories: react to wiki/WikiDeleted by disabling the wiki unit.
--- REQUEST repositories/RepoUnit: expose the external wiki URL and the "globally
---   writeable" default permission of the wiki unit (access must grant wiki write to
---   every signed-in non-restricted user of a public repository when set).
--- REQUEST repositories: rename/transfer must carry the wiki git data; repository
---   deletion removes it; pull/push mirrors also sync the wiki; migration may import a
---   wiki, setting Repository.wiki_branch to the imported default branch and Wiki.status initialised.
--- REQUEST access/can_read, access/can_write, access/is_repo_admin: wrapped here as
---   2-argument local functions (simulator limitation with enum-literal arguments).
--- REQUEST keys: a wiki signing policy ([repository.signing] WIKI, default never)
---   deciding whether wiki commits are signed and who appears as committer.
--- REQUEST keys: react to wiki/WikiCommitSigningRequested(actor, repository, wiki_head_verified)
---   with DecideWikiSigning (wiki emits it locally before each web/API commit, so keys
---   reacts rather than wiki emitting keys/WikiEditSigningRequested).
--- REQUEST notifications / webhooks: react to WikiPageCreated / WikiPageEdited /
---   WikiPageDeleted (feed entries, `wiki` webhook event with created/edited/deleted).
--- REQUEST webhooks / notifications: wiki events now also arrive from git pushes (one per
---   changed page); no new event kinds needed.
+-- REQUEST migrations, repositories: a wiki that arrives as git data (imported by a migration with
+--   wiki = true, or brought in by a pull-mirror sync) never becomes Wiki.status = initialised and gets no
+--   WikiPage records here; say which module records its pages and initialises it (wiki excludes import
+--   and mirroring as their lifecycles). Rename, transfer and deletion already carry the wiki git data.

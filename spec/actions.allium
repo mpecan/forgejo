@@ -120,6 +120,11 @@
 -- code's gate.
 --
 -- Black boxes standing for other modules' contracts:
+--   can_read_actions(user, repository)  = access/can_read(user, repository, actions)
+--   can_write_actions(user, repository) = access/can_write(user, repository, actions)
+--   is_repo_admin(user, repository)     = access/is_repo_admin(user, repository)
+--       (local two-argument names: the journey walker cannot evaluate a qualified
+--       call or an enum-literal argument)
 --   quota_allows_artifacts(repository) = quota/quota_allows(<the repository
 --       owner's QuotaAccount>, size_assets_artifacts, null): QuotaGate
 --       gate_artifact_upload, charged to the repository owner. The size of an
@@ -3203,8 +3208,10 @@ surface RunningJobCapabilities {
     @guarantee AutomaticTokenScope
         -- On its own repository the automatic token acts as the Actions bot
         -- with write access to every enabled unit, or read access for fork
-        -- pull-request runs (including pull_request_target). On any other
-        -- repository it has only what the Actions bot has (public read).
+        -- pull-request runs (including pull_request_target). Every other
+        -- repository and every organization endpoint refuses it (decided:
+        -- access 6); of packages it reaches only those linked to its own
+        -- repository.
         -- It stops working the moment the task stops running.
         -- Pushes made with it do not start workflows.
 
@@ -3219,25 +3226,3 @@ surface RunningJobCapabilities {
 deferred WorkflowRun.job_definitions    -- see: code.forgejo.org/forgejo/runner act/jobparser (YAML, matrix, reusable workflows)
 deferred Workflow.matching_workflows    -- see: modules/actions/workflows.go detectMatched (event/filter matching)
 deferred ScheduleSpec.next_cron_occurrence  -- see: github.com/gdgvda/cron (5-field cron, @descriptors, TZ=/CRON_TZ= prefixes)
-
-------------------------------------------------------------
--- Requests to other modules
-------------------------------------------------------------
--- REQUEST code/Push.ref_updates with RefUpdate.ref_kind/ref_name/new_sha (present); a black-box full_ref_name(update) / qualified_ref(kind, name) gives refs/heads/<b> or refs/tags/<t>.
--- REQUEST code: react to actions/JobCommitStatusReported from the Actions bot (creator = actions_bot()) for the job's own repository without a write-permission check; target URL = the job page. Scheduled runs report no statuses (Forgejo skips them on runner updates).
--- REQUEST accounts: a well-known system user "the Actions bot" (actions_bot(), is_actions_bot(user)); events caused by it start no workflows.
--- REQUEST repositories/Repository.default_branch, .is_empty, .is_archived, .owner_user, .owner_org — used for scoping and gating.
--- REQUEST repositories: the actions unit's per-repository settings (disabled workflow file names) are modelled here as Workflow.is_disabled; repositories may prefer to own them on RepoUnit. the actions unit counts as enabled when the repository has an enabled RepoUnit of kind actions (access's invariant keeps units in DISABLED_REPO_UNITS disabled).
--- REQUEST access: can_read(user, repo, actions), can_write(user, repo, actions), is_repo_admin(user, repo). This module uses local black-box aliases can_read_actions / can_write_actions / is_repo_admin because qualified black-box calls cannot be stipulated in journeys; integration may substitute the access functions.
--- REQUEST access: the automatic token as an authentication method (TaskAccessesOwnRepository models it) — note Forgejo grants write to every unit of the own repository, read for fork PR runs. decided (access 6): the token reaches only its own repository and packages linked to it; other repositories and organization endpoints refuse it.
--- REQUEST issues: Issue.pull_request, Issue.milestone, Comment.issue (used to route issue vs pull-request activity).
--- REQUEST pulls/PullRequest.is_fork (head repository differs from base), .head_commit_sha (present), pull_ref(pr) = refs/pull/<index>/head, merge_commit_of(pr) = merged_commit_sha.
--- REQUEST releases/Release.publisher, .tag_name, .repository.
--- RESOLVED (packages): PackageVersion.package.repository is the optional link (packages/Package.repository).
--- RESOLVED (quota): quota_allows_artifacts(repository) is quota/quota_allows(<owner account>, size_assets_artifacts, null) (QuotaGate gate_artifact_upload; see the header); Artifact.compressed_size feeds QuotaUsage.artifacts.
--- RESOLVED (notifications): superseded by decided notifications 4 — notifications mails once per failed run attempt on WorkflowRunCompleted(run, prior_status) (MailOnActionsRunFailed), never on job completion.
--- RESOLVED (webhooks): webhooks reacts to WorkflowRunCompleted / WorkflowJobCompleted and to WorkflowRunAttemptStarted / WorkflowJobAttemptStarted (Workflow*AttemptRaisesHookEvent).
--- REQUEST administration: cron tasks stop_zombie_tasks (5m), stop_endless_tasks (30m), cancel_abandoned_jobs (6h), transfer_lingering_logs (midnight), start_schedule_tasks (1m), cleanup_actions (midnight), cleanup_offline_runners (disabled by default), actions_action_user (weekly); none registered when actions are disabled. Admin web pages /-/admin/actions/{runners,variables} map to ActionsSettings with the instance scope.
--- RESOLVED (notifications): MailOnScheduledWorkflowDisabled mails the repository's admins on ScheduledWorkflowDisabledForInactivity (decided actions 8).
--- REQUEST administration: cleanup_actions also prunes finished runs older than [actions] run retention when run pruning is enabled (decided actions 7, off by default); new [actions] settings registration_token_lifetime (1h), run_pruning_enabled/run_retention, schedule_inactivity_disable_enabled/schedule_inactivity_period.
--- REQUEST access: may_manage_actions_scope for a repository scope is is_repo_admin on web and REST alike (decided actions 2).

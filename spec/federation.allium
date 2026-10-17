@@ -1396,17 +1396,3 @@ surface FederationAdministration {
 ------------------------------------------------------------
 
 deferred ActorIdParsing.rules    -- see: modules/forgefed/actor.go, actor_person.go, actor_repository.go
-
-------------------------------------------------------------
--- Requests to other modules
-------------------------------------------------------------
--- REQUEST accounts/User.full_name: display name copied from the remote Person.
--- REQUEST accounts/User.keep_email_private: WebFinger hides mailto: alias and refuses mailto: lookups.
--- REQUEST accounts/User.email_notifications: materialised remote users have e-mail notifications disabled.
--- REQUEST accounts/User: creation of kind activitypub must accept fediverse handles ("@name@host[:port]") that local name rules would reject, and reserve the name "actor" for the instance actor.
--- REQUEST repositories/Star.user, repositories/Star.repository: federated Like creates a Star; local Star creation triggers outbound Like.
--- RESOLVED (notifications): ActivityRecorded(activity) fires once per recorded activity (AnnounceActivity; decided notifications 6).
--- REQUEST access/is_repo_admin(user, repository): repository settings gate.
--- REQUEST authentication: activitypub routes accept tokens only with read:activitypub / write:activitypub scope; user-id routes honour public-only tokens.
--- REQUEST repositories/RepositoryUnstarred(user, repository): local unstar triggers outbound Undo(Like) (decided: federation 5); a federated Undo(Like) deletes the remote person's Star directly.
-

@@ -153,7 +153,8 @@ use "./keys.allium" as keys
 --   resolves_to_assignee(repository, name) = some local account of that name
 --       satisfies can_be_assigned(_, repository)
 --
--- Repository issue-unit settings (REQUEST below):
+-- Repository issue-unit settings (repositories/RepoUnit issues_settings and
+-- Repository.close_issues_via_commit_in_any_branch):
 --   timetracker_enabled(repository), only_contributors_track_time(repository),
 --   dependencies_enabled(repository), closes_via_commit_in_any_branch(repository)
 --
@@ -2202,7 +2203,7 @@ invariant TrackedTimeIsPositive {
 ------------------------------------------------------------
 
 -- Anyone who can read the repository's issues or pull requests. Anonymous
--- visitors of public repositories are included through `access` (see REQUEST).
+-- visitors of public repositories are included through `access` (access/Anonymous).
 actor TrackerReader {
     within: repositories/Repository
     identified_by: accounts/User where can_read_tracker(this, within)
@@ -2704,26 +2705,3 @@ deferred cross_references                 -- see: models/issues/issue_xref.go ve
 deferred commit_references                -- see: modules/references/references.go keyword grammar
 deferred template_is_valid                -- see: modules/issue/template/template.go Validate
 deferred is_allowed_file                  -- see: modules/upload (extensions, MIME types, wildcards)
-
-------------------------------------------------------------
--- Requests to other modules
-------------------------------------------------------------
--- REQUEST repositories/Repository.owner_org: used to scope organization labels (fixed name, listed for completeness)
--- REQUEST repositories/RepoUnit (issues) config: enable_timetracker, allow_only_contributors_to_track_time, enable_dependencies — read here as timetracker_enabled / only_contributors_track_time / dependencies_enabled; defaults come from this module's default_* config
--- REQUEST repositories/Repository.close_issues_via_commit_in_any_branch: keyword closing on non-default branches (default DEFAULT_CLOSE_ISSUES_VIA_COMMITS_IN_ANY_BRANCH = false)
--- REQUEST repositories/RepositoryDeleted(repository): trigger this module reacts to
--- REQUEST repositories/Watch.watches_issues: per-repository custom watch selection (issues / PRs) used for implicit issue subscription
--- REQUEST code/PushReceived(push) with push.repository, push.pusher, push.branch and push.commits (sha, message, timestamp)
--- REQUEST pulls/PullRequestMerged(pull_request, merger) with pull_request.issue
--- REQUEST pulls/MergeClosesReferencedIssues guidance: Forgejo does NOT ignore open dependencies when a merge closes a referenced issue — the close fails and the error is swallowed (services/pull/merge.go:303), so the issue stays open; issues/ApplyResolvedReference models that
--- REQUEST pulls: issues_closed_by(pr) / issues_reopened_by(pr) should be the latest closes/reopens Comment (ref_issue = pr.issue, ref_action) per target issue, from issues' cross-reference entries
--- REQUEST pulls: PR conversations are created as issues/Issue (is_pull = true) and must set index: next_issue_index(repository), content_version: 0, labels/assignees/mentioned_users/read_by, created_at/updated_at; pulls' Comment.created calls should also set content_version / created_at / updated_at
--- REQUEST webhooks / actions: subscribe to this module's trigger names and arities as listed in the header (e.g. IssueCommentCreated(issue, comment, doer, mentions), IssueAssigneeChanged(issue, doer, assignee, removed, comment), IssueClosed(issue, doer, comment)); there is no IssueAssigneeAdded / CommentCreated / IssueEdited trigger
--- REQUEST access: an anonymous-visitor actor usable in TrackerReader / IssueReader surfaces for public repositories
--- REQUEST accounts/UserBlock: is_blocked(blocker, user), including organizations blocking users
--- REQUEST releases/Release: links Attachments via Attachment.release; release attachment type list is releases' config
--- REQUEST moderation: reacts to IssueContentChanged / IssueCommentEdited / IssueCommentDeleted / IssueDeleted to keep shadow copies of reported content
--- REQUEST quota: attachment uploads are subject to the `size:assets:attachments:issues` quota subject
--- REQUEST releases: web release uploads that are never saved into a release (UserLinksUploadToRelease) now expire via issues/OrphanUploadExpires after issues' config.orphan_attachment_expiry; worth a note in that rule's guidance
--- REQUEST pulls: on a locked PR conversation the poster may still change title and description but not close / reopen or retarget; pulls/UserClosesPullRequest and UserReopensPullRequest should require `not issue.is_locked or can_triage(user, issue)` (issues decision 1)
--- REQUEST pulls: reactions on a locked PR conversation are open to every reader (issues decision 2); issues/UserReactsToIssue / UserReactsToComment no longer check the lock

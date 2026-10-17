@@ -90,7 +90,8 @@
 --     PullRequestAutoMerged(pull_request, merger), ReviewSubmitted(review),
 --     ReviewRequested(pull_request, requester, reviewer),
 --     ReviewRequestRemoved(pull_request, doer, reviewer),
---     PullRequestCodeCommented(pull_request, comment)
+--     PullRequestCodeCommented(pull_request, comment),
+--     ReviewCommentEdited(pull_request, comment), ReviewCommentDeleted(pull_request, comment)
 --   - administration/IssueIndexRebuildDue()   -- the cron task (and "run now")
 --
 -- Black-box predicates. Qualified calls into sibling modules cannot yet be
@@ -1557,6 +1558,18 @@ rule CodeCommentReindexesPull {
     ensures: IssueReindexRequested(issue: pull_request.issue)
 }
 
+-- decided: discovery 7 (review comments are indexed, so editing or deleting one
+-- re-indexes its pull request; the deleted comment carries identity only).
+rule ReviewCommentEditedReindexesPull {
+    when: pulls/ReviewCommentEdited(pull_request, comment)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
+rule ReviewCommentDeletedReindexesPull {
+    when: pulls/ReviewCommentDeleted(pull_request, comment)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
 rule ReviewRequestedReindexesPull {
     when: pulls/ReviewRequested(pull_request, requester, reviewer)
     ensures: IssueReindexRequested(issue: pull_request.issue)
@@ -2757,20 +2770,3 @@ surface ContributorStatsWorker {
 deferred Markup.render       -- see: markup.allium (renderers, link/mention/issue-ref processing, sanitiser allow-list)
 deferred CodeIndexer.query   -- see: implementation note; per-backend tokenisation and scoring
 deferred IssueIndexer.query  -- see: implementation note; per-backend scoring for relevance sort
-
-------------------------------------------------------------
--- Requests to other modules
-------------------------------------------------------------
-
--- REQUEST access: confirm the local predicates map onto AuthorizationPolicy (can_read, has_any_access, can_see_profile, can_see_owner_user); explore's anonymous/limited/restricted listing rule must equal has_any_access.
--- REQUEST accounts/User.keep_email_private, full_name, last_login_at, created_at, updated_at: user search matching and sort orders.
--- REQUEST organizations: a membership predicate (is_org_member) usable for org dashboards and organization listings.
--- REQUEST repositories/Repository.description, has_avatar, topics, primary_language, num_stars, num_forks, size, git_size, lfs_size, updated_at, created_at: keyword match, facets and sort orders.
--- REQUEST repositories/Topic.name, repositories/Topic.repo_count: topic search orders by usage.
--- REQUEST repositories: RecordLanguageStats should treat LanguageStatsComputed as emitted by discovery's stats job (it already listens for it).
--- REQUEST code: mirror syncs must also emit CommitsPushed for default-branch changes so mirrors are re-indexed.
--- REQUEST issues/Issue.content, created_at, updated_at, deadline, labels, assignees, milestone, mentions, subscribers, project: the indexed projection (read here via black-box accessors issue_*).
--- REQUEST pulls: reviewer sets per pull request (reviewed_by, review_requested) for the index projection.
--- REQUEST administration: react to discovery/IndexerStartupFailed(kind) by creating a SystemNotice for site admins ("<kind> indexer did not start in time; search unavailable until it is ready") (decision 4).
--- REQUEST pulls: emit ReviewCommentEdited(pull_request, comment) / ReviewCommentDeleted(pull_request, comment) from UserEditsReviewComment / UserDeletesReviewComment so discovery re-indexes the pull request (review comments are now indexed, decision 7).
--- REQUEST access: decision 5 says admin code search follows normal read access; access currently lets site admins read every repository, so confirm whether can_read for admins should stay all-repositories. - done (follow-up 1): can_read stays all-repositories for site admins (role-less reads are audited by access/AdminAccessRecord); search and listings filter by access/can_list (can_list_repository here), which ignores the site-admin grant on private repositories.

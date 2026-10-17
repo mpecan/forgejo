@@ -70,7 +70,8 @@
 --   ExternalSshKeysAsserted(user, source, keys)          -> keys (source-managed SSH keys)
 --   ExternalAvatarAsserted(user, url)                    -> accounts (avatar upload)
 --   ExternalAdminFlagsAsserted(user, is_admin, is_restricted) -> accounts
---   RequestAuthenticated(user, method)                   -> access (scope/repository reducers), accounts (token last use)
+--   RequestAuthenticated(user, method)                   -> (no listener: access reads each request's reach from
+--                                                           access/CredentialRestriction, kept here per credential)
 --   PasswordBasicAuthRefused(request)                    -> (web layer: 401 "use a token")
 --   AuthSourceDeleted(source)                            -> organizations (clear team-membership provenance)
 --   (PasswordChanged(user) is also emitted when an administrator or the operator sets
@@ -3444,18 +3445,3 @@ surface AuthenticationService {
 deferred AccessToken.enforcement           -- see: access.allium (scope/public-only/repository reducers per endpoint)
 deferred ExternalGroupsAsserted.team_mapping -- see: organizations.allium (group_team_map, dynamic maps, removal)
 deferred ExternalQuotaGroupsAsserted.quota_mapping -- see: quota.allium (quota_group_map)
-
-------------------------------------------------------------
--- Requests to other modules
-------------------------------------------------------------
--- REQUEST accounts/User.kind: individual | bot | ... — used to refuse password sign-in for non-individuals.
--- REQUEST accounts/username_available(name): black-box check covering syntax, reserved names (the fixed lists and every accounts/ReservedName, case-insensitive), cooldown, uniqueness.
--- REQUEST accounts/email_available(email): black-box uniqueness check across all addresses.
--- REQUEST accounts/user_count(): number of user accounts (first account becomes admin).
--- REQUEST accounts/user_by_email(email): the account holding this activated address, for account-link auto mode (decided: e-mail only, no name match).
--- REQUEST accounts: react to ExternalAvatarAsserted(user, url), ExternalAdminFlagsAsserted(user, is_admin, is_restricted).
--- REQUEST accounts: UserLogin is created by authentication for self-registration; administration's "admin creates user" must create a UserLogin (with must_change_password) too.
--- REQUEST organizations: react to ExternalGroupsAsserted(user, source, groups) per the source's group_team_map / dynamic maps; react to AuthSourceDeleted(source) by clearing membership provenance.
--- REQUEST keys/SshKey.owner: accounts/User — the key an HTTP signature is verified against; react to ExternalSshKeysAsserted(user, source, keys) (source-managed keys).
--- REQUEST access: consume RequestAuthenticated(user, method) and the token's scopes / public_only / repositories to reduce permissions; access/can_read(user, repository, unit).
--- REQUEST notifications: send mail for ActivationEmailRequested, EmailConfirmationRequested, PasswordResetRequested, PasswordChanged, TotpEnrolled, TotpDisabled, SecurityKeyRemoved; push "logout" on UserSignedOut.

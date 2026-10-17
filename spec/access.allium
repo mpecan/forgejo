@@ -433,8 +433,7 @@ entity CredentialRestriction {
 -- every party including site administrators; reads are unaffected. There is
 -- one; administration switches it (AdminEntersReadOnlyMode /
 -- AdminLeavesReadOnlyMode) and shows `message` as a banner on every page.
--- Other modules' writes outside repository units consult it too (see
--- administration's REQUESTs).
+-- Other modules' writes outside repository units consult it too.
 -- decided: administration 3 (maintenance / read-only mode)
 entity InstanceWriteGate {
     read_only: Boolean
@@ -466,7 +465,7 @@ entity AccessDecision {
 -- the owning organization that includes the repository). One record per
 -- granted read that rested on the site-admin flag alone; records are never
 -- edited. Site administrators see them (SiteAdminAccessAudit); administration
--- may present them in its own log (see REQUEST).
+-- shows them next to its system notices (SystemNoticeLog).
 -- decided: follow-up 1 (admin reads of repositories they have no role in are logged)
 entity AdminAccessRecord {
     admin: accounts/User
@@ -829,7 +828,7 @@ rule OwnRepositoryAsOwnerTeamMember {
 -- request from a fork). It reaches nothing else: no other repository (public
 -- or not) and no organization endpoint - no rule of this module grants a task
 -- anything there. Packages linked to its repository are resolved by packages
--- (see REQUEST).
+-- (job_repository).
 -- decided: access decision 6 (repository-scoped only; organization endpoints
 -- refuse it)
 
@@ -1637,19 +1636,3 @@ surface AuthorizationService {
 
 deferred AuthorizationPolicy.explicit_mode         -- see: access.allium "Derivation" step 4: strongest of collaboration mode and each including team's owner/admin mode or strongest unit grant
 deferred AuthorizationPolicy.explicit_unit_mode    -- see: access.allium "Derivation" steps 5-6: per unit, strongest of collaboration mode, owner/admin team mode and the unit access of each team that includes the repository (organizations/TeamUnitAccess)
-
-------------------------------------------------------------
--- Requests to other modules
-------------------------------------------------------------
--- REQUEST repositories/Collaborations, repositories/RepoUnits: entity collection names used by invariants CollaborationNeverOwner and DisabledUnitsAreNeverEnabled.
--- REQUEST repositories/RepoUnit.everyone_access_mode, anonymous_access_mode (per-unit defaults; everyone_can_write = everyone_access_mode = write) and AdminSetsUnitDefaultAccess: done in repositories.allium (decisions 3, 4).
--- REQUEST repositories, issues: react to access/UserLostRepositoryAccess(user, repository) - done (repositories/UnwatchOnLostAccess, issues/ClearInvolvementOnLostAccess; decision 7).
--- REQUEST repositories: its local predicates can_see_repository / can_read_code / can_write_code / is_repo_admin / is_repo_owner map to access/has_any_access, can_read(.., code), can_write(.., code), is_repo_admin, is_repo_owner.
--- REQUEST accounts/AccountStatusChanged(user): must be emitted when is_restricted changes (drives AnnounceLostAccessOnUserRestrictionChanged).
--- REQUEST accounts/User.allow_git_hook is used for table D2 (git hooks editing).
--- REQUEST authentication: derive access/CredentialRestriction from authentication/AccessToken (all_repositories and not public_only -> all_repositories; public_only -> public_only; not all_repositories -> listed_repositories with `repositories`; has_admin_scope = the token's scopes include the admin category, read:admin/write:admin or all) and likewise from AuthorizedIntegration; scope-category checks stay in authentication (table column "scope"). decided (access 5): a site administrator acting through a token gets no admin power without the admin scope.
--- REQUEST actions: Task reaches its repository as task.job.run.repository; access treats status = running as the token being usable. decided (access 6): the task token reaches only its own repository (rule TaskReadsOtherPublicRepository removed).
--- REQUEST packages: decided (access 6): an Actions task token reaches only the packages linked to its own repository (read; write unless a fork pull-request run) and no other package or owner registry; replace "Actions task tokens act with their workflow user's mode" accordingly.
--- REQUEST organizations: decided (access 6): organization endpoints refuse Actions task tokens. - already: no organizations rule or surface accepts a task (they face signed-in people only; table F).
--- REQUEST pulls/PullRequest.allow_maintainer_edit: Boolean; branch-scoped write delegation (table C1).
--- REQUEST administration: decided (follow-up 1): show access/AdminAccessRecord (or react to access/SiteAdminReadWithoutRole(admin, repository, unit_kind)) in the site-administration audit log next to the system notices, with its own retention if one is wanted; access already keeps the record.

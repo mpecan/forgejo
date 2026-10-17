@@ -1930,14 +1930,6 @@ deferred HookRequestRendering.render    -- see: services/webhook/ per-kind messa
 ------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
--- (Triggers consumed are bound exactly as the integration's canonical table
---  names them; see the header.)
--- REQUEST repositories/Repository.owner_user, owner_org: used for owner-webhook fan-out; RepositoryDeleted must be emitted before the repository is removed.
--- REQUEST code/Push.ref_updates with RefUpdate.{ref_kind, ref_name, is_deletion}; PushReceived also for refs updated by pull-mirror sync, and RefCreated / RefDeleted also emitted by mirror sync.
--- REQUEST issues/Issue.milestone; issues/Comment.kind with value `comment` for plain conversation comments; IssueClosed must not be emitted for a merge.
--- REQUEST pulls: PullRequestMerged is emitted for auto-merges as well (webhooks does not react to PullRequestAutoMerged); Review.{status, kind: ReviewVerdict, reviewer, pull_request}.
--- RESOLVED (packages): PackageVersion.package; Package.repository? (the optional link), owner_user / owner_org (derived from the registry).
--- RESOLVED (actions): WorkflowRun.{status, repository, trigger_user}; Job.{status, run} are present.
--- REQUEST migrations/Migration{repository}.doer: the sender of the repository/created event for a migration.
--- REQUEST migrations (or whichever module owns the instance import addon): map stored Forgejo `gitea` / `gogs` webhooks onto kind `forgejo` on import (decided: webhooks 10).
--- REQUEST administration: list the [webhook] retry settings max_delivery_attempts (default 3) and retry_backoff_base among the instance settings, and link the instance-wide delivery log (InstanceDeliveryLog) from site administration (decided: webhooks 8, 9).
+-- REQUEST migrations (or a new instance-import module): decision webhooks 10 relies on "the import addon"
+--   to map stored Forgejo `gitea` / `gogs` hooks onto kind `forgejo`, but no module specifies that addon;
+--   migrations imports repositories only and never stored webhooks.

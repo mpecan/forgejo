@@ -1378,7 +1378,7 @@ rule PurgeOwnerPackages {
                 not exists v
     @guidance
         -- Non-purge deletion of a user or organisation is refused while
-        -- OwnerRegistry.has_packages (see Requests). Packages, blobs and
+        -- OwnerRegistry.has_packages (accounts/owns_packages, organizations' deletion guard). Packages, blobs and
         -- leftovers are removed by the next expired-data purge.
 }
 
@@ -2038,23 +2038,3 @@ deferred RepositoryIndex.file_formats  -- see: detailed/package-repository-index
 ------------------------------------------------------------
 
 -- (none: all decided, see spec/DECISIONS.md "## packages")
-
-
-------------------------------------------------------------
--- Requests to other modules
-------------------------------------------------------------
--- REQUEST accounts/UserPurged(user): emitted when an admin deletes a user with purge; packages removes the user's registry content.
--- REQUEST accounts/owns_packages(user): answer with packages/OwnerRegistry{owner_user: user}.has_packages (non-internal versions exist); refuse non-purge deletion while true.
--- REQUEST accounts/UserRenamed: no package reaction needed; image and registry coordinates are derived from the owner's current name.
--- REQUEST organizations/Organization.deletion: refuse non-purge deletion while packages/OwnerRegistry{owner_org: org}.has_packages; offer a site-admin delete with purge that emits OrganizationPurgeStarted(organization), to which packages reacts (PurgeOrganizationPackages). Done in organizations.allium (AdminPurgesOrganization).
--- REQUEST organizations/is_org_owner(org, user): used by can_manage_registry.
--- REQUEST organizations/TeamUnitAccess for unit `packages`: needed to derive can_read/can_write_packages for org registries (max of team authorize level and team packages-unit access).
--- REQUEST repositories/RepositoryDeleted(repository, doer): already emitted; packages unlinks linked packages.
--- REQUEST repositories/Repository: creating the `_cargo-index` repository on behalf of the owner (OwnerInitializesCargoIndex).
--- REQUEST can_write_repo_packages(user, repository) and can_read_repo_code(user, repository): used for linking and for showing linked repositories.
--- REQUEST access/config.require_signin_view: imported as config.require_signin_view (used by can_read_packages and the container token exchange).
--- REQUEST authentication/TokenScope: read:package / write:package and public-only flag consumed by can_read/can_write_packages.
--- REQUEST quota: decided (follow-up 2): quota_allows(owner, count_packages, 1) and quota_allows(owner, count_package_versions, 1) back quota_allows_new_package / quota_allows_new_version; QuotaUsage.packages_count / package_versions_count count packages/Package and packages/PackageVersion with is_internal = false per owner registry - done in quota.allium.
--- REQUEST quota/quota_allows(owner, size_assets_packages_all) (QuotaGate gate_package_upload, charged: package_owner): quota_allows_package_upload(registry) is exactly this, evaluated for the registry owner (not the uploader) before every write that stores data; quota/QuotaUsage.packages should sum packages/PackageFile sizes per owner (blob shared by two files counts twice). decided (packages 6): the former [packages] LIMIT_TOTAL_OWNER_SIZE is expressed as quota/config.default_packages, a default rule on size_assets_packages_all; done in quota.allium.
--- RESOLVED (webhooks, actions): both react to PackageVersionCreated(version, publisher) / PackageVersionDeleted(version, package, doer) with these names.
--- RESOLVED (actions): job_repository(user) is task.job.run.repository of the running task whose automatic token authenticated the request (actions header, "Provided to other modules"), null for any other credential; access/TaskAccessesOwnRepository carries the credential (access decision 6).

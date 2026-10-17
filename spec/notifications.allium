@@ -225,6 +225,7 @@ use "./migrations.allium" as migrations
 --   issue_notification_audience, mail_mention_recipients, mail_eligible,
 --   transfer_recipients, in_feed_of, activity_visible_to, repository_admins,
 --   organization_owners(org) (= users with organizations/is_org_owner(org, user)),
+--   repository_admins(repo) (= individual users with access/is_repo_admin(user, repo)),
 --   contribution_heatmap, feed_excerpt: described where they are used.
 
 ------------------------------------------------------------
@@ -2629,23 +2630,6 @@ deferred Heatmap.aggregate       -- see: models/activities/user_heatmap.go
 --  reviewer, kind, body, comments, status}; code/Push.ref_updates and
 --  RefUpdate.{ref_kind, ref_name, is_deletion}; organizations/TeamInvite.
 --  {email, inviter}.)
--- REQUEST accounts/UserBlock lookup has_blocked(blocker, blocked): blocked authors never reach the blocker's inbox or feed.
--- REQUEST organizations: transfer_recipients needs "members allowed to create repositories in an organization".
--- REQUEST repositories: a pull-mirror sync should emit per-ref MirrorSyncPushed(repository, ref_name, commits), MirrorRefCreated(repository, ref_name), MirrorRefDeleted(repository, ref_name) (distinct from code/PushReceived, attributed to the owner) — Forgejo keeps separate mirror_sync_* feed kinds.
--- REQUEST repositories: RepositoryStarred is listed as feeding the activity feed, but Forgejo records no star activity (star_repo is never produced); this module does not react to it.
--- REQUEST repositories: Watch.watch_issues / watch_pull_requests / watch_releases are used through repository_watchers(repo, category).
--- REQUEST issues: emit UserViewsIssue(viewer, issue) when a signed-in user opens an issue or pull request (web and API); provide Issue.subscribers / explicitly_unsubscribed, Comment.kind (comment | close | reopen | code | pull_push | review) for comment_mail_category; react to notifications/MailReplyReceived (create the comment as author, with the attachments) and notifications/MailUnsubscribeReceived (record an explicit unsubscribe).
--- REQUEST issues: IssueOpened is consumed for issues only (requires not is_pull); please confirm pulls never emits issues/IssueOpened for a PR, or the feed/inbox/mail would double up with pulls/PullRequestOpened.
--- REQUEST issues/pulls: IssueClosed / IssueReopened are consumed for both issues and PRs; pulls/PullRequestClosed / PullRequestReopened are therefore NOT consumed here — integration must ensure a PR close emits issues/IssueClosed (or switch this module to the pulls triggers).
--- REQUEST pulls: react to notifications/MailReplyReceived with replied_to_code set (reply in that code conversation); expose the mentions of a PR description, a review body and a code comment (issue_mentions / review_mentions / code_comment_mentions).
--- RESOLVED (integration): pulls emits both triggers for an auto-merge and sets
---   PullRequest.merged_automatically; the plain-merge rules here skip auto-merges.
--- RESOLVED (actions): WorkflowRun.{status, notify_email, trigger_user, repository} are present; WorkflowRunCompleted(run, prior_status) fires once per attempt and actions' Emits list now puts the failure mail under it (decided notifications 4).
--- RESOLVED (actions): ScheduledWorkflowDisabledForInactivity(repository, workflow_file) is emitted by actions and consumed by MailOnScheduledWorkflowDisabled.
--- REQUEST access: repository_admins(repository) = individual users with is_repo_admin(user, repository) (used for the workflow-disabled mail).
--- REQUEST issues: the thread audience (decided notifications 1) adds Issue.assignees; an explicit unsubscribe is read as issues/IssueWatch{user, issue, is_watching: false} (the inline mention / new-pull-request filters use it directly).
--- REQUEST repositories: MailOnCollaboratorInvited mails on CollaboratorInvited (decided notifications 5, answering repositories' REQUEST); MailOnCollaboratorAdded mails only for a site admin's direct add and tells it apart by doer.is_admin — an explicit `direct: Boolean` on CollaboratorAdded would be sturdier. Telling the inviter on acceptance / decline is not done.
--- REQUEST authentication: administration/UserPasswordSetByAdmin and UserPasswordSetByOperator revoke mail tokens here (decided notifications 3); if those resets should also send the password-changed mail, authentication should emit PasswordChanged(user) for them.
--- RESOLVED (federation): FederateLocalActivity reacts once per ActivityRecorded(activity) and reads activity.actor; visibility is activity_is_public(activity) on current state (no Activity.is_private).
--- RESOLVED (federation): FederateLocalActivity publishes it to ActivityPub followers.
--- REQUEST authentication: react to notifications/SignOutPushed only if it needs to; the stream connection belongs here.
+-- REQUEST notifications: no rule here consults accounts/has_blocked(blocker, blocked), so a blocked
+--   author still reaches the blocker's inbox, mail and feed; decide whether blocking filters them
+--   (the original request said it should) and, if so, guard the inbox, mail and feed rules with it.

@@ -68,6 +68,15 @@
 --          its reports keep a shadow copy, as for users.
 --   administration/ResolvedReportRemovalDue(keep_for)
 --       -- the remove_resolved_reports cron task ran (on schedule or "run now").
+--
+-- Black boxes other modules answer:
+--   profile_visible_to(user, viewer)        = accounts: user.visible_to(viewer)
+--   organization_visible_to(org, viewer)    = organizations: org.is_visible_to(viewer)
+--   is_org_owner(org, user)                 = organizations/is_org_owner
+--   can_read_any_unit(user, repository)     = access/has_any_access
+--   can_read_conversation(user, issue)      = access/can_read(user, issue.repository,
+--                                             pull_requests if issue.is_pull else issues)
+--   is_repo_admin(user, repository)         = access/is_repo_admin
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -843,17 +852,3 @@ deferred snapshot_user          -- see: models/user/moderation.go:66 (UserSnapsh
 deferred snapshot_repository    -- see: models/repo/moderation.go:50
 deferred snapshot_issue         -- see: models/issues/moderation.go:45
 deferred snapshot_comment       -- see: models/issues/moderation.go:90
-
--- Requests to other modules
--- REQUEST accounts/User: raise moderation/ReportableContentChanging(content, update) before changing any of name, full_name, email (incl. primary-email switch), login_name, location, website, pronouns, description, avatar, avatar_email; and (content, deletion) before deleting a user.
--- REQUEST accounts: react to moderation/ModeratorSuspendsAccount (prohibit login) and moderation/ModeratorDeletesAccount (delete with purge).
--- REQUEST accounts: profile_visible_to(user, viewer) predicate (visibility public/limited/private + blocks).
--- REQUEST organizations: organization_visible_to(org, viewer); react to moderation/ModeratorDeletesOrganization (delete with purge); raise ReportableContentChanging on org profile edits.
--- REQUEST repositories/Repository: raise ReportableContentChanging before settings updates and deletion; react to moderation/ModeratorDeletesRepository.
--- REQUEST access: can_read_any_unit(user, repository); can_read_conversation(user, issue) = can_read(user, issue.repository, pull_requests if issue.is_pull else issues).
--- REQUEST issues/Issue: raise ReportableContentChanging before title change, content change, deletion; react to moderation/ModeratorDeletesIssue.
--- REQUEST issues/Comment: has_user_content (comment kinds that carry text/attachments); raise ReportableContentChanging before content change and deletion; react to moderation/ModeratorDeletesComment.
--- REQUEST notifications: react to moderation/AbuseReported(content, reporter, category) by notifying every site admin (inbox entry; mail per their mail preference) of the new report, linking the moderation queue (decided: moderation 7).
--- REQUEST notifications: react to moderation/ReportReviewed(report, reporter) by telling the reporter (inbox; mail per preference) that their report on report.content.reference was reviewed, with no resolution or action named (decided: moderation 8).
--- REQUEST organizations: drop the REQUEST to moderation about deletion (moderation now reacts to OrganizationDeleted for evidence); profile edits should still raise ReportableContentChanging(content, update). moderation now reads is_org_owner(org, user) to refuse reports on one's own organization.
--- REQUEST access: is_repo_admin(user, repository) is used by moderation to refuse reports on a repository the reporter administers.

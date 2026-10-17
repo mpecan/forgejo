@@ -854,20 +854,3 @@ deferred quota_groups_mapped_from_unclaimed -- see: services/auth/source/source_
 deferred quota_account_of         -- see: models/quota/quota.go:20 (the holder's QuotaAccount; one exists for every user and organisation)
 deferred quota_account_of_owner   -- see: models/quota/quota.go:20 (quota_account_of the repository's owning user or organisation)
 deferred usage_union              -- see: models/quota/rule.go:46 (usage of the union of the subjects: each byte once, so a subject already covered by another listed ancestor adds nothing; decided quota 4. For a count subject it is that count: repos_count, packages_count or package_versions_count; decided follow-up 2)
-
--- Requests to other modules
--- RESOLVED (accounts): CreateQuotaAccountForNewUser creates the QuotaAccount on accounts/UserAccountCreated(user).
--- REQUEST authentication/AuthSource.quota_group_claim_name: OAuth2 claim carrying the groups used for quota sync.
--- REQUEST authentication/AuthSource.quota_group_map: mapping source-group -> set of quota group names (validated JSON).
--- REQUEST authentication/AuthSource.quota_group_map_removal: Boolean, remove memberships for unclaimed mapped groups.
--- REQUEST repositories, code, releases, issues, wiki, pulls, packages, actions: guard each operation listed in the QuotaGate defaults with `requires: quota/quota_allows(<charged account>, <subject>)` (the contract stated by surface QuotaGateReference).
--- REQUEST repositories/Repository.git_size, lfs_size; issues/Attachment.size (+ whether it belongs to a release); actions/Artifact.compressed_size and status; packages/PackageBlob.size: the figures QuotaUsage is computed from.
--- REQUEST repositories (mirror scheduler): skip a scheduled pull-mirror sync, without error, while the owner's quota does not allow size_repos_all.
--- REQUEST wiki: measure each wiki's git size (bytes of the wiki repository) and hand it to quota as QuotaUsage.wiki for the repository owner (decided quota 3).
--- REQUEST repositories: WriterRequestsMirrorSync (manual sync, web and API) should check the owner's size:git:all quota rather than the repository-size subject (decided quota 6; gate_mirror_manual).
--- REQUEST issues, releases, packages, actions: pass the incoming size to the quota gate where it is known up front (attachment, release asset, package file, artifact size), so the check is usage + size <= limit (decided quota 2).
--- REQUEST releases, issues, packages: deleting an attachment, release asset or package version must not consult the quota gate (decided quota 7: what can only shrink storage is never refused by quota).
--- REQUEST authentication: emit ExternalGroupsAsserted(user, source, entry.groups) on EVERY LDAP sign-in of an existing account (and on LDAP synchronisation), not only when the account is provisioned, so LDAP quota-group sync works like OAuth2's (decided quota 8). AuthSource.quota_group_map / quota_group_map_removal apply to LDAP sources too.
--- RESOLVED (accounts/authentication): every provisioning path emits accounts/UserAccountCreated, so CreateQuotaAccountForNewUser gives the account its QuotaAccount before the first group sync.
--- REQUEST packages: decided (follow-up 2): before creating a package ask quota_allows(<registry owner>, count_packages, 1) (gate_create_package), and before creating a non-internal version ask quota_allows(<registry owner>, count_package_versions, 1) (gate_create_package_version); QuotaUsage.packages_count / package_versions_count count the owner's non-internal packages / versions - done (quota_allows_new_package / quota_allows_new_version in packages.allium).
--- REQUEST repositories, accounts, organizations: decided (follow-up 2): QuotaUsage.repos_count is the number of repositories the holder owns (accounts/User.num_repos); repositories' within_creation_limit(owner) also requires quota_allows(owner, count_repos, 1) while quota is enabled - done (repositories.allium predicate list).

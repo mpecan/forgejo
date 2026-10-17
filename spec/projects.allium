@@ -191,7 +191,7 @@ config {
     -- from: routers/web/repo/projects.go:95
     project_list_page_size: Integer = 20
     -- True when [repository] DISABLED_REPO_UNITS contains "repo.projects".
-    -- Mirrors a repositories-owned setting; see REQUEST below.
+    -- Mirrors repositories' config.disabled_repo_units (projects); set together.
     -- decided: one switch disables all boards — repository, user and organization
     -- (Forgejo exempted owner boards via ignoreGlobal=true).
     -- from: routers/web/repo/projects.go:41
@@ -982,13 +982,3 @@ surface IssueProjectPicker {
         -- (id 0 removes). New issue/PR forms take project_id.
         -- API: every provides (and exposes) here is also offered by the REST API.
 }
-
-------------------------------------------------------------
--- Requests to other modules
-------------------------------------------------------------
-
--- REQUEST repositories/RepositoryDeleted(repository, doer): trigger emitted when a repository is deleted, so boards can be removed.
--- REQUEST repositories/config.disabled_repo_units: the instance-wide disabled units list; this module mirrors "repo.projects" as config.projects_globally_disabled.
--- REQUEST organizations/can_read_unit(user, org, unit) and organizations/can_write_unit(user, org, unit): org-level unit access (max over the user's teams; read for non-members of public, or limited-and-signed-in, orgs).
--- REQUEST can_write_projects(user, repository) must be false for archived repositories or callers must check is_archived (this spec checks it explicitly).
--- REQUEST repositories: [repository] DISABLED_REPO_UNITS "repo.projects" now disables user and organization boards too (decision 3); the projects tab/unit and owner-profile project pages follow config.projects_globally_disabled.

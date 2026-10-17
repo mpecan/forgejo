@@ -2465,31 +2465,7 @@ deferred MergeExecution.commit          -- see: services/pull/merge_*.go per sty
 -- Requests to other modules
 ------------------------------------------------------------
 
--- REQUEST code/ProtectedBranch: pulls reads repository, status_check_enabled, status_check_contexts (globs over CommitStatus.context, evaluated by required_status_checks_pass), required_approvals, block_on_rejected_reviews, block_on_official_review_requests, block_on_outdated_branch, dismiss_stale_approvals, ignore_stale_approvals, apply_to_admins, protected_file_patterns, allows_merge_by(user), counts_approval_of(user) — all present; also needs protection_for(repository, branch) as the shared "first matching rule" function and rule_matches_branch(rule, branch).
--- REQUEST code: AgitPullRequestRequested should only fire when the pusher can read pull requests (pulls re-checks); AgitPullRequestHeadPushed for refs/pull/<n>/head must require code write or the PR poster (pulls re-checks).
--- REQUEST code: react to HeadBranchDeletionRequested(user, branch) by deleting the branch as UserDeletesBranch does (done: code/PullRequestHeadBranchIsDeleted).
--- REQUEST code: the merge push (Push.merging_pull) pre-receive should apply pulls/PullRequest.may_merge and protection_satisfied minus protected files.
--- REQUEST issues: UserClosesIssue / UserReopensIssue should not apply to pull-request conversations (is_pull) — pulls owns UserClosesPullRequest / UserReopensPullRequest with PR-specific guards (merged, duplicate head/base, deleted branches) — or should defer to them.
--- REQUEST issues: Comment needs `review` for kinds review/dismiss_review/code and `old_ref`/`new_ref` for change_target_branch/delete_branch (present); review_request comments for removals carry the reviewer/team name.
--- REQUEST issues: next_issue_index(repository) for PR conversations; ConversationClosedByMerge on PullRequestMerged(pull_request, merger) closes the conversation, stops the merger's stopwatch and applies closing/reopening keywords (as written).
--- REQUEST issues/IssueTitleChanged(issue, doer, old_title): WIP prefix removal => ready for review (present).
--- REQUEST repositories/RepoUnit.pull_request_settings (PullRequestSettings value: allow_* styles, autodetect_manual_merge, allow_rebase_update, ignore_whitespace_conflicts, default_*): read through merge_style_allowed(repository, style) and autodetects_manual_merge(repository).
--- REQUEST repositories/RepositoryDeleted(repository, doer): pulls closes outgoing PRs before purge.
--- REQUEST accounts/UserRenamed(user, old_name, new_name): AGit head branch prefixes.
--- REQUEST accounts/UserBlock: is_blocked_by_owner(repository, user) as used by issues.
--- REQUEST keys: merge_signing_satisfied(pr, user, style) — when the protection rule requires signed commits, a merge that creates a commit (every style but fast_forward_only) must be signable under [repository.signing] MERGES.
--- REQUEST quota: within_quota(repository) for merges, branch updates and applied suggestions (size:git:all of the target repository owner).
--- REQUEST all consumers: the journey walker binds chained-trigger parameters BY NAME, so rules reacting to pulls triggers should use the emitted parameter names (e.g. `when: pulls/PullRequestMerged(pull_request, merger)`, not `(pr, merger)`).
--- REQUEST notifications / webhooks / actions: consume the Emits list (names and parameters reconciled here: PullRequestOpened(pull_request), PullRequestMerged(pull_request, merger), ReviewSubmitted(review), ReviewRequested(pull_request, requester, reviewer), ReviewRequestRemoved(pull_request, doer, reviewer), PullRequestSynchronized(pull_request, doer)).
--- REQUEST notifications: react to pulls/AutoMergeFailed(pull_request, scheduler, reason) by telling the scheduler (inbox and mail), even when they are the doer; the reason is the timeline comment's content.
--- REQUEST notifications / webhooks: closing a pull request now also emits AutoMergeCancelled(pull_request, doer) when a schedule existed; replacing a schedule emits AutoMergeScheduled again.
--- REQUEST issues: CommentKind pr_unscheduled_to_auto_merge is now also created by pulls when an auto-merge fails, with the failure reason as content (pulls now uses the issues kind names pr_scheduled_to_auto_merge / pr_unscheduled_to_auto_merge instead of pull_scheduled_merge / pull_cancel_scheduled_merge); a dedicated kind (e.g. auto_merge_failed) would also do — pulls would switch to it.
--- REQUEST repositories: RepoUnit.pull_request_settings.allow_rebase_update read through rebase_update_allowed(repository) (AGit update-branch by rebase).
--- REQUEST accounts: User.public_email (no-reply address when keep_email_private) is the squash-merge author email (present).
--- REQUEST administration: instance-wide merge-message templates live in <custom path>/config.instance_merge_message_templates/<STYLE>_TEMPLATE.md (pulls config); no admin UI needed.
--- REQUEST code / actions / discovery / notifications: the lookups asked for are the PullRequestQueries contract (maintainer_edit_allows, merge_requirements_met, pull_by_index, is_agit_pull, pull_poster, open_agit_pull, agit_pull_for, pull_ref, merge_commit_of, reviewed_by, review_requested, review_mentions, code_comment_mentions); actions should read pull_request.is_fork (renamed from is_from_fork).
--- REQUEST issues: when notifications/MailReplyReceived carries replied_to_code, pulls/MailReplyContinuesCodeConversation answers it; issues' reply reaction should require replied_to_code = null.
--- REQUEST notifications: Forgejo does notify team members of a team review request — each member except the PR poster (services/issue/assignee.go:238); consume TeamReviewRequested(pull_request, requester, team) like ReviewRequested, per member.
--- REQUEST notifications: a PR close / reopen is pulls/PullRequestClosed(pull_request, doer) / PullRequestReopened(pull_request, doer) (doer null when a repository deletion closed it); pulls cannot emit issues/IssueClosed, so consume these for pull requests.
--- REQUEST discovery: react to ReviewCommentEdited(pull_request, comment) / ReviewCommentDeleted(pull_request, comment) (emitted by UserEditsReviewComment / UserDeletesReviewComment; the deleted comment carries identity only).
+-- REQUEST notifications / webhooks: AutoMergeScheduled(pull_request, doer) and AutoMergeCancelled(pull_request, doer)
+--   have no listener (the timeline comments are written here); decide whether either module announces
+--   auto-merge being scheduled or cancelled, or drop the two emissions.
 

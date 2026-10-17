@@ -1508,8 +1508,8 @@ rule QueryReleaseFeed {
 -- refused and every page carries a banner with the admin's message; reads and
 -- the admin pages keep working, so the admin can switch it off again.
 -- The switch is access/InstanceWriteGate, the shared write gate access's
--- repository write and contribution rules consult; other modules'
--- non-repository writes are listed as REQUESTs at the end of this file.
+-- repository write and contribution rules consult; every other module's
+-- user-initiated writes consult it as well.
 -- decided: administration 3 (admins switch it on; every write refused with a banner)
 
 rule AdminEntersReadOnlyMode {
@@ -2816,27 +2816,3 @@ deferred instance_statistics       -- see: models/activities/statistic.go — co
 ------------------------------------------------------------
 
 -- (none: all decided, see DECISIONS.md "administration")
-
-------------------------------------------------------------
--- Requests to other modules
-------------------------------------------------------------
--- REQUEST accounts/User: fields used here already exist (max_repo_creation with null = default, allow_git_hook, allow_import_local, allow_create_organization, login_source, profile fields); config.disable_regular_org_creation now lives in organizations' config.
--- REQUEST accounts: react to UserDeletedByAdmin(admin, user, purge) with the cascade (purge: disable first, delete repos, leave orgs and delete sole-owned orgs, delete packages and federated identity; remove user dir and avatar, report a file-removal failure for a system notice (see the last request)).
--- REQUEST accounts: react to UserRenamedByAdmin with the same redirect/ownership handling as a self rename; react to UserAvatarChangedByAdmin / UserAvatarRemovedByAdmin.
--- REQUEST accounts: own InactiveAccountCleanupDue(older_than) — delete never-activated accounts older than that and report CronWorkCompleted.
--- REQUEST repositories: react to MirrorUpdateDue, RepositoryHealthCheckDue, RepositoryStatsCheckDue, RepositoryArchiveCleanupDue, AllRepositoryArchivesDeletionDue, RepositoryGarbageCollectionDue, MissingRepositoryReinitDue, MissingRepositoryDeletionDue, GeneratedRepositoryAvatarDeletionDue. (Done in integration: all nine have reactions.)
--- REQUEST repositories: react to RepositoryCreationRequestedByAdmin(admin, user, name) by creating the repository with instance defaults as UserCreatesRepository does (a site admin bypasses the creation limit), and to RepositoryDeletionRequestedByAdmin(admin, repository) with the OwnerDeletesRepository cascade, ending in RepositoryDeleted(repository, doer: admin).
--- REQUEST code: react to DeletedBranchCleanupDue, LfsGarbageCollectionDue, AllRepositoryBranchesResyncRequested.
--- REQUEST releases: react to AllRepositoryTagsResyncRequested and ReleasesSyncWithTagsRequested.
--- REQUEST keys: react to AuthorizedKeysRewriteDue, AuthorizedPrincipalsRewriteDue, AuthorizedKeysRegenerationRequested, SshKeyAddedForUserByAdmin, SshKeyRemovedForUserByAdmin.
--- REQUEST webhooks: react to HookDeliveryCleanupDue(kind, older_than, number_to_keep).
--- REQUEST packages: react to PackageCleanupDue(older_than).
--- REQUEST notifications: notifications reacts to the AdminSendsTestMail stimulus directly (fine); also react to OldActivityDeletionDue, MassMailRequested, UserCreatedByAdmin (send "account created" mail when send_notification); honour config.notify_admins_on_new_user and config.default_email_notifications.
--- REQUEST discovery: react to IssueIndexRebuildDue.
--- REQUEST migrations: react to MigrationPosterIdUpdateDue; emit MigrationFailureReported(kind, description) (local) for every failure or dropped source data that merits a repository notice — administration records it.
--- REQUEST actions: react to ZombieActionsTaskStopDue, EndlessActionsTaskStopDue, AbandonedActionsJobCancellationDue, LingeringActionsLogTransferDue, ActionsScheduleStartDue, ActionsCleanupDue, OfflineRunnerCleanupDue, ActionsUserCleanupDue.
--- REQUEST organizations: react to OrganizationCreatedForUserByAdmin; honour config.disable_regular_org_creation.
--- REQUEST all modules with writes outside repository units (accounts, organizations, issues, pulls, releases, wiki, packages, projects, keys, webhooks, actions, moderation, federation, migrations, authentication settings, notifications settings): refuse every user-initiated write while access/InstanceWriteGate.read_only (decided: administration 3); access already gates UserWritesUnit / UserContributesToRepository; code's git push goes through access table C (changes_git_content).
--- REQUEST code: refuse git push over HTTP and SSH while access/InstanceWriteGate.read_only, with the read-only message on the client's terminal (decided: administration 3).
--- REQUEST accounts: the self-edit guard of decision administration 6 counts admins via has_other_admin(user) — another active administrator who may sign in (is_admin, is_active, not prohibit_login, not being_purged).
--- REQUEST repositories: administration records SystemNotices for PullMirrorSyncFailed; for RepositoryHealthCheckFailed / RepositoryGarbageCollectionFailed emit them from a rule level the audit sees (one trigger per failing repository) and administration will add the two notice rules.

@@ -935,3 +935,62 @@ journey ReadOnlyModeFreezesRepositoryActionsSettings {
 
     ends: Repository settings wait for the end of maintenance; the admin console does not.
 }
+
+-- decided: requests 1. A run that a deploy-key push started records the key
+-- and has no user behind it, so when it fails the repository's admins are
+-- mailed instead of a trigger user.
+journey ADeployKeyRunFailureMailsTheAdmins {
+    goal: The ci deploy key pushed to main and the push started a run. Its
+          only job fails. Nobody triggered the run as a person, so ada, who
+          administers the repository, is mailed about the failure.
+
+    cast:
+        ci_key: keys/SshKey
+        ci:     keys/DeployKey
+        run:    WorkflowRun
+        job:    Job
+
+    given:
+        notifications/config.mailer_enabled = true
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.email_notifications = enabled
+        ci_key.kind = deploy
+        ci.repository = repo
+        ci.key = ci_key
+        ci.name = "ci"
+        ci.access = read_write
+        run.repository = repo
+        run.status = running
+        run.event = push
+        run.attempt = 1
+        run.workflow_file = "build.yml"
+        run.notify_email = true
+        run.trigger_user = null
+        run.trigger_deploy_key = ci
+        run.pre_execution_error = null
+        run.needs_approval = false
+        run.prioritized = false
+        run.jobs_expanded = true
+        run.previous_attempts_duration = 0.seconds
+        job.run = run
+        job.status = failure
+        job.attempt = 1
+        job.is_assigned = false
+        job.is_incomplete = false
+
+    1. the run follows its failed job and the admins are told
+        stipulate run.aggregated_status = failure
+        stipulate run.status_is_stale = true
+        stipulate notifications/is_failure(failure) = true
+        stipulate notifications/repository_admins(repo) = {ada}
+        stipulate notifications/mail_eligible(ada, false) = true
+        after 1.second
+        then RunStatusFollowsJobs fires
+        then run.status = failure
+        then MailOnDeployKeyRunFailed fires
+        then MailOnActionsRunFailed does not fire
+
+    ends: Ada, the repository's admin, has a mail about the failed run; no
+          user was credited with starting it.
+}

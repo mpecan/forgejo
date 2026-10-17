@@ -1003,3 +1003,115 @@ journey ADeployKeyPushOnThePullRequestIsTheKeys {
 
     ends: The pull request shows the ci key's push; nobody is credited with it.
 }
+
+-- Review comments are indexed with their pull request (decided: discovery 7),
+-- so editing or deleting one re-indexes the pull request.
+journey EditingAReviewCommentReindexesThePullRequest {
+    goal: Bob left a remark on a line of ada's pull request. He rewords it,
+          and later deletes it; each time the pull request is queued for the
+          issue indexer again.
+
+    cast:
+        note: Review
+        thread: CodeConversation
+        remark: ReviewComment
+        other: ReviewComment
+    given:
+        note.pull_request = pr
+        note.reviewer = bob
+        note.status = submitted
+        note.kind = comment
+        note.body = ""
+        note.commit_sha = "f00d"
+        note.is_official = false
+        note.is_stale = false
+        note.is_dismissed = false
+        thread.pull_request = pr
+        thread.review = note
+        thread.path = "widgets.go"
+        thread.line = 12
+        thread.side = proposed
+        thread.extra_lines = 0
+        thread.commit_sha = "f00d"
+        thread.is_outdated = false
+        thread.resolved_by = null
+        remark.conversation = thread
+        remark.review = note
+        remark.poster = bob
+        remark.body = "Off by one?"
+        other.conversation = thread
+        other.review = note
+        other.poster = ada
+        other.body = "Fixed."
+
+    1. bob rewords his remark and the pull request is queued for re-indexing
+        stipulate can_read_pulls(bob, repo) = true
+        stipulate count_suggestions("Off by one here?") = 0
+        bob does UserEditsReviewComment(bob, pr, remark, "Off by one here?") on PullRequestPage
+            creating job: discovery/IssueIndexJob
+        then remark.body = "Off by one here?"
+        then ReviewCommentEditedReindexesPull fires
+        then job.issue = conv
+        then job.status = queued
+
+    2. once that job has run, deleting the remark queues it again
+        stipulate discovery/issue_index_service() = indexer
+        after 1.second
+        then job.status = drained
+        bob does UserDeletesReviewComment(bob, pr, remark) on PullRequestPage
+            creating again: discovery/IssueIndexJob
+        then remark does not exist
+        then ReviewCommentDeletedReindexesPull fires
+        then again.issue = conv
+        then again.status = queued
+
+    ends: The pull request's index entry follows its review comments.
+}
+
+-- decided: requests 3. "Update branch" writes commits into the head
+-- repository, so its owner's quota decides, not the base repository's.
+journey UpdatingABranchChargesTheHeadRepositoryOwner {
+    goal: Ada's pull request comes from her fork. While her account is over
+          its git quota, bob cannot update the branch from main, even though
+          the base repository has room; once she has room again the update
+          goes through, although the base repository is now the one over.
+
+    cast:
+        fork: repositories/Repository
+    given:
+        fork.name = "widgets"
+        fork.owner_user = ada
+        fork.owner_org = null
+        fork.is_archived = false
+        fork.is_mirror = false
+        fork.is_empty = false
+        fork.is_fork = true
+        fork.fork_of = repo
+        pr.head_repository = fork
+        pr.commits_behind = 1
+
+    1. the head repository's owner is over quota, so the update is refused
+        stipulate may_update_by_merge(bob, pr) = true
+        stipulate within_quota(fork) = false
+        stipulate within_quota(repo) = true
+        bob cannot do UserUpdatesPullRequestBranch(bob, pr, merge) on PullRequestMergeBox
+
+    2. ada has room again; the base repository being over does not matter
+        stipulate within_quota(fork) = true
+        stipulate within_quota(repo) = false
+        stipulate protection_for(repo, "main") = null
+        stipulate updated_head(pr, merge) = "f11e"
+        stipulate diff_differs(pr, "f00d", "f11e") = true
+        stipulate is_force_push(fork, "f00d", "f11e") = false
+        stipulate commits_ahead_of(fork, "feature", repo, "main") = 3
+        stipulate commits_behind_of(fork, "feature", repo, "main") = 0
+        stipulate commits_between_shas(fork, "f00d", "f11e") = "f11e"
+        stipulate issue_notification_audience(conv, bob) = {ada}
+        bob does UserUpdatesPullRequestBranch(bob, pr, merge) on PullRequestMergeBox
+        then UserUpdatesPullRequestBranch fires
+        then PullRequestHeadMoves fires
+        then pr.head_commit_sha = "f11e"
+        then pr.status = checking
+
+    ends: The update was charged to ada, whose fork received the commits.
+}

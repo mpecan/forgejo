@@ -2173,29 +2173,3 @@ surface RepositoryArchiveConsole {
 
 deferred SourceDownloader.get_issues    -- see: one adapter spec per source (services/migrations/<source>.go)
 deferred is_allowed_remote              -- see: OutboundFetchPolicy.AllowBlockSemantics
-
-
-------------------------------------------------------------
--- Requests to other modules
-------------------------------------------------------------
-
--- REQUEST repositories: this module creates the being_migrated Repository record itself (it needs the record to attach the Migration to) rather than emitting ImportReservesRepository; either drop ImportReservesRepository or have it return the record. Owners may be organizations.
--- REQUEST repositories/ImportFailed: a failed import must leave the repository being_migrated (not broken) so the progress page, retry and discard keep working; retry needs no repository status change. migrations does not emit ImportFailed.
--- REQUEST repositories: react to MigratedContentDiscarded(repository) by wiping imported git data, wiki, issues, pull requests and releases while keeping the record.
--- REQUEST repositories: react to TopicsImported(repository, topics) by replacing the repository's topics.
--- REQUEST repositories: deleting a repository by any route also removes its migrations/Migration and ExternalAuthorship records.
--- REQUEST repositories/is_valid_repo_name, repository_name_free, within_creation_limit: exported as callable predicates (currently local black boxes).
--- REQUEST repositories: use migrations/is_allowed_remote(url, user) for mirror remotes (already requested the other way round; this module exposes it as a black box backed by OutboundFetchPolicy).
--- REQUEST accounts: a shared ghost placeholder account (ghost_user()) that unattributed imported content points at.
--- REQUEST accounts/User.allow_import_local (read through may_import_local_paths(user)): per-user right to import from server paths.
--- REQUEST authentication: linked_account_for(source_kind, host, external_id) — the local account holding an ExternalLogin whose provider speaks that source kind, whose source authenticates against that host (provider_host(source): custom URL host, or the public host such as github.com / gitlab.com) and whose external_id equals it as a string; also source_kind_for_provider(provider). The OAuth source's name plays no part (decided: migrations 5, 6).
--- REQUEST issues/Issue, issues/Comment, issues/Reaction: render "originally by <name> on <source>" when a migrations/ExternalAuthorship points at the item (the core keeps no import fields of its own). (pulls/Review: done, pulls PullRequestPage guidance.)
--- REQUEST quota: quota_account_of(user or org) and quota_account_of_owner(repository) helpers to reach the QuotaAccount for gate_migrate_repository / gate_retry_migration.
--- REQUEST administration: dispatch MigrationPosterIdUpdateDue() (already done) — migrations reacts with NightlyRelink; report completion via CronWorkCompleted needs the task, so administration should treat the run as finished once the trigger is handled.
--- REQUEST releases: react to RepositoryMigrated(repository) (already done) — imported releases arrive first, remaining tags become tag-only records.
--- REQUEST webhooks / notifications: react to migrations/RepositoryMigrated(repository) (webhooks currently listens to repositories/RepositoryMigrated, which nobody emits) as a repository-created event; the actor is migrations/Migration{repository}.doer.
--- REQUEST issues/Issue: show migrations/ExternalAssignee names alongside the assignees; expose assignable_named(repository, names) / resolves_to_assignee(repository, name) over can_be_assigned (decided: migrations 11).
--- REQUEST repositories: deleting a repository also removes its migrations/ExternalAssignee records.
--- REQUEST webhooks: migrations imports repositories only, never stored webhooks, so mapping Forgejo `gitea` / `gogs` hooks onto `forgejo` belongs to whichever addon imports instance data (webhooks 10), not here.
--- REQUEST administration: react to migrations/RelinkSweepCompleted(outcome, message) by closing the update_migration_poster_id run as CronWorkCompleted does (supersedes the line above about treating the run as finished on dispatch).
--- REQUEST repositories: the removal of the addon's records on deletion is now done here (ForgetImportRecordsOfDeletedRepository on repositories/RepositoryDeleted); the two "deleting a repository ... removes its migrations/..." lines above can be dropped.

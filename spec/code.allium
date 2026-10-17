@@ -149,7 +149,19 @@ use "./releases.allium" as releases
 -- `access/f(x)` as a division and the journey walker cannot match an enum literal
 -- argument; the integration pass should bind them to the access module.
 --
--- Other black boxes used below (pure; their owners are named in Requests):
+-- Black boxes other modules answer:
+--   owner_visibility_is_public(repository)          -- accounts: the owner (user or org) is public
+--   has_two_factor(user), must_have_two_factor(user),
+--   authenticated_by_password(user)                 -- authentication (password HTTP git is refused:
+--                                                      tokens only; enforced 2FA blocks SSH)
+--   SshKey.grants_read_on(repository), keys_of_repository(keys, repository),
+--   new_commits_verified(repository, old_sha, new_sha) -- keys (deploy key reach, allowlist filtering,
+--                                                      the CommitSigning contract)
+--   member_of_any_team(user, teams), can_create_org_repo(user, org) -- organizations
+--   pull_by_index, is_agit_pull, pull_poster, open_agit_pull, agit_pull_for -- pulls (AGit lookups)
+--   release_exists(repository, tag_name), has_published_release(repository, tag_name) -- releases
+--
+-- Other black boxes used below (pure):
 --   may_write_code(pusher, push)        = deploy key with write, or Actions token with write,
 --                                         or can_write_code(pusher, push.repository)
 --                                         (`pusher` is the user, or the deploy key for a
@@ -2672,27 +2684,3 @@ deferred LfsGarbageCollection.batch       -- see: services/repository/lfs.go —
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
-
-
-------------------------------------------------------------
--- Requests to other modules
-------------------------------------------------------------
--- REQUEST accounts/User.prohibit_login, accounts/User.is_active, accounts/User.is_admin: used by transport (fixed names).
--- REQUEST accounts/owner_visibility_is_public(repository): owner (user or org) visibility = public, for anonymous fetch.
--- REQUEST authentication/has_two_factor(user), must_have_two_factor(user), authenticated_by_password(user): password HTTP git is always refused (decided: tokens only); enforced-2FA blocks SSH.
--- REQUEST keys/SshKey.grants_read_on(repository) / grants_write_on(repository): deploy key modes (used directly and inside may_write_code / may_write_branch).
--- REQUEST keys/new_commits_verified(repository, old_sha, new_sha): every new commit has a verified signature (require_signed_commits).
--- REQUEST keys/can_sign_as(user, repository, branch): instance signing policy for CRUD actions (needed when the branch requires signed commits).
--- REQUEST organizations/member_of_any_team(user, teams) (is the user in any of these teams), organizations/can_create_org_repo(user, org).
--- REQUEST repositories/Repository.is_template, is_private, is_fork, is_empty, is_mirror, is_archived, status, default_branch: written by post-receive (is_empty, default_branch, is_private, is_template).
--- REQUEST repositories: react to PushToCreateRequested (create repo), PushReceived (size, updated time), CommitsPushed (auto-watch pusher).
--- REQUEST pulls/PullRequest.allow_maintainer_edit and maintainer_edit_allows(user, repository, branch_name): maintainers pushing to a PR head branch.
--- REQUEST pulls/pull_by_index, is_agit_pull, pull_poster, open_agit_pull, agit_pull_for (refs/pull/<n>/head): AGit flow lookups.
--- REQUEST pulls: react to AgitPullRequestRequested, AgitPullRequestHeadPushed, MergePushCompleted, BranchDeleted, BranchRenamed, CommitsPushed, BranchProtectionChanged, CommitStatusCreated.
--- REQUEST releases/release_exists(repository, tag_name), releases/has_published_release(repository, tag_name); react to TagCreated/TagUpdated/TagDeleted for tag-only releases.
--- REQUEST quota/exceeds_git_quota(repository), quota/exceeds_lfs_quota(repository): owner over size quota for git / LFS.
--- REQUEST issues: react to CommitsPushed for close/reopen keywords and commit references.
--- REQUEST actions: react to DefaultBranchChanged / BranchRenamed (cancel schedules). Job results arrive as actions/JobCommitStatusReported (done).
--- REQUEST keys: keys_of_repository(keys, repository) = the given DeployKeys attached to repository (allowlist filtering, decided code 4/5).
--- REQUEST notifications: a deploy-key push (code/PushReceived with push.pusher = null, push.deploy_key set) is shown in the feed as by the deploy key (its name), never the repository owner (decided code 4); BranchCreated/BranchDeleted then carry by = null.
--- REQUEST actions / webhooks / issues / repositories / discovery / pulls / releases: code/Push.pusher, CommitsPushed.pusher, RefCreated/RefDeleted.pusher, BranchCreated/BranchDeleted.by and TagCreated/TagUpdated/TagDeleted.by are null for a deploy-key push; use push.deploy_key (doer/sender = the key; no auto-watch; no issue references attributed to a user) (decided code 4).
