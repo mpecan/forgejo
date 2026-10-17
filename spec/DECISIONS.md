@@ -229,3 +229,17 @@ invariants or config. Numbers refer to the question's position in its module in
 | 7 | The `commit` notification source | **Dropped.** |
 | 8 | Release mail for prereleases | **Prereleases are mailed too.** |
 | 9 | Retrying failed mail | **No retry.** A failed mail is dropped and logged. |
+
+## administration
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Doer of a manually run cron task | **The admin who triggered it,** on every path. |
+| 2 | Global cron on/off | **No global switch.** Each task has its own enabled flag; the misleading global settings are dropped. |
+| 3 | Maintenance / read-only mode | **Yes.** Admins switch it on; every write (web, API, git push) is refused with a banner; reads and admin pages keep working. |
+| 4 | Restoring a dump | **CLI restore** that loads a dump into an empty instance. |
+| 5 | Announcement kinds | **Modal or banner,** each with optional start and end times. |
+| 6 | Admins weakening themselves | **One guard for all of it.** A self-edit that would leave no other active admin (demote, restrict, deactivate, prohibit login) is refused. |
+| 7 | Adopting unadopted repositories | **Repositories owns adopt and delete,** for users and admins; administration owns the instance-wide listing. |
+| 8 | Update checker default | **Off.** Admins opt in. |
+| 9 | Doctor checks from the web | **Read-only checks** can be run and viewed from the web admin; fixes that change data stay CLI-only. |

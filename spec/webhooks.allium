@@ -6,8 +6,9 @@
 --   every new repository); the target kinds and their per-kind settings; event
 --   selection, branch filtering, secrets/HMAC signatures and Authorization
 --   headers; turning domain events from other modules into deliveries; the
---   delivery pipeline (queue, single attempt, timeout, SSRF host allow-list,
---   proxy, TLS); delivery history, manual redelivery and test deliveries; the
+--   delivery pipeline (queue, attempts with automatic retry and backoff,
+--   timeout, SSRF host allow-list, proxy, TLS); delivery history, the
+--   instance-wide delivery log, manual redelivery and test deliveries; the
 --   nightly cleanup of delivery history; who may manage which webhooks.
 -- Includes: Webhook, HookDelivery, HookEventKind, HookEventChoice, HookKind,
 --   WebhookConfig, HookTargetSettings, HookRequest, HookResponse.
@@ -29,6 +30,8 @@
 --     compatibility).
 --   - Worker-queue sizing (QUEUE_LENGTH) and in-process de-duplication of queue
 --     items: infrastructure.
+--   - Mapping stored Forgejo `gitea` / `gogs` hooks onto the native kind when
+--     importing an existing instance: the import addon (decided: webhooks 10).
 --
 -- Emits: (internal only — nothing outside this module reacts to them)
 --   HookEventRaised(kind, action, source_repo?, owner_user?, owner_org?, branch?, commit_count?, sender?)
@@ -170,7 +173,7 @@ value HookTargetSettings {
 -- Contracts
 ------------------------------------------------------------
 
--- What every receiver of a generic (forgejo/gitea/gogs) delivery can rely on,
+-- What every receiver of a native (forgejo) delivery can rely on,
 -- and what chat-style kinds (slack, discord, dingtalk, telegram, msteams,
 -- feishu, matrix, wechatwork) also carry. packagist and sourcehut_builds send
 -- only their service-specific request.
@@ -180,7 +183,7 @@ contract SignedDelivery {
 
     @invariant IdentifyingHeaders
         -- X-Forgejo-Delivery: the delivery's unique id (stable across the
-        -- delivery, new on redelivery); X-Forgejo-Event: the coarse event name
+        -- delivery's automatic retries, new on redelivery); X-Forgejo-Event: the coarse event name
         -- (e.g. issue_assign -> "issues", pull_request_sync -> "pull_request",
         -- pull_request_comment -> "issue_comment", review approved ->
         -- "pull_request_approved"); X-Forgejo-Event-Type: the precise
@@ -208,7 +211,7 @@ contract HookRequestRendering {
     render: (webhook: Webhook, delivery: HookDelivery) -> HookRequest
 
     @invariant GenericBodies
-        -- forgejo/gitea/gogs: the event JSON; content_type json sends it as
+        -- forgejo: the event JSON; content_type json sends it as
         -- the body, form sends it url-encoded as field "payload"; method GET
         -- sends it as query parameter "payload" with no body.
 
@@ -225,17 +228,23 @@ contract HookRequestRendering {
         -- GraphQL job with the configured visibility and secrets flag.
 
     @invariant UnsupportedEvents
-        -- Kinds that cannot express an event (e.g. sourcehut_builds for
-        -- anything but push/create) produce no delivery for it.
+        -- decided (webhooks 2): kinds that cannot express an event (e.g.
+        -- sourcehut_builds for anything but push/create) produce no delivery
+        -- for it: the event is dropped at queue time (kind_supports), and the
+        -- hook form offers only the events the kind supports
+        -- (kind_supports_choice). Forgejo created a delivery that stayed
+        -- undelivered for ever.
 }
 
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
 
+-- decided (webhooks 10): one native kind (forgejo) plus the chat/CI
+-- integrations; Forgejo's gitea and gogs dialect kinds are dropped.
 -- from: modules/webhook/type.go:126
 enum HookKind {
-    forgejo | gitea | gogs | slack | discord | dingtalk | telegram | msteams
+    forgejo | slack | discord | dingtalk | telegram | msteams
     | feishu | matrix | wechatwork | packagist | sourcehut_builds
 }
 
@@ -312,23 +321,24 @@ entity WebhookConfig {
     target_url: String
     http_method: HookHttpMethod
     content_type: HookContentType
-    secret: String?                        -- HMAC key; only forgejo, gitea, gogs
-    authorization_header: String?          -- sent verbatim as Authorization header
+    secret: String?                        -- HMAC key; only forgejo; write-only
+    authorization_header: String?          -- sent verbatim as Authorization header; write-only
     event_mode: HookEventMode
     chosen_events: Set<HookEventChoice>    -- meaningful only with choose_events
     branch_filter: String?                 -- glob; empty or "*" means all branches
     settings: HookTargetSettings
 
-    is_generic: kind in {forgejo, gitea, gogs}
+    is_generic: kind = forgejo
 
     -- Validation shared by every create/edit path (web form and API).
+    -- decided (webhooks 2): only events the kind supports may be chosen.
     -- from: services/webhook/default.go:46
     is_valid:
         is_valid_http_url(target_url)
         and (branch_filter = null or is_valid_glob(branch_filter))
-        and (kind in {forgejo, gitea} implies http_method in {post, get})
-        and (kind = gogs implies http_method = post)
+        and (kind = forgejo implies http_method in {post, get})
         and (kind = matrix implies http_method = put)
+        and chosen_events.all(c => kind_supports_choice(kind, c))
         and ((not is_generic and kind != matrix) implies http_method = post)
         and ((not is_generic) implies (content_type = json and secret = null))
         and (kind = slack implies (settings.slack_channel != null and is_valid_slack_channel(settings.slack_channel)))
@@ -348,6 +358,10 @@ entity Webhook {
     owner_org: organizations/Organization?         -- scope = per_owner, an organization
     config: WebhookConfig
     is_active: Boolean
+    -- decided (webhooks 5): set on a copy of a default or template webhook
+    -- whose Authorization header was dropped; it does not fire until a
+    -- manager edits it (re-authorises it).
+    needs_reauthorization: Boolean
     last_status: HookLastStatus
     created_at: Timestamp
     updated_at: Timestamp
@@ -358,13 +372,15 @@ entity Webhook {
     is_admin_level: scope in {system, default}
     -- Default hooks are templates: they never fire themselves.
     -- from: services/webhook/webhook.go:270
-    can_fire: is_active and scope != default
+    can_fire: is_active and scope != default and not needs_reauthorization
     history_over_limit: finished_deliveries.count > config.cleanup_keep_count
 }
 
--- One attempt to send one event to one webhook ("hook task").
--- There are no automatic retries: a delivery is attempted exactly once and its
--- outcome recorded; redelivery creates a new delivery.
+-- One event sent to one webhook ("hook task").
+-- decided (webhooks 9): a delivery that meets a network error, a timeout or a
+-- 5xx answer is retried automatically with exponential backoff, up to
+-- config.max_delivery_attempts attempts in all (Forgejo made one attempt).
+-- Manual redelivery still creates a new delivery.
 -- from: models/webhook/hooktask.go:45
 entity HookDelivery {
     webhook: Webhook
@@ -374,8 +390,10 @@ entity HookDelivery {
     payload: String                  -- the event as captured when it happened
     is_test: Boolean
     created_at: Timestamp
-    status: queued | sending | succeeded | failed | skipped
+    status: queued | sending | retrying | succeeded | failed | skipped
+    attempts: Integer                -- attempts made so far
     sent_at: Timestamp?
+    next_attempt_at: Timestamp?      -- set while retrying
     finished_at: Timestamp?
     request: HookRequest?
     response: HookResponse?
@@ -386,12 +404,17 @@ entity HookDelivery {
         queued -> failed
         sending -> succeeded
         sending -> failed
+        sending -> retrying
+        retrying -> queued
         terminal: succeeded, failed, skipped
     }
 
     is_finished: status in {succeeded, failed, skipped}
+    -- another attempt is allowed after this one fails
+    may_retry: attempts < config.max_delivery_attempts
     -- from: services/webhook/deliver.go:499
     is_overdue: if status = sending: sent_at + config.deliver_timeout <= now else: false
+    is_retry_due: if status = retrying: next_attempt_at <= now else: false
     -- from: models/webhook/hooktask.go:205
     is_expired: if is_finished: finished_at + config.cleanup_older_than <= now else: false
 }
@@ -408,6 +431,10 @@ config {
     -- [webhook] DELIVER_TIMEOUT (seconds)
     -- from: modules/setting/webhook.go:24
     deliver_timeout: Duration = 5.seconds
+    -- decided (webhooks 9): attempts per delivery (first one included) and
+    -- the wait before the second attempt; each further wait doubles.
+    max_delivery_attempts: Integer = 3
+    retry_backoff_base: Duration = 10.seconds
     -- [webhook] SKIP_TLS_VERIFY
     skip_tls_verify: Boolean = false
     -- [webhook] ALLOWED_HOST_LIST: comma list of "loopback", "private",
@@ -449,6 +476,7 @@ rule RepoAdminCreatesWebhook {
         repository: repo,
         config: hook_config,
         is_active: is_active,
+        needs_reauthorization: false,
         last_status: none,
         created_at: now,
         updated_at: now
@@ -456,10 +484,10 @@ rule RepoAdminCreatesWebhook {
     @guidance
         -- Web: GET/POST {repo}/settings/hooks/{kind}/new.
         -- API: POST /repos/{owner}/{repo}/hooks (token, repo admin).
-        -- API defaults: events [] means ["push"]; "issues" selects all issue
-        -- sub-events, "pull_request" all PR sub-events; "issues_only" and
-        -- "pull_request_only" select only the base event; method is always
-        -- POST; event mode is always choose_events.
+        -- decided (webhooks 4): the API takes the full WebhookConfig, the
+        -- same fields as the web form (method, event mode, every event
+        -- choice, branch filter, per-kind settings). Forgejo's API forced
+        -- POST and choose_events.
 }
 
 -- from: routers/api/v1/utils/hook.go:110
@@ -473,6 +501,7 @@ rule OrgOwnerCreatesWebhook {
         owner_org: organization,
         config: hook_config,
         is_active: is_active,
+        needs_reauthorization: false,
         last_status: none,
         created_at: now,
         updated_at: now
@@ -494,6 +523,7 @@ rule UserCreatesOwnWebhook {
         owner_user: actor,
         config: hook_config,
         is_active: is_active,
+        needs_reauthorization: false,
         last_status: none,
         created_at: now,
         updated_at: now
@@ -515,6 +545,7 @@ rule AdminCreatesSystemWebhook {
         scope: system,
         config: hook_config,
         is_active: is_active,
+        needs_reauthorization: false,
         last_status: none,
         created_at: now,
         updated_at: now
@@ -535,6 +566,7 @@ rule AdminCreatesDefaultWebhook {
         scope: default,
         config: hook_config,
         is_active: is_active,
+        needs_reauthorization: false,
         last_status: none,
         created_at: now,
         updated_at: now
@@ -544,7 +576,11 @@ rule AdminCreatesDefaultWebhook {
         -- without is_system_webhook (or "false").
 }
 
--- Editing replaces the whole configuration. The kind cannot change.
+-- decided (webhooks 4): an edit, from the web or the API, changes only the
+-- fields given; hook_config is the stored configuration with those fields
+-- applied. The secret and the Authorization header can be replaced or
+-- cleared but are never read back (decided: webhooks 7). The kind cannot
+-- change. Any edit re-authorises a copied webhook (decided: webhooks 5).
 -- from: routers/web/repo/setting/webhook.go:282
 rule ManagerEditsWebhook {
     when: ManagerEditsWebhook(actor, webhook, hook_config, is_active)
@@ -559,6 +595,7 @@ rule ManagerEditsWebhook {
     requires: hook_config.is_valid
     ensures: webhook.config = hook_config
     ensures: webhook.is_active = is_active
+    ensures: webhook.needs_reauthorization = false
     ensures: webhook.updated_at = now
     @guidance
         -- Web: POST {base}/hooks/{id}. API: PATCH /repos/{o}/{r}/hooks/{id},
@@ -586,40 +623,56 @@ rule ManagerDeletesWebhook {
         -- Web: POST {base}/hooks/delete (id). API: DELETE .../hooks/{id}.
 }
 
--- A synthetic push of the default branch head (or a placeholder commit when
--- the repository is empty) is queued regardless of the webhook's event
--- selection, branch filter or active flag (an inactive webhook's test is
--- recorded as skipped). Only repository webhooks can be tested.
+-- A synthetic push is queued regardless of the webhook's event selection
+-- or branch filter. For a repository webhook it is the default branch head
+-- (or a placeholder commit when the repository is empty); for owner and
+-- system webhooks it is a placeholder push.
+-- decided (webhooks 11): repository, organisation, user and system webhooks
+-- can all be tested (Forgejo: repository webhooks only). Default webhooks
+-- never fire, so they cannot be tested.
+-- decided (webhooks 1): an inactive webhook cannot be tested; no delivery is
+-- created (Forgejo recorded a skipped one).
 -- from: routers/web/repo/setting/webhook.go:401
-rule RepoAdminTestsWebhook {
-    when: RepoAdminTestsWebhook(actor, webhook)
+rule ManagerTestsWebhook {
+    when: ManagerTestsWebhook(actor, webhook)
     requires: not config.disable_webhooks
-    requires: webhook.scope = per_repository
-    requires: is_repo_admin(actor, webhook.repository)
+    requires: webhook.scope != default
+    requires: webhook.can_fire
+    let may_manage =
+        if webhook.scope = per_repository: is_repo_admin(actor, webhook.repository)
+        else: if webhook.scope = per_owner and webhook.owner_user != null: webhook.owner_user = actor
+        else: if webhook.scope = per_owner and webhook.owner_org != null: is_org_owner(webhook.owner_org, actor) or actor.is_admin
+        else: webhook.is_admin_level and actor.is_admin
+    requires: may_manage
     ensures:
         let fresh = HookDelivery.created(
             webhook: webhook,
             delivery_id: new_delivery_id(),
             event: push,
             action: pushed,
-            payload: synthetic_push_payload(webhook.repository, actor),
+            payload: synthetic_push_payload(webhook, actor),
             is_test: true,
             created_at: now,
-            status: queued
+            status: queued,
+            attempts: 0
         )
         HookDeliveryQueued(delivery: fresh)
     @guidance
-        -- Web: POST {repo}/settings/hooks/{id}/test.
-        -- API: POST /repos/{o}/{r}/hooks/{id}/tests?ref=... (optional ref
-        -- overrides the default branch; empty repository -> nothing queued).
+        -- Web: POST {base}/hooks/{id}/test on every webhook settings page.
+        -- API: POST .../hooks/{id}/tests (repos, orgs, user, admin);
+        -- for a repository webhook an optional ref overrides the default
+        -- branch.
 }
 
 -- Redeliver an earlier delivery: a fresh delivery (new id) with the same
 -- event and captured payload is queued.
+-- decided (webhooks 1): an inactive webhook gets no delivery at all; the
+-- redelivery is refused (Forgejo queued one and recorded it as skipped).
 -- from: models/webhook/hooktask.go:154
 rule ManagerRedeliversDelivery {
     when: ManagerRedeliversDelivery(actor, delivery)
     requires: not config.disable_webhooks
+    requires: delivery.webhook.can_fire
     let may_manage =
         if delivery.webhook.scope = per_repository: is_repo_admin(actor, delivery.webhook.repository)
         else: if delivery.webhook.scope = per_owner and delivery.webhook.owner_user != null: delivery.webhook.owner_user = actor
@@ -635,7 +688,8 @@ rule ManagerRedeliversDelivery {
             payload: delivery.payload,
             is_test: delivery.is_test,
             created_at: now,
-            status: queued
+            status: queued,
+            attempts: 0
         )
         HookDeliveryQueued(delivery: fresh)
     @guidance
@@ -649,6 +703,8 @@ rule ManagerRedeliversDelivery {
 
 -- Every new repository (created, forked, migrated, generated, adopted) gets
 -- its own copy of each default webhook.
+-- decided (webhooks 5): the copy drops the Authorization header and must be
+-- re-authorised by a manager before it fires; the rest is copied.
 -- from: models/webhook/webhook_system.go:71
 rule CopyDefaultWebhooksIntoNewRepository {
     when: repository: repositories/Repository.created
@@ -656,8 +712,9 @@ rule CopyDefaultWebhooksIntoNewRepository {
         ensures: Webhook.created(
             scope: per_repository,
             repository: repository,
-            config: template.config,
+            config: without_authorization(template.config),
             is_active: template.is_active,
+            needs_reauthorization: template.config.authorization_header != null,
             last_status: none,
             created_at: now,
             updated_at: now
@@ -666,6 +723,8 @@ rule CopyDefaultWebhooksIntoNewRepository {
 
 -- "Generate from template" with the webhooks option copies the template
 -- repository's own webhooks.
+-- decided (webhooks 5): as for default webhooks, the Authorization header is
+-- dropped and the copy must be re-authorised.
 -- from: services/repository/hooks.go:49
 rule CopyTemplateRepositoryWebhooks {
     when: repositories/RepositoryGeneratedFromTemplate(template, repository, doer, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches)
@@ -674,8 +733,9 @@ rule CopyTemplateRepositoryWebhooks {
         ensures: Webhook.created(
             scope: per_repository,
             repository: repository,
-            config: source.config,
+            config: without_authorization(source.config),
             is_active: source.is_active,
+            needs_reauthorization: source.config.authorization_header != null,
             last_status: none,
             created_at: now,
             updated_at: now
@@ -692,6 +752,8 @@ rule RemoveWebhooksOfDeletedRepository {
         ensures: not exists w
 }
 
+-- decided (webhooks 6): a deleted owner's webhooks are removed with their
+-- delivery history (Forgejo left them behind).
 rule RemoveWebhooksOfDeletedUser {
     when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
     for w in Webhooks where scope = per_owner and owner_user = user:
@@ -701,6 +763,7 @@ rule RemoveWebhooksOfDeletedUser {
         ensures: not exists w
 }
 
+-- decided (webhooks 6): as for users.
 rule RemoveWebhooksOfDeletedOrganization {
     when: organizations/OrganizationDeleted(organization)
     for w in Webhooks where scope = per_owner and owner_org = organization:
@@ -733,6 +796,10 @@ rule FanOutHookEvent {
 }
 
 -- Per-webhook filtering, then a queued delivery.
+-- decided (webhooks 1): inactive webhooks and globally disabled webhooks get
+-- no delivery (FanOutHookEvent matches only webhooks that can fire).
+-- decided (webhooks 3): pull_request_review gates all three review outcomes
+-- (approved, rejected, comment) via choice_of.
 -- from: services/webhook/webhook.go:161
 rule QueueDeliveryForMatchedEvent {
     when: HookEventMatched(webhook, kind, action, branch?, commit_count?)
@@ -747,6 +814,7 @@ rule QueueDeliveryForMatchedEvent {
         or webhook.config.branch_filter = null
         or webhook.config.branch_filter = "*"
         or glob_matches(webhook.config.branch_filter, branch)
+    -- decided (webhooks 2): an event the kind cannot render is dropped here
     requires: kind_supports(webhook.config.kind, kind)
     ensures:
         let fresh = HookDelivery.created(
@@ -757,7 +825,8 @@ rule QueueDeliveryForMatchedEvent {
             payload: capture_payload(kind, action),
             is_test: false,
             created_at: now,
-            status: queued
+            status: queued,
+            attempts: 0
         )
         HookDeliveryQueued(delivery: fresh)
 }
@@ -1131,6 +1200,9 @@ rule CommentDeletedRaisesHookEvent {
 -- Pull requests ---------------------------------------------------
 
 -- Pending reviews and review-request markers are not announced.
+-- decided (webhooks 3): all three kinds are selected by the
+-- pull_request_review choice (Forgejo's checker used pull_request_comment
+-- for review comments).
 -- from: services/webhook/notifier.go:698
 rule ReviewSubmittedRaisesHookEvent {
     when: pulls/ReviewSubmitted(review)
@@ -1328,6 +1400,10 @@ rule WorkflowJobCompletionRaisesHookEvent {
 
 -- A queued delivery is picked up by the delivery worker. Queued deliveries
 -- survive restarts: on start-up every still-queued delivery is re-queued.
+-- A delivery already queued when its webhook was deactivated (or webhooks
+-- were disabled) is skipped.
+-- decided (webhooks 1): skipping leaves the webhook's last_status untouched
+-- (Forgejo set it to failed).
 -- from: services/webhook/deliver.go:330
 rule DispatchQueuedDelivery {
     when: HookDeliveryQueued(delivery)
@@ -1337,7 +1413,6 @@ rule DispatchQueuedDelivery {
         if config.disable_webhooks or not w.is_active:
             delivery.status = skipped
             delivery.finished_at = now
-            w.last_status = failed
             HookDeliveryCompleted(delivery: delivery)
         else:
             if not host_allowed(config.allowed_host_list, w.config.target_url):
@@ -1349,6 +1424,7 @@ rule DispatchQueuedDelivery {
                 HookDeliveryCompleted(delivery: delivery)
             else:
                 delivery.status = sending
+                delivery.attempts = delivery.attempts + 1
                 delivery.request = render_request(w, delivery)
                 delivery.sent_at = now
     @guidance
@@ -1359,44 +1435,78 @@ rule DispatchQueuedDelivery {
         -- through redirects and the proxy), not only on the URL host name.
 }
 
+-- A 5xx answer is retried while attempts remain (decided: webhooks 9); any
+-- other non-2xx answer fails at once. last_status records only the final
+-- outcome.
 -- from: services/webhook/deliver.go:447
 rule ReceiverAnswers {
     when: ReceiverResponds(delivery, status_code, headers, body)
     requires: delivery.status = sending
     ensures: delivery.response = HookResponse{status_code: status_code, headers: headers, body: body}
-    ensures: delivery.finished_at = now
     ensures:
         if status_code >= 200 and status_code < 300:
             delivery.status = succeeded
+            delivery.finished_at = now
             delivery.webhook.last_status = succeeded
+            HookDeliveryCompleted(delivery: delivery)
         else:
-            delivery.status = failed
-            delivery.webhook.last_status = failed
-    ensures: HookDeliveryCompleted(delivery: delivery)
+            if status_code >= 500 and delivery.may_retry:
+                delivery.status = retrying
+                delivery.next_attempt_at = now + backoff_delay(config.retry_backoff_base, delivery.attempts)
+            else:
+                delivery.status = failed
+                delivery.finished_at = now
+                delivery.webhook.last_status = failed
+                HookDeliveryCompleted(delivery: delivery)
 }
 
 -- Connection refused, DNS failure, TLS failure, a host refused by the
--- allow-list after resolution, or an unreadable response body.
+-- allow-list after resolution, or an unreadable response body. Retried while
+-- attempts remain (decided: webhooks 9).
 -- from: services/webhook/deliver.go:440
 rule DeliveryTransportFails {
     when: DeliveryTransportFailed(delivery, reason)
     requires: delivery.status = sending
-    ensures: delivery.status = failed
     ensures: delivery.response = HookResponse{status_code: null, headers: {}, body: reason}
-    ensures: delivery.finished_at = now
-    ensures: delivery.webhook.last_status = failed
-    ensures: HookDeliveryCompleted(delivery: delivery)
+    ensures:
+        if delivery.may_retry:
+            delivery.status = retrying
+            delivery.next_attempt_at = now + backoff_delay(config.retry_backoff_base, delivery.attempts)
+        else:
+            delivery.status = failed
+            delivery.finished_at = now
+            delivery.webhook.last_status = failed
+            HookDeliveryCompleted(delivery: delivery)
 }
 
+-- A timeout counts as a network error and is retried while attempts remain
+-- (decided: webhooks 9).
 -- from: services/webhook/deliver.go:499
 rule DeliveryTimesOut {
     when: delivery: HookDelivery.is_overdue
     requires: delivery.status = sending
-    ensures: delivery.status = failed
     ensures: delivery.response = HookResponse{status_code: null, headers: {}, body: "timeout"}
-    ensures: delivery.finished_at = now
-    ensures: delivery.webhook.last_status = failed
-    ensures: HookDeliveryCompleted(delivery: delivery)
+    ensures:
+        if delivery.may_retry:
+            delivery.status = retrying
+            delivery.next_attempt_at = now + backoff_delay(config.retry_backoff_base, delivery.attempts)
+        else:
+            delivery.status = failed
+            delivery.finished_at = now
+            delivery.webhook.last_status = failed
+            HookDeliveryCompleted(delivery: delivery)
+}
+
+-- decided (webhooks 9): when the backoff has passed the delivery is queued
+-- again under the same delivery id; DispatchQueuedDelivery re-checks the
+-- webhook and the host allow-list before the next attempt.
+-- backoff_delay(base, n) = base * 2^(n-1): 10s, 20s, ... by default.
+rule RetryDeliveryAfterBackoff {
+    when: delivery: HookDelivery.is_retry_due
+    requires: delivery.status = retrying
+    ensures: delivery.status = queued
+    ensures: delivery.next_attempt_at = null
+    ensures: HookDeliveryQueued(delivery: delivery)
 }
 
 ------------------------------------------------------------
@@ -1455,9 +1565,16 @@ invariant WebhookHasExactlyOneHome {
         and (w.is_admin_level implies (w.repository = null and w.owner_user = null and w.owner_org = null))
 }
 
+-- A copy awaiting re-authorisation may lack a required Authorization header
+-- (matrix, sourcehut_builds) until a manager edits it.
 invariant StoredConfigIsValid {
     for w in Webhooks:
-        w.config.is_valid
+        w.needs_reauthorization or w.config.is_valid
+}
+
+invariant AttemptsAreBounded {
+    for d in HookDeliveries:
+        d.attempts <= config.max_delivery_attempts
 }
 
 invariant DeliveryIdsAreUnique {
@@ -1509,7 +1626,6 @@ surface RepoWebhookSettings {
             w.config.target_url
             w.config.http_method
             w.config.content_type
-            w.config.authorization_header
             w.config.event_mode
             w.config.chosen_events
             w.config.branch_filter
@@ -1531,11 +1647,17 @@ surface RepoWebhookSettings {
         RepoAdminCreatesWebhook(admin, repo, hook_config, is_active) when not config.disable_webhooks
         ManagerEditsWebhook(admin, webhook, hook_config, is_active) when not config.disable_webhooks
         ManagerDeletesWebhook(admin, webhook) when not config.disable_webhooks
-        RepoAdminTestsWebhook(admin, webhook) when not config.disable_webhooks
+        ManagerTestsWebhook(admin, webhook) when not config.disable_webhooks
         ManagerRedeliversDelivery(admin, delivery) when not config.disable_webhooks
 
     @guarantee SecretIsWriteOnly
         -- The HMAC secret is never shown back, in the web UI or the API.
+
+    @guarantee AuthorizationIsWriteOnly
+        -- decided (webhooks 7): the Authorization header is write-only like
+        -- the secret, on every webhook surface: managers can replace or
+        -- clear it, never read it (Forgejo returned it in clear). Recorded
+        -- requests show it redacted.
 
     @guarantee HistoryIsPaged
         -- Deliveries are listed newest first, config.history_page_size per page.
@@ -1560,7 +1682,6 @@ surface OrgWebhookSettings {
         for w in hooks:
             w.config.kind
             w.config.target_url
-            w.config.authorization_header
             w.config.event_mode
             w.config.chosen_events
             w.config.branch_filter
@@ -1578,10 +1699,11 @@ surface OrgWebhookSettings {
         OrgOwnerCreatesWebhook(owner, organization, hook_config, is_active) when not config.disable_webhooks
         ManagerEditsWebhook(owner, webhook, hook_config, is_active) when not config.disable_webhooks
         ManagerDeletesWebhook(owner, webhook) when not config.disable_webhooks
+        ManagerTestsWebhook(owner, webhook) when not config.disable_webhooks
         ManagerRedeliversDelivery(owner, delivery) when not config.disable_webhooks
 
     @guidance
-        -- Web: {org}/settings/hooks[...] (no test button). API: GET/POST
+        -- Web: {org}/settings/hooks[...]. API: GET/POST
         -- /orgs/{org}/hooks, GET/PATCH/DELETE /orgs/{org}/hooks/{id}.
 }
 
@@ -1596,7 +1718,6 @@ surface UserWebhookSettings {
         for w in hooks:
             w.config.kind
             w.config.target_url
-            w.config.authorization_header
             w.config.event_mode
             w.config.chosen_events
             w.config.branch_filter
@@ -1614,6 +1735,7 @@ surface UserWebhookSettings {
         UserCreatesOwnWebhook(user, hook_config, is_active) when not config.disable_webhooks
         ManagerEditsWebhook(user, webhook, hook_config, is_active) when not config.disable_webhooks
         ManagerDeletesWebhook(user, webhook) when not config.disable_webhooks
+        ManagerTestsWebhook(user, webhook) when not config.disable_webhooks
         ManagerRedeliversDelivery(user, delivery) when not config.disable_webhooks
 
     @guidance
@@ -1633,7 +1755,6 @@ surface AdminWebhookSettings {
             w.scope
             w.config.kind
             w.config.target_url
-            w.config.authorization_header
             w.config.event_mode
             w.config.chosen_events
             w.config.branch_filter
@@ -1652,6 +1773,7 @@ surface AdminWebhookSettings {
         AdminCreatesDefaultWebhook(admin, hook_config, is_active) when not config.disable_webhooks
         ManagerEditsWebhook(admin, webhook, hook_config, is_active) when not config.disable_webhooks
         ManagerDeletesWebhook(admin, webhook) when not config.disable_webhooks
+        ManagerTestsWebhook(admin, webhook) when not config.disable_webhooks
         ManagerRedeliversDelivery(admin, delivery) when not config.disable_webhooks
 
     @guidance
@@ -1659,6 +1781,35 @@ surface AdminWebhookSettings {
         -- GET/POST /admin/hooks/{id}; POST /admin/hooks/{id}/replay/{uuid};
         -- POST /admin/hooks/delete. API: GET/POST /admin/hooks (list shows
         -- system hooks only), GET/PATCH/DELETE /admin/hooks/{id}.
+}
+
+-- decided (webhooks 8): an instance-wide delivery log. Site admins browse
+-- every delivery of every webhook (repository, owner and system), newest
+-- first, filterable by webhook and by status. Forgejo had none.
+surface InstanceDeliveryLog {
+    facing admin: access/SiteAdmin
+
+    exposes:
+        for d in HookDeliveries:
+            d.webhook
+            d.delivery_id
+            d.event
+            d.status
+            d.attempts
+            d.is_test
+            d.request
+            d.response
+            d.finished_at
+
+    provides:
+        ManagerRedeliversDelivery(admin, delivery) when not config.disable_webhooks
+
+    @guarantee HistoryIsPaged
+        -- config.history_page_size deliveries per page.
+
+    @guidance
+        -- Web: /admin/hooks/deliveries?hook=<id>&status=<status>.
+        -- API: GET /admin/hooks/deliveries with the same filters.
 }
 
 -- The external endpoint receiving a delivery.
@@ -1678,8 +1829,10 @@ surface HookReceiverEndpoint {
         fulfils SignedDelivery
         fulfils HookRequestRendering
 
-    @guarantee AtMostOnce
-        -- Each delivery is sent at most once; there are no automatic retries.
+    @guarantee BoundedAttempts
+        -- decided (webhooks 9): each attempt is sent at most once, and a
+        -- delivery makes at most config.max_delivery_attempts attempts, all
+        -- under the same X-Forgejo-Delivery id.
 
     @guarantee BoundedWait
         -- The receiver has config.deliver_timeout to answer.
@@ -1695,22 +1848,6 @@ surface HookReceiverEndpoint {
 deferred HookRequestRendering.render    -- see: services/webhook/ per-kind message formatting: services/webhook/{slack,discord,dingtalk,telegram,msteams,feishu,matrix,wechatwork,packagist}.go, sourcehut/builds.go
 
 ------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Inactive or globally-disabled deliveries: Forgejo marks them delivered, not succeeded, and sets the webhook's last status to failed. Should a skipped delivery leave last_status untouched instead?"
-open question "Kinds that cannot render an event (e.g. sourcehut_builds for issues): Forgejo still creates the delivery and it stays undelivered forever (re-queued at every start). The spec drops such events at queue time (kind_supports) — confirm, or record them as failed?"
-open question "Review comments: Forgejo's event checker gates pull_request_review_comment on the pull_request_comment choice while the matching helper uses pull_request_review. The spec uses pull_request_review for all three review outcomes — confirm."
-open question "API edit (PATCH .../hooks/{id}) resets event mode to choose_events and leaves package, workflow_run_* and workflow_job_* selections untouched; the API create path also ignores http_method. Should API create/edit accept the full WebhookConfig like the web form?"
-open question "Copying default webhooks into a new repository and copying template webhooks drop the Authorization header in Forgejo. The spec copies the whole config, including it — confirm."
-open question "Owner deletion: Forgejo leaves a deleted user's or organization's webhooks behind. The spec removes them — confirm."
-open question "Secret: the web edit form re-renders the stored secret into a password field, while the API never returns it. The spec treats it as write-only; the Authorization header, however, is returned in clear to managers by the API and form — should it also become write-only?"
-open question "Delivery history is visible on repo/org/user/admin pages, but the admin page only shows history for system hooks it can edit; default hooks never have history. Is there a need for an instance-wide delivery log?"
-open question "Should failed deliveries be retried automatically with backoff? Forgejo never retries (one attempt; manual redelivery only)."
-open question "gitea and gogs kinds exist only to speak older receivers' dialects (short ref names on create/delete for gitea, POST-only for gogs). Keep them as distinct kinds in a rebuild?"
-open question "Test deliveries are only offered for repository webhooks; should org, user and system webhooks have a test action too?"
-
-------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
 -- (Triggers consumed are bound exactly as the integration's canonical table
@@ -1722,3 +1859,5 @@ open question "Test deliveries are only offered for repository webhooks; should 
 -- REQUEST packages/PackageVersion.package; packages/Package.repository?, owner_user?, owner_org?.
 -- REQUEST actions: WorkflowRun.{status, repository, trigger_user}; Job.{status, run}.
 -- REQUEST migrations/Migration{repository}.doer: the sender of the repository/created event for a migration.
+-- REQUEST migrations (or whichever module owns the instance import addon): map stored Forgejo `gitea` / `gogs` webhooks onto kind `forgejo` on import (decided: webhooks 10).
+-- REQUEST administration: list the [webhook] retry settings max_delivery_attempts (default 3) and retry_backoff_base among the instance settings, and link the instance-wide delivery log (InstanceDeliveryLog) from site administration (decided: webhooks 8, 9).
