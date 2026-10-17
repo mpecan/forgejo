@@ -405,6 +405,7 @@ journey AReleaseLandsInTheFeed {
     given:
         repo.is_private = false
         repo.is_archived = false
+        repo.is_mirror = false
         repo.is_empty = false
 
     1. she publishes it

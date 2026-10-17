@@ -15,6 +15,7 @@
 --     or commit, optionally annotated) or on an existing tag
 --   - editing, publishing, un-publishing, re-targeting drafts, deleting a
 --     release (the tag stays)
+--   - pull mirrors: their releases follow upstream tags only (read-only)
 --   - asset upload / external link / rename / URL change / delete / download
 --     counting
 --   - latest release determination and the "latest" download alias
@@ -23,7 +24,9 @@
 --     mirror sync, after adoption / fork / migration, and on an admin request
 -- Excludes:
 --   - the git tag ref, bare tag creation/deletion (web "tag only", tags page
---     delete, API /tags), tag protection and signature verification — code /
+--     delete, API /tags; all need code write — decided releases 9 — and a tag
+--     carrying a published release cannot be deleted — decided releases 6),
+--     tag protection and signature verification — code /
 --     keys own Tag, ProtectedTag, CommitVerification; we react to code's
 --     TagCreated / TagUpdated / TagDeleted and ask code to create the tag
 --     when a release is published
@@ -47,6 +50,7 @@
 -- Emits:
 --   ReleasePublished(release)              -- a release became visible to readers (publisher = release.publisher)
 --   ReleaseUpdated(release, doer)          -- a published release was edited
+--   ReleaseUnpublished(release, doer)      -- a published release became a draft (by edit, or its tag vanished: doer null)
 --   ReleaseDeleted(release, doer)          -- a published release was deleted (the record survives as tag-only)
 --   ReleaseTagRequested(release, doer)     -- publishing needs the git tag created at release.target;
 --                                          -- code creates it as a tag push (TagCreated follows)
@@ -168,6 +172,7 @@ rule UserCreatesDraftRelease {
     when: UserCreatesRelease(user, repository, tag_name, target, title, note, is_draft, is_prerelease, hide_archive_links)
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: not repository.is_empty
     requires: is_valid_tag_name(tag_name)
     requires: not exists Release{repository: repository, tag_name: tag_name}
@@ -202,6 +207,7 @@ rule UserCreatesPublishedRelease {
     when: UserCreatesRelease(user, repository, tag_name, target, title, note, is_draft, is_prerelease, hide_archive_links)
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: not repository.is_empty
     requires: is_valid_tag_name(tag_name)
     requires: not exists Release{repository: repository, tag_name: tag_name}
@@ -234,6 +240,10 @@ rule UserCreatesPublishedRelease {
         -- repository's default branch is used (API).
         -- If a git tag of that name already exists but has no record (records
         -- out of step), it is used as is.
+        -- decided (releases 9): the form's "tag only" button is not a release
+        -- action: it is code's UserCreatesTag, which needs code write and obeys
+        -- protected-tag rules like every other bare tag creation; the
+        -- TagCreated it emits gives the tag its tag-only record here.
 }
 
 -- Writing a release for a tag that already exists (a tag-only record).
@@ -243,6 +253,7 @@ rule UserCreatesReleaseOnExistingTag {
     let existing = Release{repository: repository, tag_name: tag_name}
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: not repository.is_empty
     requires: exists existing
     requires: existing.state = tag_only
@@ -276,6 +287,7 @@ rule UserEditsDraftRelease {
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: release.state = draft
     requires: is_draft
     requires: release_quota_allows(repository)
@@ -286,12 +298,15 @@ rule UserEditsDraftRelease {
 }
 
 -- Publishing a draft. Its tag is created now if it does not exist yet.
+-- decided (releases 1): ReleasePublished is emitted whether or not the tag
+-- already existed (Forgejo sent only 'updated' when it did).
 -- from: services/release/release.go:248
 rule UserPublishesDraftRelease {
     when: UserEditsRelease(user, repository, release, title, note, is_draft, is_prerelease, hide_archive_links)
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: release.state = draft
     requires: not is_draft
     requires: release.has_tag or may_control_tag(user, repository, release.tag_name)
@@ -319,6 +334,7 @@ rule UserEditsPublishedRelease {
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: release.state = published
     requires: not is_draft
     requires: release_quota_allows(repository)
@@ -336,6 +352,7 @@ rule UserUnpublishesRelease {
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: release.state = published
     requires: is_draft
     ensures: release.title = title
@@ -343,23 +360,56 @@ rule UserUnpublishesRelease {
     ensures: release.is_prerelease = is_prerelease
     ensures: release.hide_archive_links = hide_archive_links
     ensures: release.state = draft
+    -- decided (releases 2): un-publishing is announced (Forgejo was silent)
+    ensures: ReleaseUnpublished(release: release, doer: user)
 }
 
--- API only: moving a draft to another tag name and/or target before its tag exists.
+-- API only: moving a draft to another tag name and/or target. Only drafts:
+-- a published release's tag is fixed.
+-- decided (releases 4): drafts only; un-publish first to change a published
+-- release's tag. A draft that still has its tag and moves to a new name leaves
+-- the old tag behind as a tag-only record and waits for its new tag (Forgejo
+-- let the API retarget published releases, creating a second tag).
 -- from: routers/api/v1/repo/release.go:353
 rule UserRetargetsDraftRelease {
     when: UserRetargetsRelease(user, repository, release, tag_name, target)
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: release.state = draft
-    requires: not release.has_tag
     requires: is_valid_tag_name(tag_name)
     requires: tag_name = release.tag_name or not exists Release{repository: repository, tag_name: tag_name}
+    let old_tag_name = release.tag_name
+    let old_commit_sha = release.commit_sha
+    let old_num_commits = release.num_commits
+    let leaves_tag_behind = release.has_tag and tag_name != old_tag_name
     ensures: release.tag_name = tag_name
     ensures: release.target = target
+    ensures:
+        if leaves_tag_behind:
+            release.commit_sha = null
+            release.num_commits = 0
+            Release.created(
+                repository: repository,
+                tag_name: old_tag_name,
+                target: "",
+                title: old_tag_name,
+                note: "",
+                publisher: release.publisher,
+                original_author: null,
+                state: tag_only,
+                is_prerelease: false,
+                hide_archive_links: false,
+                commit_sha: old_commit_sha,
+                num_commits: old_num_commits,
+                created_at: release.created_at
+            )
     @guidance
         -- PATCH /repos/{owner}/{repo}/releases/{id} with tag_name / target_commitish.
+        -- A published release is refused: no rule fires.
+        -- Changing only the target of a draft whose tag exists has no effect
+        -- until the tag is re-created.
 }
 
 ------------------------------------------------------------
@@ -368,12 +418,15 @@ rule UserRetargetsDraftRelease {
 
 -- Deleting a release but keeping its tag: the record reverts to tag-only and
 -- all its assets are removed. A draft whose tag never existed disappears.
+-- decided (releases 5): a never-tagged draft's record is removed entirely
+-- (Forgejo left a tag-less 'tag' record behind).
 -- from: services/release/release.go:390
 rule UserDeletesRelease {
     when: UserDeletesRelease(user, repository, release)
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: release.is_release
     let was_published = release.state = published
     ensures:
@@ -394,6 +447,9 @@ rule UserDeletesRelease {
         -- Title and notes are kept on the tag-only record (Tags page).
         -- Deleting the tag itself is code's UserDeletesTag; the record then
         -- follows via TagVanished.
+        -- decided (releases 6): there is no 'delete the tag with its release'
+        -- path. code refuses deleting (on the web, the API or by push) a tag
+        -- that carries a published release; delete the release here first.
 }
 
 ------------------------------------------------------------
@@ -409,9 +465,12 @@ rule UserUploadsReleaseAsset {
     requires: config.attachments_enabled
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: release.is_release
     requires: name != ""
     requires: file_type_allowed(name, head_bytes, config.release_allowed_types)
+    -- decided (releases 7): the size limit holds on every upload path (web and
+    -- API), not only in the web upload widget
     requires: size <= config.max_asset_size_mb * 1048576
     requires: asset_quota_allows(repository)
     ensures: issues/Attachment.created(
@@ -443,6 +502,7 @@ rule UserLinksUploadToRelease {
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: release.is_release
     requires: file.repository = repository
     requires: file.uploader = user
@@ -458,6 +518,7 @@ rule UserAddsExternalAsset {
     requires: config.attachments_enabled
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: release.is_release
     requires: is_valid_url(url)
     requires: name != ""
@@ -487,6 +548,7 @@ rule UserRenamesReleaseAsset {
     requires: asset.release != null
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: name != ""
     ensures: asset.name = name
     @guidance
@@ -500,6 +562,7 @@ rule UserChangesExternalAssetUrl {
     requires: asset.release != null
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: asset.external_url != null
     requires: is_valid_url(url)
     ensures: asset.external_url = url
@@ -515,6 +578,7 @@ rule UserDeletesReleaseAsset {
     requires: asset.release != null
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
+    requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     ensures: not exists asset
     @guidance
         -- Web: "attachment-del-*" on the edit form; API DELETE .../assets/{asset_id}.
@@ -586,6 +650,8 @@ rule TagOnlyRecordRefreshed {
 
 -- The tag of a written release appeared (again). A draft that was waiting for
 -- its tag is published by the push.
+-- decided (releases 3): reviving a draft this way emits ReleasePublished
+-- (Forgejo did so silently).
 -- from: services/repository/push.go:399
 rule ReleaseTagArrives {
     when: TagObserved(repository, tag_name, commit_sha, tagger, tagged_at, subject, body)
@@ -605,10 +671,16 @@ rule ReleaseTagArrives {
 -- A tag disappeared from git: a tag-only record goes; a written release is
 -- demoted to a draft that waits for its tag to come back.
 -- from: models/repo/release.go:533
+-- decided (releases 2): a published release demoted this way emits
+-- ReleaseUnpublished with no doer. Since code refuses deleting a tag that
+-- carries a published release (decided releases 6), this happens only when
+-- reconciliation finds the tag gone (e.g. a pull mirror whose upstream
+-- dropped it).
 rule TagDisappears {
     when: TagVanished(repository, tag_name)
     let existing = Release{repository: repository, tag_name: tag_name}
     requires: exists existing
+    let was_published = existing.state = published
     ensures:
         if existing.state = tag_only:
             not exists existing
@@ -616,6 +688,9 @@ rule TagDisappears {
             existing.state = draft
             existing.commit_sha = null
             existing.num_commits = 0
+    ensures:
+        if was_published:
+            ReleaseUnpublished(release: existing, doer: null)
 }
 
 -- code reports tags created or moved — by a push, or by its own tag creation
@@ -846,30 +921,38 @@ surface ReleaseManagement {
 
     provides:
         UserCreatesRelease(writer, repository, tag_name, target, title, note, is_draft, is_prerelease, hide_archive_links)
-            when not repository.is_archived and not repository.is_empty
+            when not repository.is_archived and not repository.is_mirror and not repository.is_empty
         UserEditsRelease(writer, repository, release, title, note, is_draft, is_prerelease, hide_archive_links)
-            when not repository.is_archived
+            when not repository.is_archived and not repository.is_mirror
         UserRetargetsRelease(writer, repository, release, tag_name, target)
-            when not repository.is_archived
+            when not repository.is_archived and not repository.is_mirror
         UserDeletesRelease(writer, repository, release)
-            when not repository.is_archived
+            when not repository.is_archived and not repository.is_mirror
         UserUploadsReleaseAsset(writer, repository, release, name, size, head_bytes)
-            when not repository.is_archived and config.attachments_enabled
+            when not repository.is_archived and not repository.is_mirror and config.attachments_enabled
         UserLinksUploadToRelease(writer, repository, release, file)
-            when not repository.is_archived
+            when not repository.is_archived and not repository.is_mirror
         UserAddsExternalAsset(writer, repository, release, name, url)
-            when not repository.is_archived and config.attachments_enabled
+            when not repository.is_archived and not repository.is_mirror and config.attachments_enabled
         UserRenamesReleaseAsset(writer, repository, asset, name)
-            when not repository.is_archived
+            when not repository.is_archived and not repository.is_mirror
         UserChangesExternalAssetUrl(writer, repository, asset, url)
-            when not repository.is_archived
+            when not repository.is_archived and not repository.is_mirror
         UserDeletesReleaseAsset(writer, repository, asset)
-            when not repository.is_archived
+            when not repository.is_archived and not repository.is_mirror
         VisitorDownloadsReleaseAsset(writer, repository, asset)
 
+    -- decided (releases 8): archived repositories freeze every release and
+    -- asset change, deletes included (Forgejo's API still allowed deletes).
     @guarantee ArchivedRepositoriesAreFrozen
         -- No release or asset of an archived repository can be created,
-        -- changed or deleted.
+        -- changed or deleted, on the web or the API.
+
+    -- decided (releases 10): pull mirrors' releases are read-only.
+    @guarantee PullMirrorReleasesAreReadOnly
+        -- No release or asset of a pull mirror can be created, changed or
+        -- deleted by a user; its records follow upstream tags only, through
+        -- MirrorSyncReconcilesTags.
 
     @guidance
         -- Web: GET/POST /{o}/{r}/releases/new (?tag= pre-fills from a
@@ -928,21 +1011,6 @@ deferred is_valid_tag_name    -- see: code.allium (git ref-format rules for refs
 deferred file_type_allowed    -- see: issues.allium (is_allowed_file: extension or sniffed mime type)
 
 ------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Publishing a draft whose tag already exists emits only 'release updated' in Forgejo (not 'published'); this spec emits ReleasePublished on every draft -> published. Confirm."
-open question "Un-publishing (published -> draft) and tag-deletion-by-push (published -> draft) are silent in Forgejo; should webhooks/feeds get a 'release unpublished' event?"
-open question "A push that brings back the tag of a draft release publishes it; Forgejo does so silently. This spec emits ReleasePublished. Intended?"
-open question "Forgejo lets the API change tag_name/target of a published release, which creates a second tag and leaves the old one; this spec restricts retargeting to drafts without a tag. Confirm."
-open question "Deleting a draft that never had a tag leaves a tag-less 'tag' record in Forgejo; this spec removes the record entirely. Confirm."
-open question "Forgejo's tags-page delete removes a tag together with its published release (and emits release-deleted); code.allium refuses deleting a tag that carries a published release. Which is intended?"
-open question "[attachment] MAX_SIZE is enforced only by the web upload widget in Forgejo; this spec enforces it on every upload path. Confirm."
-open question "Archived repositories: Forgejo's API still allows deleting releases/assets of an archived repository; this spec freezes all release mutations. Confirm."
-open question "Creating a bare tag needs releases-write on the web release form ('tag only') but code-write on the API; should one permission govern both?"
-open question "Should pull-mirrors' releases be read-only (mirror owners cannot meaningfully write releases for upstream tags)?"
-
-------------------------------------------------------------
 -- Functions this module provides to others
 ------------------------------------------------------------
 -- release_exists(repository, tag_name)        = exists Release{repository, tag_name} where is_release
@@ -979,7 +1047,6 @@ open question "Should pull-mirrors' releases be read-only (mirror owners cannot 
 --   internal tag push, so TagCreated, push notifications and Actions events follow.
 -- REQUEST code/Tag.tagger, .message, .created_at, .commit_sha: used to build TagObserved.
 -- REQUEST code/ProtectedTag: a predicate equivalent to may_control_tag(user, repository, tag_name).
--- REQUEST code/UserDeletesTag: Forgejo deletes the tag's release record with it (see open question).
 -- REQUEST issues/Attachment.release, .external_url, .download_count, .is_linked: as already
 --   declared; issues/Attachments collection; the release upload endpoint uses
 --   [repository.release] ALLOWED_TYPES and needs releases write, not tracker read.
@@ -999,3 +1066,8 @@ open question "Should pull-mirrors' releases be read-only (mirror owners cannot 
 -- REQUEST notifications: ReleasePublished now carries only (release); use release.publisher.
 -- REQUEST webhooks / actions: react to ReleasePublished(release) / ReleaseUpdated(release, doer)
 --   / ReleaseDeleted(release, doer) (release event actions published / updated / deleted).
+-- REQUEST actions: decide whether releases/ReleaseUnpublished(release, doer) starts `release`
+--   workflows (type `unpublished`); webhooks and notifications already react (decided releases 2).
+-- REQUEST code: UserCreatesTag is also the web release form's "tag only" path (decided releases 9).
+-- REQUEST repositories: is_mirror means a pull mirror; releases refuse user changes on it
+--   (decided releases 10).

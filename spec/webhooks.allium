@@ -64,7 +64,8 @@
 --   pulls/PullRequestSynchronized(pull_request, doer), pulls/ReviewSubmitted(review),
 --   pulls/ReviewRequested(pull_request, requester, reviewer), pulls/ReviewRequestRemoved(pull_request, doer, reviewer)
 --   wiki/WikiPageCreated(repository, doer, page), wiki/WikiPageEdited(...), wiki/WikiPageDeleted(...)
---   releases/ReleasePublished(release), releases/ReleaseUpdated(release, doer), releases/ReleaseDeleted(release, doer)
+--   releases/ReleasePublished(release), releases/ReleaseUpdated(release, doer), releases/ReleaseDeleted(release, doer),
+--   releases/ReleaseUnpublished(release, doer)
 --   packages/PackageVersionCreated(version, publisher), packages/PackageVersionDeleted(version, doer)
 --   actions/WorkflowRunStatusChanged(run, prior_status), actions/WorkflowRunCompleted(run, prior_status),
 --   actions/WorkflowJobStatusChanged(job, prior_status), actions/WorkflowJobCompleted(job, prior_status)
@@ -295,7 +296,7 @@ enum HookAction {
     opened | edited | closed | reopened | assigned | unassigned
     | label_updated | label_cleared | milestoned | demilestoned
     | synchronized | reviewed | review_requested | review_request_removed
-    | created | deleted | published | updated | pushed | forked
+    | created | deleted | published | unpublished | updated | pushed | forked
     | status_changed
 }
 
@@ -1206,6 +1207,13 @@ rule ReleaseUpdatedRaisesHookEvent {
 rule ReleaseDeletedRaisesHookEvent {
     when: releases/ReleaseDeleted(release, doer)
     ensures: HookEventRaised(kind: release, action: deleted, source_repo: release.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
+}
+
+-- decided (releases 2): un-publishing raises a release event; Forgejo had none.
+-- With no doer (the tag vanished during a sync) the publisher is the sender.
+rule ReleaseUnpublishedRaisesHookEvent {
+    when: releases/ReleaseUnpublished(release, doer)
+    ensures: HookEventRaised(kind: release, action: unpublished, source_repo: release.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: if doer = null: release.publisher else: doer)
 }
 
 -- Packages --------------------------------------------------------

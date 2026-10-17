@@ -173,3 +173,12 @@ invariants or config. Numbers refer to the question's position in its module in
 | 5 | Who deletes wiki data and changes the wiki branch | **Repository admins,** on every path. |
 | 6 | Editing a page that doesn't exist | **Refused;** creating is a separate operation. |
 | 7 | Nested pages | **Supported.** A `/` in a page name is a directory path. |
+
+## actions
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Dispatching a disabled workflow | **Allowed.** Disabling stops automatic triggers (push, schedule, events) and re-runs; a manual dispatch still starts it. |
+| 2 | Who manages repo secrets, variables and runners | **Repository admins,** on every path. |
+| 3 | Artifact retention vs `ARTIFACT_RETENTION_DAYS` | **The config is only the default.** A workflow may request any retention. |
+| 4 | Runner registration tokens | **Expire after a configurable lifetime** (default 1 hour), reusable for several runners until then. |

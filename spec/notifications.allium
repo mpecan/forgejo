@@ -102,6 +102,7 @@
 --   code/BranchCreated(branch, by)
 --   code/BranchDeleted(branch, by)
 --   releases/ReleasePublished(release)                  -- publisher is release.publisher
+--   releases/ReleaseUnpublished(release, doer)          -- doer null when the tag vanished in a sync
 --   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
 --   accounts/PrimaryEmailChanged(user, old_address, new_address)
 --   authentication/UserSignedUp(user)
@@ -266,6 +267,7 @@ enum ActivityKind {
     | reject_pull_request
     | pull_review_dismissed
     | publish_release
+    | unpublish_release     -- decided (releases 2)
 }
 
 -- Which part of a repository a watcher must be watching for an activity to
@@ -1689,6 +1691,16 @@ rule RecordReleasePublished {
     )
 }
 
+-- decided (releases 2): un-publishing is recorded in feeds; Forgejo had no entry.
+rule RecordReleaseUnpublished {
+    when: releases/ReleaseUnpublished(release, doer)
+    ensures: Activity.created(
+        kind: unpublish_release, actor: doer, repository: release.repository,
+        issue: null, comment: null, code_comment: null, ref_name: release.tag_name, content: release.title,
+        is_private: release.repository.is_private, watch_category: releases, created_at: now
+    )
+}
+
 ------------------------------------------------------------
 -- Activity feed: fan-out into feeds
 ------------------------------------------------------------
@@ -1718,7 +1730,8 @@ rule FanOutActivity {
         -- feed_reaches(watch, activity): the watch covers
         -- activity.watch_category, the watcher has not blocked the actor,
         -- and can read the unit the activity is about:
-        --   commit_repo, push_tag, delete_tag, delete_branch, publish_release -> code
+        --   commit_repo, push_tag, delete_tag, delete_branch, publish_release,
+        --   unpublish_release                                                -> code
         --   create/comment/close/reopen issue                                -> issues
         --   create/comment/merge/auto-merge/close/reopen pull request        -> pull_requests
         -- (rename/transfer/create repo, mirror syncs, reviews, dismissals:
