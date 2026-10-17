@@ -299,3 +299,16 @@ invariants or config. Numbers refer to the question's position in its module in
 | 6 | Profile tabs' default sort | **Their own default** (recently updated), independent of the explore setting. |
 | 7 | Review comments in issue search | **Indexed;** they make their pull request findable. |
 | 8 | "Relevant only" heuristic | **Avatar dropped;** relevance comes from activity (repositories, recent sign-in). |
+
+## migrations
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | API migrations | **Queued on every path;** the API returns the pending repository and a task to poll. |
+| 2 | Migrating into an organisation | **Anyone who may create repositories in it,** on every path. |
+| 3 | Cancelling | **Queued and running migrations** can both be cancelled. |
+| 4 | Content selections on mirror imports | **Refused** as a validation error; mirrors carry git only. |
+| 5 | Matching imported identities | **Kind + host + external id.** OAuth source names no longer need to equal the forge kind. |
+| 6 | Non-numeric external ids | **Re-attributed too;** ids are opaque strings. |
+| 7 | Visibility on restore | **The archive's visibility** (`FORCE_PRIVATE` still forces private). |
+| 8 | Host policy for `dump-repo` | **Operators exempt;** the policy guards user-initiated migrations. |

@@ -100,12 +100,16 @@ journey AnonymousVisitorsMustSignIn {
 }
 
 -- The operator switched the users page off.
+-- Updated for decided discovery 3: the API user search now still answers
+-- signed-in users (it used to be refused for everyone).
 journey TheUsersPageIsDisabled {
-    goal: With the explore users page disabled, neither the page nor the API
-          user search answers — but the organizations page still does.
+    goal: With the explore users page disabled, the page is refused and so is
+          an anonymous API user search, but Ada's signed-in API search (used
+          by pickers) still answers, and the organizations page still does.
 
     cast:
-        ada: accounts/User
+        ada:   accounts/User
+        guest: accounts/User
 
     given:
         ada.is_active = true
@@ -115,15 +119,22 @@ journey TheUsersPageIsDisabled {
         stipulate directory() = dir
         ada cannot do ViewerSearchesUsers(ada, explore, "bo", newest) on UserDirectory
 
-    2. so is the API search
-        ada cannot do ViewerSearchesUsers(ada, api, "bo", alphabetically) on UserDirectory
+    2. an anonymous API search is refused
+        guest cannot do ViewerSearchesUsers(null, api, "bo", alphabetically) on UserDirectory
 
-    3. organizations remain browsable
+    3. ada's API search still answers
+        stipulate contains_nul("bo") = false
+        ada does ViewerSearchesUsers(ada, api, "bo", alphabetically) on UserDirectory
+            creating users: UserSearch
+        then ViewerSearchesUsers fires
+        then users.match_email = true
+
+    4. organizations remain browsable
         ada does ViewerExploresOrganizations(ada, "", newest) on OrganizationDirectory
             creating orgs: OrganizationSearch
         then ViewerExploresOrganizations fires
 
-    ends: Only the users directory went dark.
+    ends: Only the public users directory went dark.
 }
 
 -- A site admin re-indexes a repository and the queue works it off.
@@ -293,6 +304,72 @@ journey TheCodeIndexerFailsToStart {
     ends: Code search reports the indexer as unavailable.
 }
 
+-- decided: discovery 4 — the instance keeps running without a ready index.
+journey ALateIndexerDegradesThenRecovers {
+    goal: The code indexer misses the start-up timeout; the instance keeps
+          serving, Ada's repository search says the index is unavailable, and
+          once the indexer finishes starting search works again.
+
+    cast:
+        ada:  accounts/User
+        repo: repositories/Repository
+        svc:  CodeSearchService
+
+    given:
+        ada.is_active = true
+        svc.enabled = true
+        svc.status = starting
+        svc.kind = elasticsearch
+        svc.started_at = now
+        svc.fuzzy_enabled = false
+
+    1. the timeout passes and search degrades
+        after 31.seconds
+        then CodeIndexerStartupTimesOut fires
+        then svc.status = unavailable
+
+    2. ada still gets an answer, flagged unavailable
+        stipulate code_search_service() = svc
+        stipulate can_read_code(ada, repo) = true
+        ada does ReaderSearchesRepositoryCode(ada, repo, null, "main", null, exact) on CodeSearchPage
+            creating search: CodeSearch
+        then ReaderSearchesRepositoryCodeIndexed fires
+        then search.index_unavailable = true
+
+    3. the indexer finishes starting late
+        svc does CodeIndexerStartupCompleted(svc, false) on CodeIndexBackend
+        then CodeIndexerStarts fires
+        then svc.status = ready
+
+    ends: Search was unavailable, never the whole instance.
+}
+
+-- decided: discovery 5 — admins get no code-search bypass.
+journey AnAdminSearchesOnlyReadableCode {
+    goal: Root searches the code of one repository she may not read under the
+          access rules; the search is refused like anyone else's.
+
+    cast:
+        root: accounts/User
+        repo: repositories/Repository
+        svc:  CodeSearchService
+
+    given:
+        root.is_admin = true
+        root.is_active = true
+        repo.is_private = true
+        svc.enabled = true
+        svc.status = ready
+
+    1. the search is refused
+        stipulate code_search_service() = svc
+        stipulate can_read_code(root, repo) = false
+        root cannot do ReaderSearchesRepositoryCode(root, repo, null, "secret", null, exact) on CodeSearchPage
+
+    ends: Code search follows read access, whoever asks.
+}
+
+
 -- Cross-repository dashboards are for signed-in users.
 journey TheIssueDashboard {
     goal: Ada opens her pull-request dashboard filtered to review requests;
@@ -392,6 +469,7 @@ journey VisitingAProfile {
             creating view: ProfileView
         then view.tab = repositories
         then view.has_profile_readme = false
+        then view.default_sort = recent_update
         ada sees view.tab on ProfilePage in view
 
     2. carol may not see bob
@@ -427,6 +505,39 @@ journey CrawlersAndTools {
         then answer.owner_name = "ada"
 
     ends: Crawlers see only what the operator allows; tooling keeps working.
+}
+
+-- decided: discovery 1 — go-get leaks nothing about unreadable repositories.
+journey GoGetHidesAPrivateDefaultBranch {
+    goal: A private repository uses "trunk" as its default branch; an
+          anonymous go tool gets the instance default instead, while its
+          owner Ada gets "trunk".
+
+    cast:
+        ada:  accounts/User
+        bot:  accounts/User
+        repo: repositories/Repository
+
+    given:
+        ada.is_active = true
+        repo.is_private = true
+        repo.default_branch = "trunk"
+
+    1. the anonymous go tool sees the instance default
+        stipulate repository_named("ada", "secret") = repo
+        stipulate trim_git_suffix("secret") = "secret"
+        stipulate can_see_repository(null, repo) = false
+        bot does GoToolRequestsImportMeta(null, "ada", "secret") on Crawlers
+            creating answer: GoImportAnswer
+        then answer.source_branch = "main"
+
+    2. the owner sees the real branch
+        stipulate can_see_repository(ada, repo) = true
+        ada does GoToolRequestsImportMeta(ada, "ada", "secret") on Crawlers
+            creating mine: GoImportAnswer
+        then mine.source_branch = "trunk"
+
+    ends: Only readers learn the repository's real default branch.
 }
 
 -- Markup rendering needs an authenticated client.

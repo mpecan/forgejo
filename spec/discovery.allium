@@ -67,7 +67,7 @@
 --   - CodeIndexRefreshed(repository, commit_sha)
 --       -- informational: the code index now reflects that default-branch commit
 --   - IndexerStartupFailed(kind)
---       -- administration may record a SystemNotice
+--       -- administration records a SystemNotice for site admins (decided: discovery 4)
 --   - CodeSearchAnswered(search), ContributorStatsGenerationStarted(repository, revision),
 --     TemplateRead(client, template), IssueIndexRebuildStarted(service)
 --       -- internal / informational
@@ -87,7 +87,8 @@
 --   - pulls/PullRequestOpened(pull_request), PullRequestMerged(pull_request, merger),
 --     PullRequestAutoMerged(pull_request, merger), ReviewSubmitted(review),
 --     ReviewRequested(pull_request, requester, reviewer),
---     ReviewRequestRemoved(pull_request, doer, reviewer)
+--     ReviewRequestRemoved(pull_request, doer, reviewer),
+--     PullRequestCodeCommented(pull_request, comment)
 --   - administration/IssueIndexRebuildDue()   -- the cron task (and "run now")
 --
 -- Black-box predicates. Qualified calls into sibling modules cannot yet be
@@ -101,9 +102,8 @@
 --   can_see_profile(viewer?, user)          -- access/can_see_profile
 --   can_see_owner(viewer?, owner)           -- access/can_see_owner_user
 --   is_org_member(user, organization)       -- organizations membership
---   listable_account(user, viewer?)         -- user-directory visibility: site admins see all;
---       signed-in users see public and limited accounts (restricted users: none), organizations
---       they belong to, and themselves; anonymous visitors see public accounts only
+--   user search lists exactly the accounts whose profile the viewer may see
+--       (can_see_profile; decided: discovery 2)
 --   listable_organization(org, viewer?)     -- same rule applied to organizations
 -- Singletons are reached through accessors: directory(), code_search_service(),
 -- issue_index_service(). Other free-standing calls are query black boxes whose
@@ -217,7 +217,7 @@ enum RepoFacet {
     | collaborative_only    -- repos the subject does not own but has access to
     | owned_only            -- API `exclusive`
     | topic_only            -- keyword matches topic names exactly
-    | relevant_only         -- hide forks unless asked; require description, topic or avatar; hide empty
+    | relevant_only         -- hide forks unless asked; hide empty; require activity (see config.relevant_activity_window)
 }
 
 -- What a repository listing is about.
@@ -428,7 +428,8 @@ entity IssueIndexDocument {
     is_public: Boolean                        -- repository is not private
     title: String
     content: String
-    comments: List<String>                    -- non-empty conversation comments
+    comments: List<String>                    -- non-empty conversation and review (code) comments
+                                              -- decided: discovery 7 (Forgejo indexed conversation comments only)
     is_pull: Boolean
     is_closed: Boolean
     labels: Set<issues/Label>
@@ -701,6 +702,7 @@ entity ProfileView {
     tab: ProfileTab
     has_profile_readme: Boolean
     shows_private: Boolean                     -- viewer is the subject or a site admin
+    default_sort: RepoSortOrder                -- used by repository tabs when no sort is chosen (decided: discovery 6)
     repositories: List<repositories/Repository>
     people: List<accounts/User>                -- followers / following tabs
     total: Integer
@@ -772,6 +774,13 @@ config {
     picker_page_size: Integer = 20                     -- MEMBERS_PAGING_NUM
     profile_repo_page_size: Integer = 15               -- [ui.user] REPO_PAGING_NUM
     explore_default_sort: RepoSortOrder = recent_update -- EXPLORE_PAGING_DEFAULT_SORT
+    -- decided: discovery 6 (profile tabs have their own default sort,
+    -- independent of explore_default_sort; Forgejo reused the explore one).
+    profile_default_sort: RepoSortOrder = recent_update
+    -- decided: discovery 8 (relevance comes from activity, not the avatar):
+    -- a repository is active when it was updated, or its owner signed in,
+    -- within this window. Not a Forgejo setting.
+    relevant_activity_window: Duration = 180.days
     only_show_relevant_repos: Boolean = false          -- ONLY_SHOW_RELEVANT_REPOS
     search_repo_description: Boolean = true           -- SEARCH_REPO_DESCRIPTION
     show_user_email: Boolean = true                    -- SHOW_USER_EMAIL
@@ -873,6 +882,11 @@ rule ViewerSearchesRepositories {
         -- profile_repo_page_size, API = limit capped at api_max_page_size.
         -- The explore page adds relevant_only by default when
         -- config.only_show_relevant_repos is on (overridable per request).
+        -- relevant_only hides forks (unless fork is asked for) and empty
+        -- repositories, and keeps only active ones: updated, or owned by an
+        -- account that signed in, within config.relevant_activity_window.
+        -- decided: discovery 8 (avatar dropped; Forgejo required a
+        -- description, topic or avatar). from: models/repo/repo_list.go:130
         -- The JSON picker (/repo/search) requires sign-in.
 }
 
@@ -885,7 +899,13 @@ rule ViewerSearchesRepositories {
 -- is not kept private, or belongs to the viewer, or the viewer is a site
 -- admin. Only individual accounts are listed — never remote fediverse
 -- people (kind activitypub), who appear only where they act; the explore and
--- picker scopes list only activated accounts.
+-- picker scopes list only activated accounts. The accounts listed are exactly
+-- those whose profile the viewer may see (can_see_profile), so a private
+-- account's followers find it too.
+-- decided: discovery 2 (user search unified with profile visibility; Forgejo
+-- hid private accounts from everyone but admins, self and org co-members).
+-- decided: discovery 3 (the API search stays available to signed-in users
+-- when the explore users page is disabled; only the public directory goes).
 -- decided: federation 10 (remote people are excluded from the user explore
 -- page and searches; Forgejo listed their materialised accounts).
 -- from: routers/web/explore/user.go:121
@@ -894,7 +914,7 @@ rule ViewerSearchesUsers {
     let dir = directory()
     requires: viewer != null or not (dir.require_signin_view or dir.explore_require_signin)
     requires: scope != explore or not dir.users_page_disabled
-    requires: scope != api or not dir.users_page_disabled
+    requires: scope != api or not dir.users_page_disabled or viewer != null
     requires: scope = api or sort in { newest, oldest, alphabetically, reverse_alphabetically }
     requires: not contains_nul(keyword)
     let found = user_search(viewer, scope, keyword, sort)
@@ -916,7 +936,8 @@ rule ViewerSearchesUsers {
         --   pseudo-ids of the ghost user and the actions bot answer with that
         --   single pseudo-account. A token restricted to public resources
         --   lists only public accounts.
-        -- When the users page is disabled the API search answers "not found".
+        -- When the users page is disabled the API search answers "not found"
+        -- to anonymous clients only.
         -- An unsupported sort on the explore page is "not found".
 }
 
@@ -978,7 +999,9 @@ rule ClientReadsTemplate {
 ------------------------------------------------------------
 
 -- Instance-wide code search across every repository whose code the viewer
--- can read (site admins: all repositories).
+-- can read. Site admins get no search-specific bypass: hits follow normal read
+-- access (can_read_code), exactly as for any other viewer.
+-- decided: discovery 5 (admin code search covers readable repositories only).
 -- from: routers/web/explore/code.go:25
 rule ViewerSearchesAllCode {
     when: ViewerSearchesAllCode(viewer, keyword, language, path, mode)
@@ -1116,9 +1139,11 @@ rule ReaderSearchesRepositoryCodeByGrep {
 ------------------------------------------------------------
 
 -- from: modules/indexer/code/indexer.go:111
+-- A start-up that completes after the timeout still brings the indexer up.
+-- decided: discovery 4.
 rule CodeIndexerStarts {
     when: CodeIndexerStartupCompleted(service, index_was_empty)
-    requires: service.status = starting
+    requires: service.status in { starting, unavailable }
     ensures: service.status = ready
     ensures:
         if index_was_empty:
@@ -1130,8 +1155,11 @@ rule CodeIndexerStarts {
         -- marks. Repositories created meanwhile are queued by their own events.
 }
 
--- The indexer must become ready within the startup timeout; otherwise the
--- instance refuses to run with a half-initialised index.
+-- An indexer that is not ready within the startup timeout is declared
+-- unavailable and site admins are told (IndexerStartupFailed becomes a system
+-- notice); the instance keeps serving, with code search reporting the index
+-- as unavailable until the indexer finishes starting.
+-- decided: discovery 4 (degrade instead of terminating the process).
 -- from: modules/indexer/code/indexer.go:264
 rule CodeIndexerStartupTimesOut {
     when: service: CodeSearchService.started_at + config.indexer_startup_timeout <= now
@@ -1140,8 +1168,7 @@ rule CodeIndexerStartupTimesOut {
     ensures: service.status = unavailable
     ensures: IndexerStartupFailed(kind: service.kind)
     @guidance
-        -- Forgejo terminates the process here. A rebuild may instead keep
-        -- serving with code search unavailable; see open questions.
+        -- Forgejo terminates the process here; this rebuild does not.
 }
 
 -- from: modules/indexer/code/indexer.go:298
@@ -1306,15 +1333,19 @@ rule LanguageStatsJobRuns {
 ------------------------------------------------------------
 
 -- from: modules/indexer/issues/indexer.go:65
+-- decided: discovery 4 (a late start-up still brings the indexer up).
 rule IssueIndexerStarts {
     when: IssueIndexerStartupCompleted(service, index_was_empty)
-    requires: service.status = starting
+    requires: service.status in { starting, unavailable }
     ensures: service.status = ready
     ensures:
         if index_was_empty:
             IssueIndexRebuildStarted(service: service)
 }
 
+-- Same degradation as the code indexer: issue keyword search reports
+-- unavailable until the indexer is ready; admins get a system notice.
+-- decided: discovery 4.
 -- from: modules/indexer/issues/indexer.go:147
 rule IssueIndexerStartupTimesOut {
     when: service: IssueIndexService.started_at + config.indexer_startup_timeout <= now
@@ -1488,6 +1519,13 @@ rule PullRequestAutoMergedIsReindexed {
 rule ReviewSubmittedReindexesPull {
     when: pulls/ReviewSubmitted(review)
     ensures: IssueReindexRequested(issue: review.pull_request.issue)
+}
+
+-- decided: discovery 7 (review comments are indexed, so a new code comment
+-- re-indexes its pull request).
+rule CodeCommentReindexesPull {
+    when: pulls/PullRequestCodeCommented(pull_request, comment)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
 }
 
 rule ReviewRequestedReindexesPull {
@@ -1967,6 +2005,7 @@ rule ViewerOpensProfile {
             tab: tab,
             has_profile_readme: readme,
             shows_private: viewer != null and (viewer.is_admin or viewer = subject),
+            default_sort: config.profile_default_sort,
             repositories: profile_repositories(viewer, subject, tab, readme),
             people: profile_people(viewer, subject, tab),
             total: profile_total(viewer, subject, tab, readme)
@@ -1982,6 +2021,9 @@ rule ViewerOpensProfile {
         --   notifications/federation. Funding links from the profile
         --   repository are shown with the overview.
         -- No pinned repositories exist in Forgejo.
+        -- Repository tabs without an explicit sort use
+        -- config.profile_default_sort, not config.explore_default_sort.
+        -- decided: discovery 6.
 }
 
 ------------------------------------------------------------
@@ -2032,7 +2074,10 @@ rule CrawlerFetchesSitemapPage {
 -- Answered for any path with ?go-get=1, whether or not the repository
 -- exists or the requester may read it, so that the go tool can proceed to
 -- authenticate on clone. The branch used for source links is the
--- repository's default branch when it exists, else the instance default.
+-- repository's default branch only when the requester may see the
+-- repository; for a missing or unreadable one it is the instance default,
+-- so the answer reveals nothing about the real repository.
+-- decided: discovery 1 (Forgejo used the real default branch for anyone).
 -- from: routers/web/goget.go:20
 rule GoToolRequestsImportMeta {
     when: GoToolRequestsImportMeta(requester, owner_name, repo_name)
@@ -2044,7 +2089,7 @@ rule GoToolRequestsImportMeta {
         repo_name: repo_name,
         import_path: go_import_path(owner_name, trim_git_suffix(repo_name)),
         clone_url: clone_url(owner_name, repo_name, config.go_get_clone_url_protocol),
-        source_branch: if repository != null: repository.default_branch else: config.default_branch_name,
+        source_branch: if repository != null and can_see_repository(requester, repository): repository.default_branch else: config.default_branch_name,
         insecure_hint: instance_is_plain_http()
     )
     @guidance
@@ -2116,6 +2161,7 @@ invariant RepositorySearchHonoursFacets {
             and (private in s.facets implies r.is_private)
             and (public in s.facets implies not r.is_private)
             and (relevant_only in s.facets implies not r.is_empty)
+            and (relevant_only in s.facets and not (fork in s.facets) implies not r.is_fork)
 }
 
 invariant RepositorySearchPageBounded {
@@ -2123,11 +2169,12 @@ invariant RepositorySearchPageBounded {
         s.results.count <= s.page_size
 }
 
--- Users and organizations listed are ones the viewer may see.
+-- Users listed are exactly ones whose profile the viewer may see.
+-- decided: discovery 2.
 invariant UserSearchShowsOnlyListable {
     for s in UserSearches:
         for u in s.results:
-            listable_account(u, s.viewer)
+            can_see_profile(s.viewer, u)
 }
 
 -- decided: federation 10.
@@ -2648,19 +2695,6 @@ deferred CodeIndexer.query   -- see: implementation note; per-backend tokenisati
 deferred IssueIndexer.query  -- see: implementation note; per-backend scoring for relevance sort
 
 ------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "go-get answers reveal a private repository's default branch name to anyone; should the answer for unreadable repositories use the instance default branch instead?"
-open question "User search hides private accounts from everyone but admins/self/org co-members, while profile visibility also admits followers of a private account; should the two rules be unified?"
-open question "The API user search is disabled whenever the explore users page is disabled, which also breaks pickers that use the API; should the API stay available to signed-in users?"
-open question "An indexer that does not become ready within STARTUP_TIMEOUT terminates the instance; should a rebuild degrade to 'search unavailable' instead?"
-open question "Instance-wide code search for site admins searches every repository, including private ones they have no role in; intended?"
-open question "Explore orders by recent update by default but profile tabs fall back to the explore default too; should profiles have their own default sort?"
-open question "Only conversation comments are indexed for issue search; should review (code) comments be searchable too?"
-open question "The relevant-only filter treats 'has avatar' as relevance; keep that heuristic?"
-
-------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
 
@@ -2673,3 +2707,6 @@ open question "The relevant-only filter treats 'has avatar' as relevance; keep t
 -- REQUEST code: mirror syncs must also emit CommitsPushed for default-branch changes so mirrors are re-indexed.
 -- REQUEST issues/Issue.content, created_at, updated_at, deadline, labels, assignees, milestone, mentions, subscribers, project: the indexed projection (read here via black-box accessors issue_*).
 -- REQUEST pulls: reviewer sets per pull request (reviewed_by, review_requested) for the index projection.
+-- REQUEST administration: react to discovery/IndexerStartupFailed(kind) by creating a SystemNotice for site admins ("<kind> indexer did not start in time; search unavailable until it is ready") (decision 4).
+-- REQUEST pulls: emit ReviewCommentEdited(pull_request, comment) / ReviewCommentDeleted(pull_request, comment) from UserEditsReviewComment / UserDeletesReviewComment so discovery re-indexes the pull request (review comments are now indexed, decision 7).
+-- REQUEST access: decision 5 says admin code search follows normal read access; access currently lets site admins read every repository, so confirm whether can_read for admins should stay all-repositories.
