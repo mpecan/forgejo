@@ -316,3 +316,12 @@ invariants or config. Numbers refer to the question's position in its module in
 | 10 | Milestones without a deadline | **Far-future deadline** (9999-01-01), as Forgejo stores it. |
 | 11 | Assignees | **Imported** when they resolve to local users with access; others are kept as external names. |
 | 12 | Repository-wide retry | **The requester or a repository admin.** |
+
+## follow-ups
+
+Questions that came up while the decisions were applied.
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Site admins reading private repositories they have no role in | **Kept, but audited.** Admins can open any repository, but search and listings don't surface private repositories they have no role in, and each such access is logged. |
+| 2 | Package count limits after folding into quota | **Quota gains count subjects** (for example packages and repositories per owner), alongside the byte subjects. |
