@@ -266,18 +266,51 @@ journey CarolKeepsHerProfilePrivate {
     ends: Private means visible to a chosen circle, not to everyone signed in.
 }
 
--- Site admins cannot delete their own account from settings.
+-- The last active site admin cannot delete their own account from settings.
+-- (Updated for decision 5: the refusal now rests on there being no other
+-- active admin, not on being an admin at all.)
 journey AdminCannotDeleteThemselves {
-    goal: The site admin tries to delete their own account from the
-          account settings page and is refused.
+    goal: Root, the only active site admin, tries to delete their own
+          account from the account settings page and is refused.
 
     1. root tries to delete their own account
+        stipulate deletion_disabled_for(root) = false
         stipulate owns_packages(root) = false
         stipulate owns_repositories(root) = false
         stipulate belongs_to_organizations(root) = false
+        stipulate has_other_active_admin(root) = false
         root cannot do UserDeletesOwnAccount(root) on OwnAccountSettings
 
-    ends: An admin account has to be demoted (or removed by another admin) first.
+    ends: The instance keeps an admin; root has to appoint another first.
+}
+
+-- Decision 5: an admin may leave while another active admin remains.
+journey AnAdminLeavesWhileAnotherRemains {
+    goal: Dora has become a second site admin. Root, who owns nothing,
+          deletes their own account from settings; Dora runs the instance.
+
+    cast:
+        dora: User
+
+    given:
+        dora.name = "dora"
+        dora.kind = individual
+        dora.is_active = true
+        dora.prohibit_login = false
+        dora.is_admin = true
+        dora.is_restricted = false
+
+    1. root deletes their own account
+        stipulate deletion_disabled_for(root) = false
+        stipulate owns_packages(root) = false
+        stipulate owns_repositories(root) = false
+        stipulate belongs_to_organizations(root) = false
+        stipulate has_other_active_admin(root) = true
+        root does UserDeletesOwnAccount(root) on OwnAccountSettings
+        then DeleteUserAccount fires
+        then root does not exist
+
+    ends: Root is gone; Dora is still an admin.
 }
 
 -- An account that still owns repositories cannot be deleted without purge.
@@ -426,3 +459,116 @@ journey AMigratedAuthorClaimsTheirPlaceholder {
 
     ends: The placeholder is Mia's account and she may sign in with it.
 }
+
+-- Decision 1: following needs the followee to be visible, and an invisible
+-- account is refused as if it did not exist.
+journey BobCannotFollowAPrivateStranger {
+    goal: Carol's profile is private and Bob is a stranger to her. He tries
+          to follow her and is refused, exactly as for a name that does not exist.
+
+    cast:
+        carol: User
+
+    given:
+        carol.name = "carol"
+        carol.kind = individual
+        carol.is_active = true
+        carol.prohibit_login = false
+        carol.is_admin = false
+        carol.is_restricted = false
+        carol.visibility = private
+
+    1. bob tries to follow her
+        stipulate shares_organization(carol, bob) = false
+        bob cannot do UserFollowsUser(bob, carol) on UserProfile
+
+    2. ada, a stranger with a public profile, he can follow
+        bob does UserFollowsUser(bob, ada) on UserProfile
+            creating follow: Follow
+        then follow.followee = ada
+
+    ends: Bob follows only people he can see.
+}
+
+-- Decision 3: a block binds a site admin like anyone else.
+journey AdaBlocksTheAdmin {
+    goal: Ada blocks Root, who happens to be the site admin. Root cannot
+          follow her while the block stands; admin rank is no exemption.
+
+    1. ada blocks root
+        ada does UserBlocksUser(ada, root) on UserProfile
+            creating block: UserBlock
+        then block.blocked = root
+
+    2. root cannot follow her
+        root cannot do UserFollowsUser(root, ada) on UserProfile
+
+    ends: The block holds against the admin; admin tools are the override.
+}
+
+-- Decision 2: admins reserve names against re-registration and renames.
+journey RootReservesAName {
+    goal: Root takes the name "acme" out of circulation. Ada, not an admin,
+          cannot; while it is reserved Bob cannot rename himself to it; once
+          Root releases it, he can.
+
+    1. ada cannot reserve names
+        stipulate is_usable_username("acme") = true
+        ada cannot do AdminReservesName(ada, "acme") on ReservedNameAdministration
+
+    2. root reserves it
+        root does AdminReservesName(root, "acme") on ReservedNameAdministration
+            creating hold: ReservedName
+        then hold.name = "acme"
+        then hold.reserved_by = root
+
+    3. bob cannot rename himself to it
+        stipulate name_taken("acme") = false
+        stipulate same_name("acme", "bob") = false
+        bob cannot do UserRenamesSelf(bob, "acme") on OwnProfileSettings
+
+    4. root releases it
+        root does AdminReleasesName(root, hold) on ReservedNameAdministration
+        then hold does not exist
+
+    5. now bob can have it
+        stipulate same_name("bob", "bob") = true
+        stipulate same_name("bob", "acme") = false
+        bob does UserRenamesSelf(bob, "acme") on OwnProfileSettings
+        then bob.name = "acme"
+
+    ends: The name was unavailable exactly while it was reserved.
+}
+
+-- Decision 9: a purge that fails halfway is recorded and resumable.
+journey APurgeThatFailsIsResumed {
+    goal: Root purges Ada's account. Part of the purge fails: the account
+          stays disabled and the job is recorded as failed. Bob, not an
+          admin, cannot resume it; Root resumes it and it completes.
+
+    1. root purges ada and a step fails
+        stipulate purge_steps_complete(ada) = false
+        root does AdminDeletesUser(root, ada, true) on AdminUserAccount
+            creating job: AccountPurge
+        then AdminDeletionCascades fires
+        then AccountPurgeStalls fires
+        then job.status = failed
+        then job.attempts = 1
+        then ada.prohibit_login = true
+        then ada.is_active = false
+
+    2. bob cannot resume it
+        bob cannot do AdminResumesPurge(bob, job) on AccountPurgeAdministration
+
+    3. root resumes it and the rest goes through
+        stipulate purge_steps_complete(ada) = true
+        root does AdminResumesPurge(root, job) on AccountPurgeAdministration
+        then AccountPurgeCompletes fires
+        then job.status = completed
+        then job.attempts = 2
+        then job.user_name = "ada"
+        then ada does not exist
+
+    ends: The account is gone and the job's record says it took two runs.
+}
+

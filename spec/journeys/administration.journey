@@ -298,6 +298,7 @@ journey AnAccountThatOwnsThingsMustBePurged {
         root cannot do AdminDeletesUser(root, ada, false) on AdminUserAccount
 
     2. a purge goes through
+        stipulate accounts/purge_steps_complete(ada) = true
         root does AdminDeletesUser(root, ada, true) on AdminUserAccount
         then AdminDeletesUser fires
         then ada does not exist

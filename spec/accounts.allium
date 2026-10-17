@@ -12,12 +12,14 @@
 --   - EmailAddress (primary / secondary, activation, admin forced changes)
 --   - UserRedirect (old names after a rename), username rules, reserved names,
 --     USERNAME_PREFIX, USERNAME_COOLDOWN_PERIOD, MAX_USER_REDIRECTS
+--   - ReservedName (names a site admin has reserved against registration,
+--     organization creation and renames)
 --   - Follow (user -> user or user -> organization)
 --   - UserBlock (user or organization blocks a user) and the block enforcement
 --     contract the other modules must honour
 --   - UserSetting (per-user key/value preferences that change behaviour)
---   - Badge / UserBadge (profile badges)
---   - Account deletion (self / admin), purge, inactive-account cleanup cron
+--   - Account deletion (self / admin), the resumable purge job (AccountPurge),
+--     inactive-account cleanup cron
 --   - Profile visibility (public / limited / private), keep-email-private,
 --     keep-pronouns-private, keep-activity-private
 --   - Profile README (`.profile` repository) and funding display rules
@@ -54,8 +56,8 @@
 --   - The X-Gitea-Warning header on admin email-domain conflicts: Gitea API
 --     compatibility only; the behaviour (admin bypasses domain lists) is kept.
 --   - Reserved user/organization placeholder rows (UserTypeUserReserved /
---     UserTypeOrganizationReserved): no code path creates them; parked as an
---     open question.
+--     UserTypeOrganizationReserved) as User rows: replaced by ReservedName.
+--   - Badge / UserBadge: nothing in Forgejo creates or awards them (decided: dropped).
 --
 -- Emits:
 --   UserAccountCreated(user)                       -- any new account
@@ -80,12 +82,15 @@
 --   OrganizationBlockedUser(organization, blocked) -- same consequences for org-owned repos
 --   UserUnblocked(blocker, blocked)
 --   AccountStatusChanged(user)                     -- admin flags changed
---   UserPurged(user)                               -- purge began; repositories delete owned repos,
+--   UserPurged(user)                               -- purge began or was resumed (every step must be
+--                                                  -- idempotent); repositories delete owned repos,
 --                                                  -- organizations remove memberships and
 --                                                  -- delete orgs where user is last owner,
 --                                                  -- packages delete owned packages,
 --                                                  -- federation deletes FederatedUser,
 --                                                  -- authentication ends sessions
+--   AccountPurgeFailed(purge)                      -- a purge stopped short; administration records a
+--                                                  -- system notice
 --   UserAccountDeleted(user, kind, purge, delete_contributions)  -- `user` is already gone; read nothing from it but identity
 --                                                  -- every module removes or ghosts the user's
 --                                                  -- rows (see DeleteUserAccount guidance)
@@ -228,7 +233,6 @@ entity User {
     blocks_given: UserBlock with blocker = this
     blocks_received: UserBlock with blocked = this
     settings: UserSetting with user = this
-    badges: UserBadge with user = this
 
     -- Projections
     followers: follows_received -> follower
@@ -241,10 +245,12 @@ entity User {
     num_following: follows_given.count
     is_local: login_source = null
     is_system: false                     -- stored users are never system identities
+    -- decided: a purge is a recorded job; while it runs the account cannot sign in
+    being_purged: exists AccountPurge{user: this}
     no_reply_email: name + "@" + config.no_reply_address
     public_email: if keep_email_private: no_reply_email else: primary_email
     display_name: if full_name != "": full_name else: name
-    can_sign_in: is_active and not prohibit_login
+    can_sign_in: is_active and not prohibit_login and not being_purged
     can_receive_mail: is_active and not prohibit_login and kind = individual
     avatar_source:
         if use_custom_avatar: uploaded
@@ -327,17 +333,36 @@ entity UserSetting {
     value: String
 }
 
--- A badge an instance can award; shown on profiles.
--- from: models/user/badge.go:12
-entity Badge {
-    description: String
-    image_url: String
+-- A name a site admin has taken out of circulation: it cannot be registered,
+-- used for an organization or taken by a rename until an admin releases it.
+-- A reservation may name a live account's name (that is how an admin reserves
+-- the name of an account being deleted); the account keeps it, and the
+-- reservation holds it once the account renames away or is gone.
+-- from: models/user/user.go:56 (UserTypeUserReserved / UserTypeOrganizationReserved:
+-- Forgejo's schema has the kinds but nothing creates them)
+-- decided: admins can reserve names
+entity ReservedName {
+    name: String                         -- compared case-insensitively
+    reserved_by: User?                   -- null once that admin is deleted
+    created_at: Timestamp
 }
 
--- from: models/user/badge.go:18
-entity UserBadge {
-    badge: Badge
-    user: User
+-- One admin-deletion-with-purge, recorded so a purge that fails halfway can be
+-- resumed. The account is disabled when the job starts and removed when it
+-- completes; every step (owned repositories, packages, organization
+-- memberships, federated identity, sessions) is idempotent, so running the job
+-- again only finishes what is left.
+-- from: services/user/user.go:183 (purge disables the account, then deletes)
+-- decided: a purge is resumable
+entity AccountPurge {
+    user: User?                          -- null once the account is gone
+    user_name: String                    -- the name it had, kept for the record
+    requested_by: User?
+    status: running | failed | completed
+    attempts: Integer
+    started_at: Timestamp
+    failed_at: Timestamp?
+    completed_at: Timestamp?
 }
 
 ------------------------------------------------------------
@@ -425,7 +450,30 @@ config {
 -- name or address (UserRedirect{old_name}, EmailAddress{address}) are
 -- case-insensitive too.
 -- ActivityPub mirrors instead use the handle form "@user@host[:port]".
+-- Besides these fixed lists, a name a site admin reserved (ReservedName) is
+-- refused for registration, organizations and renames until released.
 -- from: models/user/user.go:621
+
+-- A site admin reserves a name. The name may still belong to a live account
+-- (reserving it while deleting that account keeps anyone from re-registering
+-- it); otherwise it must not be held by an organization or user at all.
+-- decided: admins can reserve names (anti re-registration)
+rule AdminReservesName {
+    when: AdminReservesName(admin, name)
+    requires: admin.is_admin
+    requires: is_usable_username(name)
+    requires: not exists ReservedName{name: name}
+    ensures: ReservedName.created(name: name, reserved_by: admin, created_at: now)
+}
+
+-- A site admin releases a reservation; the name is free again.
+-- decided: a reserved name stays reserved until an admin releases it
+rule AdminReleasesName {
+    when: AdminReleasesName(admin, reservation)
+    requires: admin.is_admin
+    requires: exists reservation
+    ensures: not exists reservation
+}
 
 -- Self-registration, on every path (sign-up form, external-login
 -- auto-registration, reverse-proxy and directory provisioning). authentication
@@ -532,6 +580,8 @@ rule UserRenamesSelf {
     requires: user.login_source = null or user.login_source.allows_username_change
     requires: is_usable_username(new_name)
     requires: same_name(new_name, user.name) or not name_taken(new_name)
+    -- decided: a reserved name cannot be taken by a rename (a case-only change of one's own name is not a take)
+    requires: same_name(new_name, user.name) or not exists ReservedName{name: new_name}
     let claimed = UserRedirect{old_name: new_name}
     requires: not exists claimed
         or not claimed.in_cooldown
@@ -820,7 +870,10 @@ rule ActivatedAccountActivatesPrimaryAddress {
 -- Make an activated secondary address the primary; the old primary stays as
 -- a secondary address and is told about the change.
 -- Web: POST /user/settings/account/email with _method=PRIMARY.
+-- The activation check is the rule's, not only the UI's: Forgejo's web
+-- handler relies on the hidden button.
 -- from: services/user/email.go:217
+-- decided: only an activated address can become primary
 rule UserMakesEmailPrimary {
     when: UserMakesEmailPrimary(user, address)
     requires: address.user = user
@@ -865,7 +918,10 @@ rule UserDeletesEmail {
 
 -- Web: POST /{username} action=follow. API: PUT /user/following/{username}.
 -- Following an organization uses the same endpoint on the org's name.
+-- Forgejo itself does not check visibility on follow; the rebuild does, and
+-- refuses exactly as for a name that does not exist (InvisibleProfilesDoNotExist).
 -- from: models/user/follow.go:31
+-- decided: following requires being able to see the followee
 rule UserFollowsUser {
     when: UserFollowsUser(follower, followee)
     requires: follower != followee
@@ -914,8 +970,17 @@ rule UserUnfollowsOrganization {
 -- two, revoke Actions trust on the blocker's repositories) happen in the
 -- modules that own those things, reacting to UserBlocked.
 -- Organizations cannot be blocked through this rule.
+-- A block binds a site admin exactly as anyone else (there is no admin
+-- exemption); an admin who must act on the blocker's things uses the admin
+-- tools, which do not consult blocks.
+-- A personal block reaches only what the blocker owns personally:
+-- repositories the blocker owns through an organization, and organization
+-- membership, are untouched — organizations keep their own block list
+-- (OrganizationBlocksUser).
 -- Web: POST /{username} action=block. API: PUT /user/block/{username}.
 -- from: services/user/block.go:21
+-- decided: blocks bind admins like anyone (admins override via admin tools)
+-- decided: a personal block covers only the blocker's own repositories
 rule UserBlocksUser {
     when: UserBlocksUser(blocker, blocked)
     requires: blocker != blocked
@@ -964,16 +1029,18 @@ rule OrganizationUnblocksUser {
 ------------------------------------------------------------
 
 -- A user deletes their own account after re-entering their password
--- (checked by authentication). Admins cannot delete themselves; the
--- "deletion" feature can be disabled per instance (or for external users);
--- the account must own no repositories or packages and belong to no
--- organization.
+-- (checked by authentication). A site admin may delete themselves only while
+-- another active site admin remains; the "deletion" feature can be disabled
+-- per instance (or for external users); the account must own no repositories
+-- or packages and belong to no organization.
 -- Web: POST /user/settings/account/delete. No API.
 -- from: routers/web/user/setting/account.go:240
+-- decided: admins may self-delete while another active admin remains (Forgejo refuses every admin)
 rule UserDeletesOwnAccount {
     when: UserDeletesOwnAccount(user)
     requires: not deletion_disabled_for(user)   -- = user.has_feature_disabled(deletion)
-    requires: not user.is_admin
+    -- has_other_active_admin(user): some other site admin is active and may sign in
+    requires: not user.is_admin or has_other_active_admin(user)
     requires: not owns_repositories(user)
     requires: not belongs_to_organizations(user)
     requires: not owns_packages(user)
@@ -982,10 +1049,14 @@ rule UserDeletesOwnAccount {
 
 -- A site admin deleted an account (administration owns the entry point and
 -- its preconditions: not self, not the last admin, purge or owns nothing).
--- With purge the account is disabled at once, then everything it owns is
--- removed by the owning modules, then the account itself.
+-- Without purge the account is removed at once. With purge a recorded
+-- AccountPurge job starts: the account is disabled at once (and, being
+-- purged, cannot sign in), everything it owns is removed by the owning
+-- modules reacting to UserPurged, and the account itself is removed when
+-- every step has finished.
 -- API: DELETE /admin/users/{username}?purge=. Web: POST /-/admin/users/{id}/delete.
 -- from: services/user/user.go:183
+-- decided: a purge is a resumable recorded job (Forgejo disables outside the transaction and can leave a half-purged account)
 rule AdminDeletionCascades {
     when: administration/UserDeletedByAdmin(admin, user, purge)
     ensures:
@@ -995,8 +1066,56 @@ rule AdminDeletionCascades {
             user.is_admin = false
             user.prohibit_login = true
             user.max_repo_creation = 0
+            let job = AccountPurge.created(user: user, user_name: user.name, requested_by: admin, status: running, attempts: 1, started_at: now)
             UserPurged(user: user)
-        DeleteUserAccount(user: user, purge: purge)
+            RunAccountPurge(purge: job)
+        else:
+            DeleteUserAccount(user: user, purge: false)
+}
+
+-- A purge run in which every step finished: the account is removed and the
+-- job is recorded as completed.
+-- decided: a purge is a resumable recorded job
+rule AccountPurgeCompletes {
+    when: RunAccountPurge(purge)
+    requires: purge.status = running
+    requires: purge_steps_complete(purge.user)
+    let user = purge.user
+    ensures: purge.status = completed
+    ensures: purge.completed_at = now
+    ensures: purge.user = null
+    ensures: DeleteUserAccount(user: user, purge: true)
+    @guidance
+        -- purge_steps_complete(user): nothing the account owned is left —
+        -- no owned repository or package, no organization membership, no
+        -- federated identity, no session. Each owning module's UserPurged
+        -- reaction must be idempotent so a resumed run only does what is left.
+}
+
+-- A purge run that stopped short: the job is marked failed and the account
+-- stays disabled (and unable to sign in) until an admin resumes it.
+-- decided: a purge is a resumable recorded job
+rule AccountPurgeStalls {
+    when: RunAccountPurge(purge)
+    requires: purge.status = running
+    requires: not purge_steps_complete(purge.user)
+    ensures: purge.status = failed
+    ensures: purge.failed_at = now
+    ensures: AccountPurgeFailed(purge: purge)
+}
+
+-- A site admin resumes (retries) a failed purge. Every step is idempotent,
+-- so the run only finishes what is left; it may be retried until it completes.
+-- decided: an admin can resume or retry a failed purge until it completes
+rule AdminResumesPurge {
+    when: AdminResumesPurge(admin, purge)
+    requires: admin.is_admin
+    requires: purge.status = failed
+    ensures: purge.status = running
+    ensures: purge.attempts = purge.attempts + 1
+    ensures: purge.failed_at = null
+    ensures: UserPurged(user: purge.user)
+    ensures: RunAccountPurge(purge: purge)
 }
 
 -- The removal itself. Things this module owns go here; everything else
@@ -1015,8 +1134,9 @@ rule DeleteUserAccount {
         for b in user.blocks_given: not exists b
         for b in user.blocks_received: not exists b
         for s in user.settings: not exists s
-        for ub in user.badges: not exists ub
         for r in user.redirects: not exists r
+        for n in ReservedNames where reserved_by = user: n.reserved_by = null
+        for p in AccountPurges where requested_by = user: p.requested_by = null
         UserAccountDeleted(user: user, kind: kind, purge: purge, delete_contributions: purge or young)
         not exists user
     @guidance
@@ -1047,7 +1167,9 @@ rule DeleteUserAccount {
 -- administration's delete_inactive_accounts cron task runs (disabled by
 -- default, @annually when enabled, runnable on demand). Accounts that own
 -- something, belong to an organization, or are the last admin are skipped.
+-- Eligibility is not continuous: an account is removed only when the sweep runs.
 -- from: services/user/user.go:363
+-- decided: inactive accounts are cleaned up by the scheduled sweep only
 rule DeleteInactiveAccounts {
     when: administration/InactiveAccountCleanupDue(older_than)
     -- an account that does not qualify is skipped, not a reason to stop the sweep
@@ -1140,6 +1262,19 @@ invariant RedirectHasOneTarget {
 invariant RedirectNeverShadowsLiveName {
     for r in UserRedirects:
         not Users.any(u => same_name(u.name, r.old_name))
+}
+
+-- A name is reserved at most once (case-insensitively).
+invariant UniqueReservedNames {
+    for a in ReservedNames:
+        for b in ReservedNames:
+            a = b or not same_name(a.name, b.name)
+}
+
+-- An account with a purge job stays disabled until the job completes.
+invariant PurgingAccountStaysDisabled {
+    for p in AccountPurges:
+        p.user = null or (p.user.prohibit_login and not p.user.is_admin)
 }
 
 -- User visibility is always one of the instance's allowed modes at the
@@ -1241,7 +1376,7 @@ surface OwnAccountSettings {
         UserDeletesEmail(user, address)
         UserChangesEmailNotifications(user, preference)
         UserDeletesOwnAccount(user)
-            when not deletion_disabled_for(user) and not user.is_admin
+            when not deletion_disabled_for(user)
 
     @guarantee DeletionWarnsAboutContributions
         -- When USER_DELETE_WITH_COMMENTS_MAX_TIME is set and the account is
@@ -1278,9 +1413,6 @@ surface UserProfile {
         for f in profile.follows_received:
             f.follower.name
                 when f.follower.visible_to(viewer)
-        for ub in profile.badges:
-            ub.badge.description
-            ub.badge.image_url
 
     provides:
         UserFollowsUser(viewer, profile)
@@ -1367,6 +1499,44 @@ surface OrganizationBlockList {
         -- PUT /orgs/{org}/block/{username}, PUT /orgs/{org}/unblock/{username}.
 }
 
+-- Site admins' list of reserved names.
+-- decided: admins can reserve names
+surface ReservedNameAdministration {
+    facing admin: access/SiteAdmin
+
+    exposes:
+        for r in ReservedNames:
+            r.name
+            r.created_at
+
+    provides:
+        AdminReservesName(admin, name)
+        AdminReleasesName(admin, reservation)
+
+    @guidance
+        -- The admin delete-account form offers "reserve this name", which
+        -- issues AdminReservesName for the account's name before the deletion.
+}
+
+-- Site admins' view of purge jobs, with resume for one that failed.
+-- decided: a purge is a resumable recorded job
+surface AccountPurgeAdministration {
+    facing admin: access/SiteAdmin
+    context purge: AccountPurge
+
+    exposes:
+        purge.user_name
+        purge.status
+        purge.attempts
+        purge.started_at
+        purge.failed_at
+        purge.completed_at
+
+    provides:
+        AdminResumesPurge(admin, purge)
+            when purge.status = failed
+}
+
 -- The block contract other modules must enforce. Stated here because the
 -- block is defined here; each module states its own rule-level check.
 surface BlockEnforcement {
@@ -1407,15 +1577,7 @@ deferred is_usable_username           -- see: header comment "Names"
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Follow visibility: Forgejo lets anyone follow a user they cannot see (no visibility check on follow). The spec requires visibility to avoid leaking private accounts; confirm."
-open question "Reserved user/organization placeholder kinds (UserTypeUserReserved/OrganizationReserved) exist in the schema with no creation path; should the rebuild offer admin-reserved names (anti re-registration) as a feature?"
-open question "Admins are not immune to being blocked (TODO in services/user/block.go). Should a block prevent a site admin's actions?"
-open question "Blocking does not remove the blocked user from repositories the blocker owns through an organization, nor org membership; should it?"
-open question "Self-deletion is refused for site admins entirely (not only the last admin). Keep, or allow when other admins remain?"
-open question "Making an address primary via the web does not re-check activation server-side (only the UI hides the button). The spec requires activation; confirm."
-open question "Badges have a schema and display but no management UI or API; should the rebuild offer admin badge management?"
-open question "Inactive-account cleanup runs only on its cron schedule (default yearly, disabled). Should eligibility be continuous instead?"
-open question "Purge disables the account outside the deletion transaction so a failure can leave a disabled, half-purged account; should purge be resumable?"
+-- None: the nine accounts questions are decided (see DECISIONS.md, "## accounts").
 
 ------------------------------------------------------------
 -- Requests to other modules
@@ -1439,3 +1601,8 @@ open question "Purge disables the account outside the deletion transaction so a 
 -- REQUEST federation: emit RemoteActorDiscovered(handle, full_name, email); react to UserPurged (delete FederatedUser).
 -- REQUEST access: anonymous visitors see only public profiles; restricted users see only public profiles (plus their own and admins' rules); expose an anonymous actor this module's profile surface can face.
 -- REQUEST moderation: keep a shadow copy of a reported user's profile fields before UserProfileUpdated / PrimaryEmailChanged / deletion.
+-- REQUEST authentication: username_available(name) must also refuse a name held by an accounts/ReservedName (case-insensitive); refuse sign-in for an account whose User.being_purged is true (User.can_sign_in).
+-- REQUEST organizations: is_usable_owner_name / org creation and org renames must refuse a name held by an accounts/ReservedName.
+-- REQUEST administration: AdminCreatesUser, AdminRenamesUser and AdminCreatesOrganizationForUser must refuse a reserved name (accounts/ReservedName) until AdminReleasesName; offer "reserve this name" on the delete-account form (issues accounts' AdminReservesName before AdminDeletesUser); link accounts' ReservedNameAdministration and AccountPurgeAdministration from the admin panel.
+-- REQUEST administration: react to accounts/AccountPurgeFailed(purge) with a SystemNotice; refuse status changes (AdminSetsProhibitLogin false, AdminSetsUserActive, AdminSetsUserAdmin) on an account whose User.being_purged is true (invariant PurgingAccountStaysDisabled).
+-- REQUEST repositories, packages, organizations, federation, authentication: every UserPurged reaction must be idempotent (a resumed purge emits UserPurged again) and together make purge_steps_complete(user) true.
