@@ -121,6 +121,9 @@
 --   releases/ReleaseTagRequested(release, doer)        -- publishing a release creates its tag as an internal tag push
 --   keys/SshKeyAuthenticated(connection, key)          -- a deploy key on git-receive-pack opens a deploy-key push
 --   organizations/TeamDeleted(team)                    -- the team leaves every branch / tag protection allowlist
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions) -- the user leaves every allowlist
+--   repositories/CollaboratorRemoved(repository, user, doer) -- the user leaves that repository's allowlists
+--   keys/DeployKeyDeleted(deploy_key, repository, name, actor) -- the key leaves that repository's allowlists
 --   `pulls` performs merges by sending a Push whose merging_pull is set.
 
 use "./accounts.allium" as accounts
@@ -556,7 +559,7 @@ config {
     -- transport
     disable_http_git: Boolean = false                    -- [repository] DISABLE_HTTP_GIT
     disable_ssh: Boolean = false                         -- [server] DISABLE_SSH
-    require_signin_view: Boolean = false                 -- [service] REQUIRE_SIGNIN_VIEW (also used by access)
+    require_signin_view: Boolean = access/config.require_signin_view   -- [service] REQUIRE_SIGNIN_VIEW, owned by access
     enable_push_create_user: Boolean = false             -- [repository] ENABLE_PUSH_CREATE_USER
     enable_push_create_org: Boolean = false              -- [repository] ENABLE_PUSH_CREATE_ORG
     default_push_create_private: Boolean = true          -- [repository] DEFAULT_PUSH_CREATE_PRIVATE
@@ -1549,6 +1552,52 @@ rule AdminDeletesTagProtection {
     requires: is_repo_admin(admin, protected_tag.repository)
     requires: not protected_tag.repository.is_archived
     ensures: not exists protected_tag
+}
+
+-- A deleted account leaves every branch and tag protection allowlist it was on.
+-- from: models/git/protected_branch.go:479
+rule DeletedUserLeavesProtectionAllowlists {
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+    ensures:
+        for p in ProtectedBranches where user in push_allowlist_users or user in force_push_allowlist_users
+                or user in merge_allowlist_users or user in approvals_allowlist_users:
+            p.push_allowlist_users = p.push_allowlist_users - { user }
+            p.force_push_allowlist_users = p.force_push_allowlist_users - { user }
+            p.merge_allowlist_users = p.merge_allowlist_users - { user }
+            p.approvals_allowlist_users = p.approvals_allowlist_users - { user }
+    ensures:
+        for t in ProtectedTags where user in allowlist_users:
+            t.allowlist_users = t.allowlist_users - { user }
+}
+
+-- A collaborator removed from a repository leaves that repository's allowlists.
+-- from: models/git/protected_branch.go:479
+rule RemovedCollaboratorLeavesProtectionAllowlists {
+    when: repositories/CollaboratorRemoved(repository, user, doer)
+    ensures:
+        for p in ProtectedBranches where repository = repository and (user in push_allowlist_users or user in force_push_allowlist_users
+                or user in merge_allowlist_users or user in approvals_allowlist_users):
+            p.push_allowlist_users = p.push_allowlist_users - { user }
+            p.force_push_allowlist_users = p.force_push_allowlist_users - { user }
+            p.merge_allowlist_users = p.merge_allowlist_users - { user }
+            p.approvals_allowlist_users = p.approvals_allowlist_users - { user }
+    ensures:
+        for t in ProtectedTags where repository = repository and user in allowlist_users:
+            t.allowlist_users = t.allowlist_users - { user }
+}
+
+-- A deploy key detached from its repository leaves that repository's push,
+-- force-push and tag allowlists (decided code 4/5).
+rule DeletedDeployKeyLeavesProtectionAllowlists {
+    when: keys/DeployKeyDeleted(deploy_key, repository, name, actor)
+    ensures:
+        for p in ProtectedBranches where repository = repository
+                and (deploy_key in push_allowlist_deploy_keys or deploy_key in force_push_allowlist_deploy_keys):
+            p.push_allowlist_deploy_keys = p.push_allowlist_deploy_keys - { deploy_key }
+            p.force_push_allowlist_deploy_keys = p.force_push_allowlist_deploy_keys - { deploy_key }
+    ensures:
+        for t in ProtectedTags where repository = repository and deploy_key in allowlist_deploy_keys:
+            t.allowlist_deploy_keys = t.allowlist_deploy_keys - { deploy_key }
 }
 
 -- A deleted team leaves every branch and tag protection allowlist it was on.
@@ -2615,8 +2664,6 @@ deferred LfsGarbageCollection.batch       -- see: services/repository/lfs.go —
 ------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
--- REQUEST access/can_read, access/can_write, access/is_repo_admin: callable unqualified (parser reads `access/f(x)` as division), or provide a parse-safe form.
--- REQUEST access/config.require_signin_view: one owner for REQUIRE_SIGNIN_VIEW (duplicated here as config.require_signin_view).
 -- REQUEST accounts/User.prohibit_login, accounts/User.is_active, accounts/User.is_admin: used by transport (fixed names).
 -- REQUEST accounts/owner_visibility_is_public(repository): owner (user or org) visibility = public, for anonymous fetch.
 -- REQUEST authentication/has_two_factor(user), must_have_two_factor(user), authenticated_by_password(user): password HTTP git is always refused (decided: tokens only); enforced-2FA blocks SSH.
@@ -2624,8 +2671,6 @@ deferred LfsGarbageCollection.batch       -- see: services/repository/lfs.go —
 -- REQUEST keys/new_commits_verified(repository, old_sha, new_sha): every new commit has a verified signature (require_signed_commits).
 -- REQUEST keys/can_sign_as(user, repository, branch): instance signing policy for CRUD actions (needed when the branch requires signed commits).
 -- REQUEST organizations/member_of_any_team(user, teams) (is the user in any of these teams), organizations/can_create_org_repo(user, org).
--- REQUEST organizations: on team deletion, remove the team from ProtectedBranch/ProtectedTag allowlists (RemoveTeamIDFromProtectedBranch).
--- REQUEST accounts / repositories: on user deletion or collaborator removal, remove the user from ProtectedBranch allowlists (RemoveUserIDFromProtectedBranch).
 -- REQUEST repositories/Repository.is_template, is_private, is_fork, is_empty, is_mirror, is_archived, status, default_branch: written by post-receive (is_empty, default_branch, is_private, is_template).
 -- REQUEST repositories: react to PushToCreateRequested (create repo), PushReceived (size, updated time), CommitsPushed (auto-watch pusher).
 -- REQUEST pulls/PullRequest.allow_maintainer_edit and maintainer_edit_allows(user, repository, branch_name): maintainers pushing to a PR head branch.
@@ -2639,5 +2684,3 @@ deferred LfsGarbageCollection.batch       -- see: services/repository/lfs.go —
 -- REQUEST keys: keys_of_repository(keys, repository) = the given DeployKeys attached to repository (allowlist filtering, decided code 4/5).
 -- REQUEST notifications: a deploy-key push (code/PushReceived with push.pusher = null, push.deploy_key set) is shown in the feed as by the deploy key (its name), never the repository owner (decided code 4); BranchCreated/BranchDeleted then carry by = null.
 -- REQUEST actions / webhooks / issues / repositories / discovery / pulls / releases: code/Push.pusher, CommitsPushed.pusher, RefCreated/RefDeleted.pusher, BranchCreated/BranchDeleted.by and TagCreated/TagUpdated/TagDeleted.by are null for a deploy-key push; use push.deploy_key (doer/sender = the key; no auto-watch; no issue references attributed to a user) (decided code 4).
--- REQUEST organizations / accounts / keys: on team or user deletion also clear force_push_allowlist_teams/users; on deploy-key deletion remove the key from ProtectedBranch push/force-push allowlists and ProtectedTag.allowlist_deploy_keys.
--- REQUEST keys: SshKeyAuthenticated for a deploy key on git-receive-pack leads to code/DeployKeyPushes(deploy_key, repository) with the DeployKey grant (not the SshKey).
