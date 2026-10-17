@@ -135,6 +135,10 @@
 --   within_repo_quota(owner)              -- quota: owner's repository-size quota not exceeded
 --   within_creation_limit(owner)          -- accounts: owner's repository count below its effective limit
 --                                            (per-owner max_repo_creation when >= 0, else config.max_creation_limit; -1 = unlimited)
+--                                            and, while quota is enabled, quota/quota_allows(owner, count_repos, 1):
+--                                            the owner's count:repos quota rules allow one more repository.
+--                                            One check, so a site admin's exemption covers both, as it did MAX_CREATION_LIMIT.
+--                                            decided: follow-up 2 (quota count subjects; the per-owner limit and count:repos are related here)
 --   is_valid_repo_name(name)              -- name rules, see AllowedRepositoryNames
 --   is_allowed_remote(address, user)      -- migrations allow/block lists (re-checked at every sync)
 --   is_valid_external_url(url)            -- absolute http(s) URL, not loopback/localhost, not this instance's API
@@ -3131,6 +3135,7 @@ deferred LanguageDetection.classify         -- see: modules/analyze (linguist-st
 -- NOTE for integration: siblings call some of this module's triggers with other shapes — RepositoryDeleted(repository) (here: repository, doer), RepositoryForked(fork, source, doer) (here: source, fork, doer), RepositoryGeneratedFromTemplate(repository, template, include_webhooks) (here: template, repository, doer, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches), RepositoryTransferred(repository, old_owner)
 -- REQUEST administration/CronTask: schedule this module's tasks and emit their *Due triggers with named arguments (see Reacts to); create SystemNotice on PullMirrorSyncFailed / RepositoryHealthCheckFailed / RepositoryGarbageCollectionFailed
 -- REQUEST quota: within_repo_quota(owner) for the repository-size subject
+-- REQUEST quota: decided (follow-up 2): within_creation_limit(owner) includes quota_allows(owner, count_repos, 1) (gates gate_*_repository_count, charged to the new owner / transfer recipient) and QuotaUsage.repos_count = repositories owned (accounts/User.num_repos, organisations alike) - done in quota.allium.
 -- REQUEST discovery: emit LanguageStatsComputed(repository, commit_sha, sizes) from the stats indexer
 -- REQUEST keys: initial-commit signing policy (config.initial_commit_signing) and TrustModel semantics
 -- REQUEST webhooks: copy default/system webhooks on RepositoryCreated; copy template webhooks on RepositoryGeneratedFromTemplate(webhooks)

@@ -99,6 +99,9 @@
 --   can_read_pulls(user?, repository)     -- access/can_read(user, repository, pull_requests)
 --   can_read_releases(user?, repository)  -- access/can_read(user, repository, releases)
 --   can_see_repository(user?, repository)   -- access/has_any_access
+--   can_list_repository(user?, repository)  -- access/can_list: has_any_access
+--       without the site-admin grant on private repositories; every search
+--       result and listing passes it (decided: follow-up 1)
 --   can_see_profile(viewer?, user)          -- access/can_see_profile
 --   can_see_owner(viewer?, owner)           -- access/can_see_owner_user
 --   is_org_member(user, organization)       -- organizations membership
@@ -701,7 +704,7 @@ entity ProfileView {
     requested_tab: ProfileTab
     tab: ProfileTab
     has_profile_readme: Boolean
-    shows_private: Boolean                     -- viewer is the subject or a site admin
+    shows_private: Boolean                     -- viewer is the subject or a site admin (repositories listed still pass can_list_repository; decided: follow-up 1)
     default_sort: RepoSortOrder                -- used by repository tabs when no sort is chosen (decided: discovery 6)
     repositories: List<repositories/Repository>
     people: List<accounts/User>                -- followers / following tabs
@@ -1000,8 +1003,12 @@ rule ClientReadsTemplate {
 
 -- Instance-wide code search across every repository whose code the viewer
 -- can read. Site admins get no search-specific bypass: hits follow normal read
--- access (can_read_code), exactly as for any other viewer.
+-- access (can_read_code), exactly as for any other viewer, and come only from
+-- repositories the viewer may be shown (can_list_repository), so a private
+-- repository an admin holds no role in is never a hit.
 -- decided: discovery 5 (admin code search covers readable repositories only).
+-- decided: follow-up 1 (admins keep read of every repository, but search
+-- does not surface private repositories they have no role in).
 -- from: routers/web/explore/code.go:25
 rule ViewerSearchesAllCode {
     when: ViewerSearchesAllCode(viewer, keyword, language, path, mode)
@@ -2146,6 +2153,26 @@ invariant RepositorySearchShowsOnlyReadable {
             can_see_repository(s.viewer, r)
 }
 
+-- Search and listings (explore, profile tabs, the picker, REST search) never
+-- surface a private repository to a site administrator who holds no role in
+-- it: the admin may still open it by name (and that read is audited by
+-- access), but is not shown it.
+-- decided: follow-up 1 (admin read kept, not surfaced in listings)
+invariant RepositorySearchShowsOnlyListable {
+    for s in RepositorySearches:
+        for r in s.results:
+            can_list_repository(s.viewer, r)
+}
+
+-- Profile repository tabs follow the same listing rule: a site admin's
+-- shows_private covers the subject's private repositories only where the
+-- admin holds a role. decided: follow-up 1
+invariant ProfileRepositoriesListable {
+    for v in ProfileViews:
+        for r in v.repositories:
+            can_list_repository(v.viewer, r)
+}
+
 -- Facets are honoured exactly.
 invariant RepositorySearchHonoursFacets {
     for s in RepositorySearches:
@@ -2203,6 +2230,12 @@ invariant CodeHitsReadable {
         can_read_code(h.search.viewer, h.repository)
 }
 
+-- decided: follow-up 1 (no hits from private repositories an admin has no role in).
+invariant CodeHitsListable {
+    for h in CodeSearchHits:
+        can_list_repository(h.search.viewer, h.repository)
+}
+
 -- Issue results are readable, and pull requests appear only under the pull
 -- request unit's permission.
 invariant IssueResultsReadable {
@@ -2210,6 +2243,15 @@ invariant IssueResultsReadable {
         for i in s.results:
             (i.is_pull implies can_read_pulls(s.viewer, i.repository))
             and (not i.is_pull implies can_read_issues(s.viewer, i.repository))
+}
+
+-- Issue and pull request searches and dashboards list nothing from a
+-- private repository a site administrator holds no role in.
+-- decided: follow-up 1 (admin read kept, not surfaced in listings)
+invariant IssueResultsListable {
+    for s in IssueSearches:
+        for i in s.results:
+            can_list_repository(s.viewer, i.repository)
 }
 
 invariant IssueResultsMatchState {
@@ -2709,4 +2751,4 @@ deferred IssueIndexer.query  -- see: implementation note; per-backend scoring fo
 -- REQUEST pulls: reviewer sets per pull request (reviewed_by, review_requested) for the index projection.
 -- REQUEST administration: react to discovery/IndexerStartupFailed(kind) by creating a SystemNotice for site admins ("<kind> indexer did not start in time; search unavailable until it is ready") (decision 4).
 -- REQUEST pulls: emit ReviewCommentEdited(pull_request, comment) / ReviewCommentDeleted(pull_request, comment) from UserEditsReviewComment / UserDeletesReviewComment so discovery re-indexes the pull request (review comments are now indexed, decision 7).
--- REQUEST access: decision 5 says admin code search follows normal read access; access currently lets site admins read every repository, so confirm whether can_read for admins should stay all-repositories.
+-- REQUEST access: decision 5 says admin code search follows normal read access; access currently lets site admins read every repository, so confirm whether can_read for admins should stay all-repositories. - done (follow-up 1): can_read stays all-repositories for site admins (role-less reads are audited by access/AdminAccessRecord); search and listings filter by access/can_list (can_list_repository here), which ignores the site-admin grant on private repositories.

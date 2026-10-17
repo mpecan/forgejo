@@ -562,3 +562,47 @@ journey RenderingMarkup {
 
     ends: Rendering is a signed-in convenience, and its output is sanitised.
 }
+
+-- decided: follow-up 1 (site admins keep read of every repository, but
+-- search and listings do not surface private repositories they hold no role in)
+journey AnAdminIsNotShownPrivateRepositoriesHeHasNoRoleIn {
+    goal: Ash is a site administrator. He could open Olga's private
+          repository by name, but searching the explore page lists only the
+          public repository; Olga's private one is not shown.
+
+    cast:
+        ash:   accounts/User
+        olga:  accounts/User
+        pub:   repositories/Repository
+        secret: repositories/Repository
+
+    given:
+        ash.is_admin = true
+        ash.is_active = true
+        ash.is_restricted = false
+        pub.name = "forge-public"
+        pub.is_private = false
+        pub.owner_user = olga
+        secret.name = "forge-secret"
+        secret.is_private = true
+        secret.owner_user = olga
+
+    1. he searches the explore page
+        stipulate directory() = dir
+        stipulate can_see_repository(ash, secret) = true
+        stipulate can_list_repository(ash, secret) = false
+        stipulate can_list_repository(ash, pub) = true
+        stipulate repository_search(ash, explore, null, "forge", null, {}, recent_update) = {pub}
+        ash does ViewerSearchesRepositories(ash, explore, null, "forge", null, {}, recent_update) on ExploreDirectory
+            creating search: RepositorySearch
+        then ViewerSearchesRepositories fires
+
+    2. the public repository is listed
+        ash sees pub.name on ExploreDirectory in search
+
+    3. the private repository he has no role in is not, though he may read it
+        ash cannot see secret.name on ExploreDirectory in search
+
+    ends: Being an administrator lets Ash open any repository, not find
+          other people's private ones in search.
+}

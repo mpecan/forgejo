@@ -276,3 +276,58 @@ journey WithQuotaOffNothingIsGated {
 
     ends: Nothing is measured against a limit while quota is off.
 }
+
+-- decided: follow-up 2 (quota gains count subjects next to the byte subjects)
+journey AnAdminLimitsHowManyRepositoriesAndPackagesAdaOwns {
+    goal: The site admin limits Ada to 3 repositories and 10 packages with
+          count rules. A rule mixing a count with bytes is refused. At her
+          repository limit, a fourth repository is refused by the gate; a new
+          package, still under its own limit, goes through.
+
+    1. she defines a repository-count rule
+        root does AdminCreatesQuotaRule(root, "repos-3", 3, {count_repos}) on QuotaAdministration
+            creating repos_rule: QuotaRule
+        then AdminCreatesQuotaRule fires
+        then repos_rule.limit = 3
+
+    2. and a package-count rule
+        root does AdminCreatesQuotaRule(root, "packages-10", 10, {count_packages}) on QuotaAdministration
+            creating pkg_rule: QuotaRule
+        then AdminCreatesQuotaRule fires
+
+    3. a rule mixing a count and a byte subject is refused
+        root cannot do AdminCreatesQuotaRule(root, "mixed", 3, {count_repos, size_repos_all}) on QuotaAdministration
+
+    4. at three repositories, creating a fourth is refused
+        stipulate quota_allows(acct, count_repos, 1) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, count_repos, create_repository, 1) on QuotaGateReference
+        then StorageConsumptionGated does not fire
+
+    5. a new package still fits under the package count
+        stipulate quota_allows(acct, count_packages, 1) = true
+        ada does StorageConsumptionRequested(ada, acct, count_packages, create_package, 1) on QuotaGateReference
+        then StorageConsumptionGated fires
+
+    ends: How many repositories and packages a holder owns is limited by
+          quota rules, alongside how many bytes they use.
+}
+
+-- decided: follow-up 2 (LIMIT_TOTAL_OWNER_COUNT restored as a default count rule)
+journey TheDefaultPackageVersionCountApplies {
+    goal: The operator sets the built-in package-version count to 100 (the
+          former LIMIT_TOTAL_OWNER_COUNT). Ada has no quota groups; at 100
+          versions her next version is refused.
+
+    given:
+        quota/config.default_package_versions = 100
+
+    1. the default count rule is in force
+        then quota/config.default_package_versions = 100
+
+    2. her 101st version is refused
+        stipulate quota_allows(acct, count_package_versions, 1) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, count_package_versions, create_package_version, 1) on QuotaGateReference
+
+    ends: Holders without groups are held to the instance's package-version
+          count, as LIMIT_TOTAL_OWNER_COUNT did.
+}

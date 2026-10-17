@@ -26,7 +26,7 @@
 --   * The operation -> required-permission table (see "Authorization table").
 --
 -- Includes: AccessMode, OperationClass, GrantBasis, CredentialRestriction, InstanceWriteGate,
---   AccessDecision, AnonymousVisitor, RequestParty, ForgeComponent,
+--   AccessDecision, AdminAccessRecord, AnonymousVisitor, RequestParty, ForgeComponent,
 --   AuthorizationPolicy contract, and the shared actors Visitor,
 --   SignedInUser, SiteAdmin and RepoAdmin (see "Actor Declarations").
 --
@@ -61,6 +61,10 @@
 --       (issue subscriptions, assignees) clear what presumed access.
 --   - SiteAdminImpersonates(admin, target)
 --       an API request performed by a site administrator "as" another user (sudo).
+--   - SiteAdminReadWithoutRole(admin, repository, unit_kind)
+--       a site administrator read a unit of a private repository in which
+--       they hold no role (decided: follow-up 1); the read is also kept as an
+--       AdminAccessRecord.
 --   - RepositoryAccessMayHaveNarrowed(repository)
 --       internal: a repository-wide input changed; every user with a stake
 --       in the repository (watch, issue subscription, assignment) who is left
@@ -282,6 +286,16 @@ contract AuthorizationPolicy {
     can_write: (user: accounts/User?, repository: repositories/Repository, unit: repositories/UnitKind) -> Boolean
     -- can_read on at least one unit (the repository "exists" for the user).
     has_any_access: (user: accounts/User?, repository: repositories/Repository) -> Boolean
+    -- may the repository be surfaced to the user in search results and
+    -- listings? has_any_access, except that the site-admin grant does not
+    -- count on a private repository: a site administrator is shown a private
+    -- repository only when they own it, hold an explicit grant
+    -- (explicit_mode != none) or reach one of its units by unit default,
+    -- exactly as if they were not an administrator. They may still open it
+    -- (has_any_access), and doing so without a role is audited
+    -- (AdminAccessRecord).
+    -- decided: follow-up 1 (admin read kept, but not surfaced in listings)
+    can_list: (user: accounts/User?, repository: repositories/Repository) -> Boolean
     -- repository-wide mode >= admin.
     is_repo_admin: (user: accounts/User?, repository: repositories/Repository) -> Boolean
     -- repository-wide mode = owner.
@@ -310,6 +324,10 @@ contract AuthorizationPolicy {
         -- Adding a grant (collaboration, team membership, team repository,
         -- team unit access, unit default access, site admin flag) never
         -- lowers any result; removing one never raises any result.
+
+    @invariant ListingNeverExceedsAccess
+        -- can_list implies has_any_access; for a user who is not a site
+        -- administrator, and for any public repository, they are equal.
 
     @invariant OwnerDominates
         -- is_repo_owner implies is_repo_admin implies can_write on every
@@ -423,6 +441,20 @@ entity AccessDecision {
     decided_at: Timestamp
 }
 
+-- The audit trail of site administrators opening private repositories in
+-- which they hold no role (not the owning user, no collaboration, no team of
+-- the owning organization that includes the repository). One record per
+-- granted read that rested on the site-admin flag alone; records are never
+-- edited. Site administrators see them (SiteAdminAccessAudit); administration
+-- may present them in its own log (see REQUEST).
+-- decided: follow-up 1 (admin reads of repositories they have no role in are logged)
+entity AdminAccessRecord {
+    admin: accounts/User
+    repository: repositories/Repository
+    unit_kind: repositories/UnitKind
+    accessed_at: Timestamp
+}
+
 ------------------------------------------------------------
 -- Config
 ------------------------------------------------------------
@@ -464,7 +496,21 @@ rule ReadUnitAsSiteAdmin {
     requires: subject.is_admin
     requires: unit.enabled
     requires: credential = null or (credential?.has_admin_scope = true and (credential?.reach = all_repositories or (credential?.reach = listed_repositories and repository in credential?.listed) or (not repository.is_private and owner_public)))
-    ensures: AccessDecision.created(subject: subject, repository: repository, unit_kind: unit.kind, operation: read_unit, basis: site_admin, decided_at: now)
+    let unit_kind = unit.kind
+    let without_role = repository.is_private and repository.owner_user != subject and explicit_mode(subject, repository) = none
+    ensures:
+        AccessDecision.created(subject: subject, repository: repository, unit_kind: unit.kind, operation: read_unit, basis: site_admin, decided_at: now)
+        -- decided: follow-up 1 (admins keep implicit read of every repository,
+        -- but opening a private repository they have no role in is audited)
+        if without_role:
+            SiteAdminReadWithoutRole(admin: subject, repository: repository, unit_kind: unit_kind)
+}
+
+-- Every role-less read by a site administrator leaves one audit record.
+-- decided: follow-up 1 (each such access is logged)
+rule RecordSiteAdminReadWithoutRole {
+    when: SiteAdminReadWithoutRole(admin, repository, unit_kind)
+    ensures: AdminAccessRecord.created(admin: admin, repository: repository, unit_kind: unit_kind, accessed_at: now)
 }
 
 -- from: models/perm/access/repo_permission.go:240
@@ -1487,6 +1533,27 @@ surface SiteAdministration {
         -- outright and is never silently ignored.
 }
 
+-- The audit of site-administrator reads that rested on the admin flag alone
+-- (private repositories the administrator holds no role in). Only site
+-- administrators see it; nobody edits or deletes a record here.
+-- decided: follow-up 1 (each such access is logged)
+surface SiteAdminAccessAudit {
+    facing admin: SiteAdmin
+
+    context record: AdminAccessRecord
+
+    exposes:
+        record.admin
+        record.repository
+        record.unit_kind
+        record.accessed_at
+
+    @guarantee EveryRoleLessReadIsRecorded
+        -- Every granted read of a private repository by a site administrator
+        -- who is not its owning user and holds no explicit grant leaves exactly
+        -- one record, whichever channel (web, API, git) it came through.
+}
+
 -- What a running Actions task can do with its automatic token.
 -- API: the /repos/{o}/{r}/* routes of the task's own repository accept the
 -- task token, reqToken treats it as signed; every other repository and every
@@ -1554,3 +1621,4 @@ deferred AuthorizationPolicy.explicit_unit_mode    -- see: access.allium "Deriva
 -- REQUEST packages: decided (access 6): an Actions task token reaches only the packages linked to its own repository (read; write unless a fork pull-request run) and no other package or owner registry; replace "Actions task tokens act with their workflow user's mode" accordingly.
 -- REQUEST organizations: decided (access 6): organization endpoints refuse Actions task tokens.
 -- REQUEST pulls/PullRequest.allow_maintainer_edit: Boolean; branch-scoped write delegation (table C1).
+-- REQUEST administration: decided (follow-up 1): show access/AdminAccessRecord (or react to access/SiteAdminReadWithoutRole(admin, repository, unit_kind)) in the site-administration audit log next to the system notices, with its own retention if one is wanted; access already keeps the record.

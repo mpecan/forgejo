@@ -387,6 +387,10 @@ config {
     -- and an owner's package storage is limited by quota rules on
     -- size:assets:packages:all (quota/config.default_packages for holders
     -- without groups).
+    -- decided (follow-up 2): owner counts are quota count subjects:
+    -- count:packages and count:packages:versions, the latter replacing
+    -- LIMIT_TOTAL_OWNER_COUNT (quota/config.default_package_versions for
+    -- holders without groups).
     -- [packages] DEFAULT_RPM_SIGN_ENABLED: sign every uploaded RPM with the
     -- owner's RPM key even when the uploader did not ask for it
     default_rpm_sign_enabled: Boolean = false
@@ -490,6 +494,17 @@ default KindPolicy vagrant_policy = { kind: vagrant, display_name: "Vagrant", ve
 --   registries), evaluated before the upload is stored.
 --   from: routers/api/packages/api.go:96
 --
+-- quota_allows_new_package(registry): quota/quota_allows(<owner>,
+--   count_packages, 1), the QuotaGate gate_create_package: the registry owner
+--   may own one more package. Asked before a new package name is created.
+-- quota_allows_new_version(registry): quota/quota_allows(<owner>,
+--   count_package_versions, 1), the QuotaGate gate_create_package_version:
+--   the owner may own one more non-internal version (Forgejo's
+--   LIMIT_TOTAL_OWNER_COUNT; from: services/packages/packages.go:226).
+--   Asked before every new version; re-pointing a container tag replaces a
+--   version and is not asked. Site administrators are gated like everyone
+--   else (Forgejo exempted them). decided: follow-up 2
+--
 -- job_repository(user): see step 6 above.
 -- same_owner(registry, repository): repository.owner_user = registry.owner_user
 --   and repository.owner_org = registry.owner_org.
@@ -546,6 +561,9 @@ rule PublishFirstVersionOfNewPackage {
     requires: valid_coordinates(kind, name, version, file_name)
     requires: quota_allows_package_upload(registry)
     requires: not exists existing
+    -- decided (follow-up 2): a new package and its first version are counted
+    requires: quota_allows_new_package(registry)
+    requires: quota_allows_new_version(registry)
     -- decided: an Actions job token may publish a new package only into its
     -- own repository's owner registry, and the package is linked to that repository
     requires: job_repository(publisher) = null or same_owner(registry, job_repository(publisher))
@@ -619,6 +637,8 @@ rule PublishNewVersionOfExistingPackage {
     requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
     requires: package.is_internal = false
     requires: not exists PackageVersion{package: package, version: version}
+    -- decided (follow-up 2): a new version is counted
+    requires: quota_allows_new_version(registry)
     ensures:
         let new_version = PackageVersion.created(
             package: package,
@@ -1016,6 +1036,9 @@ rule ContainerPushesManifestForNewImage {
     requires: quota_allows_package_upload(registry)
     requires: not exists Package{registry: registry, kind: container, name: image}
     requires: manifest_references_resolve(registry, image, sha256)
+    -- decided (follow-up 2): a new image package and its first version are counted
+    requires: quota_allows_new_package(registry)
+    requires: quota_allows_new_version(registry)
     -- decided: a job token pushes a new image only into its own repository's
     -- owner registry, linked to that repository
     requires: job_repository(publisher) = null or same_owner(registry, job_repository(publisher))
@@ -1049,6 +1072,8 @@ rule ContainerPushesNewReference {
     requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
     requires: not exists PackageVersion{package: package, version: reference}
     requires: manifest_references_resolve(registry, image, sha256)
+    -- decided (follow-up 2): a new reference is a new version and is counted
+    requires: quota_allows_new_version(registry)
     ensures:
         let new_version = PackageVersion.created(package: package, creator: publisher, version: reference, created_at: now, is_internal: false, metadata: extracted_image_metadata(sha256), properties: extracted_image_properties(sha256), download_count: 0, last_downloaded_at: null, is_tagged: is_tag, is_yanked: false, dist_tags: {})
         FileStored(version: new_version, file_name: manifest_file_name(sha256), composite_key: null, is_lead: true, size: size, sha256: sha256)
@@ -1969,6 +1994,7 @@ deferred RepositoryIndex.file_formats  -- see: detailed/package-repository-index
 -- REQUEST can_write_repo_packages(user, repository) and can_read_repo_code(user, repository): used for linking and for showing linked repositories.
 -- REQUEST access/config.require_signin_view: imported as config.require_signin_view (used by can_read_packages and the container token exchange).
 -- REQUEST authentication/TokenScope: read:package / write:package and public-only flag consumed by can_read/can_write_packages.
+-- REQUEST quota: decided (follow-up 2): quota_allows(owner, count_packages, 1) and quota_allows(owner, count_package_versions, 1) back quota_allows_new_package / quota_allows_new_version; QuotaUsage.packages_count / package_versions_count count packages/Package and packages/PackageVersion with is_internal = false per owner registry - done in quota.allium.
 -- REQUEST quota/quota_allows(owner, size_assets_packages_all) (QuotaGate gate_package_upload, charged: package_owner): quota_allows_package_upload(registry) is exactly this, evaluated for the registry owner (not the uploader) before every write that stores data; quota/QuotaUsage.packages should sum packages/PackageFile sizes per owner (blob shared by two files counts twice). decided (packages 6): the former [packages] LIMIT_TOTAL_OWNER_SIZE is expressed as quota/config.default_packages, a default rule on size_assets_packages_all; done in quota.allium.
 -- REQUEST webhooks, actions: react to PackageVersionCreated(version, publisher) / PackageVersionDeleted(version, package, doer) with exactly these parameter names.
 -- REQUEST actions/access: job_repository(user): the repository of the Actions job whose automatic token authenticated the request, null for any other credential (consistent with access decision 6: the token reaches only its own repository and packages linked to it).

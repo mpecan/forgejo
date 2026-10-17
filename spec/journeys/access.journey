@@ -761,3 +761,60 @@ journey ReadOnlyModeRefusesEveryWrite {
 
     ends: Nothing changes while the instance is read-only.
 }
+
+-- decided: follow-up 1 (site admins keep implicit read, but a read of a
+-- private repository they hold no role in is audited)
+journey ASiteAdminReadsAPrivateRepositoryAndIsRecorded {
+    goal: Ash, a site administrator with no role in Olga's private
+          repository, opens its code. He may read it, and the read is
+          recorded for audit. Reading a private repository he collaborates
+          on leaves no audit record.
+
+    cast:
+        ash:   accounts/User
+        crepo: repositories/Repository
+        ccode: repositories/RepoUnit
+
+    given:
+        ash.is_admin = true
+        ash.is_restricted = false
+        ash.is_active = true
+        ash.prohibit_login = false
+        repo.is_private = true
+        explicit_unit_mode(ash, repo, code) = none
+        explicit_mode(ash, repo) = none
+        crepo.owner_user = olga
+        crepo.owner_org = null
+        crepo.is_private = true
+        crepo.is_archived = false
+        crepo.is_mirror = false
+        ccode.repository = crepo
+        ccode.kind = code
+        ccode.enabled = true
+        ccode.is_external = false
+        ccode.everyone_access_mode = none
+        ccode.anonymous_access_mode = none
+        explicit_unit_mode(ash, crepo, code) = read
+        explicit_mode(ash, crepo) = read
+
+    1. a stranger still cannot read the private repository
+        sam cannot do UserReadsUnit(sam, code) on RepositoryUnitAccess
+
+    2. Ash reads it on the strength of being an administrator, and it is logged
+        ash does UserReadsUnit(ash, code) on RepositoryUnitAccess
+            creating record: AdminAccessRecord
+        then ReadUnitAsSiteAdmin fires
+        then RecordSiteAdminReadWithoutRole fires
+        then record.admin = ash
+        then record.repository = repo
+        then record.unit_kind = code
+
+    3. where he collaborates, his read needs no audit
+        ash does UserReadsUnit(ash, ccode) on RepositoryUnitAccess
+        then ReadUnitByExplicitGrant fires
+        then ReadUnitAsSiteAdmin fires
+        then RecordSiteAdminReadWithoutRole does not fire
+
+    ends: Administrators can open any repository; every role-less read of a
+          private one leaves an audit record.
+}

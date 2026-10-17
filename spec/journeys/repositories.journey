@@ -72,6 +72,30 @@ journey CreationLimitStopsANewRepository {
     ends: Nothing was created.
 }
 
+-- decided: follow-up 2 (quota count:repos rules are part of the per-owner
+-- creation limit): Bob's own limit is unlimited, but a quota rule allows him
+-- three repositories and he owns three, so within_creation_limit is false.
+journey ARepositoryCountQuotaStopsANewRepository {
+    goal: Bob is under every size quota and has no per-user repository limit,
+          but his quota group limits him to three repositories, which he
+          already owns. A fourth is refused; once he is allowed one more, it is
+          created.
+
+    1. at his count:repos quota, a fourth repository is refused
+        stipulate is_valid_repo_name("fourth") = true
+        stipulate within_repo_quota(bob) = true
+        stipulate within_creation_limit(bob) = false
+        bob cannot do UserCreatesRepository(bob, "fourth", "", false, false, false, sha1) on RepositoryCreation
+
+    2. when the count quota allows one more, it goes through
+        stipulate within_creation_limit(bob) = true
+        bob does UserCreatesRepository(bob, "fourth", "", false, false, false, sha1) on RepositoryCreation
+        then UserCreatesRepository fires
+
+    ends: How many repositories an owner may have is one check: the per-owner
+          limit and the owner's count:repos quota rules together.
+}
+
 -- One fork per owner per fork network; forks inherit the base's privacy.
 journey BobForksAlicesRepositoryOnce {
     goal: Bob forks Alice's public repository. The fork is public, knows its base, and Bob

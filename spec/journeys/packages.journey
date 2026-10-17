@@ -31,6 +31,10 @@ world {
         -- here unless one says otherwise.
         can_write_packages(ada, reg) = true
         quota_allows_package_upload(reg) = true
+        -- and her registry may hold one more package and one more version
+        -- (quota count subjects, decided: follow-up 2)
+        quota_allows_new_package(reg) = true
+        quota_allows_new_version(reg) = true
         -- Nobody here is an Actions job token unless a story says so.
         job_repository(ada) = null
         job_repository(bob) = null
@@ -441,4 +445,36 @@ journey AdminPurgesLeftovers {
         then orphan does not exist
 
     ends: Packages without versions and unreferenced blobs are gone.
+}
+
+-- decided: follow-up 2 (package and version counts are quota count subjects)
+journey PackageCountsAreLimitedByQuota {
+    goal: Ada's registry has storage to spare, but her quota allows no more
+          packages: a new package name is refused, while a new version of
+          her existing package goes through. Once her version count is used
+          up too, further versions are refused.
+
+    1. a first upload under a new name is refused at the package count
+        stipulate valid_coordinates(generic, "tool", "1.0.0", "tool.bin") = true
+        stipulate quota_allows_new_package(reg) = false
+        ada cannot do PublisherUploadsPackageFile(ada, reg, generic, "tool", "1.0.0", "tool.bin", null, true, 100, "aaa111") on PackageClientProtocol
+
+    2. while the count allows it, the package is created
+        stipulate quota_allows_new_package(reg) = true
+        ada does PublisherUploadsPackageFile(ada, reg, generic, "tool", "1.0.0", "tool.bin", null, true, 100, "aaa111") on PackageClientProtocol
+        then PublishFirstVersionOfNewPackage fires
+
+    3. at the package limit, a new version of the existing package still goes through
+        stipulate quota_allows_new_package(reg) = false
+        stipulate valid_coordinates(generic, "tool", "1.1.0", "tool.bin") = true
+        ada does PublisherUploadsPackageFile(ada, reg, generic, "tool", "1.1.0", "tool.bin", null, true, 100, "bbb222") on PackageClientProtocol
+        then PublishNewVersionOfExistingPackage fires
+
+    4. once the version count is used up, the next version is refused
+        stipulate quota_allows_new_version(reg) = false
+        stipulate valid_coordinates(generic, "tool", "1.2.0", "tool.bin") = true
+        ada cannot do PublisherUploadsPackageFile(ada, reg, generic, "tool", "1.2.0", "tool.bin", null, true, 100, "ccc333") on PackageClientProtocol
+
+    ends: tool 1.0.0 and 1.1.0 are stored; the other uploads were refused as
+          "quota exceeded".
 }

@@ -6,7 +6,9 @@
 --   their exposures are guarded by it) and admits every storage-growing
 --   operation; every management rule below requires it. Login-source sync of
 --   quota groups is not switched: Forgejo records memberships either way.
--- Scope: Instance-wide storage quota for users and organizations ("quota holders").
+-- Scope: Instance-wide storage quota for users and organizations ("quota holders"),
+--   in bytes (size:* subjects) and, since follow-up 2, in numbers of things
+--   owned (count:* subjects: repositories, packages, package versions).
 --   An administrator defines quota rules (a byte limit over a set of storage
 --   subjects), bundles them into quota groups, and assigns holders to groups
 --   (explicitly, via configured default groups, or via OAuth2 group claims at
@@ -25,7 +27,9 @@
 -- Excludes:
 --   - (decided, packages 6: the former [packages] LIMIT_TOTAL_OWNER_* and
 --     LIMIT_SIZE_<KIND> limits are gone; package storage is limited only by
---     quota rules on size:assets:packages:all, see config.default_packages.)
+--     quota rules on size:assets:packages:all, see config.default_packages.
+--     decided, follow-up 2: LIMIT_TOTAL_OWNER_COUNT comes back as a default
+--     count rule on count:packages:versions, see config.default_package_versions.)
 --   - How each storage figure is measured on disk (git object size, LFS size,
 --     blob dedup): the measuring belongs to code/packages/actions; quota only
 --     consumes the figures (see QuotaUsage).
@@ -91,6 +95,16 @@ value QuotaUsage {
     -- git size of the wikis of all the holder's repositories (measured by
     -- wiki; Forgejo reported 0)
     wiki: Integer
+    -- decided (follow-up 2): counts, for the count:* subjects. Not bytes, and
+    -- never part of `all`.
+    -- repositories the holder owns (repositories/Repository.owner)
+    repos_count: Integer
+    -- non-internal packages the holder's registry holds
+    packages_count: Integer
+    -- non-internal package versions the holder's registry holds (what
+    -- Forgejo's LIMIT_TOTAL_OWNER_COUNT counted)
+    -- from: services/packages/packages.go:395
+    package_versions_count: Integer
 
     repos_all: repos_public + repos_private
     git_all: repos_all + git_lfs + wiki
@@ -139,6 +153,18 @@ value QuotaRuleSpec {
 --
 -- decided (quota 3): size:wiki sits under size:git:all (Forgejo listed it
 -- under size:assets:all and never measured it).
+--
+-- Count subjects stand beside the tree, each on its own (no ancestor, no
+-- descendant): a rule on one limits how many of those things a holder owns,
+-- and an operation that adds one asks with incoming = 1.
+--
+--   count:repos                                repos_count
+--   count:packages                             packages_count
+--   count:packages:versions                    package_versions_count
+--
+-- decided (follow-up 2): quota gains count subjects next to the byte
+-- subjects (Forgejo had byte subjects only; package counts were a separate
+-- [packages] setting).
 -- from: models/quota/limit_subject.go:13
 enum QuotaSubject {
     size_all
@@ -148,6 +174,7 @@ enum QuotaSubject {
     | size_assets_attachments_all | size_assets_attachments_issues | size_assets_attachments_releases
     | size_assets_artifacts | size_assets_packages_all
     | size_wiki
+    | count_repos | count_packages | count_package_versions
 }
 
 -- Every operation that consults the quota gate before it runs.
@@ -165,6 +192,7 @@ enum QuotaGatedOperation {
     | merge_pull_request | update_pull_request_branch | apply_review_suggestion
     | sync_mirror_manually | sync_mirror_scheduled
     | upload_package | upload_actions_artifact
+    | create_package | create_package_version
 }
 
 -- Whose quota an operation is charged to.
@@ -184,7 +212,9 @@ enum MembershipOrigin {
 -- Entities and Variants
 ------------------------------------------------------------
 
--- A byte limit over a set of subjects. The limit applies to the usage of the
+-- A limit over a set of subjects: bytes for size:* subjects, a number of
+-- things for a count:* subject. A rule names either size subjects only or
+-- exactly one count subject (decided: follow-up 2; units never mix). The limit applies to the usage of the
 -- UNION of the listed subjects: each byte counts once per rule, so a rule on
 -- {size:all, size:git:all} measures exactly size:all.
 -- decided (quota 4): union, not a sum (Forgejo summed overlapping subjects twice).
@@ -192,7 +222,7 @@ enum MembershipOrigin {
 -- from: models/quota/rule.go:13
 entity QuotaRule {
     name: String                      -- unique, immutable identity
-    limit: Integer                    -- bytes; -1 means unlimited; 0 forbids any growth
+    limit: Integer                    -- bytes (or things, for a count subject); -1 means unlimited; 0 forbids any growth
     subjects: Set<QuotaSubject>
 
     group_links: QuotaGroupRule with rule = this
@@ -266,6 +296,15 @@ config {
     -- [quota] DEFAULT_GROUPS: names of groups governing every holder that has
     -- no explicit group. Names that do not exist are ignored.
     default_groups: Set<String> = {}
+    -- decided (follow-up 2): [packages] LIMIT_TOTAL_OWNER_COUNT restored as
+    -- a third built-in fallback rule, on count:packages:versions: how many
+    -- non-internal package versions a holder without groups may own. -1 =
+    -- unlimited (Forgejo's default). Holders with explicit or default groups
+    -- get count limits from rules on count:* subjects in those groups. There
+    -- is no built-in count:repos rule: repositories' per-owner creation limit
+    -- (MAX_CREATION_LIMIT / max_repo_creation) already plays that part.
+    -- from: modules/setting/packages.go:49
+    default_package_versions: Integer = -1
     -- [quota.default] TOTAL: limit of the built-in fallback rule (subject
     -- size:all) used when a holder has neither explicit nor default groups.
     -- -1 = unlimited. Accepts byte-size notation ("1 GiB").
@@ -317,6 +356,26 @@ default QuotaGate gate_mirror_scheduled = { operation: sync_mirror_scheduled, su
 default QuotaGate gate_package_upload = { operation: upload_package, subject: size_assets_packages_all, charged: package_owner }
 default QuotaGate gate_artifact_upload = { operation: upload_actions_artifact, subject: size_assets_artifacts, charged: repository_owner }
 
+-- Count gates (decided: follow-up 2). Each is asked with incoming = 1, beside
+-- the size gate of the same operation where it has one. A new repository
+-- counts against the owner it will have; a repository's arrival by transfer
+-- counts against the recipient. repositories folds the count:repos check into
+-- its per-owner creation limit (within_creation_limit), so the instance
+-- MAX_CREATION_LIMIT / per-user max_repo_creation and quota count rules are
+-- one check there, and both must allow.
+default QuotaGate gate_create_repository_count = { operation: create_repository, subject: count_repos, charged: target_owner }
+default QuotaGate gate_generate_repository_count = { operation: generate_repository_from_template, subject: count_repos, charged: target_owner }
+default QuotaGate gate_fork_repository_count = { operation: fork_repository, subject: count_repos, charged: target_owner }
+default QuotaGate gate_migrate_repository_count = { operation: migrate_repository, subject: count_repos, charged: target_owner }
+default QuotaGate gate_transfer_repository_count = { operation: transfer_repository, subject: count_repos, charged: transfer_recipient }
+default QuotaGate gate_accept_transfer_count = { operation: accept_repository_transfer, subject: count_repos, charged: transfer_recipient }
+-- the first upload under a new package name (or first manifest of a new image)
+default QuotaGate gate_create_package = { operation: create_package, subject: count_packages, charged: package_owner }
+-- every upload or manifest push that adds a version (re-pointing a container
+-- tag replaces one and is not counted)
+-- from: services/packages/packages.go:226
+default QuotaGate gate_create_package_version = { operation: create_package_version, subject: count_package_versions, charged: package_owner }
+
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
@@ -334,9 +393,14 @@ default QuotaGate gate_artifact_upload = { operation: upload_actions_artifact, s
 --   0. when config.enabled is false: always true (nothing is gated).
 --   1. groups := account's explicit groups; if none, the existing groups
 --      named in config.default_groups; if still none, a built-in group with
---      the rules { limit: config.default_total, subjects: {size_all} } and
+--      the rules { limit: config.default_total, subjects: {size_all} },
 --      { limit: config.default_packages, subjects: {size_assets_packages_all} }
---      (both must permit a package upload).
+--      (both must permit a package upload) and
+--      { limit: config.default_package_versions, subjects: {count_package_versions} }
+--      (decided: follow-up 2, the former LIMIT_TOTAL_OWNER_COUNT).
+--   For a count subject `incoming` is 1 (one more repository, package or
+--   version) and the usage is the matching count in QuotaUsage, so a holder
+--   may own exactly `limit` of them.
 --   2. if NO group in groups matches(subject): allowed.
 --   3. otherwise allowed iff SOME group in groups both matches(subject) and
 --      permits(subject, account.usage, incoming).
@@ -350,6 +414,8 @@ default QuotaGate gate_artifact_upload = { operation: upload_actions_artifact, s
 -- packages) never asks the gate, so quota never refuses it.
 -- decided (packages 6): the built-in fallback group also carries the default
 -- package rule (config.default_packages); packages has no limits of its own
+-- decided (follow-up 2): count subjects are gated through the same decision,
+-- with incoming = 1; the built-in group's count rule is config.default_package_versions
 rule StorageConsumptionGated {
     when: StorageConsumptionRequested(requester, account, subject, operation, incoming)
     requires: not config.enabled or quota_allows(account, subject, incoming)
@@ -386,6 +452,8 @@ rule AdminCreatesQuotaRule {
     requires: name != ""
     requires: limit != null
     requires: limit >= -1
+    -- decided (follow-up 2): size subjects only, or exactly one count subject
+    requires: subjects.count = 1 or subjects.all(x => x not in {count_repos, count_packages, count_package_versions})
     requires: not exists QuotaRule{name: name}
     ensures: QuotaRule.created(name: name, limit: limit, subjects: subjects)
 }
@@ -398,6 +466,8 @@ rule AdminEditsQuotaRule {
     requires: admin.is_admin
     requires: config.enabled
     requires: new_limit = null or new_limit >= -1
+    -- decided (follow-up 2): an edit may not mix count and size subjects
+    requires: new_subjects = null or new_subjects.count = 1 or new_subjects.all(x => x not in {count_repos, count_packages, count_package_versions})
     ensures:
         if new_limit != null:
             rule.limit = new_limit
@@ -431,6 +501,8 @@ rule AdminCreatesQuotaGroup {
     requires: config.enabled
     requires: name != ""
     requires: not exists QuotaGroup{name: name}
+    -- decided (follow-up 2): no new rule may mix count and size subjects
+    requires: rule_specs.all(spec => spec.subjects.count = 1 or spec.subjects.all(x => x not in {count_repos, count_packages, count_package_versions}))
     ensures:
         let group = QuotaGroup.created(name: name)
         for spec in rule_specs:
@@ -569,6 +641,12 @@ invariant LimitIsUnlimitedOrNonNegative {
         r.limit >= -1
 }
 
+-- decided (follow-up 2): a rule limits bytes or a count, never both.
+invariant RuleUnitsNeverMix {
+    for r in QuotaRules:
+        r.subjects.count = 1 or r.subjects.all(x => x not in {count_repos, count_packages, count_package_versions})
+}
+
 invariant AccountHasExactlyOneHolder {
     for a in QuotaAccounts:
         (a.user = null) != (a.organization = null)
@@ -663,6 +741,10 @@ surface OwnStorageOverview {
         account.usage.packages when config.enabled
         account.usage.wiki when config.enabled
         account.usage.all when config.enabled
+        -- decided (follow-up 2): the counts governed by count:* rules
+        account.usage.repos_count when config.enabled
+        account.usage.packages_count when config.enabled
+        account.usage.package_versions_count when config.enabled
         quota_allows(account, subject, null) when config.enabled
         for m in account.memberships:
             for l in m.group.rule_links:
@@ -672,8 +754,9 @@ surface OwnStorageOverview {
     @guarantee EffectiveGroupsShown
         -- The overview shows the groups that actually govern the holder: the
         -- explicit ones, else the default groups, else a synthetic "global
-        -- quota" with the [quota.default] TOTAL limit on size:all and the
-        -- default package limit on size:assets:packages:all.
+        -- quota" with the [quota.default] TOTAL limit on size:all, the
+        -- default package limit on size:assets:packages:all and the default
+        -- package-version count on count:packages:versions.
 
     @guidance
         -- Web: /user/settings/storage_overview (per-subject bars).
@@ -700,6 +783,10 @@ surface OrganizationStorageOverview {
         account.usage.packages when config.enabled
         account.usage.wiki when config.enabled
         account.usage.all when config.enabled
+        -- decided (follow-up 2): the counts governed by count:* rules
+        account.usage.repos_count when config.enabled
+        account.usage.packages_count when config.enabled
+        account.usage.package_versions_count when config.enabled
         quota_allows(account, subject, null) when config.enabled
 
     @guidance
@@ -737,7 +824,7 @@ deferred quota_allows             -- see: models/quota/quota.go:20 (prose on Sto
 deferred subject_lineage          -- see: models/quota/rule.go:19 (the subject plus its ancestors in the QuotaSubject tree)
 deferred quota_groups_mapped_from          -- see: services/auth/source/source_quota_group_sync.go:26 (quota groups mapped from source groups the user is in; unknown group names dropped)
 deferred quota_groups_mapped_from_unclaimed -- see: services/auth/source/source_quota_group_sync.go:36 (quota groups mapped from source groups the user is NOT in)
-deferred usage_union              -- see: models/quota/rule.go:46 (usage of the union of the subjects: each byte once, so a subject already covered by another listed ancestor adds nothing; decided quota 4)
+deferred usage_union              -- see: models/quota/rule.go:46 (usage of the union of the subjects: each byte once, so a subject already covered by another listed ancestor adds nothing; decided quota 4. For a count subject it is that count: repos_count, packages_count or package_versions_count; decided follow-up 2)
 
 -- Requests to other modules
 -- REQUEST accounts/User: a QuotaAccount must exist for every user (or accounts exposes user.quota_account).
@@ -754,3 +841,5 @@ deferred usage_union              -- see: models/quota/rule.go:46 (usage of the 
 -- REQUEST releases, issues, packages: deleting an attachment, release asset or package version must not consult the quota gate (decided quota 7: what can only shrink storage is never refused by quota).
 -- REQUEST authentication: emit ExternalGroupsAsserted(user, source, entry.groups) on EVERY LDAP sign-in of an existing account (and on LDAP synchronisation), not only when the account is provisioned, so LDAP quota-group sync works like OAuth2's (decided quota 8). AuthSource.quota_group_map / quota_group_map_removal apply to LDAP sources too.
 -- REQUEST accounts/authentication: a user provisioned by an external source needs its QuotaAccount at once, so LoginSourceSyncsQuotaGroups can run on first sign-in.
+-- REQUEST packages: decided (follow-up 2): before creating a package ask quota_allows(<registry owner>, count_packages, 1) (gate_create_package), and before creating a non-internal version ask quota_allows(<registry owner>, count_package_versions, 1) (gate_create_package_version); QuotaUsage.packages_count / package_versions_count count the owner's non-internal packages / versions - done (quota_allows_new_package / quota_allows_new_version in packages.allium).
+-- REQUEST repositories, accounts, organizations: decided (follow-up 2): QuotaUsage.repos_count is the number of repositories the holder owns (accounts/User.num_repos); repositories' within_creation_limit(owner) also requires quota_allows(owner, count_repos, 1) while quota is enabled - done (repositories.allium predicate list).
