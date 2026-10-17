@@ -23,15 +23,15 @@ allium-inspect                              # browse it (reads .allium-inspect.t
 
 | | |
 |---|---|
-| Modules | 22 `.allium` files, about 42,800 lines |
-| Entities | 200, plus 18 external entities and 54 value types |
-| Rules | 1,224 |
-| Surfaces | 216, for 68 actors |
+| Modules | 22 `.allium` files, about 45,900 lines |
+| Entities | 199, plus 18 external entities and 54 value types |
+| Rules | 1,385 |
+| Surfaces | 217, for 69 actors |
 | Invariants | 225 |
 | Config parameters | every `app.ini` setting that changes behaviour, with Forgejo's default |
 | Open questions | none left: all 201 were decided ([`DECISIONS.md`](DECISIONS.md)) |
-| Journeys | 452 in 22 files: **all 1,025 steps hold** with allium-journey 0.1.4, with no walker diagnostics |
-| Cross-module reactions | 320; every one matches its emitter's trigger name and argument names |
+| Journeys | 499 in 22 files: **all 1,114 steps hold** with allium-journey 0.1.4, with no walker diagnostics |
+| Cross-module reactions | 477; every one matches its emitter's trigger name and argument names |
 | `allium check .` | 0 errors |
 
 ## Modules
@@ -216,4 +216,11 @@ The Allium `distill` process, run as a fan-out:
    decision changed behaviour, and adding journeys for the new behaviour
    (often a refusal). Two follow-up questions that came up while applying them
    are recorded too. The set grew to 452 journeys, and all 1,025 steps hold.
+8. The cross-module `REQUEST` lines were then resolved, one agent per group of
+   target modules: each request was met, found already met, or declined, and the
+   handful that needed a product decision are in DECISIONS.md under "requests".
+   This pass added the instance read-only gate to every write a person starts.
+   An integration pass then wired the remaining cross-module reactions. Four
+   requests remain open, each saying what is missing. All 499 journeys
+   (1,114 steps) hold.
 
