@@ -257,3 +257,17 @@ invariants or config. Numbers refer to the question's position in its module in
 | 7 | API file deletions | **Exempt.** Anything that can only shrink storage is never refused by quota. |
 | 8 | Quota group sync | **Every group-capable source** (OAuth2 and LDAP), through the same mapping. |
 | 9 | Pushes to protected branches | **Already decided under code #1:** an admin config, default exempt. |
+
+## moderation
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Admin action vs reported kind | **Must match.** Only actions for the reported item's kind are offered. |
+| 2 | What resolving touches | **Open reports only;** earlier resolutions keep their time and resolver. |
+| 3 | Purging shared shadow copies | **Kept while any report references them.** |
+| 4 | Reporting your own content | **Refused** by the server. |
+| 5 | Duplicate reports | **The reporter is told** they already have an open report on the item. |
+| 6 | Evidence for organisation deletion | **Shadow copy kept** when a reported organisation is deleted, as for users. |
+| 7 | Admin notification and API | **Both.** Site admins are notified (inbox, optional mail) of new reports; reporting, listing and resolving are available through the API. |
+| 8 | Telling reporters the outcome | **Yes, without details:** the reporter learns it was handled, not what was done. |
+| 9 | Purging resolved reports | **On by default:** resolved reports and unreferenced evidence are purged after a retention period (default 180 days); admins can turn it off. |
