@@ -161,3 +161,15 @@ invariants or config. Numbers refer to the question's position in its module in
 | 8 | Release changes on archived repositories | **All frozen,** deletes included. |
 | 9 | Permission to create a bare tag | **Code write,** wherever it happens; protected-tag rules apply. |
 | 10 | Releases on pull mirrors | **Read-only.** A pull mirror's releases follow upstream tags only; creating, editing or deleting them is refused. |
+
+## wiki
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Renaming onto an existing page | **Refused.** |
+| 2 | Edit conflicts | **Stale edits refused.** An edit carries the revision it started from; if the page has changed since, the save is refused. |
+| 3 | Empty page content | **Refused on every path.** |
+| 4 | Git pushes to the wiki | **Emit an event per changed page** (created, edited, deleted), attributed to the pusher. |
+| 5 | Who deletes wiki data and changes the wiki branch | **Repository admins,** on every path. |
+| 6 | Editing a page that doesn't exist | **Refused;** creating is a separate operation. |
+| 7 | Nested pages | **Supported.** A `/` in a page name is a directory path. |
