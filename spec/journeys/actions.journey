@@ -239,6 +239,7 @@ journey ARunnerRegistersAndOnlyGetsJobsItCanRun {
     given:
         token.scope = repo_scope
         token.is_active = true
+        token.created_at = now
         runner.scope = repo_scope
         runner.is_ephemeral = false
         runner.has_taken_task = false
@@ -282,6 +283,7 @@ journey RotatingTheRegistrationToken {
     given:
         old_token.scope = repo_scope
         old_token.is_active = true
+        old_token.created_at = now
 
     1. bob is not allowed to reset it
         stipulate may_manage_actions_scope(bob, repo_scope) = false
@@ -694,4 +696,208 @@ journey LogsExpireAfterTheRetentionPeriod {
         ada cannot see task.log_length on JobAttemptView in task
 
     ends: The task record remains with its status; its log is gone.
+}
+
+-- decided (actions 4): a registration token serves several runners within
+-- its lifetime and is refused once it has expired.
+journey ARegistrationTokenExpiresAfterAnHour {
+    goal: Two machines register into the repository with the same token
+          within the hour; a third, an hour later, is refused and needs a
+          fresh token.
+
+    cast:
+        token: RunnerRegistrationToken
+
+    given:
+        token.scope = repo_scope
+        token.is_active = true
+        token.created_at = now
+
+    1. two runners register with the same token
+        token does RunnerRegistersWithToken(token, "builder-1", {"docker"}, "v12.0.0", false) on RunnerRegistration
+            creating first: Runner
+        then RunnerRegisters fires
+        then first.scope = repo_scope
+        after 30.minutes
+        token does RunnerRegistersWithToken(token, "builder-2", {"docker"}, "v12.0.0", false) on RunnerRegistration
+            creating second: Runner
+        then RunnerRegisters fires
+        then second.scope = repo_scope
+
+    2. after an hour the token is refused
+        after 31.minutes
+        token cannot do RunnerRegistersWithToken(token, "builder-3", {"docker"}, "v12.0.0", false) on RunnerRegistration
+
+    3. ada issues a fresh one, which works
+        stipulate may_manage_actions_scope(ada, repo_scope) = true
+        ada does UserRequestsNewRegistrationToken(ada, repo_scope) on ActionsSettings
+            creating fresh: RunnerRegistrationToken
+        then UserResetsRegistrationToken fires
+        then token.is_active = false
+        fresh does RunnerRegistersWithToken(fresh, "builder-3", {"docker"}, "v12.0.0", false) on RunnerRegistration
+            creating third: Runner
+        then RunnerRegisters fires
+        then third.scope = repo_scope
+
+    ends: Two runners joined on the first token, the third on a fresh one.
+}
+
+-- decided (actions 1): disabling a workflow stops its automatic runs, but a
+-- writer can still start it by hand.
+journey ADisabledWorkflowCanStillBeDispatched {
+    goal: Ada, a repository admin, disables the build workflow; she can
+          still dispatch it manually and a run starts.
+
+    cast:
+        build: Workflow
+
+    given:
+        build.repository = repo
+        build.file_name = "build.yml"
+        build.directory = ".forgejo/workflows"
+        build.has_dispatch_trigger = true
+        build.is_disabled = false
+
+    1. she disables it
+        stipulate is_repo_admin(ada, repo) = true
+        stipulate can_read_actions(ada, repo) = true
+        stipulate can_write_actions(ada, repo) = true
+        ada does UserDisablesWorkflowFile(ada, build) on RepositoryWorkflows
+        then UserDisablesWorkflow fires
+        then build.is_disabled = true
+
+    2. a manual dispatch still starts a run
+        stipulate ref_exists(repo, "refs/heads/main") = true
+        stipulate required_inputs_present(build, {}) = true
+        ada does UserDispatchesWorkflowRun(ada, build, "refs/heads/main", {}) on RepositoryWorkflows
+            creating run: WorkflowRun
+        then UserDispatchesWorkflow fires
+        then run.event = workflow_dispatch
+        then run.status = waiting
+
+    ends: The workflow stays disabled for events, and the dispatched run waits for a runner.
+}
+
+-- decided (actions 7): with pruning switched on, finished runs older than
+-- the retention age disappear with their artifacts.
+journey OldRunsArePrunedWhenEnabled {
+    goal: The instance prunes runs after a year. A finished run is kept for
+          the year and then deleted, its artifact queued for deletion.
+
+    cast:
+        run:      WorkflowRun
+        artifact: Artifact
+
+    given:
+        config.run_pruning_enabled = true
+        run.repository = repo
+        run.status = success
+        run.stopped_at = now
+        run.jobs_expanded = true
+        run.pre_execution_error = null
+        run.needs_approval = false
+        artifact.run = run
+        artifact.status = expired
+
+    1. after eleven months the run is still there
+        stipulate run.status_is_stale = false
+        after 330.days
+        then run.status = success
+
+    2. after a year it is pruned
+        after 36.days
+        then OldRunPruned fires
+        then PruneRun fires
+        then artifact.status = pending_deletion
+
+    ends: The run record is gone; its artifact is purged by the next clean-up.
+}
+
+-- decided (actions 8): with inactivity disabling switched on, a schedule of
+-- a repository nobody touched for the period disables its workflow instead
+-- of running.
+journey AnInactiveRepositoryStopsItsSchedule {
+    goal: The instance disables schedules after 60 days of inactivity. The
+          nightly workflow of a repository untouched for longer is disabled
+          when its cron comes due, no run starts, and the admins are told.
+
+    cast:
+        schedule: Schedule
+        spec:     ScheduleSpec
+        nightly:  Workflow
+
+    given:
+        config.schedule_inactivity_disable_enabled = true
+        schedule.repository = repo
+        schedule.workflow_file = "nightly.yml"
+        schedule.workflow_directory = ".forgejo/workflows"
+        schedule.title = "nightly"
+        schedule.ref = "refs/heads/main"
+        schedule.commit_sha = "abc123"
+        spec.schedule = schedule
+        spec.cron = "@daily"
+        nightly.repository = repo
+        nightly.file_name = "nightly.yml"
+        nightly.is_disabled = false
+
+    1. the cron comes due in a repository idle for 61 days
+        stipulate spec.next_run_at = now
+        stipulate last_repository_activity(repo) = now - 61.days
+        stipulate workflow_disabled(repo, "nightly.yml") = false
+        stipulate schedule_is_broken(spec) = false
+        after 1.minute
+        then ScheduleFires fires
+        then InactivityDisablesScheduledWorkflow fires
+        then StartScheduledRun does not fire
+        then nightly.is_disabled = true
+
+    ends: The nightly workflow is disabled and no scheduled run was started.
+}
+
+-- releases now announces un-publishing; actions reacts with a `release`
+-- event of type `unpublished` on the release's tag (GitHub has the same
+-- type). When the tag itself vanished there is no doer and nothing runs.
+-- (Workflow matching is a black box the walker cannot settle for an enum
+-- argument, so this repository keeps its Actions unit switched off and the
+-- story stops at the event.)
+journey UnpublishingAReleaseIsAWorkflowEvent {
+    goal: Ada turns the published v1.0 back into a draft, and Actions hears
+          a release event of type unpublished. When the tag of v2.0 vanishes
+          in a sync, no release event reaches Actions.
+
+    cast:
+        rel:  releases/Release
+        gone: releases/Release
+
+    given:
+        actions_unit.enabled = false
+        repo.is_mirror = false
+        rel.repository = repo
+        rel.tag_name = "v1.0"
+        rel.title = "One"
+        rel.state = published
+        rel.commit_sha = "abc123"
+        rel.publisher = ada
+        gone.repository = repo
+        gone.tag_name = "v2.0"
+        gone.state = published
+        gone.commit_sha = "def456"
+        gone.publisher = ada
+
+    1. she un-publishes v1.0 and Actions is told
+        stipulate can_write_releases(ada, repo) = true
+        stipulate qualified_ref(tag_ref, "v1.0") = "refs/tags/v1.0"
+        ada does UserEditsRelease(ada, repo, rel, "One", "Notes", true, false, false) on ReleaseManagement
+        then UserUnpublishesRelease fires
+        then rel.state = draft
+        then ReleaseUnpublishedStartsWorkflows fires
+
+    2. a vanished tag un-publishes v2.0 without a doer; no workflow event
+        stipulate can_write_code(ada, repo) = true
+        ada does TagVanished(repo, "v2.0") on TagReconciliation
+        then TagDisappears fires
+        then gone.state = draft
+        then ReleaseUnpublishedStartsWorkflows does not fire
+
+    ends: v1.0 raised a release event of type unpublished; v2.0's vanished tag raised none.
 }

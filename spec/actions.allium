@@ -20,12 +20,14 @@
 --     container handling): executed by the runner and the shared jobparser
 --     library; referenced here through black-box functions (job_definitions,
 --     evaluate_if, expand_incomplete_job, matching_workflows).
---   - The legacy v1-v3 artifact upload protocol's chunk/file layout (several
---     rows per artifact): a compatibility concern; artifacts are modelled as
---     one logical (run, name) object, as the v4 protocol stores them.
---   - Pre-translated pre-execution error strings stored by Forgejo v13 and the
---     legacy OIDC subject format `legacy_forgejo_15`: data-import concerns
---     (an open question keeps the subject format choice visible).
+--   - The v1-v3 artifact upload protocol's chunk/file layout (several rows
+--     per artifact): decided (actions 6), v1-v4 are all supported, but the
+--     layout is a storage detail; artifacts are modelled as one logical
+--     (run, name) object, as the v4 protocol stores them.
+--   - Pre-translated pre-execution error strings stored by Forgejo v13: a
+--     data-import concern.
+--   - The legacy OIDC subject format `legacy_forgejo_15`: decided (actions 5),
+--     dropped; there is one subject format and no per-repository option.
 --   - `GITEA_TOKEN`/`GITHUB_TOKEN`/`gitea_runtime_token` aliases: kept only as
 --     names the runner expects; the rebuild exposes one automatic token under
 --     whatever names its runner protocol requires.
@@ -50,6 +52,8 @@
 --       -- creator = the Actions bot; code reacts and records the CommitStatus
 --       -- exactly as the commit-status API does
 --   IdTokenIssued(task, audience, expires_at)
+--   ScheduledWorkflowDisabledForInactivity(repository, workflow_file)
+--       -- notifications tells the repository's admins
 --
 -- Reacts to:
 --   code/PushReceived(push)                     -- push; also refreshes schedules on default branch
@@ -83,7 +87,7 @@
 --   pulls/ReviewRequestRemoved(pull_request, doer, reviewer),
 --   pulls/PullRequestTargetBranchChanged(pull_request, doer, old_base_branch)
 --   releases/ReleasePublished(release), releases/ReleaseUpdated(release, doer),
---   releases/ReleaseDeleted(release, doer)
+--   releases/ReleaseDeleted(release, doer), releases/ReleaseUnpublished(release, doer)
 --   packages/PackageVersionCreated(version, publisher), packages/PackageVersionDeleted(version, doer)
 --   wiki/WikiPageCreated(repository, doer, page), wiki/WikiPageEdited(repository, doer, page),
 --   wiki/WikiPageDeleted(repository, doer, page)
@@ -178,7 +182,7 @@ contract RunnerProtocol {
 -- from: services/actions/notifier_helper.go:423
 contract WorkflowParser {
     job_definitions: (repository: repositories/Repository, workflow_file: String, commit_sha: String) -> Set<JobDefinition>
-    matching_workflows: (repository: repositories/Repository, event: TriggeringEvent, activity: String, ref: String, commit_sha: String) -> Set<Workflow>
+    matching_workflows: (repository: repositories/Repository, event: TriggeringEvent, activity: String?, ref: String, commit_sha: String?, pull_request: pulls/PullRequest?) -> Set<Workflow>
 
     @invariant ExpressionContext
         -- Expressions see the git context (repository, ref, sha, event
@@ -193,6 +197,8 @@ contract WorkflowParser {
 }
 
 -- The artifact upload/download protocol used from inside a running job.
+-- decided (actions 6): both the v1-v3 protocol (actions/upload-artifact@v3)
+-- and v4 are served; they share this contract.
 -- from: routers/api/actions/artifactsv4.go:1
 contract ArtifactProtocol {
     create_artifact: (name: String, expires_at: Timestamp?) -> Artifact
@@ -531,7 +537,8 @@ entity Runner {
 
 -- A shared secret runners present to register themselves into a scope.
 -- Creating a new one invalidates the previous ones of the same scope; it can
--- be used any number of times while active.
+-- be used any number of times while active and younger than
+-- config.registration_token_lifetime (decided actions 4; Forgejo's never expired).
 -- from: models/actions/runner_token.go:27
 entity RunnerRegistrationToken {
     scope: ActionsScope
@@ -634,7 +641,8 @@ config {
     log_retention: Duration = 365.days
     -- [actions] LOG_COMPRESSION
     log_compression: LogCompression = zstd
-    -- [actions] ARTIFACT_RETENTION_DAYS (values <= 0 mean the default)
+    -- [actions] ARTIFACT_RETENTION_DAYS (values <= 0 mean the default);
+    -- decided (actions 3): only the default, never a cap on what a job asks for
     artifact_retention: Duration = 90.days
     -- [actions] DEFAULT_ACTIONS_URL: base for `uses:` without a host
     default_actions_url: String = "https://data.forgejo.org"
@@ -652,6 +660,14 @@ config {
     concurrency_group_queue_enabled: Boolean = true
     -- [actions] ID_TOKEN_EXPIRATION_TIME (seconds)
     id_token_lifetime: Duration = 1.hour
+    -- decided (actions 4): registration tokens expire after this lifetime
+    registration_token_lifetime: Duration = 1.hour
+    -- decided (actions 7): pruning finished runs, off by default
+    run_pruning_enabled: Boolean = false
+    run_retention: Duration = 365.days
+    -- decided (actions 8): disabling schedules of inactive repositories, off by default
+    schedule_inactivity_disable_enabled: Boolean = false
+    schedule_inactivity_period: Duration = 60.days
 
     -- fixed behaviour (not configurable in Forgejo)
     runner_offline_after: Duration = 1.minute
@@ -939,19 +955,29 @@ rule TargetBranchChangeStartsWorkflows {
 rule ReleasePublishedStartsWorkflows {
     when: releases/ReleasePublished(release)
     ensures: ForgeEventObserved(repository: release.repository, doer: release.publisher, event: release, activity: "published",
-        ref: "refs/tags/" + release.tag_name, commit_sha: null, pull_request: null)
+        ref: qualified_ref(tag_ref, release.tag_name), commit_sha: null, pull_request: null)
 }
 
 -- from: services/actions/notifier.go:696
 rule ReleaseUpdatedStartsWorkflows {
     when: releases/ReleaseUpdated(release, doer)
-    ensures: ForgeEventObserved(repository: release.repository, doer: doer, event: release, activity: "edited", ref: "refs/tags/" + release.tag_name, commit_sha: null, pull_request: null)
+    ensures: ForgeEventObserved(repository: release.repository, doer: doer, event: release, activity: "edited", ref: qualified_ref(tag_ref, release.tag_name), commit_sha: null, pull_request: null)
 }
 
 -- from: services/actions/notifier.go:701
 rule ReleaseDeletedStartsWorkflows {
     when: releases/ReleaseDeleted(release, doer)
-    ensures: ForgeEventObserved(repository: release.repository, doer: doer, event: release, activity: "deleted", ref: "refs/tags/" + release.tag_name, commit_sha: null, pull_request: null)
+    ensures: ForgeEventObserved(repository: release.repository, doer: doer, event: release, activity: "deleted", ref: qualified_ref(tag_ref, release.tag_name), commit_sha: null, pull_request: null)
+}
+
+-- decided (releases 2, for actions): un-publishing a release starts `release`
+-- workflows of type `unpublished`, as GitHub does; Forgejo had no such event.
+-- It runs on the release's tag, which an edit keeps. When the tag itself
+-- vanished (no doer) there is no ref to read workflows from, so nothing runs.
+rule ReleaseUnpublishedStartsWorkflows {
+    when: releases/ReleaseUnpublished(release, doer)
+    requires: doer != null
+    ensures: ForgeEventObserved(repository: release.repository, doer: doer, event: release, activity: "unpublished", ref: qualified_ref(tag_ref, release.tag_name), commit_sha: null, pull_request: null)
 }
 
 -- `registry_package` (type `published` / `deleted`), only for packages
@@ -1452,11 +1478,14 @@ rule RevokeLapsedTrust {
 ------------------------------------------------------------
 
 -- A runner registers itself with an active registration token. The token
--- stays usable for further registrations until it is rotated.
+-- stays usable for further registrations until it is rotated or expires.
 -- from: routers/api/actions/runner/runner.go:47
+-- decided (actions 4): registration tokens expire after a configurable
+-- lifetime (default 1 hour) and are reusable until then.
 rule RunnerRegisters {
     when: RunnerRegistersWithToken(registration_token, name, labels, version, is_ephemeral)
     requires: registration_token.is_active
+    requires: registration_token.created_at + config.registration_token_lifetime > now
     requires: name != ""
     ensures: Runner.created(
         scope: registration_token.scope,
@@ -1544,7 +1573,8 @@ rule UserDeletesRunner {
 }
 
 -- Issue a fresh registration token and invalidate the scope's older ones.
--- The runners page and API issue one automatically when none exists.
+-- The runners page and API issue one automatically when none exists or the
+-- active one has expired.
 -- from: models/actions/runner_token.go:60
 rule UserResetsRegistrationToken {
     when: UserRequestsNewRegistrationToken(user, scope)
@@ -1839,6 +1869,33 @@ rule UserDeletesRun {
         not exists run
 }
 
+-- When the instance enables it, finished runs older than the retention age
+-- are deleted exactly as UserDeletesRun deletes them.
+-- decided (actions 7): admin config, off by default (Forgejo keeps run
+-- records forever).
+rule OldRunPruned {
+    when: run: WorkflowRun.stopped_at + config.run_retention <= now
+    requires: config.run_pruning_enabled
+    requires: run.is_done
+    ensures: RunPruneDue(run: run)
+}
+
+rule PruneRun {
+    when: RunPruneDue(run)
+    requires: config.run_pruning_enabled
+    requires: run.is_done
+    ensures:
+        for artifact in run.artifacts where status in {upload_pending, upload_confirmed, expired}:
+            artifact.status = pending_deletion
+        for job in run.jobs:
+            for task in job.tasks:
+                not exists task
+            not exists job
+        not exists run
+    @guidance
+        -- Swept by the daily cleanup_actions cron alongside artifacts and logs.
+}
+
 -- from: services/actions/run.go:345
 rule UserPrioritizesRun {
     when: UserPrioritizesWorkflowRun(user, run)
@@ -1861,7 +1918,7 @@ rule UserDeprioritizesRun {
 }
 
 -- A disabled workflow starts no event-driven or scheduled runs and cannot
--- be re-run.
+-- be re-run; a manual dispatch still starts it (decided actions 1).
 -- from: routers/web/repo/actions/view.go:880
 rule UserDisablesWorkflow {
     when: UserDisablesWorkflowFile(user, workflow)
@@ -1931,8 +1988,9 @@ rule UserDispatchesWorkflow {
         -- optional return_run_info. Boolean inputs are passed as
         -- "true"/"false". The title is the workflow `name:` (else its path),
         -- replaced by `run-name:` when that evaluates non-empty.
-        -- Forgejo does not refuse dispatching a disabled workflow (see open
-        -- questions).
+        -- decided (actions 1): dispatching a disabled workflow is allowed;
+        -- disabling stops automatic triggers and re-runs only, so there is
+        -- deliberately no `not workflow.is_disabled` requirement here.
 }
 
 ------------------------------------------------------------
@@ -1959,6 +2017,8 @@ rule TaskCreatesArtifact {
 }
 
 -- The job may ask for its own retention (in days, or an expiry time).
+-- decided (actions 3): any retention is honoured; ARTIFACT_RETENTION_DAYS
+-- is only the default used by TaskCreatesArtifact.
 -- from: routers/api/actions/artifactsv4.go:284
 rule TaskCreatesArtifactWithRetention {
     when: TaskCreatesArtifactWithRetention(task, name, retention)
@@ -2186,9 +2246,10 @@ rule TaskRequestsIdToken {
     @guidance
         -- An empty audience means the repository owner's URL.
         -- `sub` is "repo:<owner>-<owner_id>/<repo>-<repo_id>:pull_request"
-        -- for pull_request events, else "...:ref:<ref>"; a per-repository
-        -- legacy format omits the ids. Public keys are published at a JWKS
-        -- endpoint with an OpenID discovery document.
+        -- for pull_request events, else "...:ref:<ref>". Public keys are
+        -- published at a JWKS endpoint with an OpenID discovery document.
+        -- decided (actions 5): this is the only subject format; Forgejo's
+        -- per-repository legacy_forgejo_15 option (no ids) is dropped.
 }
 
 ------------------------------------------------------------
@@ -2364,6 +2425,8 @@ rule StartScheduledRun {
     requires: spec.schedule.repository.units.any(u => u.kind = actions and u.enabled)
     requires: not workflow_disabled(spec.schedule.repository, spec.schedule.workflow_file)
     requires: not schedule_is_broken(spec)
+    requires: not (config.schedule_inactivity_disable_enabled
+        and last_repository_activity(spec.schedule.repository) + config.schedule_inactivity_period <= now)
     ensures: WorkflowRun.created(
         repository: spec.schedule.repository,
         index: next_run_index(spec.schedule.repository),
@@ -2405,7 +2468,29 @@ rule StartScheduledRun {
         spec.next_run_at = next_cron_occurrence(spec, now + 1.minute)
     @guidance
         -- Checked every minute (start_schedule_tasks cron). Scheduled runs
-        -- report no commit statuses. There is no inactivity-based disabling.
+        -- report no commit statuses. Inactive repositories: see
+        -- InactivityDisablesScheduledWorkflow.
+}
+
+-- When the instance enables it, a due cron entry of a repository that has
+-- seen no activity for the configured period disables its workflow instead
+-- of running it, and the repository's admins are told.
+-- decided (actions 8): admin config, off by default (GitHub disables after
+-- 60 days; Forgejo never did). A manual dispatch or re-enabling still works.
+rule InactivityDisablesScheduledWorkflow {
+    when: ScheduleSpecDue(spec)
+    requires: config.schedule_inactivity_disable_enabled
+    requires: last_repository_activity(spec.schedule.repository) + config.schedule_inactivity_period <= now
+    requires: not workflow_disabled(spec.schedule.repository, spec.schedule.workflow_file)
+    ensures:
+        for workflow in Workflows where repository = spec.schedule.repository
+                and file_name = spec.schedule.workflow_file:
+            workflow.is_disabled = true
+        ScheduledWorkflowDisabledForInactivity(repository: spec.schedule.repository, workflow_file: spec.schedule.workflow_file)
+    @guidance
+        -- last_repository_activity: the latest push to any branch, or the
+        -- repository's creation when nothing was pushed since. Scheduled runs
+        -- and pushes by the Actions bot do not count as activity.
 }
 
 -- A cron entry that can never produce a run (unparseable cron, unknown
@@ -2567,6 +2652,10 @@ rule ActionsCleanupSweep {
             TaskLogExpiryDue(task: task)
         for runner in Runners where has_used_its_single_task and not is_busy:
             RunnerRemovalDue(runner: runner)
+        if config.run_pruning_enabled:
+            for run in WorkflowRuns where is_done and stopped_at != null
+                    and stopped_at + config.run_retention <= now:
+                RunPruneDue(run: run)
 }
 
 -- Trust that has not been relied upon within the expiry lapses.
@@ -2674,7 +2763,12 @@ actor WorkflowViewer {
     identified_by: accounts/User where can_read_actions(this, within.repository)
 }
 
--- Whoever may manage a scope's runners, secrets and variables.
+-- Whoever may manage a scope's runners, secrets and variables:
+-- may_manage_actions_scope is a site admin for the instance scope, the user
+-- for a user scope, an organization owner for an organization scope, and a
+-- repository admin (is_repo_admin) for a repository scope.
+-- decided (actions 2): repository admins on every path (web and REST alike;
+-- Forgejo's REST API required the repository owner).
 actor ScopeManager {
     within: ActionsScope
     identified_by: accounts/User where may_manage_actions_scope(this, within)
@@ -3038,26 +3132,13 @@ deferred Workflow.matching_workflows    -- see: modules/actions/workflows.go det
 deferred ScheduleSpec.next_cron_occurrence  -- see: github.com/gdgvda/cron (5-field cron, @descriptors, TZ=/CRON_TZ= prefixes)
 
 ------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Dispatching a disabled workflow is allowed by Forgejo (manual and API dispatch do not check the disabled list) while re-runs and scheduled runs of it are refused. Should dispatch also be refused?"
-open question "Repository-scoped secrets/variables/runners need repository admin on the web UI but repository owner on the REST API. Which permission does the rebuild want?"
-open question "Artifact retention requested by a job is not capped by ARTIFACT_RETENTION_DAYS. Should the instance setting be a maximum as well as the default?"
-open question "The registration token is reusable until rotated and never expires. Should registration tokens expire or be single-use?"
-open question "Should the legacy OIDC subject format (legacy_forgejo_15) be offered at all in the rebuild, or only the standard one?"
-open question "Should the v1-v3 artifact protocol (still used by actions/upload-artifact@v3) be supported, or only v4?"
-open question "Deleting a run discards its artifacts and logs; there is no retention for run records themselves. Should old runs be pruned automatically?"
-open question "Scheduled workflows are never disabled for inactivity (GitHub disables after 60 days without repository activity). Keep Forgejo's behaviour?"
-
-------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
 -- REQUEST code/Push.ref_updates with RefUpdate.ref_kind/ref_name/new_sha (present); a black-box full_ref_name(update) / qualified_ref(kind, name) gives refs/heads/<b> or refs/tags/<t>.
 -- REQUEST code: react to actions/JobCommitStatusReported from the Actions bot (creator = actions_bot()) for the job's own repository without a write-permission check; target URL = the job page. Scheduled runs report no statuses (Forgejo skips them on runner updates).
 -- REQUEST accounts: a well-known system user "the Actions bot" (actions_bot(), is_actions_bot(user)); events caused by it start no workflows.
 -- REQUEST repositories/Repository.default_branch, .is_empty, .is_archived, .owner_user, .owner_org — used for scoping and gating.
--- REQUEST repositories: the actions unit's per-repository settings (disabled workflow file names, OIDC subject format) are modelled here as Workflow.is_disabled; repositories may prefer to own them on RepoUnit. the actions unit counts as enabled when the repository has an enabled RepoUnit of kind actions (access's invariant keeps units in DISABLED_REPO_UNITS disabled).
+-- REQUEST repositories: the actions unit's per-repository settings (disabled workflow file names) are modelled here as Workflow.is_disabled; repositories may prefer to own them on RepoUnit. the actions unit counts as enabled when the repository has an enabled RepoUnit of kind actions (access's invariant keeps units in DISABLED_REPO_UNITS disabled).
 -- REQUEST access: can_read(user, repo, actions), can_write(user, repo, actions), is_repo_admin(user, repo). This module uses local black-box aliases can_read_actions / can_write_actions / is_repo_admin because qualified black-box calls cannot be stipulated in journeys; integration may substitute the access functions.
 -- REQUEST access: the automatic token as an authentication method (TaskAccessesOwnRepository models it) — note Forgejo grants write to every unit of the own repository, read for fork PR runs. decided (access 6): the token reaches only its own repository and packages linked to it; other repositories and organization endpoints refuse it.
 -- REQUEST issues: Issue.pull_request, Issue.milestone, Comment.issue (used to route issue vs pull-request activity).
@@ -3068,3 +3149,6 @@ open question "Scheduled workflows are never disabled for inactivity (GitHub dis
 -- REQUEST notifications: react to WorkflowJobCompleted(job, prior) — when the job failed and job.run.notify_email, mail the trigger user (repository owner for system-triggered runs) unless they disabled email notifications.
 -- REQUEST webhooks: also react to WorkflowRunCompleted / WorkflowJobCompleted / WorkflowRunAttemptStarted / WorkflowJobAttemptStarted (this module splits final transitions out of *StatusChanged).
 -- REQUEST administration: cron tasks stop_zombie_tasks (5m), stop_endless_tasks (30m), cancel_abandoned_jobs (6h), transfer_lingering_logs (midnight), start_schedule_tasks (1m), cleanup_actions (midnight), cleanup_offline_runners (disabled by default), actions_action_user (weekly); none registered when actions are disabled. Admin web pages /-/admin/actions/{runners,variables} map to ActionsSettings with the instance scope.
+-- REQUEST notifications: react to ScheduledWorkflowDisabledForInactivity(repository, workflow_file) by telling the repository's admins (decided actions 8).
+-- REQUEST administration: cleanup_actions also prunes finished runs older than [actions] run retention when run pruning is enabled (decided actions 7, off by default); new [actions] settings registration_token_lifetime (1h), run_pruning_enabled/run_retention, schedule_inactivity_disable_enabled/schedule_inactivity_period.
+-- REQUEST access: may_manage_actions_scope for a repository scope is is_repo_admin on web and REST alike (decided actions 2).

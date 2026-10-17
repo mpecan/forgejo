@@ -215,3 +215,11 @@ invariants or config. Numbers refer to the question's position in its module in
 | 9 | Automatic retries | **Retry with backoff.** A configurable number of attempts (default 3) with exponential backoff on network errors and 5xx responses; manual redelivery stays. |
 | 10 | `gitea` and `gogs` kinds | **Dropped.** One native kind plus the chat/CI integrations; the import addon maps old hooks. |
 | 11 | Test deliveries | **Every level:** repository, organisation, user and system hooks. |
+
+## notifications
+
+| # | Question | Decision |
+|---|---|---|
+| 2 | Filters for new pull requests | **Applied.** New pull requests go through the same unsubscribe and block filters as every other notification. |
+| 3 | Mail reply/unsubscribe tokens on password change | **Revoked explicitly** on password change and account reset. |
+| 4 | Job-failure mail | **Exactly one mail per failed run attempt.** |
