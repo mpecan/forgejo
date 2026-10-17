@@ -418,6 +418,7 @@ journey ImportedIssuesKeepTheirAuthor {
         m.repository = repo
         m.doer = alice
         m.source = gh
+        m.source_host = "github.com"
         m.status = running
         m.source_address = addr
         m.credentials = creds
@@ -426,18 +427,26 @@ journey ImportedIssuesKeepTheirAuthor {
         stipulate m.content_scope = {issue_items, comments}
         stipulate m.imported_numbers = {}
         stipulate item.label_names = {}
+        stipulate item.assignee_names = {"bob", "carol-gh"}
+        stipulate assignable_named(repo, {"bob", "carol-gh"}) = {bob}
+        stipulate resolves_to_assignee(repo, "bob") = true
+        stipulate resolves_to_assignee(repo, "carol-gh") = false
         stipulate resolve_author(m, who) = null
         stipulate ghost_user() = ghost
         stipulate truncate("It breaks", 255) = "It breaks"
         adapter does SourceYieldsIssue(m, item) on SourceAdapterBoundary
             creating authorship: ExternalAuthorship
+            creating outsider: ExternalAssignee
         then ImportIssue fires
         then authorship.external_name = "carol-gh"
+        then authorship.source_host = "github.com"
         then authorship.status = unlinked
+        then outsider.external_name = "carol-gh"
         then m.imported_numbers = {7}
 
     ends: The issue keeps its number and is recorded as Carol's, waiting
-          for her to link a GitHub login.
+          for her to link a GitHub login. Bob, who has an account here, is
+          assigned; Carol is kept as an assignee by name.
 }
 
 journey ACommentForAMissingIssueStopsTheImport {
@@ -524,6 +533,8 @@ journey AnOperatorRestoresAnArchive {
         archive.status = writing
         archive.source_kind = gitlab
         archive.original_url = "https://gitlab.com/acme/widget"
+        archive.source_host = "gitlab.com"
+        archive.is_private = true
         archive.includes_wiki = true
         lab.kind = gitlab
 
@@ -544,8 +555,11 @@ journey AnOperatorRestoresAnArchive {
         then m.status = queued
         then m.validate_archive = true
         then m.content_scope = {issue_items, comments, labels}
+        then m.source_host = "gitlab.com"
+        then m.repository.is_private = true
 
-    ends: The archive is queued for import like any other migration.
+    ends: The archive is queued for import like any other migration, and
+          the repository is as private as the one that was dumped.
 }
 
 journey ARestoreHandsCommentsToLinkedAccounts {
@@ -578,6 +592,7 @@ journey ARestoreHandsCommentsToLinkedAccounts {
         m.credentials = creds
         ext.repository = repo
         ext.source_kind = gitlab
+        ext.source_host = "gitlab.com"
         ext.external_id = "77"
         ext.external_name = "dave-gl"
         ext.content = on_comment
@@ -585,7 +600,7 @@ journey ARestoreHandsCommentsToLinkedAccounts {
         ext.status = unlinked
 
     1. the archive import finishes
-        stipulate linked_account_for(gitlab, "77") = dave
+        stipulate linked_account_for(gitlab, "gitlab.com", "77") = dave
         stipulate sanitized_url(addr) = "https://github.com/acme/widget"
         stipulate url_of(null) = null
         stipulate code_search_service() = indexer
@@ -599,4 +614,284 @@ journey ARestoreHandsCommentsToLinkedAccounts {
         then ext.linked_user = dave
 
     ends: Dave owns his old comments without having done anything.
+}
+
+-- Re-attribution is scoped by host, and ids are opaque.
+journey ReattributionMatchesTheSourceHost {
+    goal: Two GitLab archives were restored, one from gitlab.com and one from
+          a company GitLab. Both carry an author with the same non-numeric id.
+          Dave's linked gitlab.com login claims only the gitlab.com comment;
+          the other belongs to someone else and stays unlinked.
+
+    cast:
+        dave:  accounts/User
+        repo:  repositories/Repository
+        m:     Migration
+        ext:   ExternalAuthorship
+        other: ExternalAuthorship
+        ghost: accounts/User
+        note:  issues/Comment
+        theirs: issues/Comment
+    given:
+        repo.status = being_migrated
+        repo.is_mirror = false
+        note.poster = ghost
+        theirs.poster = ghost
+        m.repository = repo
+        m.doer = alice
+        m.source = gh
+        m.from_archive = true
+        m.mirror = false
+        m.lfs = false
+        m.lfs_endpoint = null
+        m.mirror_interval = 8.hours
+        m.status = running
+        m.stage = finalizing
+        m.source_address = addr
+        m.credentials = creds
+        ext.repository = repo
+        ext.source_kind = gitlab
+        ext.source_host = "gitlab.com"
+        ext.external_id = "u-dave"
+        ext.external_name = "dave-gl"
+        ext.content = on_comment
+        ext.comment = note
+        ext.status = unlinked
+        other.repository = repo
+        other.source_kind = gitlab
+        other.source_host = "git.example.org"
+        other.external_id = "u-dave"
+        other.external_name = "dave-corp"
+        other.content = on_comment
+        other.comment = theirs
+        other.status = unlinked
+
+    1. the archive import finishes and a relink pass runs
+        stipulate linked_account_for(gitlab, "gitlab.com", "u-dave") = dave
+        stipulate linked_account_for(gitlab, "git.example.org", "u-dave") = null
+        stipulate sanitized_url(addr) = "https://github.com/acme/widget"
+        stipulate url_of(null) = null
+        stipulate code_search_service() = indexer
+        stipulate git_tags(repo) = {}
+        adapter does SourceImportFinished(m) on SourceAdapterBoundary
+        then RelinkPass fires
+        then ext.status = linked
+        then note.poster = dave
+        then other.status = unlinked
+        then theirs.poster = ghost
+
+    ends: Only the identity from the same host is handed over, and a
+          non-numeric id is matched like any other.
+}
+
+-- Cancelling before a worker picks it up.
+journey AQueuedMigrationCanBeCancelled {
+    goal: Alice's import is still waiting in the queue. She cancels it, and
+          when a worker comes round it does not start.
+
+    cast:
+        repo: repositories/Repository
+        m:    Migration
+    given:
+        repo.status = being_migrated
+        repo.is_mirror = false
+        m.repository = repo
+        m.doer = alice
+        m.source = gh
+        m.status = queued
+        m.source_address = addr
+        m.credentials = creds
+
+    1. she cancels it while queued
+        stipulate is_repo_admin(alice, repo) = true
+        alice does RepoAdminCancelsMigration(alice, m) on MigrationAdministration
+        then m.status = failed
+        then m.failure_reason = canceled
+
+    2. the worker does not start it
+        core cannot do MigrationDequeued(m) on CoreHostBoundary
+
+    ends: The queued import never ran.
+}
+
+-- Retry by the requester.
+journey TheRequesterRetriesWithoutBeingAnAdmin {
+    goal: Alice imported a repository into an organisation she may create
+          repositories in but does not administer. It failed. She retries it
+          from her task status; Bob, who neither requested it nor
+          administers it, cannot.
+
+    cast:
+        repo: repositories/Repository
+        m:    Migration
+    given:
+        repo.status = being_migrated
+        repo.is_mirror = false
+        m.repository = repo
+        m.doer = alice
+        m.source = gh
+        m.status = failed
+        m.failure_reason = remote_error
+        m.source_address = addr
+        m.credentials = creds
+        m.items_processed = 3
+
+    1. bob cannot retry it
+        stipulate is_repo_admin(bob, repo) = false
+        stipulate quota_allows_retry(repo) = true
+        bob cannot do RepoAdminRetriesMigration(bob, m) on MigrationAdministration
+
+    2. alice retries it from her task status
+        stipulate is_repo_admin(alice, repo) = false
+        alice does RepoAdminRetriesMigration(alice, m) on MigrationTaskStatus
+        then RepoAdminRetriesMigration fires
+        then m.status = queued
+        then m.items_processed = 0
+
+    ends: The requester can try again without asking an admin.
+}
+
+-- Organisation targets.
+journey AMemberWhoMayCreateReposImportsIntoTheOrg {
+    goal: Alice is not an owner of Acme, but she may create repositories in
+          it, so she may import into it. Bob may not, and is refused.
+
+    cast:
+        acme: organizations/Organization
+    1. bob is refused
+        stipulate gh.supports = {milestones, labels, issue_items, comments}
+        stipulate req.wanted = {issue_items, comments}
+        stipulate can_create_in_org(bob, acme) = false
+        bob cannot do UserRequestsOrgMigration(bob, acme, req) on MigrationForm
+
+    2. alice imports
+        stipulate can_create_in_org(alice, acme) = true
+        stipulate length("widget") = 6
+        stipulate length("Widgets") = 7
+        stipulate repository_name_free(acme, "widget") = true
+        stipulate within_creation_limit(acme) = true
+        stipulate quota_allows_new_repository(acme) = true
+        stipulate is_allowed_remote("https://github.com/acme/widget", alice) = true
+        stipulate sanitized_url(addr) = "https://github.com/acme/widget"
+        alice does UserRequestsOrgMigration(alice, acme, req) on MigrationForm
+            creating m: Migration
+        then UserRequestsOrgMigration fires
+        then m.status = queued
+        then m.doer = alice
+
+    ends: The import is queued in Acme, the same on the web and the API.
+}
+
+-- Milestones without a deadline.
+journey AMilestoneWithoutADeadlineGetsTheFarFutureOne {
+    goal: GitHub's "1.0" milestone has no due date. It arrives with the
+          far-future deadline Forgejo uses for "no deadline".
+
+    cast:
+        repo: repositories/Repository
+        m:    Migration
+        ms:   ImportedMilestone
+        far:  Timestamp
+    given:
+        repo.status = being_migrated
+        repo.is_mirror = false
+        m.repository = repo
+        m.doer = alice
+        m.source = gh
+        m.status = running
+        m.source_address = addr
+        m.credentials = creds
+        ms.title = "1.0"
+        ms.description = ""
+        ms.deadline = null
+        ms.is_closed = false
+        ms.closed_at = null
+        ms.created_at = null
+        ms.updated_at = null
+
+    1. the adapter yields the milestone
+        stipulate far_future_deadline() = far
+        stipulate first_present(null, null, null) = far
+        adapter does SourceYieldsMilestone(m, ms) on SourceAdapterBoundary
+            creating milestone: issues/Milestone
+        then ImportMilestone fires
+        then milestone.deadline = far
+
+    ends: The milestone shows no due date, stored as Forgejo stores it.
+}
+
+-- Who merged an imported pull request.
+journey AnImportedMergeKeepsItsOriginalMerger {
+    goal: Carol merged pull request 12 on GitHub but has no account here.
+          The imported pull request is not credited to Alice, who ran the
+          import; it is held for Carol's GitHub identity.
+
+    cast:
+        ghost: accounts/User
+        repo:  repositories/Repository
+        m:     Migration
+        pr:    ImportedPullRequest
+        head:  PullRequestEndpoint
+        base:  PullRequestEndpoint
+        when:  Timestamp
+    given:
+        repo.status = being_migrated
+        repo.is_mirror = false
+        m.repository = repo
+        m.doer = alice
+        m.source = gh
+        m.source_host = "github.com"
+        m.status = running
+        m.source_address = addr
+        m.credentials = creds
+        head.ref = "fix"
+        head.sha = "abc"
+        base.ref = "main"
+        base.sha = "def"
+        pr.number = 12
+        pr.author = who
+        pr.title = "Fix it"
+        pr.content = ""
+        pr.milestone_title = null
+        pr.is_closed = true
+        pr.is_locked = false
+        pr.is_draft = false
+        pr.merged = true
+        pr.merged_at = when
+        pr.merge_commit_sha = "fed"
+        pr.merged_by = who
+        pr.head = head
+        pr.base = base
+        pr.created_at = when
+        pr.updated_at = when
+        pr.closed_at = when
+        pr.reactions = {}
+        pr.is_fork_pull = false
+        pr.ensured_safe = true
+
+    1. the adapter yields the merged pull request
+        stipulate m.imported_numbers = {}
+        stipulate pr.label_names = {}
+        stipulate pr.assignee_names = {}
+        stipulate assignable_named(repo, {}) = {}
+        stipulate resolve_author(m, who) = null
+        stipulate ghost_user() = ghost
+        stipulate with_draft_prefix("Fix it", false) = "Fix it"
+        stipulate truncate("Fix it", 255) = "Fix it"
+        stipulate first_present(when, when, when) = when
+        stipulate imported_head_branch(pr) = "fix"
+        stipulate present_or_empty("main") = "main"
+        stipulate present_or_empty("abc") = "abc"
+        stipulate present_or_empty("fed") = "fed"
+        adapter does SourceYieldsPullRequest(m, pr) on SourceAdapterBoundary
+            creating merge: pulls/PullRequest
+            creating held: ExternalAuthorship
+        then ImportPullRequest fires
+        then merge.merger = ghost
+        then held.content = on_merge
+        then held.external_name = "carol-gh"
+        then merge.status = merged
+
+    ends: The merge waits, under the ghost placeholder, for Carol to link
+          her GitHub login; Alice is not recorded as its merger.
 }
