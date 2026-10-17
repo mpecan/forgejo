@@ -124,6 +124,7 @@ journey BobForksAlicesRepositoryOnce {
         bob does UserForksRepository(bob, src, "notes", "Bob's copy") on RepositoryOverview
             creating fork: Repository
             where git_tags(fork) = {}
+            where git_branches(fork) = {}
         then UserForksRepository fires
         then ForkInheritsLanguageStats fires
         then fork.is_fork = true
@@ -196,7 +197,7 @@ journey TransferAwaitsTheRecipient {
 
     4. Bob accepts
         -- the repository is public, so nobody watching it loses access (access checks)
-        stipulate has_any_access(bob, repo) = true
+        stipulate has_any_access(bob, repo) = false
         stipulate has_any_access(alice, repo) = true
         bob does RecipientAcceptsTransfer(bob, offer) on IncomingTransfer
             creating redirect: RepoRedirect
@@ -381,7 +382,7 @@ journey CollaboratorsComeAndGo {
     5. Bob accepts, and his access starts now
         -- what access derives from the grant (access recalculates it)
         stipulate explicit_mode(bob, repo) = write
-        stipulate has_any_access(bob, repo) = true
+        stipulate has_any_access(bob, repo) = false
         bob does InviteeAcceptsCollaboration(bob, invite) on IncomingCollaboratorInvitation
             creating collab: Collaboration
         then InviteeAcceptsCollaboration fires
@@ -697,11 +698,21 @@ journey PullMirrorKeepsItselfCurrent {
 
     cast:
         worker:  BackgroundWorker
+        repo:    Repository
         m:       migrations/Migration
         git:     migrations/SourceProfile
         adapter: migrations/SourceAdapterProcess
     given:
         worker.queue = "mirror"
+        -- migrations reserved the record (it creates it with its Migration)
+        repo.name = "upstream"
+        repo.owner_user = alice
+        repo.owner_org = null
+        repo.status = being_migrated
+        repo.is_mirror = true
+        repo.is_empty = true
+        repo.is_archived = false
+        m.repository = repo
         git.kind = plain_git
         adapter.source_kind = plain_git
         adapter.active = true
@@ -716,15 +727,7 @@ journey PullMirrorKeepsItselfCurrent {
         m.status = running
         m.stage = finalizing
 
-    1. the importer reserves the mirror, and the migration completes it
-        stipulate is_valid_repo_name("upstream") = true
-        stipulate repository_name_free(alice, "upstream") = true
-        stipulate within_creation_limit(alice) = true
-        worker does ImportReservesRepository(alice, alice, "upstream", "", false, true, "https://example.org/upstream.git") on RepositoryIntegrations
-            creating repo: Repository
-        then repo.status = being_migrated
-        then repo.is_mirror = true
-        stipulate m.repository = repo
+    1. the migration completes the reserved mirror
         -- the remote has no tags yet
         stipulate git_tags(repo) = {}
         -- a plain git import brings no issues, and the indexers find no
@@ -763,6 +766,7 @@ journey PullMirrorKeepsItselfCurrent {
         then mirror.sync_state = queued
 
     5. and this time it succeeds
+        stipulate git_branches(repo) = {}
         worker does PullMirrorFetchSucceeded(worker, mirror, true) on RepositoryWorkers
         then mirror.sync_state = idle
         then repo.is_empty = false
@@ -823,7 +827,7 @@ journey AFailingPullMirrorPausesUntilSynced {
     5. Alice syncs it now
         stipulate can_write_code(alice, repo) = true
         stipulate repo.owner = alice
-        stipulate within_repo_quota(alice) = true
+        stipulate within_git_quota(alice) = true
         alice does WriterRequestsMirrorSync(alice, mirror) on RepositoryOverview
         then mirror.sync_state = queued
         then mirror.health = healthy
@@ -831,6 +835,7 @@ journey AFailingPullMirrorPausesUntilSynced {
     6. and the fetch succeeds
         -- the remote has no tags
         stipulate git_tags(repo) = {}
+        stipulate git_branches(repo) = {}
         worker does PullMirrorFetchSucceeded(worker, mirror, true) on RepositoryWorkers
         then mirror.consecutive_failures = 0
         then mirror.last_error = null
@@ -867,7 +872,7 @@ journey MirrorSettingsAreGuarded {
     3. Alice asks for one
         stipulate can_write_code(alice, repo) = true
         stipulate repo.owner = alice
-        stipulate within_repo_quota(alice) = true
+        stipulate within_git_quota(alice) = true
         alice does WriterRequestsMirrorSync(alice, mirror) on RepositoryOverview
         then mirror.sync_state = queued
 
@@ -1083,4 +1088,159 @@ journey AMirrorSyncMovesABranch {
         then MirrorBranchUpdateIsAPush fires
 
     ends: Everyone who reacts to pushes saw main move, attributed to alice.
+}
+
+-- A block reaches the blocker's repositories: the blocked user stops watching and
+-- collaborating, and a transfer they offered the blocker is withdrawn.
+journey ABlockEndsCollaborationAndWatching {
+    goal: Bob collaborates on and watches Alice's repository and has offered her his own.
+          Alice blocks him: he is no longer a collaborator, no longer watches, and his
+          transfer offer is gone, so his repository is ready again.
+
+    cast:
+        repo:   Repository
+        mine:   Repository
+        collab: Collaboration
+        watch:  Watch
+        offer:  RepoTransfer
+    given:
+        repo.owner_user = alice
+        repo.owner_org = null
+        repo.status = ready
+        collab.repository = repo
+        collab.user = bob
+        collab.access_mode = write
+        watch.repository = repo
+        watch.user = bob
+        watch.source = explicit
+        watch.watch_issues = true
+        watch.watch_pull_requests = true
+        watch.watch_releases = true
+        mine.owner_user = bob
+        mine.owner_org = null
+        mine.status = pending_transfer
+        offer.repository = mine
+        offer.doer = bob
+        offer.recipient_user = alice
+        offer.recipient_org = null
+
+    1. Alice blocks Bob
+        -- with the collaboration gone, nothing else gives Bob access to the repository
+        stipulate has_any_access(bob, repo) = false
+        alice does UserBlocksUser(alice, bob) on UserProfile
+        then BlockedUserLeavesBlockersRepositories fires
+        then collab does not exist
+        then watch.watch_issues = false
+        then watch.watch_releases = false
+        then offer does not exist
+        then mine.status = ready
+
+    ends: Bob keeps nothing on Alice's repositories.
+}
+
+-- Read-only mode refuses repository writes, and reading goes on.
+-- decided: administration 3
+journey ReadOnlyModeRefusesRepositoryWrites {
+    goal: The instance is in read-only mode. Bob can still open Alice's repository but cannot
+          star it, and Alice cannot create a repository.
+
+    cast:
+        repo: Repository
+        gate: access/InstanceWriteGate
+    given:
+        repo.owner_user = alice
+        repo.owner_org = null
+        gate.read_only = true
+
+    1. Bob reads but cannot star
+        stipulate can_see_repository(bob, repo) = true
+        bob does UserViewsRepository(bob, repo) on RepositoryOverview
+        then UserViewsRepository fires
+        bob cannot do UserStarsRepository(bob, repo) on RepositoryOverview
+
+    2. Alice cannot create a repository
+        stipulate is_valid_repo_name("later") = true
+        stipulate within_creation_limit(alice) = true
+        stipulate within_repo_quota(alice) = true
+        alice cannot do UserCreatesRepository(alice, "later", "", false, false, false, sha1) on RepositoryCreation
+
+    ends: Nothing changed while the instance was read-only.
+}
+
+-- A manual pull-mirror sync is gated by the owner's git quota, like a push.
+-- decided: quota 6
+journey AManualMirrorSyncNeedsGitQuota {
+    goal: Alice's mirror is idle, but she is over her size:git:all quota: "Synchronise now"
+          is refused.
+
+    cast:
+        repo:   Repository
+        mirror: Mirror
+    given:
+        repo.owner_user = alice
+        repo.owner_org = null
+        repo.is_mirror = true
+        repo.is_archived = false
+        mirror.repository = repo
+        mirror.sync_state = idle
+        mirror.health = healthy
+
+    1. she asks for a sync
+        stipulate can_write_code(alice, repo) = true
+        stipulate repo.owner = alice
+        stipulate within_git_quota(alice) = false
+        alice cannot do WriterRequestsMirrorSync(alice, mirror) on RepositoryOverview
+
+    ends: The mirror stays idle until she has room.
+}
+
+-- Deleting the wiki's data switches the wiki unit off.
+journey DeletingTheWikiSwitchesItsUnitOff {
+    goal: Alice deletes all wiki data of her repository; the wiki unit is no longer enabled.
+
+    cast:
+        repo:      Repository
+        repo_wiki: wiki/Wiki
+        unit:      RepoUnit
+    given:
+        repo.owner_user = alice
+        repo.owner_org = null
+        repo_wiki.repository = repo
+        repo_wiki.status = initialised
+        unit.repository = repo
+        unit.kind = wiki
+        unit.enabled = true
+
+    1. she deletes the wiki data
+        stipulate can_admin_repository(alice, repo) = true
+        stipulate repository_full_name(repo) = "alice/notes"
+        alice does AdminDeletesWiki(alice, repo_wiki, "alice/notes") on WikiAdministration
+        then WikiUnitOffWhenWikiDeleted fires
+        then unit.enabled = false
+
+    ends: The repository has no wiki unit enabled.
+}
+
+-- Purging an account takes its repositories with it.
+journey APurgedAccountLosesItsRepositories {
+    goal: An admin purges Bob's account; his repository is deleted with the usual cascade.
+
+    cast:
+        root: accounts/User
+        box:  Repository
+    given:
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+        box.owner_user = bob
+        box.owner_org = null
+        box.fork_of = null
+
+    1. the purge starts
+        stipulate accounts/purge_steps_complete(bob) = false
+        root does AdminDeletesUser(root, bob, true) on AdminUserAccount
+        then DeleteRepositoriesOfPurgedUser fires
+        then box does not exist
+
+    ends: Bob owns no repository.
 }
