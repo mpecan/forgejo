@@ -1,0 +1,783 @@
+-- Journeys through project boards: creating them, shaping their columns,
+-- putting issues on them and moving cards about, and who is refused.
+
+world {
+    cast:
+        ada:   accounts/User
+        bob:   accounts/User
+        repo:  repositories/Repository
+        org:   organizations/Organization
+    given:
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.kind = individual
+        bob.is_active = true
+        bob.prohibit_login = false
+        bob.kind = individual
+        repo.is_archived = false
+}
+
+-- A repository writer starts a kanban board and gets the template's columns.
+journey WriterStartsAKanbanBoard {
+    goal: Ada maintains a repository and wants a board to track work. She picks
+          the basic kanban template and the board arrives with its columns.
+
+    1. ada creates a board from the basic kanban template
+        stipulate can_write_projects(ada, repo) = true
+        stipulate length("Roadmap") = 7
+        ada does UserCreatesRepositoryProject(ada, repo, "Roadmap", "Q3 work", basic_kanban, text_only) on RepositoryProjectList
+            creating board: Project
+        then UserCreatesRepositoryProject fires
+        then SeedColumnsFromTemplate fires
+        then board.status = open
+        then board.owner_kind = repository
+        then board.template = basic_kanban
+
+    2. she sees the board's title on its page
+        ada sees board.title on ProjectBoard in board
+
+    ends: An open repository board exists, seeded with Backlog (default) and
+          the configured kanban columns.
+}
+
+-- A reader cannot create boards.
+journey ReaderCannotCreateABoard {
+    goal: Bob can read the repository but has no write access to its projects
+          unit; the create action is refused.
+
+    1. bob tries to create a board
+        stipulate can_write_projects(bob, repo) = false
+        stipulate length("Mine") = 4
+        bob cannot do UserCreatesRepositoryProject(bob, repo, "Mine", "", none, text_only) on RepositoryProjectList
+
+    ends: No board was created.
+}
+
+-- Boards cannot be created in an archived repository.
+journey ArchivedRepositoryRefusesNewBoards {
+    goal: Even a writer cannot add boards once the repository is archived.
+
+    given:
+        repo.is_archived = true
+
+    1. ada tries to create a board in the archived repository
+        stipulate can_write_projects(ada, repo) = true
+        stipulate length("Late") = 4
+        ada cannot do UserCreatesRepositoryProject(ada, repo, "Late", "", none, text_only) on RepositoryProjectList
+
+    ends: The archived repository has no new board.
+}
+
+-- A user board on one's own profile; an organization board needs team write.
+journey PersonalAndOrganizationBoards {
+    goal: Ada keeps a personal board on her profile. Bob, who has no write on
+          the organization's projects unit, cannot add one to the organization.
+
+    1. ada creates a personal board
+        stipulate length("Reading list") = 12
+        ada does UserCreatesUserProject(ada, "Reading list", "", none, text_only) on UserProjectList
+            creating mine: Project
+        then mine.owner_kind = individual
+        then mine.owner_user = ada
+
+    2. bob is refused an organization board
+        stipulate can_write_org_projects(bob, org) = false
+        stipulate length("Ops") = 3
+        bob cannot do UserCreatesOrgProject(bob, org, "Ops", "", bug_triage, text_only) on OrgProjectList
+
+    3. ada, an org owner, creates one
+        stipulate can_write_org_projects(ada, org) = true
+        ada does UserCreatesOrgProject(ada, org, "Ops", "", bug_triage, images_and_text) on OrgProjectList
+            creating ops: Project
+        then ops.owner_kind = organization
+        then SeedColumnsFromTemplate fires
+
+    ends: One personal board and one organization board exist; Bob made none.
+}
+
+-- Closing and reopening a board.
+journey CloseThenReopen {
+    goal: When a milestone ships Ada closes its board, and reopens it later.
+
+    cast:
+        board: Project
+    given:
+        board.owner_kind = repository
+        board.owner_repository = repo
+        board.status = open
+
+    1. she closes it
+        stipulate may_manage(ada, board) = true
+        ada does UserClosesProject(ada, board) on ProjectBoard
+        then board.status = closed
+
+    2. closing it twice is refused
+        ada cannot do UserClosesProject(ada, board) on ProjectBoard
+
+    3. she reopens it
+        ada does UserReopensProject(ada, board) on ProjectBoard
+        then board.status = open
+
+    ends: The board is open again; its cards were never touched.
+}
+
+-- Someone without management rights cannot change a board.
+journey NonManagerCannotTouchTheBoard {
+    goal: Bob can see Ada's repository board but cannot close or delete it.
+
+    cast:
+        board: Project
+    given:
+        board.owner_kind = repository
+        board.owner_repository = repo
+        board.status = open
+
+    1. bob tries to close it
+        stipulate may_manage(bob, board) = false
+        bob cannot do UserClosesProject(bob, board) on ProjectBoard
+
+    2. bob tries to delete it
+        bob cannot do UserDeletesProject(bob, board) on ProjectBoard
+
+    ends: The board is unchanged.
+}
+
+-- Columns: the first is the default, the default cannot be deleted, and a
+-- deleted column's cards fall into the default.
+journey ShapingColumns {
+    goal: Ada builds columns on an empty board, moves the default, and removes
+          a column without losing its cards.
+
+    cast:
+        board: Project
+    given:
+        board.owner_kind = repository
+        board.owner_repository = repo
+        board.status = open
+        board.template = none
+
+    1. the first column becomes the default
+        stipulate may_manage(ada, board) = true
+        stipulate board.has_room_for_column = true
+        stipulate length("Todo") = 4
+        ada does UserCreatesColumn(ada, board, "Todo", null) on ProjectBoard
+            creating todo: ProjectColumn
+        then todo.is_default = true
+        then todo.position = 0
+
+    2. a second column is not the default
+        stipulate length("Doing") = 5
+        stipulate is_hex_colour("#00ff00") = true
+        ada does UserCreatesColumn(ada, board, "Doing", "#00ff00") on ProjectBoard
+            creating doing: ProjectColumn
+        then doing.is_default = false
+
+    3. she makes the second column the default
+        ada does UserSetsDefaultColumn(ada, doing) on ProjectBoard
+        then doing.is_default = true
+        then todo.is_default = false
+
+    4. the default column cannot be deleted
+        ada cannot do UserDeletesColumn(ada, doing) on ProjectBoard
+
+    5. the other one can
+        ada does UserDeletesColumn(ada, todo) on ProjectBoard
+        then todo does not exist
+
+    ends: The board has one column, the default.
+}
+
+-- The column cap.
+journey ColumnLimitReached {
+    goal: A board already holding the maximum number of columns refuses more.
+
+    cast:
+        board: Project
+    given:
+        board.owner_kind = repository
+        board.owner_repository = repo
+
+    1. a further column is refused
+        stipulate may_manage(ada, board) = true
+        stipulate board.has_room_for_column = false
+        stipulate length("One more") = 8
+        ada cannot do UserCreatesColumn(ada, board, "One more", null) on ProjectBoard
+
+    ends: The board still has the maximum number of columns.
+}
+
+-- From the issue side: put an issue on a board, then move it to another.
+journey IssueGoesOntoABoardAndMoves {
+    goal: Ada triages an issue onto the roadmap board and later moves it to
+          the bugs board; an issue lives on one board at a time.
+
+    cast:
+        bug:     issues/Issue
+        roadmap: Project
+        bugs:    Project
+        backlog: ProjectColumn
+    given:
+        bug.repository = repo
+        bug.is_pull = false
+        roadmap.owner_kind = repository
+        roadmap.owner_repository = repo
+        roadmap.status = open
+        bugs.owner_kind = repository
+        bugs.owner_repository = repo
+        bugs.status = open
+        backlog.project = bugs
+        backlog.is_default = true
+        backlog.position = 0
+
+    1. she puts the issue on the roadmap board, which has no columns yet
+        stipulate may_write_issue(ada, bug) = true
+        stipulate may_assign_to(ada, bug, roadmap) = true
+        stipulate roadmap.accepts_issue(bug) = true
+        ada does UserAssignsIssueToProject(ada, bug, roadmap) on IssueProjectPicker
+            creating card: ProjectCard
+            creating entry: issues/Comment
+        then UserAssignsIssueToProject fires
+        then card.project = roadmap
+        then RecordProjectChange fires
+        then entry.kind = project
+        then entry.project = roadmap
+        then entry.old_project = null
+
+    2. she moves it to the bugs board
+        stipulate may_assign_to(ada, bug, bugs) = true
+        stipulate bugs.accepts_issue(bug) = true
+        ada does UserAssignsIssueToProject(ada, bug, bugs) on IssueProjectPicker
+            creating moved: ProjectCard
+        then moved.project = bugs
+        then moved.column = backlog
+        then card does not exist
+
+    3. she takes it off the board
+        ada does UserRemovesIssueFromProject(ada, bug) on IssueProjectPicker
+        then moved does not exist
+
+    ends: The issue is on no board; its timeline records three project changes.
+}
+
+-- Only issue writers can put issues on boards.
+journey IssueReaderCannotAssignABoard {
+    goal: Bob can read the issue but cannot write issues in the repository.
+
+    cast:
+        bug:   issues/Issue
+        board: Project
+    given:
+        bug.repository = repo
+        board.owner_kind = repository
+        board.owner_repository = repo
+
+    1. bob tries to put the issue on the board
+        stipulate may_write_issue(bob, bug) = false
+        bob cannot do UserAssignsIssueToProject(bob, bug, board) on IssueProjectPicker
+
+    ends: The issue is not on the board.
+}
+
+-- Dragging cards between columns.
+journey DragCardsAcrossColumns {
+    goal: Ada drags a card from Todo to Done on her board.
+
+    cast:
+        bug:   issues/Issue
+        board: Project
+        todo:  ProjectColumn
+        done:  ProjectColumn
+        card:  ProjectCard
+    given:
+        bug.repository = repo
+        board.owner_kind = repository
+        board.owner_repository = repo
+        todo.project = board
+        todo.is_default = true
+        todo.position = 0
+        done.project = board
+        done.is_default = false
+        done.position = 1
+        card.project = board
+        card.column = todo
+        card.issue = bug
+        card.position = 0
+
+    1. she drops the card into Done
+        stipulate may_manage(ada, board) = true
+        stipulate may_see_card(ada, card) = true
+        stipulate distinct({card}) = true
+        stipulate index_of({card}, card) = 0
+        ada does UserMovesCards(ada, done, {card}) on ProjectBoard
+        then UserMovesCards fires
+        then card.column = done
+        then card.position = 0
+
+    ends: The card sits at the top of Done.
+}
+
+-- Cards are filtered per viewer.
+journey CardsFromPrivateRepositoriesStayHidden {
+    goal: An organization board holds an issue from a private repository. Ada,
+          who can read it, sees the card; Bob, who cannot, does not.
+
+    cast:
+        secret: issues/Issue
+        board:  Project
+        col:    ProjectColumn
+        card:   ProjectCard
+    given:
+        board.owner_kind = organization
+        board.owner_org = org
+        col.project = board
+        col.is_default = true
+        card.project = board
+        card.column = col
+        card.issue = secret
+
+    1. ada sees the card's title
+        stipulate may_see_card(ada, card) = true
+        ada sees card.issue.title on ProjectBoard in board
+
+    2. bob does not
+        stipulate may_see_card(bob, card) = false
+        bob cannot see card.issue.title on ProjectBoard in board
+
+    ends: The board looks different to each of them, and neither is told why.
+}
+
+-- Deleting a board removes its columns and cards, not the issues.
+journey DeletingABoard {
+    goal: Ada deletes an obsolete board.
+
+    cast:
+        bug:   issues/Issue
+        board: Project
+        col:   ProjectColumn
+        card:  ProjectCard
+    given:
+        board.owner_kind = repository
+        board.owner_repository = repo
+        col.project = board
+        col.is_default = true
+        card.project = board
+        card.column = col
+        card.issue = bug
+
+    1. she deletes it
+        stipulate may_manage(ada, board) = true
+        ada does UserDeletesProject(ada, board) on ProjectBoard
+        then board does not exist
+        then col does not exist
+        then card does not exist
+        then bug exists
+
+    ends: The issue survives; the board, its column and its card are gone.
+}
+
+-- Editing a closed owner board keeps it closed, and an empty description
+-- clears the old one. Decisions 1 and 2.
+journey EditingAClosedBoardKeepsItClosed {
+    goal: Ada closed her personal board. She tidies its title and empties its
+          description; the board stays closed and the description is gone.
+          When she reopens it, it no longer carries a closing time.
+
+    cast:
+        board: Project
+    given:
+        board.owner_kind = individual
+        board.owner_user = ada
+        board.status = closed
+        board.description = "Old notes"
+
+    1. she edits the closed board with an empty description
+        stipulate may_manage(ada, board) = true
+        stipulate length("Reading") = 7
+        ada does UserEditsProject(ada, board, "Reading", "", text_only) on ProjectBoard
+        then board.status = closed
+        then board.description = ""
+        then board.title = "Reading"
+
+    2. she reopens it and the closing time is cleared
+        ada does UserReopensProject(ada, board) on ProjectBoard
+        then board.status = open
+        then board.closed_at = null
+
+    ends: The board is open, retitled, with no description and no closed_at.
+}
+
+-- The global switch turns off every kind of board. Decision 3.
+journey GlobalSwitchDisablesOwnerBoards {
+    goal: The instance disables the projects unit. Ada can no longer start a
+          personal board or an organization board, not only repository ones.
+
+    given:
+        config.projects_globally_disabled = true
+
+    1. a personal board is refused
+        stipulate length("Reading list") = 12
+        ada cannot do UserCreatesUserProject(ada, "Reading list", "", none, text_only) on UserProjectList
+
+    2. an organization board is refused even for an org owner
+        stipulate can_write_org_projects(ada, org) = true
+        stipulate length("Ops") = 3
+        ada cannot do UserCreatesOrgProject(ada, org, "Ops", "", none, text_only) on OrgProjectList
+
+    3. a repository board is refused
+        stipulate can_write_projects(ada, repo) = true
+        stipulate length("Roadmap") = 7
+        ada cannot do UserCreatesRepositoryProject(ada, repo, "Roadmap", "", none, text_only) on RepositoryProjectList
+
+    ends: No board of any kind was created.
+}
+
+-- Organization boards need board write plus triage on the issue. Decision 4.
+journey OrgBoardNeedsBoardWriteAndTriage {
+    goal: Bob triages issues in the repository but has no write on the
+          organization's boards, so he cannot put an issue on one. Ada has both.
+
+    cast:
+        bug:   issues/Issue
+        board: Project
+    given:
+        bug.repository = repo
+        bug.is_pull = false
+        board.owner_kind = organization
+        board.owner_org = org
+        board.owner_repository = null
+        board.owner_user = null
+        board.status = open
+        repo.owner_user = null
+        repo.owner_org = org
+
+    1. bob, a triager without board write, is refused
+        stipulate may_write_issue(bob, bug) = true
+        stipulate board.accepts_issue(bug) = true
+        stipulate can_write_org_projects(bob, org) = false
+        stipulate may_assign_to(bob, bug, board) = true
+        bob cannot do UserAssignsIssueToProject(bob, bug, board) on IssueProjectPicker
+
+    2. ada, with board write and triage, puts it on the board
+        stipulate may_write_issue(ada, bug) = true
+        stipulate can_write_org_projects(ada, org) = true
+        stipulate may_assign_to(ada, bug, board) = true
+        ada does UserAssignsIssueToProject(ada, bug, board) on IssueProjectPicker
+            creating card: ProjectCard
+        then card.project = board
+
+    ends: The issue is on the organization board, put there by Ada.
+}
+
+-- A closed board accepts no new cards; its existing cards still move. Decision 7.
+journey ClosedBoardTakesNoNewCards {
+    goal: The release board is closed. Ada cannot add another issue to it, but
+          she can still tidy the cards already there.
+
+    cast:
+        bug:   issues/Issue
+        later: issues/Issue
+        board: Project
+        todo:  ProjectColumn
+        done:  ProjectColumn
+        card:  ProjectCard
+    given:
+        bug.repository = repo
+        later.repository = repo
+        later.is_pull = false
+        board.owner_kind = repository
+        board.owner_repository = repo
+        board.status = closed
+        todo.project = board
+        todo.is_default = true
+        todo.position = 0
+        done.project = board
+        done.is_default = false
+        done.position = 1
+        card.project = board
+        card.column = todo
+        card.issue = bug
+        card.position = 0
+
+    1. a new issue cannot go on the closed board
+        stipulate may_write_issue(ada, later) = true
+        stipulate board.accepts_issue(later) = true
+        stipulate may_assign_to(ada, later, board) = true
+        ada cannot do UserAssignsIssueToProject(ada, later, board) on IssueProjectPicker
+
+    2. an existing card still moves
+        stipulate may_manage(ada, board) = true
+        stipulate may_see_card(ada, card) = true
+        stipulate distinct({card}) = true
+        stipulate index_of({card}, card) = 0
+        ada does UserMovesCards(ada, done, {card}) on ProjectBoard
+        then card.column = done
+
+    ends: The closed board has only the card it had, now in Done.
+}
+
+-- A reorder moves only the cards whose issue the actor can read. Decision 11.
+journey ReorderSkipsUnreadableCards {
+    goal: An organization board holds an issue from a private repository Ada
+          cannot read. Her drag lists that card too, but only her readable card
+          moves.
+
+    cast:
+        mine:    issues/Issue
+        secret:  issues/Issue
+        board:   Project
+        todo:    ProjectColumn
+        done:    ProjectColumn
+        visible: ProjectCard
+        hidden:  ProjectCard
+    given:
+        board.owner_kind = organization
+        board.owner_org = org
+        todo.project = board
+        todo.is_default = true
+        todo.position = 0
+        done.project = board
+        done.is_default = false
+        done.position = 1
+        visible.project = board
+        visible.column = todo
+        visible.issue = mine
+        visible.position = 0
+        hidden.project = board
+        hidden.column = todo
+        hidden.issue = secret
+        hidden.position = 1
+
+    1. she drags both into Done; only hers moves
+        stipulate may_manage(ada, board) = true
+        stipulate may_see_card(ada, visible) = true
+        stipulate may_see_card(ada, hidden) = false
+        stipulate distinct({visible, hidden}) = true
+        stipulate index_of({visible}, visible) = 0
+        ada does UserMovesCards(ada, done, {visible, hidden}) on ProjectBoard
+        then visible.column = done
+        then visible.position = 0
+        then hidden.column = todo
+
+    ends: The card she cannot read stayed where it was.
+}
+
+-- Boards go with their owner. Decision 5.
+journey DeletingAnOrganizationDeletesItsBoards {
+    goal: Ada deletes an empty organization; its board, columns and cards go
+          with it, while the issue on the board survives.
+
+    cast:
+        bug:   issues/Issue
+        board: Project
+        col:   ProjectColumn
+        card:  ProjectCard
+    given:
+        org.name = "acme"
+        board.owner_kind = organization
+        board.owner_org = org
+        col.project = board
+        col.is_default = true
+        card.project = board
+        card.column = col
+        card.issue = bug
+
+    1. she deletes the organization
+        stipulate is_org_owner(org, ada) = true
+        stipulate owned_repository_count(org) = 0
+        stipulate owned_package_count(org) = 0
+        ada does OwnerDeletesOrganization(ada, org, "acme") on OrganizationSettings
+        then OrganizationDeletionRemovesProjects fires
+        then board does not exist
+        then col does not exist
+        then card does not exist
+        then bug exists
+
+    ends: No board is left behind without an owner.
+}
+
+journey DeletingAnAccountDeletesItsBoards {
+    goal: Bob deletes his account; the personal board on his profile goes too.
+
+    cast:
+        board: Project
+        col:   ProjectColumn
+    given:
+        bob.is_admin = false
+        repo.status = ready
+        board.owner_kind = individual
+        board.owner_user = bob
+        col.project = board
+        col.is_default = true
+
+    1. he deletes his account
+        stipulate owns_repositories(bob) = false
+        stipulate belongs_to_organizations(bob) = false
+        stipulate owns_packages(bob) = false
+        stipulate deletion_disabled_for(bob) = false
+        stipulate password_matches(bob, "my password") = true
+        bob does UserDeletesOwnAccount(bob, "my password") on OwnAccountSettings
+        then UserDeletionRemovesProjects fires
+        then board does not exist
+        then col does not exist
+
+    ends: Bob's board went with him.
+}
+
+-- Moving a repository takes its issues off the old owner's boards. Decision 6.
+journey TransferTakesIssuesOffTheOldOwnersBoards {
+    goal: Ada keeps a personal board with an issue from her repository, and the
+          repository's own board with the same kind of card. She gives the
+          repository to Bob: the card on her personal board goes, the card on
+          the repository's own board stays.
+
+    cast:
+        bug:      issues/Issue
+        task:     issues/Issue
+        personal: Project
+        own:      Project
+        pcol:     ProjectColumn
+        rcol:     ProjectColumn
+        pcard:    ProjectCard
+        rcard:    ProjectCard
+    given:
+        ada.is_admin = false
+        bob.is_admin = false
+        repo.name = "notes"
+        repo.owner_user = ada
+        repo.owner_org = null
+        repo.status = ready
+        repo.is_private = false
+        bug.repository = repo
+        bug.assignees = {}
+        task.repository = repo
+        task.assignees = {}
+        personal.owner_kind = individual
+        personal.owner_user = ada
+        own.owner_kind = repository
+        own.owner_repository = repo
+        pcol.project = personal
+        pcol.is_default = true
+        rcol.project = own
+        rcol.is_default = true
+        pcard.project = personal
+        pcard.column = pcol
+        pcard.issue = bug
+        rcard.project = own
+        rcard.column = rcol
+        rcard.issue = task
+
+    1. ada offers the repository to bob
+        stipulate is_repo_owner(ada, repo) = true
+        stipulate is_blocked(bob, ada) = false
+        stipulate repository_name_free(bob, "notes") = true
+        stipulate within_repo_quota(bob) = true
+        stipulate within_creation_limit(bob) = true
+        stipulate can_see_repository(bob, repo) = true
+        ada does OwnerTransfersRepositoryToUser(ada, repo, bob) on RepositoryDangerZone
+            creating offer: repositories/RepoTransfer
+            where transfer_recipients(offer) = {bob}
+
+    2. bob accepts and the card leaves ada's personal board
+        stipulate has_any_access(bob, repo) = true
+        stipulate has_any_access(ada, repo) = true
+        bob does RecipientAcceptsTransfer(bob, offer) on IncomingTransfer
+        then RepositoryTransferRemovesOwnerBoardCards fires
+        then repo.owner_user = bob
+        then pcard does not exist
+        then rcard exists
+        then bug exists
+
+    ends: Ada's board no longer holds an issue it cannot accept; the
+          repository's own board moved with the repository.
+}
+
+-- The new-issue form may name a board; issues hands the new issue over and the
+-- card lands in the board's default column, with a timeline entry. A closed
+-- board named in the form is dropped with the rest of the metadata.
+-- decided: projects 7 (a closed board accepts no new cards)
+journey NewIssueLandsOnTheChosenBoard {
+    goal: Ada triages the repository. She opens an issue and picks the open
+          roadmap board in the form: the issue arrives as a card in the
+          roadmap's default column and its timeline says so. Picking the
+          closed release board instead puts the next issue on no board.
+
+    cast:
+        roadmap: Project
+        release: Project
+        todo:    ProjectColumn
+    given:
+        roadmap.owner_kind = repository
+        roadmap.owner_repository = repo
+        roadmap.status = open
+        release.owner_kind = repository
+        release.owner_repository = repo
+        release.status = closed
+        todo.project = roadmap
+        todo.is_default = true
+        todo.position = 0
+
+    1. she opens an issue onto the roadmap board
+        stipulate can_read_tracker(ada, repo) = true
+        stipulate can_manage_tracker(ada, repo) = true
+        stipulate is_blocked_by_owner(repo, ada) = false
+        stipulate trim("Plan v2") = "Plan v2"
+        stipulate length("Plan v2") = 7
+        stipulate next_issue_index(repo) = 1
+        stipulate all_assignable({}, repo) = true
+        stipulate resolve_mentions_in(repo, ada, "Scope") = {}
+        stipulate cross_references(repo, ada, "Plan v2", "Scope") = {}
+        stipulate labels_usable_in({}, repo) = {}
+        stipulate without_scope_duplicates({}) = {}
+        ada does UserOpensIssue(ada, repo, "Plan v2", "Scope", {}, null, {}, null, roadmap, {}, null) on IssueTracker
+            creating issue: issues/Issue
+            where issue_notification_audience(issue, ada) = {}
+            creating card: ProjectCard
+            creating entry: issues/Comment
+        then IssueCreatedOnProject fires
+        then card.issue = issue
+        then card.column = todo
+        then entry.kind = project
+        then entry.project = roadmap
+
+    2. the closed board is not offered a card
+        stipulate trim("Ship it") = "Ship it"
+        stipulate length("Ship it") = 7
+        stipulate next_issue_index(repo) = 2
+        stipulate resolve_mentions_in(repo, ada, "Notes") = {}
+        stipulate cross_references(repo, ada, "Ship it", "Notes") = {}
+        ada does UserOpensIssue(ada, repo, "Ship it", "Notes", {}, null, {}, null, release, {}, null) on IssueTracker
+            creating later: issues/Issue
+            where issue_notification_audience(later, ada) = {}
+        then later.index = 2
+        then IssueCreatedOnProject does not fire
+
+    ends: Issue #1 is on the roadmap board; issue #2 is on no board.
+}
+
+-- Maintenance (read-only) mode refuses board changes.
+-- decided: administration 3 (every write is refused while read-only)
+journey ReadOnlyModeFreezesBoards {
+    goal: While the instance is read-only, Ada can still look at her board but
+          cannot add a column to it.
+
+    cast:
+        board: Project
+        gate:  access/InstanceWriteGate
+    given:
+        board.owner_kind = repository
+        board.owner_repository = repo
+        board.status = open
+        board.title = "Roadmap"
+        gate.read_only = true
+
+    1. she still sees the board
+        ada sees board.title on ProjectBoard in board
+
+    2. but cannot add a column while the instance is read-only
+        stipulate may_manage(ada, board) = true
+        stipulate board.has_room_for_column = true
+        stipulate length("Later") = 5
+        ada cannot do UserCreatesColumn(ada, board, "Later", null) on ProjectBoard
+
+    ends: The board is unchanged.
+}

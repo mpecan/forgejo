@@ -1,0 +1,2471 @@
+-- allium: 3
+-- pulls.allium — pull requests: proposing a head branch for a base branch, checking it, reviewing it and merging it.
+--
+-- Scope: the lifecycle of a pull request from opening (same repository, from a
+--   fork, or by an AGit `refs/for/` push) through mergeability checking, head and
+--   base updates, review and review requests, code conversations and suggested
+--   changes, merge preconditions (repository merge settings and branch
+--   protection), merging in every style, scheduled auto-merge, closing,
+--   reopening, retargeting and head-branch cleanup.
+-- Includes: PullRequest, Review, ReviewRequest, CodeConversation, ReviewComment,
+--   AutoMerge, FileViewState, CodeOwnerRule; the MergeStyle and UpdateStyle
+--   enums; mergeability checking; merge-message composition; CODEOWNERS
+--   auto-requests; maintainer edits on fork pull requests.
+-- Excludes:
+--   - The conversation half of a pull request (title, description, labels,
+--     milestone, assignees, deadline, lock, pin, reactions, plain timeline
+--     comments, subscriptions, time tracking, dependencies): owned by issues.
+--     Pinning a pull request is issues/IssuePin. issues closes the
+--     conversation on PullRequestMerged and applies closing keywords; this
+--     module sets `issue.status` for PR-specific close/reopen (with guards) and
+--     creates the pulls-owned timeline Comment kinds.
+--   - The pull-request unit settings of a repository (allowed merge styles,
+--     autodetect manual merge, allow rebase update, defaults): owned by
+--     repositories (RepoUnit.pull_request_settings); read here through
+--     merge_style_allowed() and autodetects_manual_merge().
+--   - Branch protection rule management (create/edit/delete rules, push
+--     allowlists, protected-file rejection on push): owned by code. This module
+--     only reads the merge-related fields of code/ProtectedBranch.
+--   - Commit statuses and their reporting API: owned by code (CommitStatus);
+--     read here through required_status_checks_pass().
+--   - Git transport, pre/post-receive hooks and AGit parsing of push options as
+--     transport: owned by code; this module owns what an AGit push *does* to a
+--     pull request (open or update) and the pull-ref push rules.
+--   - Signing keys and the merge signing policy (`[repository.signing] MERGES`):
+--     owned by keys; read here through merge_signing_satisfied().
+--   - Actions trust decisions for fork pull requests ("approve workflows",
+--     trust poster): owned by actions.
+--   - Git notes on pull-request commits (`/pulls/{index}/commits/{sha}/notes`):
+--     a commit concern owned by code.
+--   - Compare view for arbitrary refs (`/compare/a...b` without opening a PR)
+--     and diff rendering options (split/unified, whitespace, file tree, image
+--     and CSV diff, blob excerpts): presentation, owned by code/discovery. Only
+--     the behaviour-relevant diff limits are kept as config here.
+--   - LFS object propagation on merge/update: storage plumbing.
+--   - The merge-check and auto-merge queues, their restart re-queueing
+--     (`InitializePullRequests`) and the per-PR working lock: infrastructure;
+--     the spec models the check as an asynchronous step (check_requested_at).
+--   - Import of pull requests and reviews from other forges, and the
+--     "originally by" / "merged by <name> on <source>" attribution of imported
+--     content: the migrations addon (migrations/ImportPullRequest,
+--     ImportReview, ExternalAuthorship). An imported pull request is created
+--     already `merged` (with its original merge time, commit and merger) or
+--     `checking` with a check queued, and is then checked like any other.
+--     Gitea "PullRequestType": legacy, not behaviour.
+--   - Notifications, mail, webhooks, activity feed entries: reacted to by those
+--     modules from the triggers below.
+--
+-- Emits:
+--   PullRequestOpened(pull_request)
+--   PullRequestSynchronized(pull_request, doer, deploy_key) -- head moved (webhook "synchronized", actions);
+--                                                      -- deploy_key set (doer null) for a deploy-key push
+--   PullRequestHeadUpdated(pull_request, pusher, old_commit_sha, new_commit_sha, is_force_push)
+--                                                      -- the "pushed commits" timeline entry (notifications)
+--   PullRequestTargetBranchChanged(pull_request, doer, old_base_branch)
+--   PullRequestClosed(pull_request, doer)              -- doer is null when a repository deletion closed it
+--   PullRequestReopened(pull_request, doer)
+--   PullRequestReadyForReview(pull_request, doer)      -- WIP prefix removed from the title
+--   PullRequestBranchUpdated(pull_request, doer, style) -- head updated from base ("update branch")
+--   PullRequestMerged(pull_request, merger)            -- also for manual merges; style in pull_request.merge_style
+--                                                      -- issues closes the conversation and applies closing keywords
+--   PullRequestAutoMerged(pull_request, merger)        -- emitted together with PullRequestMerged
+--   AutoMergeScheduled(pull_request, doer) / AutoMergeCancelled(pull_request, doer)
+--                                                      -- scheduled also when a schedule is replaced; cancelled also on close
+--   AutoMergeFailed(pull_request, scheduler, reason)   -- a ready auto-merge could not merge; the schedule is gone
+--                                                      -- (notifications tells the scheduler)
+--   ReviewSubmitted(review)                            -- review.pull_request; approvals re-evaluate auto-merge
+--   PullRequestCodeCommented(pull_request, comment)
+--   ReviewRequested(pull_request, requester, reviewer)
+--   ReviewRequestRemoved(pull_request, doer, reviewer)
+--   TeamReviewRequested(pull_request, requester, team) -- notified to each member except the poster
+--   TeamReviewRequestRemoved(pull_request, doer, team)
+--   ReviewDismissed(review, dismisser, message)
+--   PullRequestHeadBranchDeleted(pull_request, doer)
+--   HeadBranchDeletionRequested(user, branch)          -- code deletes the head branch as UserDeletesBranch does
+--   SuggestionsApplied(pull_request, doer, conversations)
+--   IssueClosedByPullRequest(issue, pull_request, doer)   -- per issue the merged PR closes by keyword
+--   IssueReopenedByPullRequest(issue, pull_request, doer) -- per issue the merged PR reopens by keyword
+--   ReviewCommentEdited(pull_request, comment)         -- discovery re-indexes the pull request
+--   ReviewCommentDeleted(pull_request, comment)        -- (comment is gone: identity only)
+--
+-- Reacts to:
+--   code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force, deploy_key)
+--                                       -- head pushes update PRs; base pushes re-check PRs
+--   code/AgitPullRequestRequested(repository, pusher, base_branch, head_branch, head_sha, title, description)
+--   code/AgitPullRequestHeadPushed(pull, pusher, old_sha, new_sha)
+--   code/MergePushCompleted(pull, pusher, merge_commit_sha)
+--   code/BranchDeleted(branch, by)      -- open PRs from/into the branch are closed
+--   code/BranchRenamed(repository, from_name, to_name, by)  -- unmerged PRs follow the rename
+--   code/BranchProtectionChanged(rule)  -- PRs into matching branches are re-checked
+--   code/CommitStatusCreated(status)    -- (through AutoMerge.is_ready) auto-merge re-evaluates
+--   issues/IssueTitleChanged(issue, doer, old_title)  -- WIP prefix removed => ready for review
+--   repositories/RepositoryDeleted(repository, doer)  -- PRs from its branches into other repos close
+--   accounts/UserRenamed(user, old_name, new_name)    -- AGit head branch names follow the poster
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+--                                       -- the user's auto-merge schedules, viewed-file marks,
+--                                       -- review requests and draft reviews go
+--   organizations/TeamDeleted(team, organization)     -- the team's review requests go
+--   notifications/MailReplyReceived(author, issue, replied_to, replied_to_code, body, attachment_count)
+--                                       -- a mail reply to a code comment continues that conversation
+--
+-- Offered to other modules: the PullRequestQueries contract (served by the
+-- PullRequestQueryService surface) — the lookups code, actions, discovery,
+-- notifications and keys call by local names.
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./repositories.allium" as repositories
+use "./access.allium" as access
+use "./code.allium" as code
+use "./issues.allium" as issues
+use "./notifications.allium" as notifications
+
+------------------------------------------------------------
+-- Black-box predicates and functions used below
+------------------------------------------------------------
+-- Permissions (thin local names for access semantics, so journeys can state them):
+--   can_read_pulls(user, repository)  = access/can_read(user, repository, pull_requests)
+--   can_write_pulls(user, repository) = access/can_write(user, repository, pull_requests)
+--   can_read_code(user, repository)   = access/can_read(user, repository, code)
+--   can_write_code(user, repository)  = access/can_write(user, repository, code)
+--   is_repo_admin(user, repository)   = access/is_repo_admin(user, repository)
+--   is_repository_owner(user, repository), is_collaborator(user, repository),
+--   in_team_reading_pulls(user, repository): owner / repositories/Collaboration /
+--       member of an organization team with read access to the pull-request unit
+--   is_blocked_by_owner(repository, user) = the owner (user or org) blocks user (accounts/UserBlock)
+--   is_team_member(user, team), team_has_repository(team, repository),
+--   is_organization(user), is_organization_owned(repository): organizations
+-- Repository pull-request settings (repositories/RepoUnit.pull_request_settings):
+--   merge_style_allowed(repository, style) = the matching allow_* flag
+--       (allow_merge, allow_rebase, allow_rebase_merge, allow_squash,
+--       allow_fast_forward_only, allow_manual_merge)
+--   autodetects_manual_merge(repository) = autodetect_manual_merge
+-- Branch protection (code):
+--   protection_for(repository, branch) -> code/ProtectedBranch?   first matching rule
+--   rule_matches_branch(rule, branch_name)
+--   branch_is_protected(repository, branch_name) = protection_for(...) != null
+--   required_status_checks_pass(pr): every status_check_contexts glob matches at
+--       least one commit status of the head commit and the worst matching state
+--       is success; with no contexts configured, the combined status is success
+--   team_is_official_reviewer(team, pr): with a rule, the team is on the
+--       approvals allowlist (or, allowlist disabled, has code write); without a
+--       rule, never
+-- Git (code):
+--   branch_exists(repository, name) = a live code/Branch exists
+--   head_commit_of(repository, branch), commit_in_branch(repository, branch, sha),
+--   full_commit_sha(repository, sha), commit_authored_at(repository, sha),
+--   is_force_push(repository, old_sha, new_sha), is_related_fork(head_repo, base_repo),
+--   commits_ahead_of / commits_behind_of(head_repo, head_branch, base_repo, base_branch),
+--   commits_between(...), commits_between_shas(...)
+--   merge_check_outcome(pr) -> MergeCheckOutcome, merge_base_of(pr),
+--   conflicting_files(pr), protected_files_changed(pr), merge_commit_containing(pr),
+--   manual_merge_author(pr), merge_result_commit(pr, style, message),
+--   updated_head(pr, style), suggestion_commit(pr, threads, summary, message)
+--   diff_differs(pr, old_sha, new_sha): the head-vs-base diff changed
+--   anchored_lines_changed(conversation, sha), blamed_commit(...), diff_hunk_around(...)
+--   head_equals_branch(pr, branch): the head commit equals that branch's tip
+-- Pull requests (this module):
+--   open_pull_request_exists(head_repo, head_branch, base_repo, base_branch): an open unmerged PR
+--       with that head and base exists (of the same flow as the one being opened/reopened)
+--   open_pull_requests_into(repository, branch) -> Set<PullRequest>
+--   has_other_open_pull_request_from(pr): another open PR uses the same head branch
+--   has_wip_prefix(title): title starts, case-insensitively, with one of
+--       config.work_in_progress_prefixes
+--   latest_blocking_review_of(pr, reviewer) -> Review?  (newest approve/request_changes)
+--   has_submitted_review(pr, reviewer)
+--   may_update_by_merge(user, pr), may_update_by_rebase(user, pr): see UserUpdatesPullRequestBranch
+--   suggestion_applicable(conversation, head_sha), suggestions_overlap(conversations)
+--   count_suggestions(body): number of ```suggestion blocks
+--   code_owner_users(rules, pr), code_owner_teams(rules, pr)
+--   compose_merge_message(pr, style, title, message), default_merge_message(pr, style):
+--       the title/body template is the repository's template for the style, else
+--       the instance-wide template for the style, else the built-in default
+--       (see UserMergesPullRequest guidance)
+--   repository_merge_message_template(repository, style) -> String?:
+--       .forgejo/default_merge_message/<STYLE>_TEMPLATE.md, then .gitea/..., on the
+--       default branch (read up to config.default_merge_message_size)
+--   instance_merge_message_template(style) -> String?:
+--       <custom path>/config.instance_merge_message_templates/<STYLE>_TEMPLATE.md
+--   merge_attempt_fails(pr, style, message): carrying out the merge (git work and
+--       the merge push) fails although every precondition held — conflicts found
+--       at merge time, unrelated histories, base moved, push rejected by hooks
+--   auto_merge_failure_reason(pr, scheduler, style) -> String: why a ready
+--       auto-merge could not merge (lost merge permission, style no longer
+--       allowed, signing not possible, or the merge attempt's error)
+--   rebase_update_allowed(repository): pull-request settings allow_rebase_update
+--   issues_closed_by(pr) / issues_reopened_by(pr) -> Set<issues/Issue>: the issues whose
+--       latest keyword reference from this PR (issues/Comment with ref_issue = pr.issue
+--       and ref_action closes / reopens) is a close / reopen; one entry per issue
+--   agit_head_branch / rename_agit_head_branch: "<lowercase user name>/<topic>"
+-- Elsewhere:
+--   has_open_blocking_dependencies(issue): issues dependencies enabled and an open blocker exists
+--   merge_signing_satisfied(pr, user, style): keys. Before a merge creates commits
+--       (every style but fast_forward_only and manually_merged) pulls asks keys
+--       through keys' ForgeSubsystem surface — MergeSigningRequested(actor: the
+--       merger, pull, base_verified, head_verified, all_commits_verified,
+--       has_approval) — and signs the commits as the decision's signer when
+--       SigningDecision.will_sign. The predicate holds when the decision will
+--       sign, or when the protection rule does not require signed commits (the
+--       merge then goes ahead unsigned).
+--   within_quota(repository): quota/quota_allows(<repository owner's QuotaAccount>,
+--       size_git_all, null) when quota is enabled, true otherwise. Gates:
+--       gate_merge_pull (UserMergesPullRequest, base repository),
+--       gate_update_pull (UserUpdatesPullRequestBranch, head repository — where
+--       the commits land), gate_apply_suggestion (UserAppliesSuggestions, head
+--       repository owner)
+--   mentions_in(repository, text): the users @-mentioned in text who can read the
+--       repository (issues' mention resolution)
+--   next_issue_index(repository): issues
+--   trimmed_length(text), truncate(text, n)
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The pull-request lookups other modules call (each under the same local name
+-- in the caller). Every answer is derived from current state.
+contract PullRequestQueries {
+    -- code (maintainer pushes to a fork PR's head branch): some open, unmerged
+    -- branch-flow pull request has head (repository, branch_name), its poster
+    -- allowed maintainer edits and can still write repository's code, and user
+    -- can write the code of that pull request's base repository
+    -- (PullRequest.may_push_to_head without the head-writer case). Grants push,
+    -- never deletion of the branch.
+    maintainer_edit_allows: (user: accounts/User, repository: repositories/Repository, branch_name: String) -> Boolean
+    -- code (merge push into a protected branch): PullRequest.merge_requirements_met —
+    -- required status checks, approvals, rejected reviews, official review
+    -- requests and outdated branch; protected files are code's own check.
+    merge_requirements_met: (pull: PullRequest) -> Boolean
+    -- code (AGit and refs/pull pushes): the pull request into repository whose
+    -- conversation index n is named by ref_name refs/pull/<n>/head, if any.
+    pull_by_index: (repository: repositories/Repository, ref_name: String) -> PullRequest?
+    -- PullRequest.flow = agit.
+    is_agit_pull: (pull: PullRequest) -> Boolean
+    -- PullRequest.issue.poster.
+    pull_poster: (pull: PullRequest) -> accounts/User
+    -- the open, unmerged AGit pull request of repository with that head branch
+    -- ("<lowercase pusher name>/<topic>") into base_branch, if any.
+    open_agit_pull: (repository: repositories/Repository, head_branch: String, base_branch: String) -> PullRequest?
+    -- pull_by_index(update.push.repository, update.ref_name) for a
+    -- refs/pull/<n>/head update.
+    agit_pull_for: (update: code/RefUpdate) -> PullRequest?
+    -- actions: "refs/pull/<pull.issue.index>/head", the ref the head commit is
+    -- kept under in the base repository.
+    pull_ref: (pull: PullRequest) -> String
+    -- actions: merged_commit_sha of a merged (or manually merged) pull request, else null.
+    merge_commit_of: (pull: PullRequest) -> String?
+    -- discovery (issue index): the reviewers of the pull request's submitted
+    -- reviews, any verdict (pending drafts are private and do not count).
+    reviewed_by: (pull: PullRequest) -> Set<accounts/User>
+    -- discovery: the users with a pending user review request (team requests
+    -- name no user).
+    review_requested: (pull: PullRequest) -> Set<accounts/User>
+    -- notifications: the users @-mentioned in a submitted review's body /
+    -- a code comment's body who can read the base repository's pull requests.
+    -- (A pull request's description mentions are its conversation's
+    -- issues/Issue.mentioned_users.)
+    review_mentions: (review: Review) -> Set<accounts/User>
+    code_comment_mentions: (comment: ReviewComment) -> Set<accounts/User>
+
+    @invariant AnswersFollowCurrentState
+        -- No answer is cached past a change to the pull request, its reviews
+        -- or review requests.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- How a pull request's commits land on the base branch.
+-- from: models/repo/git.go:13
+enum MergeStyle {
+    merge                -- merge commit (--no-ff)
+    | rebase             -- rebase head onto base, fast-forward base
+    | rebase_merge       -- rebase head onto base, then a merge commit
+    | squash             -- one squashed commit authored by the PR poster's account identity
+    | fast_forward_only  -- fast-forward base to head or fail
+    | manually_merged    -- not a git operation: the PR is marked as already merged
+}
+
+-- How "update branch" brings base changes into the head branch.
+-- from: models/repo/git.go:28
+enum UpdateStyle { merge | rebase }
+
+-- Where the head of a pull request lives.
+-- `branch`: a branch of the base repository or of a related fork.
+-- `agit`: no head branch; the head is the pull ref written by an AGit push.
+-- from: models/issues/pull.go:138
+enum PullRequestFlow { branch | agit }
+
+-- Result of one mergeability check (black box over git; see CheckMergeability).
+-- from: services/pull/patch.go:162
+enum MergeCheckOutcome {
+    clean            -- merges cleanly and changes something
+    | conflicting    -- three-way merge has conflicts
+    | no_changes     -- merges cleanly but the merged tree equals the base tree
+    | already_in_base  -- the head commit is already contained in the base branch
+    | failed         -- the check itself could not run
+}
+
+-- The verdict a reviewer submits.
+-- from: models/issues/review.go:74
+enum ReviewVerdict { approve | comment | request_changes }
+
+-- Which side of the diff a code conversation is anchored to.
+-- from: routers/web/repo/pull_review.go:89
+enum DiffSide { previous | proposed }
+
+-- Per-user, per-file review progress on the "files changed" view.
+-- from: models/pull/review_state.go:16
+enum FileViewedState { unviewed | has_changed | viewed }
+
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A proposal to bring head_branch (of head_repository) into base_branch (of
+-- base_repository). Its conversation (title, description, open/closed,
+-- timeline) is an issues/Issue with is_pull = true.
+-- from: models/issues/pull.go:146
+entity PullRequest {
+    issue: issues/Issue
+    flow: PullRequestFlow
+    head_repository: repositories/Repository
+    head_branch: String               -- for agit: "<poster lowercase name>/<topic>"
+    base_repository: repositories/Repository
+    base_branch: String
+    head_commit_sha: String           -- the commit the pull ref (refs/pull/<index>/head) points at
+    merge_base_sha: String?
+    created_at: Timestamp
+
+    -- Mergeability. `checking` is entered whenever head or base moves and left
+    -- by CheckMergeability. merged / manually_merged are terminal.
+    -- decided: `ancestor` (head already in base, autodetect off) stays distinct from `empty`
+    status: checking | mergeable | conflict | empty | ancestor | error | merged | manually_merged
+    check_requested_at: Timestamp?    -- set while a check is queued
+    last_check_outcome: MergeCheckOutcome?
+    conflicted_files: Set<String>
+    changed_protected_files: Set<String>  -- at most config.max_reported_protected_files
+    commits_ahead: Integer
+    commits_behind: Integer
+
+    allow_maintainer_edit: Boolean    -- "allow edits from maintainers" (fork PRs)
+
+    merged_commit_sha: String when status = merged | manually_merged
+    merge_style: MergeStyle when status = merged | manually_merged
+    merger: accounts/User when status = merged | manually_merged
+    merged_at: Timestamp when status = merged | manually_merged
+    -- true only when a scheduled auto-merge performed the merge; consumers that
+    -- react to both PullRequestMerged and PullRequestAutoMerged use it to avoid
+    -- announcing one merge twice
+    merged_automatically: Boolean when status = merged | manually_merged
+
+    transitions status {
+        checking -> mergeable
+        checking -> conflict
+        checking -> empty
+        checking -> ancestor
+        checking -> error
+        checking -> manually_merged
+        mergeable -> checking
+        conflict -> checking
+        empty -> checking
+        ancestor -> checking
+        error -> checking
+        mergeable -> merged
+        empty -> merged
+        mergeable -> manually_merged
+        conflict -> manually_merged
+        empty -> manually_merged
+        ancestor -> manually_merged
+        error -> manually_merged
+        terminal: merged, manually_merged
+    }
+
+    -- Relationships
+    reviews: Review with pull_request = this
+    review_requests: ReviewRequest with pull_request = this
+    conversations: CodeConversation with pull_request = this
+    auto_merge: AutoMerge with pull_request = this
+    file_view_states: FileViewState with pull_request = this
+
+    -- Projections
+    submitted_reviews: reviews where status = submitted
+    official_approvals: reviews where kind = approve and is_official = true and is_dismissed = false
+    fresh_official_approvals: official_approvals where is_stale = false
+    official_rejections: reviews where kind = request_changes and is_official = true and is_dismissed = false
+    official_review_requests: review_requests where is_official = true
+    open_conversations: conversations where resolved_by = null
+    current_conversations: conversations where is_outdated = false
+
+    -- Derived
+    is_open: issue.status = open
+    is_merged: status = merged or status = manually_merged
+    is_checking: status = checking
+    is_fork: head_repository != base_repository
+    is_work_in_progress: has_wip_prefix(issue.title)
+    head_branch_present: flow = agit or branch_exists(head_repository, head_branch)
+    base_branch_present: branch_exists(base_repository, base_branch)
+    is_ready_for_merge_state: status = mergeable or status = empty
+    -- decided: a squash commit is authored by the poster's account identity —
+    -- their commit email, which is the no-reply address when they keep their
+    -- email private — not a commit identity found among the PR's commits;
+    -- other commit authors become Co-authored-by trailers
+    squash_author_email: issue.poster.public_email
+
+    -- The first branch-protection rule of the base repository matching the base
+    -- branch (exact names win over globs; earliest-created glob otherwise).
+    protection: protection_for(base_repository, base_branch)
+    -- The pull-request unit settings of the base repository allow this style.
+    allows_style(style): merge_style_allowed(base_repository, style)
+    counts_only_fresh_approvals: protection != null and protection.ignore_stale_approvals
+    approval_count: if counts_only_fresh_approvals: fresh_official_approvals.count else: official_approvals.count
+    required_checks_pass: protection = null or not protection.status_check_enabled or required_status_checks_pass(this)
+    has_enough_approvals: protection = null or approval_count >= protection.required_approvals
+    blocked_by_rejection: protection != null and protection.block_on_rejected_reviews and official_rejections.count > 0
+    blocked_by_official_requests: protection != null and protection.block_on_official_review_requests and official_review_requests.count > 0
+    blocked_by_outdated_branch: protection != null and protection.block_on_outdated_branch and commits_behind > 0
+    blocked_by_protected_files: protection != null and protection.protected_file_patterns.count > 0 and changed_protected_files.count > 0
+    -- Every merge gate of the protection rule except protected files (code's
+    -- merge-push pre-receive checks touched protected files itself).
+    merge_requirements_met: required_checks_pass and has_enough_approvals
+        and not blocked_by_rejection and not blocked_by_official_requests
+        and not blocked_by_outdated_branch
+    protection_satisfied: merge_requirements_met and not blocked_by_protected_files
+
+    -- Who may merge: without protection, code writers of the base repository;
+    -- with protection, the rule's merge allowlist (or code writers when the
+    -- allowlist is disabled).
+    may_merge(u): if protection = null: can_write_code(u, base_repository) else: protection.allows_merge_by(u)
+    -- "Merge anyway": instance admins always; repository admins unless the rule
+    -- applies to admins.
+    may_bypass_protection(u): u.is_admin or (protection != null and not protection.apply_to_admins and is_repo_admin(u, base_repository))
+    -- An official review counts towards required approvals.
+    is_official_reviewer(u): if protection = null: can_write_code(u, base_repository) else: protection.counts_approval_of(u)
+    -- Poster, repository owner, collaborators, and members of org teams with
+    -- read access to pull requests may change review requests.
+    -- decided: any reader of pull requests granted access (collaborator or team
+    -- member, write not needed) may request reviews, like Forgejo
+    may_change_review_requests(u): u = issue.poster or is_repository_owner(u, base_repository)
+        or is_collaborator(u, base_repository) or in_team_reading_pulls(u, base_repository)
+    -- Poster or pull-request writers.
+    may_manage(u): u = issue.poster or can_write_pulls(u, base_repository)
+    -- Poster, pull-request writers and official reviewers resolve conversations.
+    may_resolve_conversations(u): u = issue.poster or can_write_pulls(u, base_repository) or is_official_reviewer(u)
+    -- Push to the head branch: code writers of the head repository, or base
+    -- code writers when the poster allowed maintainer edits and the poster can
+    -- still write the head repository.
+    may_push_to_head(u): can_write_code(u, head_repository)
+        or (allow_maintainer_edit and can_write_code(issue.poster, head_repository) and can_write_code(u, base_repository))
+    head_is_editable_by(u): flow = branch and is_open and not is_merged
+        and not head_repository.is_mirror and may_push_to_head(u)
+
+    invariant AgitHeadsLiveInTheBaseRepository {
+        flow = agit implies head_repository = base_repository
+    }
+}
+
+-- A reviewer's feedback on a pull request. A review starts `pending` (a draft
+-- only its author sees, collecting code comments) and becomes submitted with a
+-- verdict. Review *requests* are ReviewRequest, not Review.
+-- from: models/issues/review.go:102
+entity Review {
+    pull_request: PullRequest
+    reviewer: accounts/User
+    status: pending | submitted
+    kind: ReviewVerdict when status = submitted
+    body: String
+    commit_sha: String               -- head commit the review was made against
+    is_official: Boolean             -- counts towards required approvals (only the latest approve/request_changes per reviewer)
+    is_stale: Boolean                -- the PR diff changed since commit_sha
+    is_dismissed: Boolean
+    created_at: Timestamp
+    submitted_at: Timestamp when status = submitted
+
+    transitions status {
+        pending -> submitted
+        terminal: submitted
+    }
+
+    conversations: CodeConversation with review = this
+    comments: ReviewComment with review = this
+
+    is_pending: status = pending
+    is_blocking_verdict: status = submitted and (kind = approve or kind = request_changes)
+}
+
+-- A request for a user or a team to review. Removed when the requested user
+-- submits a review (or, for teams, when a member approves / requests changes).
+-- from: models/issues/review.go:547
+entity ReviewRequest {
+    pull_request: PullRequest
+    reviewer: accounts/User?             -- exactly one of reviewer / team is set
+    team: organizations/Team?
+    requested_by: accounts/User
+    is_official: Boolean                 -- the requested party would count towards approvals
+    created_at: Timestamp
+}
+
+-- A thread of review comments anchored to a line range of a file in the diff.
+-- Conversations belong to one review; replies join the thread.
+-- from: models/issues/comment_code.go:17
+entity CodeConversation {
+    pull_request: PullRequest
+    review: Review
+    path: String
+    line: Integer                    -- first line of the range on `side`
+    side: DiffSide
+    extra_lines: Integer             -- range spans line .. line + extra_lines
+    commit_sha: String               -- commit whose blame anchors the range
+    diff_hunk: String                -- context lines captured at creation
+    is_outdated: Boolean             -- the anchored lines changed in a later head
+    resolved_by: accounts/User?
+
+    comments: ReviewComment with conversation = this
+    is_resolved: resolved_by != null
+}
+
+-- One comment in a code conversation (pulls' "code comment"). May carry at most
+-- one ```suggestion block replacing the anchored lines.
+-- from: services/pull/review.go:131
+entity ReviewComment {
+    conversation: CodeConversation
+    review: Review
+    poster: accounts/User
+    body: String
+    created_at: Timestamp
+
+    suggestion_count: count_suggestions(body)
+    has_suggestion: suggestion_count > 0
+}
+
+-- A pull request scheduled to merge as soon as it becomes mergeable and its
+-- required status checks succeed. At most one per pull request.
+-- from: models/pull/automerge.go:16
+entity AutoMerge {
+    pull_request: PullRequest
+    scheduled_by: accounts/User
+    style: MergeStyle
+    message: String
+    delete_branch_after_merge: Boolean
+    created_at: Timestamp
+
+    is_ready: pull_request.status = mergeable and pull_request.is_open
+        and pull_request.required_checks_pass and pull_request.head_branch_present
+}
+
+-- A user's viewed/unviewed mark for one changed file at one head commit. Files
+-- marked viewed at an older head whose content changed since then show as
+-- has_changed.
+-- from: models/pull/review_state.go:26
+entity FileViewState {
+    pull_request: PullRequest
+    user: accounts/User
+    commit_sha: String
+    path: String
+    state: FileViewedState
+    updated_at: Timestamp
+}
+
+-- One line of a CODEOWNERS file on the base repository's default branch
+-- (looked up at CODEOWNERS, docs/CODEOWNERS, .gitea/CODEOWNERS,
+-- .forgejo/CODEOWNERS, first found wins). `pattern` is an anchored regular
+-- expression over changed paths; `!` negates. Owners are @user or @org/team.
+-- from: models/issues/pull.go:788
+entity CodeOwnerRule {
+    repository: repositories/Repository
+    pattern: String
+    is_negated: Boolean
+    users: Set<accounts/User>
+    teams: Set<organizations/Team>
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [repository.pull-request] WORK_IN_PROGRESS_PREFIXES (case-insensitive title prefixes)
+    work_in_progress_prefixes: List<String> = ["WIP:", "[WIP]"]
+    -- [repository.pull-request] CLOSE_KEYWORDS / REOPEN_KEYWORDS (used by issues' reference parser and the merge message)
+    close_keywords: List<String> = ["close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved"]
+    reopen_keywords: List<String> = ["reopen", "reopens", "reopened"]
+    -- [repository.pull-request] DEFAULT_MERGE_STYLE
+    default_merge_style: MergeStyle = merge
+    -- [repository.pull-request] DEFAULT_UPDATE_STYLE
+    default_update_style: UpdateStyle = merge
+    -- [repository.pull-request] DEFAULT_MERGE_MESSAGE_COMMITS_LIMIT (squash message commit scan; -1 = unlimited)
+    default_merge_message_commits_limit: Integer = 50
+    -- [repository.pull-request] DEFAULT_MERGE_MESSAGE_SIZE (bytes of commit messages in a squash message; also the merge-template read limit)
+    default_merge_message_size: Integer = 5120
+    -- [repository.pull-request] DEFAULT_MERGE_MESSAGE_ALL_AUTHORS (Co-authored-by for authors beyond the commit limit)
+    default_merge_message_all_authors: Boolean = false
+    -- [repository.pull-request] DEFAULT_MERGE_MESSAGE_MAX_APPROVERS (Reviewed-by lines; 0 = none, -1 = all)
+    default_merge_message_max_approvers: Integer = 10
+    -- [repository.pull-request] DEFAULT_MERGE_MESSAGE_OFFICIAL_APPROVERS_ONLY
+    default_merge_message_official_approvers_only: Boolean = true
+    -- [repository.pull-request] POPULATE_SQUASH_COMMENT_WITH_COMMIT_MESSAGES
+    populate_squash_comment_with_commit_messages: Boolean = false
+    -- [repository.pull-request] RETARGET_CHILDREN_ON_MERGE
+    retarget_children_on_merge: Boolean = true
+    -- [git] PULL_REQUEST_PUSH_MESSAGE: tell pushers the PR / create-PR link
+    pull_request_push_message: Boolean = true
+    -- [ui] CODE_COMMENT_LINES: diff context captured around a code comment
+    code_comment_context_lines: Integer = 4
+    -- [ui] MAX_CODE_COMMENT_LINES: longest line range one code comment may span (0 = no limit)
+    max_code_comment_lines: Integer = 50
+    -- [ui] MAX_DISPLAY_FILE_SIZE: CODEOWNERS read limit and largest file a suggestion may edit
+    max_display_file_size: Integer = 8388608
+    -- [git] MAX_GIT_DIFF_LINES / MAX_GIT_DIFF_LINE_CHARACTERS: per-file diff truncation in views
+    max_diff_lines: Integer = 1000
+    max_diff_line_characters: Integer = 5000
+    -- [ui] DIFF_PAGING_NUM? (files per page on "files changed")
+    diff_files_per_page: Integer = 20
+    -- decided: instance-wide merge-message templates, used when the repository has none
+    -- (directory under the custom path holding <STYLE>_TEMPLATE.md files)
+    instance_merge_message_templates: String = "default_merge_message"
+    -- fixed limits
+    max_title_length: Integer = 255
+    max_suggestions_per_apply: Integer = 100
+    max_reported_protected_files: Integer = 10
+}
+
+------------------------------------------------------------
+-- Rules: opening
+------------------------------------------------------------
+
+-- Open a pull request from a branch of the same repository or of a related
+-- fork (head is a fork of base, base is a fork of the head owner's repository,
+-- or both are forks of the same root). The web compare page pre-fills the
+-- title from the single commit's summary (else the head branch name; longer
+-- than max_title_length moves the rest into the description) and the
+-- description from that commit's body followed by the repository's pull
+-- request template.
+-- decided: mergeability is always checked asynchronously; a new pull request
+-- starts `checking` until CheckMergeability finishes
+-- from: services/pull/pull.go:40
+rule UserOpensPullRequest {
+    when: UserOpensPullRequest(user, base_repository, base_branch, head_repository, head_branch, title, body, allow_maintainer_edit)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: base_repository.is_archived = false
+    requires: base_repository.is_mirror = false
+    requires: base_repository.is_empty = false
+    requires: can_read_pulls(user, base_repository)
+    requires: can_read_code(user, base_repository)
+    requires: can_read_code(user, head_repository)
+    requires: head_repository = base_repository or is_related_fork(head_repository, base_repository)
+    requires: branch_exists(base_repository, base_branch)
+    requires: branch_exists(head_repository, head_branch)
+    requires: head_repository != base_repository or head_branch != base_branch
+    requires: not is_blocked_by_owner(base_repository, user)
+    requires: trimmed_length(title) > 0
+    requires: not open_pull_request_exists(head_repository, head_branch, base_repository, base_branch)
+    ensures:
+        let conversation = issues/Issue.created(
+            repository: base_repository,
+            index: next_issue_index(base_repository),
+            poster: user,
+            title: truncate(title, config.max_title_length),
+            content: body,
+            content_version: 0,
+            is_pull: true,
+            status: open,
+            is_locked: false,
+            labels: {},
+            assignees: {},
+            mentioned_users: mentions_in(base_repository, body),
+            read_by: {},
+            created_at: now,
+            updated_at: now
+        )
+        let pr = PullRequest.created(
+            issue: conversation,
+            flow: branch,
+            head_repository: head_repository,
+            head_branch: head_branch,
+            base_repository: base_repository,
+            base_branch: base_branch,
+            head_commit_sha: head_commit_of(head_repository, head_branch),
+            created_at: now,
+            status: checking,
+            check_requested_at: now,
+            conflicted_files: {},
+            changed_protected_files: {},
+            commits_ahead: commits_ahead_of(head_repository, head_branch, base_repository, base_branch),
+            commits_behind: commits_behind_of(head_repository, head_branch, base_repository, base_branch),
+            allow_maintainer_edit: allow_maintainer_edit
+        )
+        issues/Comment.created(issue: conversation, poster: user, kind: pull_push,
+            content: commits_between(base_repository, base_branch, head_repository, head_branch),
+            content_version: 0, created_at: now, updated_at: now)
+        PullRequestOpened(pull_request: pr)
+    @guidance
+        -- Web: POST /{owner}/{repo}/compare/{base}...{head} (CompareAndPullRequestPost);
+        -- API: POST /repos/{owner}/{repo}/pulls (head "branch" or "owner:branch").
+        -- Labels, milestone, assignees, project and attachments chosen on the
+        -- form are applied by issues/projects (writers only). The head commits
+        -- are copied into the base repository's pull ref refs/pull/<index>/head.
+        -- A pull request template is looked up at {"", .forgejo/, .gitea/,
+        -- .github/, docs/}{PULL_REQUEST_TEMPLATE,pull_request_template}{.md,.yaml,.yml}
+        -- on the default branch (YAML templates are issue forms).
+        -- The compare page shows "nothing to compare" when head equals the
+        -- merge base; an empty PR may still be opened unless the repository
+        -- autodetects manual merges or head and base are the same branch.
+}
+
+-- CODEOWNERS: when a non-WIP pull request opens, owners of changed paths are
+-- requested to review (by the poster).
+-- from: services/issue/pull.go:28
+rule CodeOwnersRequestedOnOpen {
+    when: PullRequestOpened(pull_request)
+    let pr = pull_request
+    requires: not pr.is_work_in_progress
+    ensures: CodeOwnerReviewRequestsDue(pull_request: pr)
+}
+
+-- A WIP prefix was removed from the title: the PR is ready for review and the
+-- CODEOWNERS requests are made now.
+-- from: services/issue/issue.go:90
+rule PullRequestBecomesReadyForReview {
+    when: issues/IssueTitleChanged(issue, doer, old_title)
+    let pr = PullRequest{issue: issue}
+    requires: exists pr
+    requires: has_wip_prefix(old_title)
+    requires: not pr.is_work_in_progress
+    ensures: PullRequestReadyForReview(pull_request: pr, doer: doer)
+    ensures: CodeOwnerReviewRequestsDue(pull_request: pr)
+}
+
+-- CODEOWNERS rules of the base repository's default branch request reviews
+-- from the owners of every changed path (not for PRs into a fork).
+-- from: services/issue/pull.go:72
+rule RequestCodeOwnerReviews {
+    when: CodeOwnerReviewRequestsDue(pull_request)
+    let pr = pull_request
+    requires: pr.base_repository.is_fork = false
+    let rules = CodeOwnerRules where repository = pr.base_repository
+    -- No CODEOWNERS file, no rules, nobody to request.
+    requires: rules.count > 0
+    let owners = code_owner_users(rules, pr)
+    let owner_teams = code_owner_teams(rules, pr)
+    let poster = pr.issue.poster
+    ensures:
+        for owner in owners:
+            if owner != poster and can_read_pulls(owner, pr.base_repository)
+                and not exists ReviewRequest{pull_request: pr, reviewer: owner}:
+                ReviewRequest.created(pull_request: pr, reviewer: owner, team: null, requested_by: poster,
+                    is_official: pr.is_official_reviewer(owner), created_at: now)
+                ReviewRequested(pull_request: pr, requester: poster, reviewer: owner)
+        for owner_team in owner_teams:
+            if not exists ReviewRequest{pull_request: pr, team: owner_team}:
+                ReviewRequest.created(pull_request: pr, reviewer: null, team: owner_team, requested_by: poster,
+                    is_official: team_is_official_reviewer(owner_team, pr), created_at: now)
+                TeamReviewRequested(pull_request: pr, requester: poster, team: owner_team)
+    @guidance
+        -- code_owner_users/teams: for every CodeOwnerRule and every path
+        -- changed between the merge base and the head, a rule whose pattern
+        -- matches (or, when negated, does not match) contributes its users and
+        -- teams. Unknown users/teams are skipped (shown as warnings when
+        -- viewing the CODEOWNERS file); a file larger than
+        -- config.max_display_file_size is read truncated.
+}
+
+------------------------------------------------------------
+-- Rules: AGit flow (push to refs/for/<base>[/<topic>])
+------------------------------------------------------------
+
+-- code accepted an AGit push for a topic with no open AGit PR: open one. The
+-- head is the pushed commit, held only in the pull ref.
+-- from: services/agit/agit.go:115
+rule AgitPushOpensPullRequest {
+    when: code/AgitPullRequestRequested(repository, pusher, base_branch, head_branch, head_sha, title, description)
+    requires: can_read_pulls(pusher, repository)
+    requires: not is_blocked_by_owner(repository, pusher)
+    requires: not open_pull_request_exists(repository, head_branch, repository, base_branch)
+    ensures:
+        let conversation = issues/Issue.created(
+            repository: repository,
+            index: next_issue_index(repository),
+            poster: pusher,
+            title: truncate(title, config.max_title_length),
+            content: description,
+            content_version: 0,
+            is_pull: true,
+            status: open,
+            is_locked: false,
+            labels: {},
+            assignees: {},
+            mentioned_users: mentions_in(repository, description),
+            read_by: {},
+            created_at: now,
+            updated_at: now
+        )
+        let pr = PullRequest.created(
+            issue: conversation,
+            flow: agit,
+            head_repository: repository,
+            head_branch: head_branch,
+            base_repository: repository,
+            base_branch: base_branch,
+            head_commit_sha: head_sha,
+            created_at: now,
+            status: checking,
+            check_requested_at: now,
+            conflicted_files: {},
+            changed_protected_files: {},
+            commits_ahead: 0,
+            commits_behind: 0,
+            allow_maintainer_edit: false
+        )
+        PullRequestOpened(pull_request: pr)
+    @guidance
+        -- Transport (code): `git push origin HEAD:refs/for/main -o topic=x
+        -- [-o title=..] [-o description=..] [-o force-push=true]`, or
+        -- refs/for/<base>/<topic>. The head branch is "<pusher>/<topic>".
+        -- The push result reports refs/pull/<index>/head.
+}
+
+-- A further AGit push (to the topic, or to refs/pull/<index>/head by a code
+-- writer or the poster) moves the PR head.
+-- from: services/agit/agit.go:230
+rule AgitPushUpdatesPullRequest {
+    when: code/AgitPullRequestHeadPushed(pull, pusher, old_sha, new_sha)
+    requires: pull.flow = agit
+    requires: pull.is_open
+    requires: can_write_code(pusher, pull.base_repository) or pusher = pull.issue.poster
+    ensures: PullRequestHeadMoved(pull_request: pull, pusher: pusher, deploy_key: null, old_commit_sha: old_sha, new_commit_sha: new_sha)
+}
+
+-- AGit head branch names carry the poster's name; renaming the user renames them.
+-- from: services/agit/agit.go:300
+rule AgitHeadBranchesFollowPosterRename {
+    when: accounts/UserRenamed(user, old_name, new_name)
+    for pr in PullRequests where flow = agit and issue.poster = user and issue.status = open
+            and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error):
+        ensures: pr.head_branch = rename_agit_head_branch(pr.head_branch, old_name, new_name)
+}
+
+------------------------------------------------------------
+-- Rules: head and base movement, mergeability checking
+------------------------------------------------------------
+
+-- `allium analyse` reports conflicts between the re-check rules (head/base
+-- push, retarget, reopen, protection change) and the merge rules on the same
+-- PullRequest state. They are real races between independent events and are
+-- resolved by serialising work per pull request (Forgejo holds a per-PR lock
+-- for check, merge, retarget and update): whichever runs second sees the
+-- state the first left — a merge refuses a PR that went back to `checking`,
+-- and a re-check of a PR already merged does nothing.
+
+-- A push to a branch updates every open branch-flow PR using it as head.
+-- from: services/pull/pull.go:298
+rule HeadBranchPushUpdatesPullRequests {
+    when: code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force, deploy_key)
+    for pr in PullRequests where head_repository = repository and head_branch = branch_name
+            and flow = branch and issue.status = open
+            and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error)
+            and head_commit_sha != new_sha:
+        ensures: PullRequestHeadMoved(pull_request: pr, pusher: pusher, deploy_key: deploy_key, old_commit_sha: pr.head_commit_sha, new_commit_sha: new_sha)
+    @guidance
+        -- Only PRs that existed before the push was received are updated (a PR
+        -- opened from the just-pushed commit is already current).
+}
+
+-- What happens whenever a PR's head moves (branch push, AGit push, update
+-- branch, applied suggestion): the pull ref follows, the PR is re-checked,
+-- reviews made against a different diff go stale (and approvals are dismissed
+-- when the protection rule says so), code conversations whose lines changed
+-- become outdated, and a push entry is added to the timeline.
+-- decided: every head move outdates code conversations, AGit pushes included
+-- from: services/pull/pull.go:378
+rule PullRequestHeadMoves {
+    when: PullRequestHeadMoved(pull_request, pusher, deploy_key, old_commit_sha, new_commit_sha)
+    let pr = pull_request
+    requires: (pr.status = checking or pr.status = mergeable or pr.status = conflict or pr.status = empty or pr.status = ancestor or pr.status = error)
+    let diff_changed = diff_differs(pr, old_commit_sha, new_commit_sha)
+    let dismiss = diff_changed and pr.protection != null and pr.protection.dismiss_stale_approvals
+    let forced = is_force_push(pr.head_repository, old_commit_sha, new_commit_sha)
+    ensures:
+        pr.head_commit_sha = new_commit_sha
+        pr.status = checking
+        pr.check_requested_at = now
+        pr.commits_ahead = commits_ahead_of(pr.head_repository, pr.head_branch, pr.base_repository, pr.base_branch)
+        pr.commits_behind = commits_behind_of(pr.head_repository, pr.head_branch, pr.base_repository, pr.base_branch)
+        for review in Reviews where pull_request = pr and status = submitted:
+            if review.commit_sha = new_commit_sha:
+                review.is_stale = false
+            else if diff_changed:
+                review.is_stale = true
+        for approval in Reviews where pull_request = pr and status = submitted and kind = approve and is_official = true and is_dismissed = false:
+            if dismiss:
+                approval.is_dismissed = true
+                ReviewDismissed(review: approval, dismisser: pusher, message: "New commits pushed, approval review dismissed automatically according to repository settings")
+        for conversation in CodeConversations where pull_request = pr and is_outdated = false:
+            if anchored_lines_changed(conversation, new_commit_sha):
+                conversation.is_outdated = true
+        -- decided: requests 1 — a deploy-key push is recorded as the key's
+        -- (poster null, deploy_key set)
+        issues/Comment.created(issue: pr.issue, poster: pusher, deploy_key: deploy_key, kind: pull_push,
+            content: commits_between_shas(pr.base_repository, old_commit_sha, new_commit_sha),
+            content_version: 0, created_at: now, updated_at: now)
+        PullRequestHeadUpdated(pull_request: pr, pusher: pusher, old_commit_sha: old_commit_sha, new_commit_sha: new_commit_sha, is_force_push: forced)
+        PullRequestSynchronized(pull_request: pr, doer: pusher, deploy_key: deploy_key)
+    @guidance
+        -- "Diff differs" compares the diff of old head vs base with new head vs
+        -- base (a rebase that keeps the same changes does not make reviews
+        -- stale). The push entry lists the new commit ids, or marks a force
+        -- push with old..new. Forgejo skips the outdating step for AGit pushes
+        -- (a TODO in its code); this spec outdates on every head move.
+}
+
+-- A push to a branch re-checks every open PR that targets it.
+-- from: services/pull/pull.go:357
+rule BaseBranchPushRechecksPullRequests {
+    when: code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force, deploy_key)
+    for pr in PullRequests where base_repository = repository and base_branch = branch_name and issue.status = open
+            and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error):
+        ensures: pr.status = checking
+        ensures: pr.check_requested_at = now
+        ensures: pr.commits_ahead = commits_ahead_of(pr.head_repository, pr.head_branch, pr.base_repository, pr.base_branch)
+        ensures: pr.commits_behind = commits_behind_of(pr.head_repository, pr.head_branch, pr.base_repository, pr.base_branch)
+}
+
+-- Changing a branch protection rule re-checks PRs into matching branches
+-- (protected-file changes and status-check requirements may differ).
+-- from: services/pull/check.go:339
+rule ProtectionChangeRechecksPullRequests {
+    when: code/BranchProtectionChanged(rule)
+    for pr in PullRequests where base_repository = rule.repository and issue.status = open
+            and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error)
+            and rule_matches_branch(rule, base_branch):
+        ensures: pr.status = checking
+        ensures: pr.check_requested_at = now
+}
+
+-- The asynchronous mergeability check. Records the merge base, conflicting
+-- files and protected files changed; detects a PR already merged outside
+-- Forgejo when the repository autodetects manual merges.
+-- decided: every check is asynchronous (Forgejo checks synchronously at
+-- creation); a new or updated PR is `checking` until this rule runs.
+-- decided: `ancestor` and `empty` stay distinct outcomes.
+-- from: services/pull/check.go:302
+rule CheckMergeability {
+    when: pr: PullRequest.check_requested_at <= now
+    requires: pr.status = checking
+    let outcome = merge_check_outcome(pr)
+    ensures:
+        pr.check_requested_at = null
+        pr.last_check_outcome = outcome
+        pr.merge_base_sha = merge_base_of(pr)
+        if outcome = failed:
+            pr.status = error
+        else if outcome = already_in_base and autodetects_manual_merge(pr.base_repository):
+            pr.status = manually_merged
+            pr.merge_style = manually_merged
+            pr.merged_commit_sha = merge_commit_containing(pr)
+            pr.merged_at = commit_authored_at(pr.base_repository, merge_commit_containing(pr))
+            pr.merger = manual_merge_author(pr)
+            pr.conflicted_files = {}
+            pr.merged_automatically = false
+            PullRequestMerged(pull_request: pr, merger: manual_merge_author(pr))
+        else if outcome = already_in_base:
+            pr.status = ancestor
+        else if outcome = conflicting:
+            pr.status = conflict
+            pr.conflicted_files = conflicting_files(pr)
+        else if outcome = no_changes:
+            pr.status = empty
+            pr.conflicted_files = {}
+            pr.changed_protected_files = {}
+        else:
+            pr.status = mergeable
+            pr.conflicted_files = {}
+            pr.changed_protected_files = protected_files_changed(pr)
+    @guidance
+        -- manual_merge_author: the user whose email authored the merge commit,
+        -- else the base repository owner. merge_commit_containing: the first
+        -- merge commit on the ancestry path head..base, else the head commit
+        -- (fast-forward). Conflicts honour settings.ignore_whitespace_conflicts.
+        -- protected_files_changed: changed paths matching the protection rule's
+        -- protected_file_patterns (case-insensitive globs), at most
+        -- config.max_reported_protected_files. A newer re-check request
+        -- supersedes an in-flight one.
+}
+
+------------------------------------------------------------
+-- Rules: editing the proposal
+------------------------------------------------------------
+
+-- from: services/pull/pull.go:168
+rule UserChangesPullRequestTarget {
+    when: UserChangesPullRequestTarget(user, pr, new_base_branch)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: pr.base_repository.is_archived = false
+    requires: pr.may_manage(user)
+    -- decided (issues 1): a locked conversation keeps its target unless a triager retargets it
+    requires: not pr.issue.is_locked or can_write_pulls(user, pr.base_repository)
+    requires: pr.is_open
+    requires: (pr.status = checking or pr.status = mergeable or pr.status = conflict or pr.status = empty or pr.status = ancestor or pr.status = error)
+    requires: new_base_branch != pr.base_branch
+    requires: branch_exists(pr.base_repository, new_base_branch)
+    requires: not head_equals_branch(pr, new_base_branch)
+    requires: not open_pull_request_exists(pr.head_repository, pr.head_branch, pr.base_repository, new_base_branch)
+    ensures:
+        pr.base_branch = new_base_branch
+        pr.status = checking
+        pr.check_requested_at = now
+        pr.commits_ahead = commits_ahead_of(pr.head_repository, pr.head_branch, pr.base_repository, new_base_branch)
+        pr.commits_behind = commits_behind_of(pr.head_repository, pr.head_branch, pr.base_repository, new_base_branch)
+        issues/Comment.created(issue: pr.issue, poster: user, kind: change_target_branch, content: "",
+            old_ref: pr.base_branch, new_ref: new_base_branch,
+            content_version: 0, created_at: now, updated_at: now)
+        PullRequestTargetBranchChanged(pull_request: pr, doer: user, old_base_branch: pr.base_branch)
+    @guidance
+        -- Web: POST /{owner}/{repo}/pull/{index}/target_branch; API: PATCH
+        -- /repos/{owner}/{repo}/pulls/{index} with `base`.
+}
+
+-- Only the poster, and only while they can write the head repository, may
+-- toggle "allow edits from maintainers".
+-- from: services/pull/edits.go:64
+rule AuthorSetsMaintainerEdits {
+    when: AuthorSetsMaintainerEdits(user, pr, allow)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: user = pr.issue.poster
+    requires: can_write_code(user, pr.head_repository)
+    ensures: pr.allow_maintainer_edit = allow
+    @guidance
+        -- Web: POST /pulls/{index}/set_allow_maintainer_edit; API: PATCH
+        -- pulls/{index} `allow_maintainer_edit`. Maintainers granted this way
+        -- may push to the head branch (web editor, update branch, apply
+        -- suggestion) but not delete it.
+}
+
+-- Renaming a branch carries every unmerged PR (open or closed) with it, as
+-- head and as base.
+-- from: models/git/branch.go:395
+rule BranchRenameCarriesPullRequests {
+    when: code/BranchRenamed(repository, from_name, to_name, by)
+    ensures:
+        for pr in PullRequests:
+            if pr.base_repository = repository and pr.base_branch = from_name and pr.status != merged and pr.status != manually_merged:
+                pr.base_branch = to_name
+            if pr.head_repository = repository and pr.head_branch = from_name and pr.flow = branch and pr.status != merged and pr.status != manually_merged:
+                pr.head_branch = to_name
+}
+
+------------------------------------------------------------
+-- Rules: closing and reopening
+------------------------------------------------------------
+
+-- The poster or a pull-request writer closes. Open dependencies block closing.
+-- decided: closing cancels a scheduled auto-merge; reopening does not restore it
+-- from: routers/web/repo/issue.go:3171
+rule UserClosesPullRequest {
+    when: UserClosesPullRequest(user, pr)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: pr.base_repository.is_archived = false
+    requires: pr.may_manage(user)
+    -- decided (issues 1): on a locked conversation only triagers close
+    requires: not pr.issue.is_locked or can_write_pulls(user, pr.base_repository)
+    requires: pr.is_open
+    requires: not pr.is_merged
+    requires: not is_blocked_by_owner(pr.base_repository, user)
+    requires: not has_open_blocking_dependencies(pr.issue)
+    ensures:
+        pr.issue.status = closed
+        pr.issue.closed_at = now
+        issues/Comment.created(issue: pr.issue, poster: user, kind: close, content: "",
+            content_version: 0, created_at: now, updated_at: now)
+        for schedule in AutoMerges where pull_request = pr:
+            not exists schedule
+            issues/Comment.created(issue: pr.issue, poster: user, kind: pr_unscheduled_to_auto_merge, content: "",
+                content_version: 0, created_at: now, updated_at: now)
+            AutoMergeCancelled(pull_request: pr, doer: user)
+        PullRequestClosed(pull_request: pr, doer: user)
+    @guidance
+        -- Web: POST /issues/{index}/comments with status=close; API: PATCH
+        -- pulls/{index} state=closed. Forgejo keeps the schedule recorded
+        -- (it could fire again after reopening); this spec cancels it. The
+        -- closer's stopwatch stops (issues).
+}
+
+-- Reopening re-copies the head into the pull ref when they diverged and queues
+-- a fresh check. A schedule cancelled by closing is not restored. Refused for merged PRs, when another open PR has the same
+-- head and base, or (branch flow) when the head or base branch is gone.
+-- from: routers/web/repo/issue.go:3178
+rule UserReopensPullRequest {
+    when: UserReopensPullRequest(user, pr)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: pr.base_repository.is_archived = false
+    requires: pr.may_manage(user)
+    -- decided (issues 1): on a locked conversation only triagers reopen
+    requires: not pr.issue.is_locked or can_write_pulls(user, pr.base_repository)
+    requires: pr.issue.status = closed
+    requires: (pr.status = checking or pr.status = mergeable or pr.status = conflict or pr.status = empty or pr.status = ancestor or pr.status = error)
+    requires: not open_pull_request_exists(pr.head_repository, pr.head_branch, pr.base_repository, pr.base_branch)
+    requires: pr.flow = agit or (pr.base_branch_present and pr.head_branch_present)
+    requires: not is_blocked_by_owner(pr.base_repository, user)
+    ensures:
+        pr.issue.status = open
+        pr.issue.closed_at = null
+        pr.status = checking
+        pr.check_requested_at = now
+        if pr.flow = branch:
+            pr.head_commit_sha = head_commit_of(pr.head_repository, pr.head_branch)
+        issues/Comment.created(issue: pr.issue, poster: user, kind: reopen, content: "",
+            content_version: 0, created_at: now, updated_at: now)
+        PullRequestReopened(pull_request: pr, doer: user)
+}
+
+-- Deleting a branch closes the open PRs that use it as head or base (after any
+-- retargeting done by a merge cleanup).
+-- decided: closing cancels a scheduled auto-merge
+-- from: services/pull/pull.go:527
+rule DeletedBranchClosesPullRequests {
+    when: code/BranchDeleted(branch, by)
+    for pr in PullRequests where issue.status = open
+            and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error)
+            and ((head_repository = branch.repository and head_branch = branch.name and flow != agit)
+                 or (base_repository = branch.repository and base_branch = branch.name)):
+        ensures:
+            pr.issue.status = closed
+            pr.issue.closed_at = now
+            issues/Comment.created(issue: pr.issue, poster: by, kind: close, content: "",
+                content_version: 0, created_at: now, updated_at: now)
+            for schedule in AutoMerges where pull_request = pr:
+                not exists schedule
+                issues/Comment.created(issue: pr.issue, poster: by, kind: pr_unscheduled_to_auto_merge, content: "",
+                    content_version: 0, created_at: now, updated_at: now)
+                AutoMergeCancelled(pull_request: pr, doer: by)
+            PullRequestClosed(pull_request: pr, doer: by)
+}
+
+-- Deleting a repository closes open PRs from its branches into other repositories.
+-- decided: closing cancels a scheduled auto-merge
+-- from: services/pull/pull.go:556
+rule DeletedRepositoryClosesOutgoingPullRequests {
+    when: repositories/RepositoryDeleted(repository, doer)
+    for pr in PullRequests where head_repository = repository and base_repository != repository and issue.status = open
+            and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error):
+        ensures:
+            pr.issue.status = closed
+            pr.issue.closed_at = now
+            for schedule in AutoMerges where pull_request = pr:
+                not exists schedule
+                AutoMergeCancelled(pull_request: pr, doer: doer)
+            PullRequestClosed(pull_request: pr, doer: doer)
+}
+
+------------------------------------------------------------
+-- Rules: accounts and teams going away
+------------------------------------------------------------
+
+-- A deleted account's auto-merge schedules and viewed-file marks go with it
+-- (Forgejo deletes AutoMerge{doer} and ReviewState{user}). Its pending review
+-- requests and unsubmitted draft reviews go too, so a request nobody can
+-- answer no longer blocks merging (block_on_official_review_requests).
+-- Submitted reviews and code comments stay, shown as the ghost user (or
+-- deleted by issues when the deletion removes contributions).
+-- from: services/user/delete.go:114
+rule DeletedAccountLeavesPullRequests {
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+    ensures:
+        for schedule in AutoMerges where scheduled_by = user:
+            not exists schedule
+        for mark in FileViewStates where user = user:
+            not exists mark
+        for request in ReviewRequests where reviewer = user:
+            not exists request
+        for draft in Reviews where reviewer = user and status = pending:
+            not exists draft
+    @guidance
+        -- A schedule removed this way leaves no timeline entry and notifies
+        -- nobody: its scheduler is gone.
+}
+
+-- A deleted team's review requests are withdrawn.
+-- from: models/org_team.go:356
+rule DeletedTeamLeavesReviewRequests {
+    when: organizations/TeamDeleted(team, organization)
+    ensures:
+        for request in ReviewRequests where team = team:
+            not exists request
+}
+
+------------------------------------------------------------
+-- Rules: updating the head from the base
+------------------------------------------------------------
+
+-- "Update branch": bring base commits into the head by a merge commit
+-- ("Merge branch '<base>' into <head>") or by rebasing the head onto base and
+-- force-pushing it.
+-- decided: AGit pull requests can be updated too — the server merges or rebases
+-- the base into the AGit head ref; whoever may push that ref (base code writers
+-- and the poster) may update it, by rebase only when the repository allows
+-- rebase updates. Forgejo refuses update-branch for AGit pull requests.
+-- from: services/pull/update.go:25
+rule UserUpdatesPullRequestBranch {
+    when: UserUpdatesPullRequestBranch(user, pr, style)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: pr.is_open
+    requires: not pr.is_merged
+    requires: pr.commits_behind > 0
+    requires: (pr.flow = branch and ((style = merge and may_update_by_merge(user, pr)) or (style = rebase and may_update_by_rebase(user, pr))))
+        or (pr.flow = agit and (can_write_code(user, pr.base_repository) or user = pr.issue.poster)
+            and (style = merge or rebase_update_allowed(pr.base_repository)))
+    requires: within_quota(pr.head_repository)   -- decided: requests 3 (the head repository's owner, where the commits land)
+    ensures: PullRequestHeadMoved(pull_request: pr, pusher: user, deploy_key: null, old_commit_sha: pr.head_commit_sha, new_commit_sha: updated_head(pr, style))
+    ensures: PullRequestBranchUpdated(pull_request: pr, doer: user, style: style)
+    @guidance
+        -- Branch flow — may_update_by_merge: the user may "merge into" the head branch (code
+        -- writer of the head repository, or the head branch protection's merge
+        -- allowlist), or — when maintainer edits are allowed — the same test
+        -- with their base-repository permission; when the head branch is
+        -- protected they must also be allowed to push to it.
+        -- may_update_by_rebase: as above, plus the head branch is NOT
+        -- protected (a rebase needs a force push) and the head repository's
+        -- pull-request settings allow_rebase_update. Conflicts abort with the
+        -- conflicting output; nothing changes. AGit flow: the new head is
+        -- written to refs/pull/<index>/head (there is no head branch to protect).
+        -- Web: POST /pulls/{index}/update?style=merge|rebase; API: POST
+        -- /repos/{o}/{r}/pulls/{index}/update?style=merge|rebase. The UI
+        -- default is the repository's default_update_style, else
+        -- config.default_update_style.
+}
+
+------------------------------------------------------------
+-- Rules: merging
+------------------------------------------------------------
+
+-- Merge now. Composes the commit message from the template (or the default
+-- message) unless the merger typed one; the merge is pushed to the base branch
+-- as the merger, then the PR is marked merged (issues then closes its
+-- conversation and applies closing keywords).
+-- from: services/pull/check.go:68
+rule UserMergesPullRequest {
+    when: UserMergesPullRequest(user, pr, style, title, message, expected_head_sha, delete_branch_after_merge, force_merge)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: pr.base_repository.is_archived = false
+    requires: style != manually_merged
+    requires: pr.allows_style(style)
+    requires: pr.is_open
+    requires: pr.may_merge(user)
+    requires: not pr.is_work_in_progress
+    requires: pr.status = mergeable or pr.status = empty
+    requires: pr.protection_satisfied or (force_merge and pr.may_bypass_protection(user))
+    requires: merge_signing_satisfied(pr, user, style)
+    requires: not has_open_blocking_dependencies(pr.issue)
+    requires: expected_head_sha = null or expected_head_sha = pr.head_commit_sha
+    requires: pr.head_branch_present
+    requires: within_quota(pr.base_repository)
+    let final_message = compose_merge_message(pr, style, title, message)
+    ensures:
+        pr.status = merged
+        pr.merge_style = style
+        pr.merged_commit_sha = merge_result_commit(pr, style, final_message)
+        pr.merger = user
+        pr.merged_at = now
+        pr.check_requested_at = null
+        pr.conflicted_files = {}
+        not exists pr.auto_merge
+        pr.merged_automatically = false
+        PullRequestMerged(pull_request: pr, merger: user)
+        if delete_branch_after_merge:
+            PullRequestHeadBranchDeletionRequested(pull_request: pr, doer: user)
+    @guidance
+        -- Styles: merge = merge commit; rebase = rebase head onto base then
+        -- fast-forward (amending the last commit only if a REBASE template
+        -- exists); rebase_merge = rebase then --no-ff merge commit; squash = one
+        -- commit authored by the poster's account identity (display name and
+        -- squash_author_email, the no-reply address when they keep their email
+        -- private; decided — Forgejo preferred a matching commit identity from
+        -- the PR's commits) with Co-authored-by trailers for the other commit
+        -- authors; fast_forward_only = fails unless base can fast-forward to head.
+        -- Failures that leave the PR unmerged: merge/rebase conflicts, unrelated
+        -- histories, base moved during the merge, head moved since the merger
+        -- loaded the page (expected_head_sha), push rejected by hooks (the
+        -- merge push is a code/Push with merging_pull set; its pre-receive
+        -- re-checks may_merge and protection except protected files).
+        -- Web: POST /{o}/{r}/pulls/{index}/merge (form fields do,
+        -- merge_title_field, merge_message_field, head_commit_id,
+        -- delete_branch_after_merge, force_merge, merge_when_checks_succeed);
+        -- API: POST /repos/{o}/{r}/pulls/{index}/merge; GET .../merge answers
+        -- whether merged.
+        -- Message composition (compose_merge_message / default_merge_message):
+        -- a typed title replaces the template/default title and a typed body is
+        -- appended after a blank line.
+        -- Template lookup per style (decided: repository template, else the
+        -- instance-wide template, else the built-in default):
+        -- repository_merge_message_template(base_repository, style), else
+        -- instance_merge_message_template(style) from
+        -- config.instance_merge_message_templates, else the defaults below.
+        -- First line = title,
+        -- rest = body; empty parts fall back to the defaults. Variables:
+        -- BaseRepoOwnerName, BaseRepoName, BaseBranch, HeadRepoOwnerName,
+        -- HeadRepoName, HeadBranch, PullRequestTitle, PullRequestDescription,
+        -- PullRequestPosterName, PullRequestIndex, PullRequestReference,
+        -- ReviewedOn, ReviewedBy, ClosingIssues.
+        -- Defaults: squash "<title> (#<index>)"; others "Merge pull request
+        -- '<title>' (#<index>) from <head> into <base>" ("!" instead of "#"
+        -- with an external tracker). Body: "Reviewed-on: <url>" then up to
+        -- config.default_merge_message_max_approvers "Reviewed-by:" lines
+        -- (official approvers only when configured). Squash bodies start with
+        -- the PR description (or the commit messages, up to
+        -- default_merge_message_size, when
+        -- populate_squash_comment_with_commit_messages) then Co-authored-by
+        -- lines for other authors among the first
+        -- default_merge_message_commits_limit commits (all commits with
+        -- default_merge_message_all_authors).
+}
+
+-- Whatever way a pull request got merged, each issue it references with a
+-- closing or reopening keyword (title, description or its comments) is closed
+-- or reopened by the merger; issues applies the change (and leaves an issue
+-- with open blockers open).
+-- from: services/pull/merge.go:288
+rule MergeResolvesReferencedIssues {
+    when: PullRequestMerged(pull_request, merger)
+    ensures:
+        for target in issues_closed_by(pull_request):
+            IssueClosedByPullRequest(issue: target, pull_request: pull_request, doer: merger)
+        for target in issues_reopened_by(pull_request):
+            IssueReopenedByPullRequest(issue: target, pull_request: pull_request, doer: merger)
+}
+
+-- The merge push reached the base branch (code's post-receive). Marks the PR
+-- merged when the merge rule has not already done so.
+-- from: routers/private/hook_post_receive.go:355
+rule MergePushMarksPullRequestMerged {
+    when: code/MergePushCompleted(pull, pusher, merge_commit_sha)
+    requires: (pull.status = mergeable or pull.status = empty)
+    ensures:
+        pull.status = merged
+        pull.merge_style = merge
+        pull.merged_commit_sha = merge_commit_sha
+        pull.merger = pusher
+        pull.merged_at = now
+        pull.check_requested_at = null
+        pull.conflicted_files = {}
+        not exists pull.auto_merge
+        pull.merged_automatically = false
+        PullRequestMerged(pull_request: pull, merger: pusher)
+    @guidance
+        -- In a rebuild where UserMergesPullRequest records the merge directly
+        -- this rule never finds an unmerged PR; it exists for the git-transport
+        -- path, where the merge is a push carrying merging_pull. The style is
+        -- the one the merge was started with.
+}
+
+-- Mark as merged when the commits already reached the base branch outside
+-- Forgejo. Requires only merge permission and the repository setting; the
+-- commit must exist and be contained in the base branch.
+-- from: services/pull/merge_manual.go:24
+rule UserMarksPullRequestManuallyMerged {
+    when: UserMarksPullRequestManuallyMerged(user, pr, commit_sha)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: pr.base_repository.is_archived = false
+    requires: (pr.status = checking or pr.status = mergeable or pr.status = conflict or pr.status = empty or pr.status = ancestor or pr.status = error)
+    requires: pr.is_open
+    requires: pr.may_merge(user)
+    requires: pr.allows_style(manually_merged)
+    requires: commit_in_branch(pr.base_repository, pr.base_branch, commit_sha)
+    ensures:
+        pr.status = manually_merged
+        pr.merge_style = manually_merged
+        pr.merged_commit_sha = full_commit_sha(pr.base_repository, commit_sha)
+        pr.merged_at = commit_authored_at(pr.base_repository, commit_sha)
+        pr.merger = user
+        pr.check_requested_at = null
+        pr.conflicted_files = {}
+        pr.merged_automatically = false
+        PullRequestMerged(pull_request: pr, merger: user)
+    @guidance
+        -- Accepts full or abbreviated ids in any case; an ambiguous or
+        -- unknown id is "wrong commit ID". Same endpoints as merge with
+        -- do=manually-merged and merge_commit_id.
+}
+
+------------------------------------------------------------
+-- Rules: auto-merge ("merge when checks succeed")
+------------------------------------------------------------
+
+-- Scheduling runs the same checks as merging except that unmet branch
+-- protection (status checks, approvals, ...) does not refuse it.
+-- from: services/automerge/automerge.go:56
+rule UserSchedulesAutoMerge {
+    when: UserSchedulesAutoMerge(user, pr, style, message, delete_branch_after_merge)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    let existing = AutoMerge{pull_request: pr}
+    requires: not exists existing
+    requires: pr.base_repository.is_archived = false
+    requires: style != manually_merged
+    requires: pr.allows_style(style)
+    requires: not pr.is_merged
+    requires: pr.is_open
+    requires: pr.may_merge(user)
+    requires: not pr.is_work_in_progress
+    requires: pr.status = mergeable or pr.status = empty
+    requires: merge_signing_satisfied(pr, user, style)
+    requires: not has_open_blocking_dependencies(pr.issue)
+    ensures: AutoMerge.created(pull_request: pr, scheduled_by: user, style: style,
+        message: message ?? default_merge_message(pr, style),
+        delete_branch_after_merge: delete_branch_after_merge, created_at: now)
+    ensures: issues/Comment.created(issue: pr.issue, poster: user, kind: pr_scheduled_to_auto_merge, content: "",
+        content_version: 0, created_at: now, updated_at: now)
+    ensures: AutoMergeScheduled(pull_request: pr, doer: user)
+    @guidance
+        -- Web: merge form with merge_when_checks_succeed=true; API: same field
+        -- on POST pulls/{index}/merge. With a schedule already in place see
+        -- UserReplacesAutoMerge.
+}
+
+-- Scheduling when a schedule already exists replaces it: the new style,
+-- message, branch deletion choice and scheduler take over, and the timeline
+-- records the new schedule. Same checks as scheduling.
+-- decided: scheduling replaces an existing auto-merge (Forgejo's web form did,
+-- its API refused with a conflict)
+-- from: services/automerge/automerge.go:56
+rule UserReplacesAutoMerge {
+    when: UserSchedulesAutoMerge(user, pr, style, message, delete_branch_after_merge)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    let existing = AutoMerge{pull_request: pr}
+    requires: exists existing
+    requires: pr.base_repository.is_archived = false
+    requires: style != manually_merged
+    requires: pr.allows_style(style)
+    requires: not pr.is_merged
+    requires: pr.is_open
+    requires: pr.may_merge(user)
+    requires: not pr.is_work_in_progress
+    requires: pr.status = mergeable or pr.status = empty
+    requires: merge_signing_satisfied(pr, user, style)
+    requires: not has_open_blocking_dependencies(pr.issue)
+    ensures:
+        existing.scheduled_by = user
+        existing.style = style
+        existing.message = message ?? default_merge_message(pr, style)
+        existing.delete_branch_after_merge = delete_branch_after_merge
+        existing.created_at = now
+        issues/Comment.created(issue: pr.issue, poster: user, kind: pr_scheduled_to_auto_merge, content: "",
+            content_version: 0, created_at: now, updated_at: now)
+        AutoMergeScheduled(pull_request: pr, doer: user)
+}
+
+-- from: services/automerge/automerge.go:70
+rule UserCancelsAutoMerge {
+    when: UserCancelsAutoMerge(user, pr)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: pr.base_repository.is_archived = false
+    requires: exists pr.auto_merge
+    requires: user = pr.auto_merge.scheduled_by or pr.may_merge(user)
+    ensures: not exists pr.auto_merge
+    ensures: issues/Comment.created(issue: pr.issue, poster: user, kind: pr_unscheduled_to_auto_merge, content: "",
+        content_version: 0, created_at: now, updated_at: now)
+    ensures: AutoMergeCancelled(pull_request: pr, doer: user)
+    @guidance
+        -- Web: POST /pulls/{index}/cancel_auto_merge; API: DELETE pulls/{index}/merge.
+}
+
+-- When a scheduled PR becomes mergeable with passing required checks, it is
+-- merged as the scheduler once every waiting condition holds (not WIP, branch
+-- protection satisfied, no open blocking dependencies); until then it stays
+-- scheduled and is re-evaluated on the next status, review or check event.
+-- If the merge then cannot be carried out — the scheduler may no longer merge,
+-- the style is no longer allowed, the merge cannot be signed, or the merge
+-- attempt itself fails — the schedule is removed, the timeline says why and
+-- the scheduler is told (notifications reacts to AutoMergeFailed); the pull
+-- request stays open and may be merged by hand or scheduled again.
+-- decided: a failing auto-merge removes the schedule, leaves a timeline comment
+-- with the reason and notifies the scheduler (Forgejo only logged it)
+-- from: services/automerge/automerge.go:116
+rule AutoMergeExecutes {
+    when: scheduled: AutoMerge.is_ready
+    let pr = scheduled.pull_request
+    -- read before the schedule goes (postconditions see the resulting state)
+    let style = scheduled.style
+    let scheduler = scheduled.scheduled_by
+    let message = scheduled.message
+    let delete_after = scheduled.delete_branch_after_merge
+    requires: pr.status = mergeable
+    requires: not pr.is_work_in_progress
+    requires: pr.protection_satisfied
+    requires: not has_open_blocking_dependencies(pr.issue)
+    let cannot_merge = not pr.may_merge(scheduled.scheduled_by) or not pr.allows_style(scheduled.style)
+        or not merge_signing_satisfied(pr, scheduled.scheduled_by, scheduled.style)
+        or merge_attempt_fails(pr, scheduled.style, scheduled.message)
+    ensures:
+        if cannot_merge:
+            issues/Comment.created(issue: pr.issue, poster: scheduler, kind: pr_unscheduled_to_auto_merge,
+                content: auto_merge_failure_reason(pr, scheduler, style),
+                content_version: 0, created_at: now, updated_at: now)
+            AutoMergeFailed(pull_request: pr, scheduler: scheduler, reason: auto_merge_failure_reason(pr, scheduler, style))
+        else:
+            pr.status = merged
+            pr.merge_style = style
+            pr.merged_commit_sha = merge_result_commit(pr, style, message)
+            pr.merger = scheduler
+            pr.merged_at = now
+            pr.check_requested_at = null
+            pr.conflicted_files = {}
+            pr.merged_automatically = true
+            PullRequestAutoMerged(pull_request: pr, merger: scheduler)
+            PullRequestMerged(pull_request: pr, merger: scheduler)
+            if delete_after:
+                PullRequestHeadBranchDeletionRequested(pull_request: pr, doer: scheduler)
+        not exists scheduled
+    @guidance
+        -- Triggered in Forgejo by: a commit status on the head commit
+        -- (code/CommitStatusCreated), an approval, a dismissed review, and a
+        -- check finishing as mergeable. The head commit must still be the one
+        -- the triggering event was about.
+}
+
+------------------------------------------------------------
+-- Rules: head branch cleanup and retargeting
+------------------------------------------------------------
+
+-- "Delete branch" on a merged or closed PR, offered when the branch has no
+-- commits beyond the PR head.
+-- from: routers/web/repo/pull.go:1751
+rule UserDeletesPullRequestHeadBranch {
+    when: UserDeletesPullRequestHeadBranch(user, pr)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: pr.is_merged or pr.issue.status = closed
+    requires: pr.flow = branch
+    requires: head_commit_of(pr.head_repository, pr.head_branch) = pr.head_commit_sha
+    ensures: PullRequestHeadBranchDeletionRequested(pull_request: pr, doer: user)
+}
+
+-- Deleting the head branch after a merge: no other open PR may use it as head
+-- and the deleter must write the head repository (maintainer edits do not
+-- grant deletion). Children (open PRs in the same repository targeting this
+-- head branch) are first retargeted to this PR's base, then code deletes the
+-- branch (refusing the default branch and protected branches).
+-- from: services/repository/branch.go:502
+rule DeletePullRequestHeadBranch {
+    when: PullRequestHeadBranchDeletionRequested(pull_request, doer)
+    let pr = pull_request
+    let user = doer
+    let head = code/Branch{repository: pr.head_repository, name: pr.head_branch, status: live}
+    requires: exists head
+    requires: not has_other_open_pull_request_from(pr)
+    requires: can_write_code(user, pr.head_repository)
+    ensures:
+        if config.retarget_children_on_merge and pr.is_merged and pr.head_repository = pr.base_repository:
+            for child in open_pull_requests_into(pr.head_repository, pr.head_branch):
+                if (child.status = checking or child.status = mergeable or child.status = conflict or child.status = empty or child.status = ancestor or child.status = error):
+                    child.base_branch = pr.base_branch
+                    child.status = checking
+                    child.check_requested_at = now
+                    issues/Comment.created(issue: child.issue, poster: user, kind: change_target_branch, content: "",
+                        old_ref: pr.head_branch, new_ref: pr.base_branch,
+                        content_version: 0, created_at: now, updated_at: now)
+                    PullRequestTargetBranchChanged(pull_request: child, doer: user, old_base_branch: pr.head_branch)
+        HeadBranchDeletionRequested(user: user, branch: head)
+        issues/Comment.created(issue: pr.issue, poster: user, kind: delete_branch, content: "",
+            old_ref: pr.head_branch, content_version: 0, created_at: now, updated_at: now)
+        PullRequestHeadBranchDeleted(pull_request: pr, doer: user)
+    @guidance
+        -- Web: POST /pulls/{index}/cleanup, or delete_branch_after_merge on the
+        -- merge form / schedule. A refusal after a successful merge is
+        -- reported but does not undo the merge. Retargeting skips children
+        -- that would duplicate an open PR.
+}
+
+------------------------------------------------------------
+-- Rules: reviews
+------------------------------------------------------------
+
+-- Add a code comment to the user's pending review (creating the pending review
+-- at the current head if there is none). Only the author sees it until the
+-- review is submitted.
+-- from: services/pull/review.go:131
+rule UserAddsPendingCodeComment {
+    when: UserAddsPendingCodeComment(user, pr, path, line, side, extra_lines, body)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    let draft = Review{pull_request: pr, reviewer: user, status: pending}
+    requires: exists draft
+    requires: pr.base_repository.is_archived = false
+    requires: can_read_pulls(user, pr.base_repository)
+    requires: not pr.issue.is_locked or can_write_pulls(user, pr.base_repository)
+    requires: extra_lines >= 0
+    requires: config.max_code_comment_lines = 0 or extra_lines + 1 <= config.max_code_comment_lines
+    requires: count_suggestions(body) <= 1
+    ensures:
+        let thread = CodeConversation.created(pull_request: pr, review: draft, path: path, line: line, side: side,
+            extra_lines: extra_lines, commit_sha: blamed_commit(pr, path, line, side),
+            diff_hunk: diff_hunk_around(pr, path, line, side, extra_lines),
+            is_outdated: false, resolved_by: null)
+        ReviewComment.created(conversation: thread, review: draft, poster: user, body: body, created_at: now)
+    @guidance
+        -- Web: POST /pulls/{index}/files/reviews/comments (side=previous|proposed,
+        -- line, extra_lines_count, tree_path, before_commit_id, latest_commit_id);
+        -- API: comments inside POST pulls/{index}/reviews with event PENDING, or
+        -- POST pulls/{index}/reviews/{id}/comments. The anchor is the blame of
+        -- the line on the commit being viewed; comments on removed lines stay
+        -- on the previous side.
+}
+
+-- The first pending code comment starts the user's draft review at the
+-- current head.
+-- from: services/pull/review.go:183
+rule UserStartsDraftReview {
+    when: UserAddsPendingCodeComment(user, pr, path, line, side, extra_lines, body)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    let draft = Review{pull_request: pr, reviewer: user, status: pending}
+    requires: not exists draft
+    requires: pr.base_repository.is_archived = false
+    requires: can_read_pulls(user, pr.base_repository)
+    requires: not pr.issue.is_locked or can_write_pulls(user, pr.base_repository)
+    requires: extra_lines >= 0
+    requires: config.max_code_comment_lines = 0 or extra_lines + 1 <= config.max_code_comment_lines
+    requires: count_suggestions(body) <= 1
+    ensures:
+        let new_draft = Review.created(pull_request: pr, reviewer: user, status: pending, body: "",
+            commit_sha: pr.head_commit_sha, is_official: false, is_stale: false, is_dismissed: false, created_at: now)
+        let new_thread = CodeConversation.created(pull_request: pr, review: new_draft, path: path, line: line, side: side,
+            extra_lines: extra_lines, commit_sha: blamed_commit(pr, path, line, side),
+            diff_hunk: diff_hunk_around(pr, path, line, side, extra_lines),
+            is_outdated: false, resolved_by: null)
+        ReviewComment.created(conversation: new_thread, review: new_draft, poster: user, body: body, created_at: now)
+}
+
+-- "Add single comment": a code comment published at once as a `comment` review.
+-- from: services/pull/review.go:204
+rule UserPostsSingleCodeComment {
+    when: UserPostsSingleCodeComment(user, pr, path, line, side, extra_lines, body)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: pr.base_repository.is_archived = false
+    requires: can_read_pulls(user, pr.base_repository)
+    requires: not pr.issue.is_locked or can_write_pulls(user, pr.base_repository)
+    requires: extra_lines >= 0
+    requires: config.max_code_comment_lines = 0 or extra_lines + 1 <= config.max_code_comment_lines
+    requires: count_suggestions(body) <= 1
+    requires: trimmed_length(body) > 0
+    ensures:
+        let single = Review.created(pull_request: pr, reviewer: user, status: submitted, kind: comment, body: "",
+            commit_sha: pr.head_commit_sha, is_official: false, is_stale: false, is_dismissed: false,
+            created_at: now, submitted_at: now)
+        let thread = CodeConversation.created(pull_request: pr, review: single, path: path, line: line, side: side,
+            extra_lines: extra_lines, commit_sha: blamed_commit(pr, path, line, side), diff_hunk: diff_hunk_around(pr, path, line, side, extra_lines),
+            is_outdated: false, resolved_by: null)
+        let posted = ReviewComment.created(conversation: thread, review: single, poster: user, body: body, created_at: now)
+        ReviewSubmitted(review: single)
+        PullRequestCodeCommented(pull_request: pr, comment: posted)
+}
+
+-- Replying to a conversation: joins the thread. A reply to one's own pending
+-- review stays pending; any other reply is visible immediately.
+-- from: services/pull/review.go:160
+rule UserRepliesToCodeConversation {
+    when: UserRepliesToCodeConversation(user, pr, thread, body)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: thread.pull_request = pr
+    requires: pr.base_repository.is_archived = false
+    requires: can_read_pulls(user, pr.base_repository)
+    requires: not pr.issue.is_locked or can_write_pulls(user, pr.base_repository)
+    requires: thread.review.status = submitted or thread.review.reviewer = user
+    requires: trimmed_length(body) > 0
+    requires: count_suggestions(body) <= 1
+    ensures:
+        let reply = ReviewComment.created(conversation: thread, review: thread.review, poster: user, body: body, created_at: now)
+        if thread.review.status = submitted:
+            PullRequestCodeCommented(pull_request: pr, comment: reply)
+}
+
+-- A reply by mail to a code-comment notification continues that code
+-- conversation as the replying user (notifications verified the reply token;
+-- issues handles replies to plain comments). Refused like a web reply when the
+-- user may no longer comment.
+-- from: services/mailer/incoming/incoming_handler.go:145
+rule MailReplyContinuesCodeConversation {
+    when: notifications/MailReplyReceived(author, issue, replied_to, replied_to_code, body, attachment_count)
+    requires: replied_to_code != null
+    let thread = replied_to_code.conversation
+    let pr = thread.pull_request
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: pr.issue = issue
+    requires: pr.base_repository.is_archived = false
+    requires: can_read_pulls(author, pr.base_repository)
+    requires: not pr.issue.is_locked or can_write_pulls(author, pr.base_repository)
+    requires: thread.review.status = submitted
+    requires: trimmed_length(body) > 0
+    requires: count_suggestions(body) <= 1
+    ensures:
+        let reply = ReviewComment.created(conversation: thread, review: thread.review, poster: author, body: body, created_at: now)
+        PullRequestCodeCommented(pull_request: pr, comment: reply)
+    @guidance
+        -- The mail's attachments are attached to the reply (issues' upload
+        -- handling).
+}
+
+-- from: routers/api/v1/repo/pull_review.go:1066
+rule UserEditsReviewComment {
+    when: UserEditsReviewComment(user, pr, comment, body)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: comment.conversation.pull_request = pr
+    requires: pr.base_repository.is_archived = false
+    requires: user = comment.poster or can_write_pulls(user, pr.base_repository)
+    requires: not pr.issue.is_locked or can_write_pulls(user, pr.base_repository)
+    requires: count_suggestions(body) <= 1
+    ensures: comment.body = body
+    ensures: ReviewCommentEdited(pull_request: pr, comment: comment)
+}
+
+-- Deleting the last comment of a pending review removes the pending review.
+-- from: services/issue/comments.go:121
+rule UserDeletesReviewComment {
+    when: UserDeletesReviewComment(user, pr, comment)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: comment.conversation.pull_request = pr
+    requires: pr.base_repository.is_archived = false
+    requires: user = comment.poster or can_write_pulls(user, pr.base_repository)
+    ensures:
+        not exists comment
+        if comment.conversation.comments.count <= 1:
+            not exists comment.conversation
+        if comment.review.status = pending and comment.review.comments.count <= 1:
+            not exists comment.review
+        ReviewCommentDeleted(pull_request: pr, comment: comment)
+}
+
+-- Submit a review: the pending review (if any) becomes the submitted review,
+-- else a new one is created. Approve / request changes:
+--   * may not be given by the PR poster;
+--   * the reviewer's earlier reviews lose `is_official`, the new one is official
+--     when the reviewer is an official reviewer;
+--   * the reviewer's earlier approve/request_changes reviews are superseded
+--     (marked dismissed) so they cannot resurface;
+--   * team review requests of teams the reviewer belongs to are fulfilled
+--     (organization-owned repositories).
+-- Any verdict fulfils the reviewer's own review request. `comment` (and
+-- request_changes) need a body or code comments.
+-- decided: reviews and code comments are allowed on closed and merged pull
+-- requests, verdicts included, like Forgejo
+-- from: models/issues/review.go:350
+rule UserSubmitsDraftReview {
+    when: UserSubmitsDraftReview(user, draft, verdict, body, commit_sha)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    let pr = draft.pull_request
+    let decisive = verdict = approve or verdict = request_changes
+    requires: draft.reviewer = user
+    requires: draft.status = pending
+    requires: pr.base_repository.is_archived = false
+    requires: can_read_pulls(user, pr.base_repository)
+    requires: not (decisive and user = pr.issue.poster)
+    requires: verdict = approve or trimmed_length(body) > 0 or draft.comments.count > 0
+    let official = decisive and pr.is_official_reviewer(user)
+    let stale = decisive and commit_sha != pr.head_commit_sha and diff_differs(pr, commit_sha, pr.head_commit_sha)
+    ensures:
+        for earlier in Reviews where pull_request = pr and reviewer = user and status = submitted:
+            if decisive:
+                earlier.is_official = false
+                if earlier.is_blocking_verdict:
+                    earlier.is_dismissed = true
+        draft.status = submitted
+        draft.kind = verdict
+        draft.body = body
+        draft.commit_sha = commit_sha
+        draft.is_official = official
+        draft.is_stale = stale
+        draft.submitted_at = now
+        ReviewVerdictRecorded(pull_request: pr, verdict_review: draft, author: user, decisive: decisive)
+    @guidance
+        -- Web: POST /pulls/{index}/files/reviews/submit (type approve|comment|reject);
+        -- API: POST pulls/{index}/reviews (event APPROVED|REQUEST_CHANGES|COMMENT|PENDING,
+        -- body, commit_id, comments[]) and POST pulls/{index}/reviews/{id} to submit
+        -- a pending one. Code comments of the review are published with it
+        -- (PullRequestCodeCommented per comment). An approval re-evaluates auto-merge.
+        -- The web form submits the user's pending draft when one exists
+        -- (UserSubmitsDraftReview) and creates a review otherwise
+        -- (UserSubmitsReview).
+}
+
+-- Submitting without a draft creates the submitted review directly.
+-- decided: allowed on closed and merged pull requests too, like Forgejo
+-- from: models/issues/review.go:376
+rule UserSubmitsReview {
+    when: UserSubmitsReview(user, pr, verdict, body, commit_sha)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    let draft = Review{pull_request: pr, reviewer: user, status: pending}
+    let decisive = verdict = approve or verdict = request_changes
+    requires: not exists draft
+    requires: pr.base_repository.is_archived = false
+    requires: can_read_pulls(user, pr.base_repository)
+    requires: not (decisive and user = pr.issue.poster)
+    requires: verdict = approve or trimmed_length(body) > 0
+    let official = decisive and pr.is_official_reviewer(user)
+    let stale = decisive and commit_sha != pr.head_commit_sha and diff_differs(pr, commit_sha, pr.head_commit_sha)
+    ensures:
+        for earlier in Reviews where pull_request = pr and reviewer = user and status = submitted:
+            if decisive:
+                earlier.is_official = false
+                if earlier.is_blocking_verdict:
+                    earlier.is_dismissed = true
+        let submitted = Review.created(pull_request: pr, reviewer: user, status: submitted, kind: verdict, body: body,
+            commit_sha: commit_sha, is_official: official, is_stale: stale, is_dismissed: false,
+            created_at: now, submitted_at: now)
+        ReviewVerdictRecorded(pull_request: pr, verdict_review: submitted, author: user, decisive: decisive)
+}
+
+-- What every submitted verdict does to pending review requests (the
+-- submitting rules already made the reviewer's earlier reviews unofficial and
+-- superseded — marked dismissed — their earlier approve/request_changes
+-- reviews when the new verdict is decisive):
+--   * any verdict fulfils the reviewer's own review request;
+--   * approve / request changes fulfil requests of teams the reviewer belongs
+--     to (organization-owned repositories).
+-- from: models/issues/review.go:286
+rule ReviewVerdictSupersedesEarlierState {
+    when: ReviewVerdictRecorded(pull_request, verdict_review, author, decisive)
+    let pr = pull_request
+    ensures:
+        for request in ReviewRequests where pull_request = pr and reviewer = author:
+            not exists request
+        for team_request in ReviewRequests where pull_request = pr and team != null:
+            if decisive and is_team_member(author, team_request.team) and is_organization_owned(pr.base_repository):
+                not exists team_request
+        issues/Comment.created(issue: pr.issue, poster: author, kind: review, content: verdict_review.body, review: verdict_review,
+            content_version: 0, created_at: now, updated_at: now)
+        ReviewSubmitted(review: verdict_review)
+        for remark in ReviewComments where review = verdict_review:
+            PullRequestCodeCommented(pull_request: pr, comment: remark)
+}
+
+-- Delete a review (pending draft or submitted): the reviewer or an instance admin.
+-- Deleting an official review restores `is_official` on the reviewer's latest
+-- remaining approve/request_changes review.
+-- from: models/issues/review.go:820
+rule UserDeletesReview {
+    when: UserDeletesReview(user, pr, doomed)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: doomed.pull_request = pr
+    requires: user = doomed.reviewer or user.is_admin
+    ensures:
+        for thread in CodeConversations where review = doomed:
+            not exists thread
+        for remark in ReviewComments where review = doomed:
+            not exists remark
+        not exists doomed
+        if doomed.is_official:
+            ReviewerOfficialStandingRecalculated(pull_request: doomed.pull_request, reviewer: doomed.reviewer)
+    @guidance
+        -- API: DELETE /repos/{o}/{r}/pulls/{index}/reviews/{id}. Pending reviews
+        -- are visible (and deletable) only by their author and instance admins.
+}
+
+-- from: models/issues/review.go:650
+rule RestoreLatestOfficialReview {
+    when: ReviewerOfficialStandingRecalculated(pull_request, reviewer)
+    let pr = pull_request
+    let latest = latest_blocking_review_of(pr, reviewer)
+    requires: exists latest
+    requires: pr.is_official_reviewer(reviewer)
+    ensures: latest.is_official = true
+}
+
+-- Repository admins dismiss an approve/request_changes review (and the
+-- reviewer's earlier ones) with a message, while the PR is open and unmerged.
+-- from: services/pull/review.go:499
+rule RepoAdminDismissesReview {
+    when: RepoAdminDismissesReview(admin, pr, review, message)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: review.pull_request = pr
+    requires: is_repo_admin(admin, pr.base_repository)
+    requires: review.is_blocking_verdict
+    requires: pr.is_open
+    requires: not pr.is_merged
+    requires: review.is_dismissed = false
+    ensures:
+        review.is_dismissed = true
+        for earlier in Reviews where pull_request = pr and status = submitted and reviewer = review.reviewer:
+            earlier.is_dismissed = true
+        issues/Comment.created(issue: pr.issue, poster: admin, kind: dismiss_review, content: message, review: review,
+            content_version: 0, created_at: now, updated_at: now)
+        ReviewDismissed(review: review, dismisser: admin, message: message)
+    @guidance
+        -- Web: POST /{o}/{r}/pulls/dismiss_review; API: POST
+        -- pulls/{index}/reviews/{id}/dismissals. A dismissal re-evaluates auto-merge.
+}
+
+-- from: routers/api/v1/repo/pull_review.go:1024
+rule RepoAdminUndismissesReview {
+    when: RepoAdminUndismissesReview(admin, pr, review)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: review.pull_request = pr
+    requires: is_repo_admin(admin, pr.base_repository)
+    requires: review.is_blocking_verdict
+    requires: pr.is_open
+    requires: not pr.is_merged
+    requires: review.is_dismissed = true
+    ensures: review.is_dismissed = false
+}
+
+------------------------------------------------------------
+-- Rules: review requests
+------------------------------------------------------------
+
+-- Request a review from a user. Requesting again from someone who already
+-- reviewed is a re-request (only while the PR is open and unmerged); a request
+-- that is already pending is a no-op.
+-- decided: who may request is may_change_review_requests — read access to pull
+-- requests through ownership, collaboration or a team suffices, like Forgejo
+-- from: services/issue/assignee.go:84
+rule UserRequestsReview {
+    when: UserRequestsReview(user, pr, requested)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: pr.base_repository.is_archived = false
+    requires: is_organization(requested) = false
+    requires: can_read_pulls(requested, pr.base_repository)
+    requires: requested != pr.issue.poster
+    requires: pr.may_change_review_requests(user)
+    requires: not exists ReviewRequest{pull_request: pr, reviewer: requested}
+    requires: (pr.is_open and not pr.is_merged) or not has_submitted_review(pr, requested)
+    let official = pr.is_official_reviewer(requested)
+    ensures:
+        if official:
+            for earlier in Reviews where pull_request = pr and status = submitted and reviewer = requested:
+                earlier.is_official = false
+        ReviewRequest.created(pull_request: pr, reviewer: requested, team: null, requested_by: user,
+            is_official: official, created_at: now)
+        issues/Comment.created(issue: pr.issue, poster: user, kind: review_request, content: requested.name,
+            content_version: 0, created_at: now, updated_at: now)
+        if user != requested:
+            ReviewRequested(pull_request: pr, requester: user, reviewer: requested)
+    @guidance
+        -- Web: POST /{o}/{r}/issues/request_review (reviewer id, action attach);
+        -- API: POST pulls/{index}/requested_reviewers {reviewers, team_reviewers}.
+        -- With a token, the token's access must reach write.
+}
+
+-- Withdraw a user review request: anyone who may change requests, or the
+-- requested reviewer themselves.
+-- from: models/issues/review.go:612
+rule UserWithdrawsReviewRequest {
+    when: UserWithdrawsReviewRequest(user, pr, request)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: request.pull_request = pr
+    requires: request.reviewer != null
+    requires: pr.may_change_review_requests(user) or user = request.reviewer
+    ensures:
+        not exists request
+        issues/Comment.created(issue: pr.issue, poster: user, kind: review_request, content: request.reviewer.name,
+            content_version: 0, created_at: now, updated_at: now)
+        ReviewerOfficialStandingRecalculated(pull_request: pr, reviewer: request.reviewer)
+        ReviewRequestRemoved(pull_request: pr, doer: user, reviewer: request.reviewer)
+}
+
+-- Request a review from a team of the organization owning the repository. For
+-- a private repository the team must have access to it.
+-- from: services/issue/assignee.go:160
+rule UserRequestsTeamReview {
+    when: UserRequestsTeamReview(user, pr, team)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: pr.base_repository.is_archived = false
+    requires: pr.base_repository.owner_org = team.organization
+    requires: not pr.base_repository.is_private or team_has_repository(team, pr.base_repository)
+    requires: pr.may_change_review_requests(user)
+    requires: not exists ReviewRequest{pull_request: pr, team: team}
+    ensures: ReviewRequest.created(pull_request: pr, reviewer: null, team: team, requested_by: user,
+        is_official: team_is_official_reviewer(team, pr), created_at: now)
+    ensures: issues/Comment.created(issue: pr.issue, poster: user, kind: review_request, content: team.name,
+        content_version: 0, created_at: now, updated_at: now)
+    ensures: TeamReviewRequested(pull_request: pr, requester: user, team: team)
+    @guidance
+        -- Team members (except the poster) are told individually. A team is an
+        -- official reviewer when the rule's approvals allowlist contains it, or
+        -- (allowlist disabled) when it has write access to code; without a
+        -- protection rule team requests are never official.
+}
+
+-- from: models/issues/review.go:705
+rule UserWithdrawsTeamReviewRequest {
+    when: UserWithdrawsTeamReviewRequest(user, pr, request)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: request.pull_request = pr
+    requires: request.team != null
+    requires: pr.may_change_review_requests(user)
+    ensures: not exists request
+    ensures: issues/Comment.created(issue: pr.issue, poster: user, kind: review_request, content: request.team.name,
+        content_version: 0, created_at: now, updated_at: now)
+    ensures: TeamReviewRequestRemoved(pull_request: pr, doer: user, team: request.team)
+}
+
+------------------------------------------------------------
+-- Rules: conversations, suggestions, viewed files
+------------------------------------------------------------
+
+-- from: models/issues/review.go:751
+rule UserResolvesCodeConversation {
+    when: UserResolvesCodeConversation(user, pr, thread)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: thread.pull_request = pr
+    requires: pr.base_repository.is_archived = false
+    requires: pr.may_resolve_conversations(user)
+    requires: thread.resolved_by = null
+    ensures: thread.resolved_by = user
+    @guidance
+        -- Web: POST /{o}/{r}/issues/resolve_conversation (action=Resolve|UnResolve).
+}
+
+-- from: models/issues/review.go:751
+rule UserUnresolvesCodeConversation {
+    when: UserUnresolvesCodeConversation(user, pr, thread)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: thread.pull_request = pr
+    requires: pr.base_repository.is_archived = false
+    requires: pr.may_resolve_conversations(user)
+    requires: thread.resolved_by != null
+    ensures: thread.resolved_by = null
+}
+
+-- Apply one or more ```suggestion blocks as a single commit on the head branch.
+-- Each suggestion must belong to this PR, be published (not pending), be on
+-- the proposed side, and its anchored lines must be unchanged at the current
+-- head; suggestions may not overlap; binary, LFS and over-size files refuse.
+-- Authors of the applied suggestions become Co-authored-by trailers.
+-- Conversations the applier may resolve are resolved.
+-- from: services/repository/files/suggestion.go:65
+rule UserAppliesSuggestions {
+    when: UserAppliesSuggestions(user, pr, threads, summary, message)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: threads.count >= 1 and threads.count <= config.max_suggestions_per_apply
+    requires: threads.all(t => t.pull_request = pr)
+    requires: threads.all(t => t.review.status = submitted and t.side = proposed and t.line > 0)
+    requires: threads.all(t => suggestion_applicable(t, pr.head_commit_sha))
+    requires: not suggestions_overlap(threads)
+    requires: pr.head_is_editable_by(user)
+    requires: within_quota(pr.head_repository)
+    ensures:
+        for thread in threads:
+            if pr.may_resolve_conversations(user):
+                thread.resolved_by = user
+        PullRequestHeadMoved(pull_request: pr, pusher: user, deploy_key: null, old_commit_sha: pr.head_commit_sha,
+            new_commit_sha: suggestion_commit(pr, threads, summary, message))
+        SuggestionsApplied(pull_request: pr, doer: user, conversations: threads)
+    @guidance
+        -- Web: POST /pulls/{index}/files/reviews/apply_suggestion
+        -- {comment_ids (<= 100, deduplicated), commit_summary, commit_message}.
+        -- The commit goes through the web-editor path of the head repository
+        -- (protected-branch, signing and quota checks of code apply).
+}
+
+-- Mark files of the current head as viewed / not viewed for oneself.
+-- from: routers/web/repo/pull_review.go:458
+rule UserMarksFilesViewed {
+    when: UserMarksFilesViewed(user, pr, paths, viewed)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: can_read_pulls(user, pr.base_repository)
+    ensures:
+        for path in paths:
+            FileViewState.created(pull_request: pr, user: user, commit_sha: pr.head_commit_sha, path: path,
+                state: if viewed: viewed else: unviewed, updated_at: now)
+    @guidance
+        -- Web: POST /{o}/{r}/pulls/{index}/viewed-files {files: {path: bool},
+        -- headCommitSHA}. One record per (user, PR, head commit), merged with
+        -- the newest earlier record: files viewed at an older head whose diff
+        -- changed since are shown as has_changed. has_changed cannot be set by
+        -- users.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- At most one open, unmerged pull request per (head repository, head branch,
+-- base repository, base branch, flow).
+-- from: models/issues/pull.go:509
+invariant OneOpenPullRequestPerHeadAndBase {
+    for a in PullRequests:
+        for b in PullRequests:
+            (a != b and a.issue.status = open and b.issue.status = open
+                and a.status != merged and a.status != manually_merged
+                and b.status != merged and b.status != manually_merged
+                and a.head_repository = b.head_repository and a.head_branch = b.head_branch
+                and a.base_repository = b.base_repository and a.base_branch = b.base_branch
+                and a.flow = b.flow) implies false
+}
+
+-- Every pull request's conversation is a pull-request issue of its base repository.
+-- from: models/issues/pull.go:460
+invariant PullRequestConversationIsAPullIssue {
+    for pr in PullRequests:
+        pr.issue.is_pull = true and pr.issue.repository = pr.base_repository
+}
+
+-- A merged pull request's conversation is closed.
+-- from: models/issues/pull.go:399
+invariant MergedPullRequestsAreClosed {
+    for pr in PullRequests:
+        (pr.status = merged or pr.status = manually_merged) implies pr.issue.status = closed
+}
+
+-- At most one scheduled auto-merge per pull request.
+-- from: models/pull/automerge.go:47
+invariant OneAutoMergePerPullRequest {
+    for a in AutoMerges:
+        for b in AutoMerges:
+            (a != b) implies a.pull_request != b.pull_request
+}
+
+-- At most one pending review per reviewer per pull request.
+-- from: models/issues/review.go:316
+invariant OnePendingReviewPerReviewer {
+    for a in Reviews:
+        for b in Reviews:
+            (a != b and a.status = pending and b.status = pending and a.pull_request = b.pull_request) implies a.reviewer != b.reviewer
+}
+
+-- A poster never approves or requests changes on their own pull request.
+-- from: routers/web/repo/pull_review.go:400
+invariant NoSelfApproval {
+    for review in Reviews:
+        (review.status = submitted and (review.kind = approve or review.kind = request_changes))
+            implies review.reviewer != review.pull_request.issue.poster
+}
+
+-- At most one official approve/request_changes review per reviewer per PR.
+-- from: models/issues/review.go:366
+invariant OneOfficialReviewPerReviewer {
+    for a in Reviews:
+        for b in Reviews:
+            (a != b and a.is_official and b.is_official and a.pull_request = b.pull_request) implies a.reviewer != b.reviewer
+}
+
+-- A review request names exactly one of a user or a team.
+-- from: models/issues/review.go:286
+invariant ReviewRequestNamesOneParty {
+    for request in ReviewRequests:
+        (request.reviewer = null) != (request.team = null)
+}
+
+-- A code comment's line range never exceeds the configured maximum.
+-- from: services/pull/review.go:109
+invariant CodeCommentRangeWithinLimit {
+    for thread in CodeConversations:
+        thread.extra_lines >= 0
+}
+
+-- A conversation's comments belong to the conversation's review.
+-- from: models/issues/comment_code.go:214
+invariant ConversationCommentsShareTheReview {
+    for remark in ReviewComments:
+        remark.review = remark.conversation.review
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Anyone who can read the pull-request unit of a repository (including the
+-- anonymous visitor of a public repository, per access).
+actor PullRequestReader {
+    within: PullRequest
+    identified_by: accounts/User where can_read_pulls(this, within.base_repository)
+}
+
+-- A signed-in user looking at a repository they may propose changes to.
+actor Contributor {
+    within: repositories/Repository
+    identified_by: accounts/User where can_read_pulls(this, within) and can_read_code(this, within)
+}
+
+-- The poster of a pull request.
+actor PullRequestAuthor {
+    within: PullRequest
+    identified_by: accounts/User where this = within.issue.poster
+}
+
+-- Someone who may merge the pull request (code writer or merge allowlist).
+actor PullRequestMaintainer {
+    within: PullRequest
+    identified_by: accounts/User where within.may_merge(this) or can_write_pulls(this, within.base_repository)
+}
+
+-- An admin of the base repository (dismisses reviews, merges anyway).
+actor PullRequestRepoAdmin {
+    within: PullRequest
+    identified_by: accounts/User where is_repo_admin(this, within.base_repository)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- Opening a pull request: the compare page and the create endpoint.
+surface PullRequestComposer {
+    facing contributor: Contributor
+    context repository: repositories/Repository
+
+    exposes:
+        repository.default_branch
+        repository.is_archived
+
+    provides:
+        UserOpensPullRequest(contributor, repository, base_branch, head_repository, head_branch, title, body, allow_maintainer_edit)
+            when repository.is_archived = false
+
+    @guidance
+        -- Web: GET/POST /{o}/{r}/compare/{base}...{head} (also
+        -- {headOwner}:{head}, {headOwner}/{headRepo}:{head}), offering the
+        -- base repository's root repository and the user's own fork as head
+        -- candidates, the commits and diff, an existing open PR for the same
+        -- pair, the PR template, and "allow edits from maintainers" defaulted
+        -- from settings. API: POST /repos/{o}/{r}/pulls,
+        -- GET /repos/{o}/{r}/pulls/{base}/{head} (find PR by base and head).
+}
+
+-- What anyone who can read the pull requests of the base repository sees and
+-- may do on a pull request.
+surface PullRequestPage {
+    facing viewer: PullRequestReader
+    context pr: PullRequest
+
+    exposes:
+        pr.issue.title
+        pr.issue.status
+        pr.flow
+        pr.head_repository.name
+        pr.head_branch
+        pr.base_branch
+        pr.head_commit_sha
+        pr.merge_base_sha
+        pr.status
+        pr.conflicted_files
+        pr.changed_protected_files
+        pr.commits_ahead
+        pr.commits_behind
+        pr.allow_maintainer_edit
+        pr.is_work_in_progress
+        pr.head_branch_present
+        pr.required_checks_pass
+        pr.approval_count
+        pr.protection_satisfied
+        pr.merged_commit_sha when pr.is_merged
+        pr.merger when pr.is_merged
+        pr.merged_at when pr.is_merged
+        pr.auto_merge.scheduled_by
+        for review in pr.submitted_reviews:
+            review.reviewer
+            review.kind
+            review.body
+            review.is_official
+            review.is_stale
+            review.is_dismissed
+        for request in pr.review_requests:
+            request.reviewer
+            request.team
+        for thread in pr.conversations:
+            thread.path
+            thread.line
+            thread.side
+            thread.is_outdated
+            thread.resolved_by
+        for remark in pr.conversations.comments:
+            remark.body
+            remark.poster
+
+    provides:
+        UserSubmitsReview(viewer, pr, verdict, body, commit_sha)
+        UserAddsPendingCodeComment(viewer, pr, path, line, side, extra_lines, body)
+        UserPostsSingleCodeComment(viewer, pr, path, line, side, extra_lines, body)
+        UserRepliesToCodeConversation(viewer, pr, thread, body)
+        UserMarksFilesViewed(viewer, pr, paths, viewed)
+        UserRequestsReview(viewer, pr, reviewer) when pr.may_change_review_requests(viewer)
+        UserRequestsTeamReview(viewer, pr, team) when pr.may_change_review_requests(viewer)
+        UserWithdrawsReviewRequest(viewer, pr, request)
+        UserWithdrawsTeamReviewRequest(viewer, pr, request) when pr.may_change_review_requests(viewer)
+        UserResolvesCodeConversation(viewer, pr, thread) when pr.may_resolve_conversations(viewer)
+        UserUnresolvesCodeConversation(viewer, pr, thread) when pr.may_resolve_conversations(viewer)
+        UserEditsReviewComment(viewer, pr, comment, body)
+        UserDeletesReviewComment(viewer, pr, comment)
+        UserDeletesReview(viewer, pr, review)
+        UserAppliesSuggestions(viewer, pr, threads, summary, message) when pr.head_is_editable_by(viewer)
+        UserUpdatesPullRequestBranch(viewer, pr, style) when pr.is_open and pr.commits_behind > 0
+        UserChangesPullRequestTarget(viewer, pr, new_base_branch) when pr.may_manage(viewer)
+        UserClosesPullRequest(viewer, pr) when pr.may_manage(viewer) and pr.is_open
+        UserReopensPullRequest(viewer, pr) when pr.may_manage(viewer) and not pr.is_open
+        UserDeletesPullRequestHeadBranch(viewer, pr) when pr.is_merged or not pr.is_open
+
+    @guarantee PendingReviewsArePrivate
+        -- A pending review, its conversations and comments are visible only to
+        -- its author (and instance admins through the API); they appear to
+        -- others only once submitted.
+
+    @guidance
+        -- Web: GET /{o}/{r}/pulls/{index} (conversation), /commits,
+        -- /commits/{sha}, /files, /files/{sha}, /files/{from}..{to} (diffs,
+        -- optionally hiding outdated comments), /pulls/{index}.diff and
+        -- .patch (download; ?binary=true), /pulls/{index}.rss|.atom.
+        -- API: GET pulls, pulls/{index}, pulls/{index}.diff|.patch,
+        -- pulls/{index}/commits, pulls/{index}/files, pulls/{index}/reviews,
+        -- reviews/{id}, reviews/{id}/comments, pulls/{index}/merge (is merged),
+        -- pulls/pinned. Reading requires the pull-request unit to be enabled,
+        -- the repository not a mirror and not empty, and read access to code
+        -- for the API.
+        -- Imported content (migrations addon, CoreHostBoundary
+        -- GhostAndOriginalAuthor): a review attributed to the ghost
+        -- placeholder with a migrations/ExternalAuthorship (on_review) shows
+        -- "originally by <external_name> on <source>"; a merged pull request
+        -- whose merger is held by an ExternalAuthorship (on_merge) shows
+        -- "merged by <external_name> on <source>" until it is re-attributed
+        -- (decided: migrations 9). This module keeps no import fields.
+}
+
+-- A reviewer's own draft review.
+surface DraftReviewPanel {
+    facing author: accounts/User
+    context draft: Review where status = pending and reviewer = author
+
+    exposes:
+        draft.body
+        draft.commit_sha
+        for remark in draft.comments:
+            remark.body
+            remark.conversation.path
+            remark.conversation.line
+
+    provides:
+        UserSubmitsDraftReview(author, draft, verdict, body, commit_sha)
+        UserDeletesReview(author, draft.pull_request, draft)
+
+    @guarantee OnlyTheAuthorSeesADraft
+        -- A pending review exists for nobody but its author (instance admins
+        -- may list and delete it through the API).
+}
+
+-- What maintainers (people who may merge) can do.
+surface PullRequestMergeBox {
+    facing maintainer: PullRequestMaintainer
+    context pr: PullRequest
+
+    exposes:
+        pr.status
+        pr.is_work_in_progress
+        pr.protection_satisfied
+        pr.has_enough_approvals
+        pr.required_checks_pass
+        pr.blocked_by_rejection
+        pr.blocked_by_official_requests
+        pr.blocked_by_outdated_branch
+        pr.blocked_by_protected_files
+        pr.changed_protected_files
+        pr.conflicted_files
+        pr.auto_merge.style
+        pr.auto_merge.scheduled_by
+        pr.squash_author_email
+
+    provides:
+        UserMergesPullRequest(maintainer, pr, style, title, message, expected_head_sha, delete_branch_after_merge, force_merge)
+            when pr.is_open and not pr.is_merged
+        UserSchedulesAutoMerge(maintainer, pr, style, message, delete_branch_after_merge)
+            when pr.is_open
+        UserCancelsAutoMerge(maintainer, pr) when exists pr.auto_merge
+        UserMarksPullRequestManuallyMerged(maintainer, pr, commit_sha) when pr.is_open and not pr.is_merged
+        UserChangesPullRequestTarget(maintainer, pr, new_base_branch) when pr.is_open
+        UserUpdatesPullRequestBranch(maintainer, pr, style) when pr.commits_behind > 0
+        UserDeletesPullRequestHeadBranch(maintainer, pr) when pr.is_merged
+
+    timeout:
+        AutoMergeExecutes
+
+    @guidance
+        -- The merge box lists each unmet gate (WIP, conflicts, checking,
+        -- status checks with required-context glob matching, approvals,
+        -- requested changes, official review requests, outdated branch,
+        -- protected files, open dependencies) and offers "merge anyway" to
+        -- those who may bypass protection. The default style is
+        -- settings.default_merge_style, else config.default_merge_style; the
+        -- default message comes from MergeMessageTemplate.
+}
+
+-- What only the poster controls.
+surface PullRequestAuthorControls {
+    facing author: PullRequestAuthor
+    context pr: PullRequest
+
+    exposes:
+        pr.allow_maintainer_edit
+        pr.is_fork
+
+    provides:
+        AuthorSetsMaintainerEdits(author, pr, allow)
+        UserChangesPullRequestTarget(author, pr, new_base_branch) when pr.is_open
+        UserClosesPullRequest(author, pr) when pr.is_open
+        UserReopensPullRequest(author, pr) when not pr.is_open and not pr.is_merged
+        UserRequestsReview(author, pr, reviewer)
+        UserCancelsAutoMerge(author, pr) when exists pr.auto_merge and pr.auto_merge.scheduled_by = author
+}
+
+-- Repository administrators moderating reviews.
+surface ReviewModeration {
+    facing admin: PullRequestRepoAdmin
+    context pr: PullRequest
+
+    exposes:
+        for review in pr.submitted_reviews:
+            review.reviewer
+            review.kind
+            review.is_dismissed
+
+    provides:
+        RepoAdminDismissesReview(admin, pr, review, message) when pr.is_open and not pr.is_merged
+        RepoAdminUndismissesReview(admin, pr, review) when pr.is_open and not pr.is_merged
+        UserMergesPullRequest(admin, pr, style, title, message, expected_head_sha, delete_branch_after_merge, force_merge)
+            when pr.may_bypass_protection(admin)
+}
+
+-- Instance administrators.
+surface SiteAdminReviewControls {
+    facing admin: access/SiteAdmin
+    context review: Review
+
+    exposes:
+        review.reviewer
+        review.status
+
+    provides:
+        UserDeletesReview(admin, review.pull_request, review)
+}
+
+-- The lookups served to other modules (code, actions, discovery,
+-- notifications, keys).
+surface PullRequestQueryService {
+    facing component: access/ForgeInternals
+    context pr: PullRequest
+
+    exposes:
+        component.name
+        pr.flow
+        pr.head_commit_sha
+        pr.base_repository
+        pr.is_fork
+        pr.merge_requirements_met
+
+    contracts:
+        fulfils PullRequestQueries
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred MergeabilityCheck.outcome      -- see: three-way merge / merge-tree semantics in services/pull/patch.go
+deferred MergeExecution.commit          -- see: services/pull/merge_*.go per style
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- (none: the eleven questions were decided; see DECISIONS.md "## pulls")
+
+------------------------------------------------------------
+-- Requests to other modules
+------------------------------------------------------------
+
+-- REQUEST notifications / webhooks: AutoMergeScheduled(pull_request, doer) and AutoMergeCancelled(pull_request, doer)
+--   have no listener (the timeline comments are written here); decide whether either module announces
+--   auto-merge being scheduled or cancelled, or drop the two emissions.
+

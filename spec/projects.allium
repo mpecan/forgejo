@@ -1,0 +1,984 @@
+-- allium: 3
+-- projects.allium — kanban-style project boards that organise issues and pull requests into ordered columns.
+--
+-- Scope: project boards owned by a repository, an individual user or an
+--   organization; their lifecycle (create from a template, edit, close, reopen,
+--   delete); their columns (create, rename, recolour, choose the default,
+--   reorder, delete); their cards (an issue or pull request placed on a board,
+--   moved between columns and ordered within one); who may see and manage
+--   each kind of board; how an issue is put on, moved between, or taken off a
+--   board from the issue side.
+-- Includes: Project, ProjectColumn, ProjectCard; the projects repository unit
+--   as it affects boards; the per-owner project list pages; template seeding.
+-- Excludes:
+--   - The projects repository unit itself (enable/disable, global disable list):
+--     owned by repositories (RepoUnit, DISABLED_REPO_UNITS); referenced only.
+--   - The issue timeline Comment of kind `project`: owned by issues; this module
+--     emits IssueProjectChanged and issues records the comment
+--     (issues/RecordProjectChange; a board deleted since is shown as a "deleted
+--     project" placeholder). Moving a card between columns of one board leaves
+--     no timeline entry (Forgejo never records `project_column`).
+--   - Issue list filtering by project ("in project X" / "in no project"):
+--     owned by issues/discovery; they read ProjectCard.
+--   - REST API routing details: Forgejo has no project endpoints in routers/api/v1
+--     (only the `has_projects` repo flag, owned by repositories). Decided: the
+--     rebuild's API offers everything the web does — every `provides` and every
+--     `exposes` of the surfaces below (see each surface's @guidance).
+--   - Legacy cards with no column (pre-1.22 data shown in the default column):
+--     a data-import concern, not behaviour.
+--   - Webhooks/notifications/activity for board changes: Forgejo emits none;
+--     the triggers below are emitted so a rebuild may add them.
+--   - Rendering of the description (markdown) and card images: rendering is a
+--     presentation concern; only `card_type` (whether to show images) is kept.
+--   - Per-column card `Sorting` edits via the column edit form (the raw sorting
+--     field): superseded by the explicit reorder operation.
+--
+-- Emits:
+--   ProjectCreated(project, creator)
+--   ProjectEdited(project, editor)
+--   ProjectClosed(project, actor)
+--   ProjectReopened(project, actor)
+--   ProjectDeleted(project, actor)
+--   ProjectColumnCreated(column, creator)
+--   ProjectColumnDeleted(project, column, actor)
+--   ProjectCardsMoved(column, actor)
+--   IssueProjectChanged(issue, actor, old_project, new_project)
+--       -- consumed by issues to append a timeline Comment of kind `project`
+--       -- (old_project/new_project may each be null: added / removed / moved).
+--
+-- Reacts to:
+--   repositories/RepositoryDeleted(repository)  -- delete the repository's boards
+--   repositories/RepositoryTransferred(repository, doer, old_owner_name)
+--       -- drop the repository's issues from the old owner's boards
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+--       -- delete the user's own boards
+--   organizations/OrganizationDeleted(organization)  -- delete the organization's boards
+--   issues/IssueDeleted(issue, doer)            -- remove the issue's card
+--   issues/IssueCreatedWithProject(issue, poster, project)
+--       -- the new-issue / new-pull-request form may pick a board; issues emits
+--       -- this after creating the issue and this module places the card.
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./repositories.allium" as repositories
+use "./access.allium" as access
+use "./issues.allium" as issues
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Who a board belongs to.
+-- from: modules/project/project.go:695
+enum ProjectOwnerKind { individual | repository | organization }
+
+-- Starting column layout chosen at creation. Not editable afterwards.
+-- from: modules/project/project.go:636
+enum ProjectTemplate { none | basic_kanban | bug_triage }
+
+-- Whether cards show the latest image attachments of the issue.
+-- from: modules/project/project.go:667
+enum CardType { text_only | images_and_text }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A board. Exactly one of repository / owner_user / owner_org is set,
+-- matching owner_kind.
+-- from: models/project/project.go:46
+entity Project {
+    title: String                              -- 1..config.max_project_title_length
+    description: String                        -- markdown, may be empty
+    owner_kind: ProjectOwnerKind
+    owner_repository: repositories/Repository? -- set iff owner_kind = repository
+    owner_user: accounts/User?                 -- set iff owner_kind = individual
+    owner_org: organizations/Organization?     -- set iff owner_kind = organization
+    creator: accounts/User
+    template: ProjectTemplate                  -- creation-time only
+    card_type: CardType
+    status: open | closed
+    created_at: Timestamp
+    updated_at: Timestamp
+    closed_at: Timestamp when status = closed   -- set on close, cleared on reopen
+
+    transitions status {
+        open -> closed
+        closed -> open
+    }
+
+    -- Relationships
+    columns: ProjectColumn with project = this
+    cards: ProjectCard with project = this
+
+    -- The column new cards land in (at most one; see ExactlyOneDefaultColumn).
+    default_column: ProjectColumn with project = this and is_default = true
+
+    -- Derived
+    has_room_for_column: columns.count < config.max_columns_per_project
+
+    -- Whether an issue of this repository may be placed on this board:
+    -- a repository board takes only its own repository's issues; a user or
+    -- organization board takes issues from any repository that owner owns.
+    -- from: models/project/project.go:127
+    accepts_issue(issue): (owner_kind = repository and owner_repository = issue.repository)
+        or (owner_kind = individual and owner_user = issue.repository.owner_user)
+        or (owner_kind = organization and owner_org = issue.repository.owner_org)
+
+    invariant ExactlyOneOwner {
+        (owner_kind = repository implies (owner_repository != null and owner_user = null and owner_org = null))
+        and (owner_kind = individual implies (owner_user != null and owner_repository = null and owner_org = null))
+        and (owner_kind = organization implies (owner_org != null and owner_repository = null and owner_user = null))
+    }
+}
+
+-- A column on a board. The default column receives every issue placed on the
+-- board without an explicit column, and the cards of a deleted column.
+-- from: models/project/column.go:31
+entity ProjectColumn {
+    project: Project
+    title: String                     -- 1..config.max_column_title_length
+    color: String?                    -- "#RRGGBB" (six hex digits) or absent
+    is_default: Boolean
+    position: Integer                 -- 0-based left-to-right order within the project
+    creator: accounts/User
+    created_at: Timestamp
+
+    cards: ProjectCard with column = this
+}
+
+-- An issue or pull request placed on a board. An issue is on at most one
+-- board at a time (assigning it to another board moves the card).
+-- from: models/project/issue.go:19
+entity ProjectCard {
+    project: Project
+    column: ProjectColumn
+    issue: issues/Issue
+    position: Integer                 -- 0-based top-to-bottom order within the column
+
+    invariant CardColumnOnSameBoard {
+        column.project = project
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [project] PROJECT_BOARD_BASIC_KANBAN_TYPE: columns added after "Backlog"
+    -- from: modules/setting/project.go:12
+    basic_kanban_columns: List<String> = ["To do", "In progress", "Done"]
+    -- [project] PROJECT_BOARD_BUG_TRIAGE_TYPE
+    -- from: modules/setting/project.go:13
+    bug_triage_columns: List<String> = ["Needs triage", "High priority", "Low priority", "Closed"]
+    -- Title of the default column every non-empty template starts with.
+    -- from: models/project/column.go:109
+    template_default_column_title: String = "Backlog"
+    -- Title of the default column created on demand when an issue is placed
+    -- on a board that has no columns.
+    -- from: models/project/column.go:272
+    fallback_default_column_title: String = "Uncategorized"
+    -- Hard cap on columns per board (domain limit, not app.ini).
+    -- from: models/project/column.go:139
+    max_columns_per_project: Integer = 20
+    -- Form limits.
+    -- from: services/forms/repo_form.go:404
+    max_project_title_length: Integer = 100
+    -- from: services/forms/repo_form.go:412
+    max_column_title_length: Integer = 100
+    -- [ui] ISSUE_PAGING_NUM: page size of the project list pages.
+    -- from: routers/web/repo/projects.go:95
+    project_list_page_size: Integer = 20
+    -- True when [repository] DISABLED_REPO_UNITS contains "repo.projects".
+    -- Mirrors repositories' config.disabled_repo_units (projects); set together.
+    -- decided: one switch disables all boards — repository, user and organization
+    -- (Forgejo exempted owner boards via ignoreGlobal=true).
+    -- from: routers/web/repo/projects.go:41
+    projects_globally_disabled: Boolean = false
+}
+
+------------------------------------------------------------
+-- Rules: creating boards
+------------------------------------------------------------
+
+-- A repository writer creates a board for that repository.
+-- from: routers/web/repo/projects.go:164
+rule UserCreatesRepositoryProject {
+    when: UserCreatesRepositoryProject(user, repo, title, description, template, card_type)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: not config.projects_globally_disabled
+    requires: can_write_projects(user, repo)
+    requires: not repo.is_archived
+    requires: length(title) >= 1 and length(title) <= config.max_project_title_length
+    ensures:
+        let project = Project.created(
+            title: title,
+            description: description,
+            owner_kind: repository,
+            owner_repository: repo,
+            owner_user: null,
+            owner_org: null,
+            creator: user,
+            template: template,
+            card_type: card_type,
+            status: open,
+            created_at: now,
+            updated_at: now
+        )
+        ProjectCreated(project: project, creator: user)
+}
+
+-- A user creates a board on their own profile. Only the profile owner may:
+-- not even a site administrator can create boards for another user.
+-- from: routers/web/web.go:1268
+rule UserCreatesUserProject {
+    when: UserCreatesUserProject(user, title, description, template, card_type)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    -- decided: the global switch disables user boards too
+    requires: not config.projects_globally_disabled
+    requires: user.kind = individual
+    requires: length(title) >= 1 and length(title) <= config.max_project_title_length
+    ensures:
+        let project = Project.created(
+            title: title,
+            description: description,
+            owner_kind: individual,
+            owner_repository: null,
+            owner_user: user,
+            owner_org: null,
+            creator: user,
+            template: template,
+            card_type: card_type,
+            status: open,
+            created_at: now,
+            updated_at: now
+        )
+        ProjectCreated(project: project, creator: user)
+}
+
+-- A member whose teams grant write on the projects unit creates an
+-- organization board.
+-- from: routers/web/org/projects.go:177
+rule UserCreatesOrgProject {
+    when: UserCreatesOrgProject(user, org, title, description, template, card_type)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    -- decided: the global switch disables organization boards too
+    requires: not config.projects_globally_disabled
+    requires: can_write_org_projects(user, org)
+    requires: length(title) >= 1 and length(title) <= config.max_project_title_length
+    ensures:
+        let project = Project.created(
+            title: title,
+            description: description,
+            owner_kind: organization,
+            owner_repository: null,
+            owner_user: null,
+            owner_org: org,
+            creator: user,
+            template: template,
+            card_type: card_type,
+            status: open,
+            created_at: now,
+            updated_at: now
+        )
+        ProjectCreated(project: project, creator: user)
+}
+
+-- A non-empty template seeds a default "Backlog" column at position 0
+-- followed by the configured columns in order. Template `none` starts empty.
+-- from: models/project/column.go:91
+rule SeedColumnsFromTemplate {
+    when: ProjectCreated(project, creator)
+    requires: project.template != none
+    let extra = if project.template = basic_kanban: config.basic_kanban_columns
+                else: config.bug_triage_columns
+    ensures:
+        ProjectColumn.created(
+            project: project,
+            title: config.template_default_column_title,
+            color: null,
+            is_default: true,
+            position: 0,
+            creator: creator,
+            created_at: now
+        )
+    ensures:
+        for column_title in extra:
+            ProjectColumn.created(
+                project: project,
+                title: column_title,
+                color: null,
+                is_default: false,
+                position: index_of(extra, column_title) + 1,
+                creator: creator,
+                created_at: now
+            )
+}
+
+------------------------------------------------------------
+-- Rules: editing, closing, deleting boards
+------------------------------------------------------------
+
+-- Edit title, description and card type. The template cannot be changed.
+-- Editing never touches status: a closed board stays closed (Forgejo's owner
+-- board edit form sent status=open and reopened it). An empty description
+-- clears the description (Forgejo ignored an empty one).
+-- decided: editing never changes whether a board is open or closed (Forgejo reopening owner boards is a bug)
+-- decided: an empty description clears it (Forgejo ignoring it is a bug)
+-- from: services/project/project.go:192
+rule UserEditsProject {
+    when: UserEditsProject(user, project, title, description, card_type)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage(user, project)
+    requires: length(title) >= 1 and length(title) <= config.max_project_title_length
+    ensures: project.title = title
+    ensures: project.description = description
+    ensures: project.card_type = card_type
+    ensures: project.updated_at = now
+    ensures: ProjectEdited(project: project, editor: user)
+}
+
+-- Closing hides the board from the default ("open") list; its cards stay and
+-- it can still be chosen from an issue's sidebar (listed under closed boards).
+-- from: models/project/project.go:260
+rule UserClosesProject {
+    when: UserClosesProject(user, project)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage(user, project)
+    requires: project.status = open
+    ensures: project.status = closed
+    ensures: project.closed_at = now
+    ensures: ProjectClosed(project: project, actor: user)
+}
+
+-- from: models/project/project.go:260
+rule UserReopensProject {
+    when: UserReopensProject(user, project)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage(user, project)
+    requires: project.status = closed
+    ensures: project.status = open
+    -- decided: closed_at is cleared on reopen; it is kept only while closed
+    ensures: project.closed_at = null
+    ensures: ProjectReopened(project: project, actor: user)
+}
+
+-- Deleting a board removes all its columns and cards. The issues themselves
+-- are untouched; their timeline keeps earlier `project` comments, which then
+-- refer to a deleted board.
+-- from: models/project/project.go:284
+rule UserDeletesProject {
+    when: UserDeletesProject(user, project)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage(user, project)
+    ensures:
+        for card in project.cards:
+            not exists card
+    ensures:
+        for column in project.columns:
+            not exists column
+    ensures: not exists project
+    ensures: ProjectDeleted(project: project, actor: user)
+}
+
+-- Deleting a repository deletes its boards with their columns and cards.
+-- from: services/repository/delete.go:275
+rule RepositoryDeletionRemovesProjects {
+    when: repositories/RepositoryDeleted(repository, doer)
+    for project in Projects where owner_repository = repository:
+        ensures:
+            for card in project.cards:
+                not exists card
+        ensures:
+            for column in project.columns:
+                not exists column
+        ensures: not exists project
+}
+
+-- Deleting a user account deletes the boards on that user's profile with
+-- their columns and cards (Forgejo left them orphaned).
+-- decided: boards are deleted with their owner; projects reacts to the owner-deletion events
+-- from: services/user/delete.go:36
+rule UserDeletionRemovesProjects {
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+    for project in Projects where owner_user = user:
+        ensures:
+            for card in project.cards:
+                not exists card
+        ensures:
+            for column in project.columns:
+                not exists column
+        ensures: not exists project
+}
+
+-- Deleting an organization deletes its boards with their columns and cards
+-- (Forgejo left them orphaned).
+-- decided: boards are deleted with their owner; projects reacts to the owner-deletion events
+-- from: services/org/org.go:22
+rule OrganizationDeletionRemovesProjects {
+    when: organizations/OrganizationDeleted(organization)
+    for project in Projects where owner_org = organization:
+        ensures:
+            for card in project.cards:
+                not exists card
+        ensures:
+            for column in project.columns:
+                not exists column
+        ensures: not exists project
+}
+
+-- When a repository moves to a new owner, its issues leave the old owner's
+-- user or organization boards (they no longer accept them). Cards on the
+-- repository's own boards move with it. No IssueProjectChanged is emitted.
+-- decided: cards are removed from the old owner's boards when the repository moves (keeps CardIssueInScope)
+-- from: services/repository/transfer.go:68
+rule RepositoryTransferRemovesOwnerBoardCards {
+    when: repositories/RepositoryTransferred(repository, doer, old_owner_name)
+    for card in ProjectCards where project.owner_kind in {individual, organization}:
+        ensures:
+            if card.issue.repository = repository:
+                not exists card
+}
+
+-- Deleting an issue removes its card.
+-- from: services/issue/issue.go:280
+rule IssueDeletionRemovesCard {
+    when: issues/IssueDeleted(issue, doer)
+    ensures:
+        for card in ProjectCards where issue = issue:
+            not exists card
+}
+
+------------------------------------------------------------
+-- Rules: columns
+------------------------------------------------------------
+
+-- A new column goes to the right-hand end. The first column of a board
+-- becomes its default.
+-- from: models/project/column.go:142
+rule UserCreatesColumn {
+    when: UserCreatesColumn(user, project, title, color)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage(user, project)
+    requires: project.has_room_for_column
+    requires: length(title) >= 1 and length(title) <= config.max_column_title_length
+    requires: color = null or is_hex_colour(color)
+    let existing_count = project.columns.count
+    ensures:
+        let column = ProjectColumn.created(
+            project: project,
+            title: title,
+            color: color,
+            is_default: existing_count = 0,
+            position: existing_count,
+            creator: user,
+            created_at: now
+        )
+        ProjectColumnCreated(column: column, creator: user)
+}
+
+-- Rename and/or recolour. An absent colour clears it.
+-- from: models/project/column.go:226
+rule UserEditsColumn {
+    when: UserEditsColumn(user, column, title, color)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage(user, column.project)
+    requires: length(title) >= 1 and length(title) <= config.max_column_title_length
+    requires: color = null or is_hex_colour(color)
+    ensures: column.title = title
+    ensures: column.color = color
+}
+
+-- Exactly one column is the default; choosing a new one demotes the old.
+-- There is no way to have no default once a board has columns.
+-- from: models/project/column.go:283
+rule UserSetsDefaultColumn {
+    when: UserSetsDefaultColumn(user, column)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage(user, column.project)
+    ensures:
+        for other in column.project.columns where is_default = true:
+            other.is_default = false
+    ensures: column.is_default = true
+}
+
+-- The default column cannot be deleted. The cards of a deleted column move to
+-- the bottom of the default column, keeping their relative order.
+-- from: models/project/column.go:173
+rule UserDeletesColumn {
+    when: UserDeletesColumn(user, column)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage(user, column.project)
+    requires: not column.is_default
+    let project = column.project
+    let target = ProjectColumn{project: column.project, is_default: true}
+    ensures:
+        for card in column.cards:
+            card.column = target
+            card.position = target.cards.count + card.position
+    ensures: not exists column
+    ensures: ProjectColumnDeleted(project: project, column: column, actor: user)
+}
+
+-- Reorder all columns of a board at once. The new order must list every
+-- column of the board exactly once and nothing else.
+-- from: models/project/column.go:320
+rule UserReordersColumns {
+    when: UserReordersColumns(user, project, ordering)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage(user, project)
+    requires: ordering.count = project.columns.count
+    requires: distinct(ordering)
+    let board = project
+    requires: (ordering where project = board).count = ordering.count
+    ensures:
+        for column in ordering:
+            column.position = index_of(ordering, column)
+}
+
+------------------------------------------------------------
+-- Rules: cards
+------------------------------------------------------------
+
+-- Drag-and-drop: put the listed cards into `column` in the given order (from
+-- the top). Every listed card must already be on this board (an issue is put
+-- on a board only from the issue side); cards of other columns move here.
+-- Only cards whose issue the actor can read are moved; the others in the list
+-- are ignored. Cards already in the column but not moved keep their relative
+-- order and follow after the moved ones. Issues that no longer exist are
+-- skipped with a warning. A closed board's existing cards can still be moved.
+-- decided: a reorder only moves cards whose issues the actor can read
+-- from: models/project/issue.go:94
+rule UserMovesCards {
+    when: UserMovesCards(user, column, ordering)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    let board = column.project
+    requires: may_manage(user, board)
+    requires: distinct(ordering)
+    requires: (ordering where project = board).count = ordering.count
+    let readable = ordering where may_see_card(user, this)
+    let unlisted = column.cards - readable
+    ensures:
+        for card in readable:
+            card.column = column
+            card.position = index_of(readable, card)
+    ensures:
+        for card in unlisted:
+            card.position = readable.count + rank_of(unlisted, card)
+    ensures: ProjectCardsMoved(column: column, actor: user)
+}
+
+-- Put an issue (or pull request) on a board from the issue side: issue
+-- sidebar, new-issue/new-PR form, or the bulk action on the issue list.
+-- An issue is on at most one board: any existing card is removed first. The
+-- new card goes to the bottom of the board's default column; if the board has
+-- no column yet, a default column is created for it. A closed board accepts
+-- no new cards (Forgejo allowed it).
+-- Permission depends on the board's owner kind (triage = may_write_issue):
+--   repository board:   projects unit enabled and readable, and triage on the issue
+--   organization board: write on the org projects unit, and triage on the issue
+--                       in its repository (Forgejo asked for the org issues unit)
+--   user board:         triage on the issue
+-- decided: adding an issue to an organization board needs board write plus triage on the issue in its repository
+-- decided: a closed board accepts no new cards; existing cards can still move
+-- from: models/issues/issue_project.go:103
+rule UserAssignsIssueToProject {
+    when: UserAssignsIssueToProject(user, issue, project)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: not config.projects_globally_disabled
+    requires: not issue.repository.is_archived
+    requires: may_write_issue(user, issue)
+    requires: project.status = open
+    requires: project.accepts_issue(issue)
+    requires: project.owner_kind != organization or can_write_org_projects(user, project.owner_org)
+    requires: may_assign_to(user, issue, project)
+    let existing = ProjectCard{issue: issue}
+    requires: not exists existing or existing.project != project
+    let old_project = if exists existing: existing.project else: null
+    let target = ProjectColumn{project: project, is_default: true}
+    let has_default = exists target
+    let column_count = project.columns.count
+    let next_position = if has_default: target.cards.count else: 0
+    ensures:
+        if exists existing:
+            not exists existing
+    ensures:
+        if not has_default:
+            let fallback = ProjectColumn.created(
+                project: project,
+                title: config.fallback_default_column_title,
+                color: null,
+                is_default: true,
+                position: column_count,
+                creator: project.creator,
+                created_at: now
+            )
+            ProjectCard.created(project: project, column: fallback, issue: issue, position: 0)
+        else:
+            ProjectCard.created(project: project, column: target, issue: issue, position: next_position)
+    ensures: IssueProjectChanged(issue: issue, actor: user, old_project: old_project, new_project: project)
+}
+
+-- Take an issue off whatever board it is on.
+-- from: models/issues/issue_project.go:134
+rule UserRemovesIssueFromProject {
+    when: UserRemovesIssueFromProject(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: not issue.repository.is_archived
+    requires: may_write_issue(user, issue)
+    let existing = ProjectCard{issue: issue}
+    requires: exists existing
+    -- read before the card goes (postconditions see the resulting state)
+    let old_project = existing.project
+    ensures: not exists existing
+    ensures: IssueProjectChanged(issue: issue, actor: user, old_project: old_project, new_project: null)
+}
+
+-- The new-issue / new-pull-request form may name a board; the same checks as
+-- an explicit assignment apply (a failing check rejects the whole creation in
+-- Forgejo, decided by issues before it emits this).
+-- decided: a closed board accepts no new cards
+-- from: routers/web/repo/issue.go:1209
+rule IssueCreatedOnProject {
+    when: issues/IssueCreatedWithProject(issue, poster, project)
+    requires: not config.projects_globally_disabled
+    requires: project.status = open
+    requires: project.accepts_issue(issue)
+    -- decided (projects 4): an organization board needs board write (issues
+    -- checks it before emitting; checked again here, a rule never trusts its caller)
+    requires: project.owner_kind != organization or can_write_org_projects(poster, project.owner_org)
+    let target = ProjectColumn{project: project, is_default: true}
+    let has_default = exists target
+    let column_count = project.columns.count
+    let next_position = if has_default: target.cards.count else: 0
+    ensures:
+        if not has_default:
+            let fallback = ProjectColumn.created(
+                project: project,
+                title: config.fallback_default_column_title,
+                color: null,
+                is_default: true,
+                position: column_count,
+                creator: project.creator,
+                created_at: now
+            )
+            ProjectCard.created(project: project, column: fallback, issue: issue, position: 0)
+        else:
+            ProjectCard.created(project: project, column: target, issue: issue, position: next_position)
+    ensures: IssueProjectChanged(issue: issue, actor: poster, old_project: null, new_project: project)
+}
+
+------------------------------------------------------------
+-- Permission helpers (black boxes defined here in prose)
+------------------------------------------------------------
+
+-- can_write_projects(user, repository)  = access/can_write(user, repository, projects)
+-- can_write_org_projects(user, org)     = organizations/can_write_unit(user, org, projects)
+-- (local names because qualified calls cannot be evaluated by the journey walker)
+--
+
+-- read-only gate: `requires: not (exists access/InstanceWriteGate{read_only: true})`
+--   decided (administration 3): every user-initiated write here is refused while
+--   the instance is read-only; reactions to other modules' events are not gated
+--   (the write that set them off was).
+--
+-- may_manage(user, project): never when config.projects_globally_disabled
+-- (decided: one switch disables all boards), and otherwise
+--   repository board:   access/can_write(user, project.owner_repository, projects)
+--                       and not project.owner_repository.is_archived
+--   organization board: organizations/can_write_unit(user, project.owner_org, projects)
+--   user board:         user = project.owner_user
+--   (repository owners/admins pass via access/can_write.)
+-- from: routers/web/web.go:1651
+--
+-- may_view(viewer, project) (viewer may be anonymous): never when
+-- config.projects_globally_disabled, and otherwise
+--   repository board:   access/can_read(viewer, project.owner_repository, projects)
+--   organization board: organizations/can_read_unit(viewer, project.owner_org, projects)
+--                       (team members: their teams' projects access; others:
+--                       read when the org is public, or limited and signed in)
+--   user board:         owner visibility public; limited and signed in;
+--                       private and (viewer = owner or viewer.is_admin)
+-- from: routers/web/web.go:1066
+--
+-- may_write_issue(user, issue):
+--   access/can_write(user, issue.repository, pull_requests) when issue.is_pull,
+--   access/can_write(user, issue.repository, issues) otherwise.
+-- from: routers/web/web.go:1473
+--
+-- may_assign_to(user, issue, project): the rest of the per-owner-kind check in
+--   UserAssignsIssueToProject (repository board: its projects unit enabled and
+--   readable by the user); the organization-board write is checked there explicitly.
+-- from: services/context/project.go:65
+--
+-- may_see_card(viewer, card): the viewer can read card.issue (its repository
+--   and issues/pulls unit). Cards whose issue the viewer cannot read are
+--   omitted from the board and from its counts.
+-- from: models/issues/issue_project.go:53
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- An issue is on at most one board.
+-- from: models/issues/issue_project.go:134
+invariant OneBoardPerIssue {
+    for a in ProjectCards:
+        for b in ProjectCards:
+            a != b implies a.issue != b.issue
+}
+
+-- A board that has columns has exactly one default column.
+-- from: models/project/column.go:246
+invariant ExactlyOneDefaultColumn {
+    for p in Projects:
+        p.columns.count > 0 implies p.default_column != null
+}
+
+-- Column count limit (templates stay within it; see TemplatesFitColumnCap).
+-- from: models/project/column.go:139
+invariant ColumnLimit {
+    for p in Projects:
+        p.columns.count <= config.max_columns_per_project
+}
+
+-- Every template, with its default column, fits under the column cap. A
+-- configuration that breaks this is a configuration error: the server refuses
+-- to start (Forgejo seeded past the cap).
+-- decided: a template longer than the column cap is a configuration error at startup
+-- from: modules/setting/project.go:12
+invariant TemplatesFitColumnCap {
+    config.basic_kanban_columns.count + 1 <= config.max_columns_per_project
+    and config.bug_triage_columns.count + 1 <= config.max_columns_per_project
+}
+
+-- Column positions are unique within a board.
+-- from: models/project/column.go:35
+invariant UniqueColumnPositions {
+    for a in ProjectColumns:
+        for b in ProjectColumns:
+            (a != b and a.project = b.project) implies a.position != b.position
+}
+
+-- Card positions are unique within a column.
+-- from: models/project/issue.go:27
+invariant UniqueCardPositions {
+    for a in ProjectCards:
+        for b in ProjectCards:
+            (a != b and a.column = b.column) implies a.position != b.position
+}
+
+-- A card's issue belongs to the board's scope.
+-- from: models/project/project.go:127
+invariant CardIssueInScope {
+    for c in ProjectCards:
+        c.project.accepts_issue(c.issue)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Surfaces face access/SignedInUser (anyone signed in). Anonymous visitors get
+-- the read-only parts of the board surfaces when may_view allows (see
+-- @guarantee AnonymousReadOnly).
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The board list of a repository (Projects tab).
+surface RepositoryProjectList {
+    facing viewer: access/SignedInUser
+    context repo: repositories/Repository
+
+    let boards = Projects where owner_kind = repository and owner_repository = repo
+
+    exposes:
+        for project in boards:
+            project.title
+            project.description
+            project.status
+            project.updated_at
+            project.closed_at when project.status = closed
+
+    provides:
+        UserCreatesRepositoryProject(viewer, repo, title, description, template, card_type)
+            when can_write_projects(viewer, repo) and not repo.is_archived
+
+    @guarantee ReadersOnly
+        -- The tab exists only when the projects unit is enabled for the
+        -- repository, not globally disabled, and the viewer can read it.
+        -- Lists open or closed boards (with counts of each), filterable by
+        -- title keyword, sortable newest/oldest/recently updated/least
+        -- updated, paged by config.project_list_page_size. Per board it shows
+        -- the number of open and closed cards the viewer can see.
+
+    @guidance
+        -- Web: GET /{owner}/{repo}/projects, GET+POST /{owner}/{repo}/projects/new.
+        -- API: every provides (and exposes) here is also offered by the REST API
+        -- (decided; Forgejo has none).
+}
+
+-- The board list on a user profile.
+surface UserProjectList {
+    facing viewer: access/SignedInUser
+    context owner: accounts/User
+
+    let boards = Projects where owner_kind = individual and owner_user = owner
+
+    exposes:
+        for project in boards:
+            project.title
+            project.description
+            project.status
+            project.updated_at
+
+    provides:
+        UserCreatesUserProject(viewer, title, description, template, card_type)
+            when viewer = owner and not config.projects_globally_disabled
+
+    @guarantee VisibilityFollowsOwner
+        -- Visible to anyone when the owner is public, to signed-in users when
+        -- limited, and only to the owner and site administrators when private.
+        -- Hidden, like every board, when the projects unit is globally disabled.
+
+    @guidance
+        -- Web: GET /{username}/-/projects, GET+POST /{username}/-/projects/new.
+        -- API: every provides (and exposes) here is also offered by the REST API.
+}
+
+-- The board list of an organization.
+surface OrgProjectList {
+    facing viewer: access/SignedInUser
+    context org: organizations/Organization
+
+    let boards = Projects where owner_kind = organization and owner_org = org
+
+    exposes:
+        for project in boards:
+            project.title
+            project.description
+            project.status
+            project.updated_at
+
+    provides:
+        UserCreatesOrgProject(viewer, org, title, description, template, card_type)
+            when can_write_org_projects(viewer, org) and not config.projects_globally_disabled
+
+    @guarantee TeamUnitAccess
+        -- Members see and manage boards per their teams' access to the
+        -- projects unit (owners: full). Non-members can read when the org is
+        -- public, or limited and they are signed in; they can never manage.
+
+    @guidance
+        -- Web: GET /{org}/-/projects, GET+POST /{org}/-/projects/new.
+        -- API: every provides (and exposes) here is also offered by the REST API.
+}
+
+-- A single board with its columns and cards, and every management action.
+surface ProjectBoard {
+    facing viewer: access/SignedInUser
+    context project: Project
+
+    exposes:
+        project.title
+        project.description
+        project.status
+        project.owner_kind
+        project.card_type
+        project.creator
+        for column in project.columns:
+            column.title
+            column.color
+            column.is_default
+            column.position
+        for card in project.cards where may_see_card(viewer, card):
+            card.column
+            card.position
+            card.issue.title
+            card.issue.index
+            card.issue.status
+            card.issue.is_pull
+
+    provides:
+        UserEditsProject(viewer, project, title, description, card_type)
+            when may_manage(viewer, project)
+        UserClosesProject(viewer, project)
+            when may_manage(viewer, project) and project.status = open
+        UserReopensProject(viewer, project)
+            when may_manage(viewer, project) and project.status = closed
+        UserDeletesProject(viewer, project)
+            when may_manage(viewer, project)
+        UserCreatesColumn(viewer, project, title, color)
+            when may_manage(viewer, project) and project.has_room_for_column
+        UserEditsColumn(viewer, column, title, color)
+            when may_manage(viewer, project)
+        UserSetsDefaultColumn(viewer, column)
+            when may_manage(viewer, project)
+        UserDeletesColumn(viewer, column)
+            when may_manage(viewer, project)
+        UserReordersColumns(viewer, project, ordering)
+            when may_manage(viewer, project)
+        UserMovesCards(viewer, column, ordering)
+            when may_manage(viewer, project)
+
+    @guarantee ViewRequiresMayView
+        -- The board is reachable only when may_view(viewer, project) holds;
+        -- otherwise it does not exist for the viewer (not found, not forbidden).
+
+    @guarantee CardsFilteredPerViewer
+        -- An organization or user board can hold issues from several
+        -- repositories; each viewer sees only the cards whose issue they can
+        -- read. Cards show the issue's linked pull requests the viewer can
+        -- see and, for images_and_text boards, the latest image attachments.
+
+    @guarantee AnonymousReadOnly
+        -- Anonymous visitors see what may_view allows and no actions.
+
+    @guidance
+        -- Web (repository): /{owner}/{repo}/projects/{id} (GET view; POST add
+        -- column; POST /move reorder columns; POST /delete; GET+POST /edit;
+        -- POST /open, /close; PUT /{columnID} edit column; DELETE /{columnID};
+        -- POST /{columnID}/default; POST /{columnID}/move move cards).
+        -- Web (user/org): the same under /{owner}/-/projects/{id}.
+        -- Board management in a repository is refused while it is archived.
+        -- API: every provides (and exposes) here is also offered by the REST API.
+}
+
+-- The project picker on an issue or pull request.
+surface IssueProjectPicker {
+    facing viewer: access/SignedInUser
+    context issue: issues/Issue
+
+    let candidates = Projects where accepts_issue(issue)
+    let current = ProjectCard{issue: issue}
+
+    exposes:
+        current.project.title
+        for project in candidates:
+            project.title
+            project.status
+
+    provides:
+        UserAssignsIssueToProject(viewer, issue, project)
+            when may_write_issue(viewer, issue) and not issue.repository.is_archived
+                and project.status = open
+        UserRemovesIssueFromProject(viewer, issue)
+            when may_write_issue(viewer, issue) and not issue.repository.is_archived
+
+    @guarantee PickerOffersOwnerAndRepoBoards
+        -- Offers open boards of the issue's repository plus those of the
+        -- repository's owner (user or organization); closed boards are listed
+        -- (the current one may be closed) but cannot be chosen. The
+        -- picker is shown when the repository's projects unit is writable by
+        -- the viewer or the owner has boards and owner boards are enabled.
+        -- The bulk action on the issue list applies to several issues and
+        -- silently skips issues the board does not accept.
+
+    @guidance
+        -- Web: POST /{owner}/{repo}/issues/projects?issue_ids=..&id=<project|0>
+        -- (id 0 removes). New issue/PR forms take project_id.
+        -- API: every provides (and exposes) here is also offered by the REST API.
+}

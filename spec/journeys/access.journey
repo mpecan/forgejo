@@ -1,0 +1,849 @@
+-- access.journey — who may see and do what on repositories, organizations
+-- and profiles, walked through the access module's boundaries.
+--
+-- Fields of entities owned by other modules (accounts/User,
+-- repositories/Repository, repositories/RepoUnit, organizations/*) are set in
+-- `given` because the grant rules read them; every field a competing grant
+-- rule reads is set, so a refusal is a refusal and not an unknown.
+
+-- The common ground: one public user-owned repository, its code unit, its
+-- owner, and a stranger.
+world {
+    cast:
+        olga:     accounts/User
+        sam:      SignedInUser
+        repo:     repositories/Repository
+        code:     repositories/RepoUnit
+        visitor:  AnonymousVisitor
+        internals: ForgeInternals
+
+    given:
+        olga.is_admin = false
+        olga.is_restricted = false
+        olga.visibility = public
+        olga.is_active = true
+        olga.prohibit_login = false
+        sam.is_admin = false
+        sam.is_restricted = false
+        sam.visibility = public
+        repo.owner_user = olga
+        repo.owner_org = null
+        repo.is_private = false
+        repo.is_archived = false
+        repo.is_mirror = false
+        repo.is_empty = false
+        code.repository = repo
+        code.kind = code
+        code.enabled = true
+        code.everyone_access_mode = none
+        code.anonymous_access_mode = none
+        code.is_external = false
+        visitor.channel = web
+        internals.name = "repositories"
+        -- nobody holds an explicit grant until a journey says so (derived
+        -- live, decision 1)
+        explicit_unit_mode(olga, repo, code) = none
+        explicit_mode(olga, repo) = none
+        explicit_unit_mode(sam, repo, code) = none
+        explicit_mode(sam, repo) = none
+}
+
+journey AnonymousVisitorReadsAPublicRepository {
+    goal: Somebody with no account opens a public repository of a public user
+          and reads its code; nothing more is asked of them.
+
+    1. the visitor reads the code
+        visitor does AnonymousReadsUnit(visitor, code) on AnonymousRepositoryAccess
+            creating decision: AccessDecision
+        then ReadUnitAnonymously fires
+        then decision.basis = anonymous_public
+
+    2. and can see the repository exists
+        visitor sees repo.name on AnonymousRepositoryAccess in code
+
+    ends: Public code of a public owner is readable without signing in.
+}
+
+journey PrivateRepositoriesDoNotExistForStrangers {
+    goal: Olga makes her repository private. An anonymous visitor and Sam, a
+          signed-in stranger, both find nothing there; Olga still reads it.
+
+    given:
+        repo.is_private = true
+
+    1. the anonymous visitor is refused and is not told the repository exists
+        visitor cannot do AnonymousReadsUnit(visitor, code) on AnonymousRepositoryAccess
+        visitor cannot see repo.name on AnonymousRepositoryAccess in code
+
+    2. Sam, signed in but with no grant, is refused too
+        stipulate explicit_unit_mode(sam, repo, code) = none
+        sam cannot do UserReadsUnit(sam, code) on RepositoryUnitAccess
+
+    3. Olga owns it and reads it
+        olga does UserReadsUnit(olga, code) on RepositoryUnitAccess
+            creating decision: AccessDecision
+        then ReadUnitAsRepositoryOwner fires
+        then decision.basis = repository_owner
+
+    ends: A private repository is visible to its owner and to nobody without
+          a grant; to everyone else it does not exist.
+}
+
+journey PrivateProfilesAreSeenOnlyByThoseTheyKnow {
+    goal: Pia keeps her profile private. A stranger cannot see it; somebody
+          she follows can; an anonymous visitor cannot.
+
+    cast:
+        pia: accounts/User
+
+    given:
+        pia.is_admin = false
+        pia.is_restricted = false
+        pia.visibility = private
+        follow: accounts/Follow { follower: pia, followee: olga }
+
+    1. Sam, a stranger, is refused
+        stipulate shares_organization(pia, sam) = false
+        sam cannot do UserViewsProfile(sam, pia) on ProfileAccess
+        sam cannot see pia.name on VisibleProfile in pia
+
+    2. the anonymous visitor is refused
+        visitor cannot do AnonymousViewsProfile(visitor, pia) on AnonymousProfileAccess
+
+    3. Olga, whom Pia follows, sees her
+        olga does UserViewsProfile(olga, pia) on ProfileAccess
+            creating decision: AccessDecision
+        then ViewPrivateProfileByRelationship fires
+        then decision.basis = profile_visible
+        olga sees pia.name on VisibleProfile in pia
+
+    4. and everyone always sees themselves
+        olga does UserViewsProfile(olga, olga) on ProfileAccess
+        then ViewOwnProfileOrAsSiteAdmin fires
+
+    ends: Private means "people I have a relationship with".
+}
+
+-- Updated for access decision 1: there is no index to recalculate; the
+-- grant counts the moment it exists.
+journey ACollaboratorGainsWriteAsSoonAsTheGrantExists {
+    goal: Sam can read Olga's public repository but not push to it. Olga adds
+          him as a write collaborator; permission is derived from the grant
+          itself, so from then on he can write.
+
+    1. before the grant Sam reads but cannot write
+        stipulate explicit_unit_mode(sam, repo, code) = none
+        stipulate explicit_mode(sam, repo) = none
+        sam does UserReadsUnit(sam, code) on RepositoryUnitAccess
+        sam cannot do UserWritesUnit(sam, code, true) on RepositoryUnitAccess
+
+    2. the collaboration exists: Sam pushes, with nothing recalculated
+        stipulate explicit_unit_mode(sam, repo, code) = write
+        stipulate explicit_mode(sam, repo) = write
+        sam does UserWritesUnit(sam, code, true) on RepositoryUnitAccess
+            creating decision: AccessDecision
+        then WriteUnitByExplicitGrant fires
+        then decision.basis = explicit_grant
+
+    3. but a write collaborator is not a repository administrator
+        sam cannot do UserAdministersRepository(sam, repo) on RepositoryAccessAdministration
+
+    ends: Write comes from an explicit grant, live; administration needs more.
+}
+
+-- Updated for access decisions 1 and 7: the removal is seen at once, and
+-- the rest of the forge clears what presumed access.
+journey RemovingTheLastGrantTakesAccessAway {
+    goal: Sam was a write collaborator on Olga's private repository. Olga
+          removes him; he loses access at once, and the forge is told so.
+
+    given:
+        repo.is_private = true
+        collab: repositories/Collaboration { repository: repo, user: sam, access_mode: write }
+
+    1. while the grant stands Sam writes
+        stipulate explicit_unit_mode(sam, repo, code) = write
+        sam does UserWritesUnit(sam, code, true) on RepositoryUnitAccess
+
+    2. the collaboration is removed and his lost access announced
+        stipulate is_repo_admin(olga, repo) = true
+        stipulate explicit_unit_mode(sam, repo, code) = none
+        stipulate has_any_access(sam, repo) = false
+        olga does AdminRemovesCollaborator(olga, repo, collab) on RepositorySettings
+        then collab does not exist
+        then AnnounceLostAccessOnCollaboratorRemoved fires
+
+    3. and Sam can no longer even read
+        sam cannot do UserReadsUnit(sam, code) on RepositoryUnitAccess
+
+    ends: Losing the last grant on a private repository makes it vanish for
+          the user, and watches/assignments are cleaned up by their owners.
+}
+
+journey GoingPrivateClearsOutsidersWatchesAndSubscriptions {
+    goal: Sam watches Olga's public repository, follows one of its issues and
+          is assigned to it. Olga makes the repository private; Sam has no
+          grant, so he loses read access, and his watch, his issue
+          subscription and his assignment are cleared at once (decision 7).
+
+    cast:
+        bug: issues/Issue
+
+    given:
+        repo.is_fork = false
+        repo.fork_of = null
+        watch: repositories/Watch { user: sam, repository: repo, source: explicit, watch_issues: true, watch_pull_requests: true, watch_releases: true }
+        bug.repository = repo
+        bug.assignees = {sam}
+        sub: issues/IssueWatch { user: sam, issue: bug, is_watching: true }
+
+    1. Olga makes it private and Sam is told he lost access
+        stipulate is_repo_admin(olga, repo) = true
+        stipulate repo.owner_is_private = false
+        stipulate has_any_access(sam, repo) = false
+        stipulate can_be_assigned(sam, repo) = false
+        olga does AdminChangesVisibility(olga, repo, true) on RepositorySettings
+        then AnnounceLostAccessOnVisibilityChanged fires
+        then AnnounceLostAccessAcrossRepository fires
+        then UnwatchOnLostAccess fires
+        then ClearInvolvementOnLostAccess fires
+        then watch.watch_issues = false
+        then watch.watch_releases = false
+        then sub does not exist
+        then bug.assignees = {}
+
+    2. and the repository is gone for him
+        stipulate explicit_unit_mode(sam, repo, code) = none
+        sam cannot do UserReadsUnit(sam, code) on RepositoryUnitAccess
+
+    ends: Losing read access, for whatever reason, ends what presumed it.
+}
+
+journey ArchivedRepositoriesAreReadOnly {
+    goal: Olga archives her repository. She can still read it and still
+          administer it (she may unarchive), but nobody - not even she - can
+          change its content.
+
+    given:
+        repo.is_archived = true
+
+    1. reading still works
+        olga does UserReadsUnit(olga, code) on RepositoryUnitAccess
+
+    2. pushing does not
+        olga cannot do UserWritesUnit(olga, code, true) on RepositoryUnitAccess
+
+    3. Sam cannot open a pull request or comment either
+        sam cannot do UserContributesToRepository(sam, code) on RepositoryUnitAccess
+
+    4. administration (e.g. unarchiving) is still allowed
+        olga does UserAdministersRepository(olga, repo) on RepositoryAccessAdministration
+            creating decision: AccessDecision
+        then AdministerRepositoryAsOwner fires
+
+    ends: Archived means read-only for content, not frozen for its owner.
+}
+
+journey AMirrorsCodeCannotBePushedButCanBeSynced {
+    goal: Olga's repository is a pull mirror. She cannot push to it, but she
+          can trigger a sync, which needs write on code without changing it
+          by hand.
+
+    given:
+        repo.is_mirror = true
+
+    1. a push is refused
+        olga cannot do UserWritesUnit(olga, code, true) on RepositoryUnitAccess
+
+    2. "sync now" is a write that does not change git content by hand
+        olga does UserWritesUnit(olga, code, false) on RepositoryUnitAccess
+            creating decision: AccessDecision
+        then WriteUnitAsRepositoryOwner fires
+
+    ends: A mirror's code follows its upstream only.
+}
+
+journey RestrictedUsersSeeOnlyWhatTheyAreGiven {
+    goal: Rita is a restricted user. A public repository is invisible to her
+          until she is given an explicit grant on it.
+
+    cast:
+        rita: accounts/User
+
+    given:
+        rita.is_admin = false
+        rita.is_restricted = true
+        rita.is_active = true
+        rita.prohibit_login = false
+
+    1. a public repository is still closed to her, and hidden from her
+        stipulate explicit_unit_mode(rita, repo, code) = none
+        stipulate explicit_mode(rita, repo) = none
+        rita cannot do UserReadsUnit(rita, code) on RepositoryUnitAccess
+        rita cannot see repo.name on VisibleRepository in repo
+
+    2. she is added as a read collaborator, which counts at once
+        stipulate explicit_unit_mode(rita, repo, code) = read
+        stipulate explicit_mode(rita, repo) = read
+        stipulate has_any_access(rita, repo) = true
+
+    3. and now reads it, through the grant and nothing else
+        rita does UserReadsUnit(rita, code) on RepositoryUnitAccess
+            creating decision: AccessDecision
+        then ReadUnitByExplicitGrant fires
+        then ReadUnitByPublicDefault does not fire
+        then decision.basis = explicit_grant
+        rita sees repo.name on VisibleRepository in repo
+
+    ends: For a restricted user, "public" means nothing; grants mean
+          everything.
+}
+
+journey PrivateOrganizationsAreVisibleOnlyToMembers {
+    goal: A private organization owns a public repository. Sam, who is not a
+          member, can see neither the organization nor the repository; Mia,
+          a member, can see both.
+
+    cast:
+        mia:   SignedInUser
+        org:   organizations/Organization
+        orepo: repositories/Repository
+        ocode: repositories/RepoUnit
+
+    given:
+        mia.is_admin = false
+        mia.is_restricted = false
+        org.visibility = private
+        orepo.owner_user = null
+        orepo.owner_org = org
+        orepo.is_private = false
+        orepo.is_archived = false
+        ocode.repository = orepo
+        ocode.kind = code
+        ocode.enabled = true
+        ocode.is_external = false
+        ocode.everyone_access_mode = none
+        ocode.anonymous_access_mode = none
+        membership: organizations/OrgMembership { organization: org, user: mia, is_public: false }
+
+    1. Sam cannot see the organization
+        sam cannot do UserViewsOrganization(sam, org) on OrganizationAccess
+        sam cannot see org.name on VisibleOrganization in org
+
+    2. nor read its public repository
+        stipulate explicit_unit_mode(sam, orepo, code) = none
+        sam cannot do UserReadsUnit(sam, ocode) on RepositoryUnitAccess
+
+    3. Mia, a member, sees the organization
+        mia does UserViewsOrganization(mia, org) on OrganizationAccess
+            creating decision: AccessDecision
+        then ViewOrganizationAsMember fires
+        mia sees org.name on VisibleOrganization in org
+
+    4. and reads its public repository
+        stipulate explicit_unit_mode(mia, orepo, code) = none
+        mia does UserReadsUnit(mia, ocode) on RepositoryUnitAccess
+        then ReadUnitByPublicDefault fires
+
+    ends: Owner visibility gates everything the owner has, even public
+          repositories.
+}
+
+journey LimitedOrganizationsNeedASignedInViewer {
+    goal: A limited organization is visible to any signed-in user but not to
+          anonymous visitors.
+
+    cast:
+        org: organizations/Organization
+
+    given:
+        org.visibility = limited
+
+    1. the anonymous visitor is refused
+        visitor cannot do AnonymousViewsOrganization(visitor, org) on AnonymousOrganizationAccess
+        visitor cannot see org.name on AnonymousOrganizationAccess in org
+
+    2. Sam, signed in, sees it
+        sam does UserViewsOrganization(sam, org) on OrganizationAccess
+            creating decision: AccessDecision
+        then ViewOrganizationByVisibility fires
+        then decision.basis = organization_visible
+        sam sees org.name on VisibleOrganization in org
+
+    ends: Limited is "members of this instance only".
+}
+
+-- Decision 2: Tom is also a read collaborator; per unit he gets the
+-- strongest of that and the unit's team grant - never the team's best grant
+-- on every unit.
+journey TeamUnitAccessDecidesPerUnit {
+    goal: Tom is a read collaborator on a private organization repository and
+          in a team that grants write on issues but only read on code. He can
+          triage issues and read code, but cannot push.
+
+    cast:
+        tom:    SignedInUser
+        org:    organizations/Organization
+        orepo:  repositories/Repository
+        ocode:  repositories/RepoUnit
+        tracker: repositories/RepoUnit
+
+    given:
+        tom.is_admin = false
+        tom.is_restricted = false
+        org.visibility = public
+        orepo.owner_user = null
+        orepo.owner_org = org
+        orepo.is_private = true
+        orepo.is_archived = false
+        orepo.is_mirror = false
+        orepo.is_empty = false
+        ocode.repository = orepo
+        ocode.kind = code
+        ocode.enabled = true
+        ocode.is_external = false
+        ocode.everyone_access_mode = none
+        ocode.anonymous_access_mode = none
+        tracker.repository = orepo
+        tracker.kind = issues
+        tracker.enabled = true
+        tracker.is_external = false
+        tracker.everyone_access_mode = none
+        tracker.anonymous_access_mode = none
+        collab: repositories/Collaboration { repository: orepo, user: tom, access_mode: read }
+
+    1. per unit, the strongest of his read collaboration and the team's unit grant
+        stipulate explicit_unit_mode(tom, orepo, issues) = write
+        stipulate explicit_unit_mode(tom, orepo, code) = read
+
+    2. Tom triages issues
+        tom does UserWritesUnit(tom, tracker, false) on RepositoryUnitAccess
+            creating decision: AccessDecision
+        then WriteUnitByExplicitGrant fires
+
+    3. reads code
+        tom does UserReadsUnit(tom, ocode) on RepositoryUnitAccess
+
+    4. but cannot push
+        tom cannot do UserWritesUnit(tom, ocode, true) on RepositoryUnitAccess
+
+    ends: On organization repositories a team's unit access, not its overall
+          mode, decides each unit.
+}
+
+journey AdminTeamsAdministerButOnlyOwnersDelete {
+    goal: Ada is in an admin team, Otto in the owner team of the organization
+          owning a repository. Both administer it; only Otto may delete or
+          transfer it.
+
+    cast:
+        ada:   SignedInUser
+        otto:  SignedInUser
+        org:   organizations/Organization
+        orepo: repositories/Repository
+
+    given:
+        ada.is_admin = false
+        otto.is_admin = false
+        orepo.owner_user = null
+        orepo.owner_org = org
+
+    1. Ada administers the repository
+        stipulate explicit_mode(ada, orepo) = admin
+        stipulate explicit_mode(otto, orepo) = owner
+        ada does UserAdministersRepository(ada, orepo) on RepositoryAccessAdministration
+        then AdministerRepositoryByExplicitGrant fires
+
+    2. but cannot delete it
+        ada cannot do UserPerformsOwnerAction(ada, orepo) on RepositoryAccessAdministration
+
+    3. Otto, in the owner team, can
+        otto does UserPerformsOwnerAction(otto, orepo) on RepositoryAccessAdministration
+            creating decision: AccessDecision
+        then OwnRepositoryAsOwnerTeamMember fires
+
+    ends: Admin is everything but the irreversible ownership actions.
+}
+
+journey AFineGrainedTokenNarrowsEvenAnAdministrator {
+    goal: Ash is a site administrator using a token restricted to public
+          repositories. Through it he can read public code but cannot touch a
+          private repository nor use administrator powers.
+
+    cast:
+        ash:   accounts/User
+        token: CredentialRestriction
+        prepo: repositories/Repository
+        pcode: repositories/RepoUnit
+
+    given:
+        ash.is_admin = true
+        ash.is_restricted = false
+        ash.is_active = true
+        ash.prohibit_login = false
+        token.reach = public_only
+        token.has_admin_scope = false
+        prepo.owner_user = olga
+        prepo.owner_org = null
+        prepo.is_private = true
+        prepo.is_archived = false
+        prepo.is_mirror = false
+        pcode.repository = prepo
+        pcode.kind = code
+        pcode.enabled = true
+        pcode.is_external = false
+        pcode.everyone_access_mode = none
+        pcode.anonymous_access_mode = none
+
+    1. he reads public code through the token, as any user would
+        stipulate explicit_unit_mode(ash, repo, code) = none
+        ash does UserReadsUnit(ash, code, token) on RepositoryUnitAccess
+        then ReadUnitByPublicDefault fires
+        then ReadUnitAsSiteAdmin does not fire
+
+    2. a private repository is out of the token's reach
+        ash cannot do UserWritesUnit(ash, pcode, true, token) on RepositoryUnitAccess
+
+    3. and the token confers no administrator override
+        ash cannot do UserActsAsSiteAdmin(ash, token) on SiteAdministration
+
+    4. without the token he is an administrator again
+        ash does UserActsAsSiteAdmin(ash) on SiteAdministration
+            creating decision: AccessDecision
+        then ActAsSiteAdmin fires
+
+    ends: A credential restriction only ever narrows.
+}
+
+journey BlockedUsersCannotContribute {
+    goal: Olga has blocked Sam. He can still read her public repository, but
+          cannot open issues, comment or react there.
+
+    given:
+        block: accounts/UserBlock { blocker: olga, blocked: sam }
+
+    1. Olga's block is in place
+        then block exists
+
+    2. Sam still reads
+        sam does UserReadsUnit(sam, code) on RepositoryUnitAccess
+
+    3. but cannot contribute
+        sam cannot do UserContributesToRepository(sam, code) on RepositoryUnitAccess
+
+    ends: Blocking stops participation, not reading public content.
+}
+
+journey AForkPullRequestRunIsReadOnly {
+    goal: A workflow run triggered by a pull request from a fork reads the
+          repository it runs in but cannot write to it; a normal run can.
+
+    cast:
+        forkrun:   RunningTask
+        normalrun: RunningTask
+        run:       actions/WorkflowRun
+        job:       actions/Job
+
+    given:
+        run.repository = repo
+        job.run = run
+        forkrun.job = job
+        forkrun.status = running
+        forkrun.is_fork_pull_request = true
+        normalrun.job = job
+        normalrun.status = running
+        normalrun.is_fork_pull_request = false
+
+    1. the fork run reads
+        forkrun does ActionsTaskAccessesRepository(forkrun, code, read) on ActionsTaskAccess
+
+    2. but cannot write
+        forkrun cannot do ActionsTaskAccessesRepository(forkrun, code, write) on ActionsTaskAccess
+
+    3. the normal run writes
+        normalrun does ActionsTaskAccessesRepository(normalrun, code, write) on ActionsTaskAccess
+            creating decision: AccessDecision
+        then TaskAccessesOwnRepository fires
+        then decision.basis = own_task
+
+    ends: Untrusted code from forks never gets write.
+}
+
+journey ASiteAdminsTokenNeedsTheAdminScope {
+    goal: Ash, a site administrator, holds two tokens reaching every
+          repository; only one carries the admin scope. Through the other he
+          is an ordinary user: Olga's private repository is closed to him and
+          the admin endpoints refuse him (decision 5).
+
+    cast:
+        ash:     accounts/User
+        plain:   CredentialRestriction
+        admintok: CredentialRestriction
+
+    given:
+        ash.is_admin = true
+        ash.is_restricted = false
+        ash.is_active = true
+        ash.prohibit_login = false
+        plain.reach = all_repositories
+        plain.has_admin_scope = false
+        admintok.reach = all_repositories
+        admintok.has_admin_scope = true
+        repo.is_private = true
+
+    1. without the admin scope he cannot read the private repository
+        stipulate explicit_unit_mode(ash, repo, code) = none
+        ash cannot do UserReadsUnit(ash, code, plain) on RepositoryUnitAccess
+
+    2. nor administer it, nor the instance
+        stipulate explicit_mode(ash, repo) = none
+        ash cannot do UserAdministersRepository(ash, repo, plain) on RepositoryAccessAdministration
+        ash cannot do UserActsAsSiteAdmin(ash, plain) on SiteAdministration
+
+    3. with the admin scope he reads it as a site administrator
+        ash does UserReadsUnit(ash, code, admintok) on RepositoryUnitAccess
+            creating decision: AccessDecision
+        then ReadUnitAsSiteAdmin fires
+        then decision.basis = site_admin
+
+    4. and uses the admin endpoints
+        ash does UserActsAsSiteAdmin(ash, admintok) on SiteAdministration
+        then ActAsSiteAdmin fires
+
+    ends: The token limits everything; admin powers need the admin scope.
+}
+
+journey ATaskTokenStaysInItsRepository {
+    goal: A normal workflow run reads and writes the repository it runs in,
+          but its token cannot even read another public repository
+          (decision 6).
+
+    cast:
+        task:   RunningTask
+        run:    actions/WorkflowRun
+        job:    actions/Job
+        other:  repositories/Repository
+        ocode:  repositories/RepoUnit
+
+    given:
+        run.repository = repo
+        job.run = run
+        task.job = job
+        task.status = running
+        task.is_fork_pull_request = false
+        other.owner_user = olga
+        other.owner_org = null
+        other.is_private = false
+        other.is_archived = false
+        ocode.repository = other
+        ocode.kind = code
+        ocode.enabled = true
+        ocode.is_external = false
+
+    1. the task reads its own repository
+        task does ActionsTaskAccessesRepository(task, code, read) on ActionsTaskAccess
+        then TaskAccessesOwnRepository fires
+
+    2. but not another one, public as it is
+        task cannot do ActionsTaskAccessesRepository(task, ocode, read) on ActionsTaskAccess
+
+    ends: A job token is repository-scoped.
+}
+
+journey APrivateRepositoryWithAPublicIssueTracker {
+    goal: Olga keeps her repository private but opens its issue tracker to
+          everyone. Visitors read the issues - only the issues - and nobody
+          without a grant may write there (decisions 3 and 4).
+
+    cast:
+        tracker: repositories/RepoUnit
+
+    given:
+        repo.is_private = true
+        tracker.repository = repo
+        tracker.kind = issues
+        tracker.enabled = true
+        tracker.is_external = false
+        tracker.everyone_access_mode = none
+        tracker.anonymous_access_mode = none
+
+    1. an anonymous default of write is refused
+        stipulate is_repo_admin(olga, repo) = true
+        olga cannot do AdminSetsUnitDefaultAccess(olga, repo, tracker, write, write) on RepositorySettings
+
+    2. Olga makes the tracker public: read for visitors, write for signed-in users
+        stipulate has_any_access(olga, repo) = true
+        olga does AdminSetsUnitDefaultAccess(olga, repo, tracker, write, read) on RepositorySettings
+        then tracker.anonymous_access_mode = read
+        then tracker.everyone_access_mode = write
+
+    3. an anonymous visitor reads the issues but not the code
+        visitor does AnonymousReadsUnit(visitor, tracker) on AnonymousRepositoryAccess
+            creating decision: AccessDecision
+        then ReadUnitAnonymously fires
+        visitor cannot do AnonymousReadsUnit(visitor, code) on AnonymousRepositoryAccess
+
+    4. Sam, signed in, reads the issues and sees the repository
+        stipulate explicit_unit_mode(sam, repo, issues) = none
+        stipulate explicit_unit_mode(sam, repo, code) = none
+        stipulate explicit_mode(sam, repo) = none
+        sam does UserReadsUnit(sam, tracker) on RepositoryUnitAccess
+        then ReadUnitByPublicDefault fires
+        sam sees repo.name on VisibleRepository in repo
+
+    5. but not the code, and he cannot triage: a private repository's public unit is read-only
+        sam cannot do UserReadsUnit(sam, code) on RepositoryUnitAccess
+        sam cannot do UserWritesUnit(sam, tracker, false) on RepositoryUnitAccess
+
+    ends: Units, not only repositories, can be public.
+}
+
+journey AUnitDefaultLetsEveryoneWrite {
+    goal: On Olga's public repository the projects board lets every signed-in
+          user write; Sam edits it, but a restricted user may not (decision 4).
+
+    cast:
+        board: repositories/RepoUnit
+        rita:  accounts/User
+
+    given:
+        board.repository = repo
+        board.kind = projects
+        board.enabled = true
+        board.is_external = false
+        board.everyone_access_mode = write
+        board.anonymous_access_mode = none
+        rita.is_admin = false
+        rita.is_restricted = true
+        rita.is_active = true
+        rita.prohibit_login = false
+
+    1. Sam, with no grant, writes on the board
+        stipulate explicit_unit_mode(sam, repo, projects) = none
+        sam does UserWritesUnit(sam, board, false) on RepositoryUnitAccess
+            creating decision: AccessDecision
+        then WriteUnitByEveryoneWritable fires
+        then decision.basis = everyone_writable
+
+    2. but not on the code, which keeps the default
+        stipulate explicit_unit_mode(sam, repo, code) = none
+        sam cannot do UserWritesUnit(sam, code, false) on RepositoryUnitAccess
+
+    3. and a restricted user gets nothing from the default
+        stipulate explicit_unit_mode(rita, repo, projects) = none
+        rita cannot do UserWritesUnit(rita, board, false) on RepositoryUnitAccess
+
+    ends: "Everyone may write" is a per-unit setting, no longer the wiki's alone.
+}
+
+-- decided: administration 3 — while the instance is read-only every write is
+-- refused, the owner's and a site admin's included; reads keep working.
+journey ReadOnlyModeRefusesEveryWrite {
+    goal: The site administrator has put the instance into read-only mode for
+          a backup. Olga can still read her repository, but she cannot push,
+          and Sam cannot comment or open a pull request.
+
+    cast:
+        gate: InstanceWriteGate
+
+    given:
+        gate.read_only = true
+        gate.message = "Backup in progress"
+
+    1. reading still works
+        olga does UserReadsUnit(olga, code) on RepositoryUnitAccess
+
+    2. the owner's push is refused
+        olga cannot do UserWritesUnit(olga, code, true) on RepositoryUnitAccess
+
+    3. nor can Sam contribute
+        sam cannot do UserContributesToRepository(sam, code) on RepositoryUnitAccess
+
+    ends: Nothing changes while the instance is read-only.
+}
+
+-- decided: follow-up 1 (site admins keep implicit read, but a read of a
+-- private repository they hold no role in is audited)
+journey ASiteAdminReadsAPrivateRepositoryAndIsRecorded {
+    goal: Ash, a site administrator with no role in Olga's private
+          repository, opens its code. He may read it, and the read is
+          recorded for audit. Reading a private repository he collaborates
+          on leaves no audit record.
+
+    cast:
+        ash:   accounts/User
+        crepo: repositories/Repository
+        ccode: repositories/RepoUnit
+
+    given:
+        ash.is_admin = true
+        ash.is_restricted = false
+        ash.is_active = true
+        ash.prohibit_login = false
+        repo.is_private = true
+        explicit_unit_mode(ash, repo, code) = none
+        explicit_mode(ash, repo) = none
+        crepo.owner_user = olga
+        crepo.owner_org = null
+        crepo.is_private = true
+        crepo.is_archived = false
+        crepo.is_mirror = false
+        ccode.repository = crepo
+        ccode.kind = code
+        ccode.enabled = true
+        ccode.is_external = false
+        ccode.everyone_access_mode = none
+        ccode.anonymous_access_mode = none
+        explicit_unit_mode(ash, crepo, code) = read
+        explicit_mode(ash, crepo) = read
+
+    1. a stranger still cannot read the private repository
+        sam cannot do UserReadsUnit(sam, code) on RepositoryUnitAccess
+
+    2. Ash reads it on the strength of being an administrator, and it is logged
+        ash does UserReadsUnit(ash, code) on RepositoryUnitAccess
+            creating record: AdminAccessRecord
+        then ReadUnitAsSiteAdmin fires
+        then RecordSiteAdminReadWithoutRole fires
+        then record.admin = ash
+        then record.repository = repo
+        then record.unit_kind = code
+
+    3. where he collaborates, his read needs no audit
+        ash does UserReadsUnit(ash, ccode) on RepositoryUnitAccess
+        then ReadUnitByExplicitGrant fires
+        then ReadUnitAsSiteAdmin fires
+        then RecordSiteAdminReadWithoutRole does not fire
+
+    ends: Administrators can open any repository; every role-less read of a
+          private one leaves an audit record.
+}
+
+-- decided: administration 3 — a workflow's own token cannot write while the
+-- instance is read-only either; it can still read its repository.
+journey ReadOnlyModeStopsTaskTokenWrites {
+    goal: The instance is read-only for a backup. A running workflow can still
+          check out its repository's code, but its token cannot push.
+
+    cast:
+        gate:  InstanceWriteGate
+        task:  RunningTask
+        run:   actions/WorkflowRun
+        job:   actions/Job
+
+    given:
+        gate.read_only = true
+        run.repository = repo
+        job.run = run
+        task.job = job
+        task.status = running
+        task.is_fork_pull_request = false
+
+    1. the task reads
+        task does ActionsTaskAccessesRepository(task, code, read) on ActionsTaskAccess
+
+    2. but cannot write
+        task cannot do ActionsTaskAccessesRepository(task, code, write) on ActionsTaskAccess
+
+    ends: Even the automatic token writes nothing while the instance is read-only.
+}

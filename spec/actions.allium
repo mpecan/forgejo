@@ -1,0 +1,3228 @@
+-- allium: 3
+-- actions.allium — Forgejo Actions: GitHub-Actions-compatible CI/CD driven by workflow files in the repository.
+--
+-- Scope: everything between "something happened in a repository" and "a runner
+--   reported a result": workflow discovery and event matching, workflow runs,
+--   jobs and their dependency graph, tasks handed to runners, runner
+--   registration and the runner protocol, logs, step summaries, job outputs,
+--   artifacts, secrets, variables, the automatic token and OIDC ID tokens,
+--   scheduled (cron) workflows, manual dispatch, pull-request approval for
+--   untrusted contributors, concurrency groups, cancellation, re-runs, run
+--   priority, commit-status reporting, and every background clean-up job.
+-- Includes: Workflow, WorkflowRun, Job, Task, TaskStep, TaskOutput, Runner,
+--   RunnerRegistrationToken, ActionsScope, Secret, Variable, Artifact,
+--   Schedule, ScheduleSpec, TrustedContributor.
+-- Excludes:
+--   - ActionsCache: Forgejo hosts no cache server; the runner hosts the
+--     actions/cache backend. Forgejo only grants a write-everything cache
+--     scope inside the runtime token (see Task.runtime_token_cache_scope).
+--   - Workflow YAML semantics (expressions, matrix expansion, step execution,
+--     container handling): executed by the runner and the shared jobparser
+--     library; referenced here through black-box functions (job_definitions,
+--     evaluate_if, expand_incomplete_job, matching_workflows).
+--   - The v1-v3 artifact upload protocol's chunk/file layout (several rows
+--     per artifact): decided (actions 6), v1-v4 are all supported, but the
+--     layout is a storage detail; artifacts are modelled as one logical
+--     (run, name) object, as the v4 protocol stores them.
+--   - Pre-translated pre-execution error strings stored by Forgejo v13: a
+--     data-import concern.
+--   - The legacy OIDC subject format `legacy_forgejo_15`: decided (actions 5),
+--     dropped; there is one subject format and no per-repository option.
+--   - `GITEA_TOKEN`/`GITHUB_TOKEN`/`gitea_runtime_token` aliases: kept only as
+--     names the runner expects; the rebuild exposes one automatic token under
+--     whatever names its runner protocol requires.
+--   - The `repository` hook event (repository created/migrated, fork created)
+--     reaching workflows: it has no GitHub workflow equivalent and a new
+--     repository is empty; not specified.
+--   - Tasks-version polling counter (lets idle runners skip a query): a
+--     performance optimisation; behaviourally a runner may poll at any time.
+--   - Doctor fixes for runners whose owner/repository vanished: replaced by
+--     the deletion reactions below.
+--   - Rendering of logs/summary markdown, badge SVG drawing: presentation.
+--
+-- Emits:
+--   WorkflowRunAttemptStarted(run)                     -- a run was created or re-run
+--   WorkflowRunStatusChanged(run, prior_status)        -- non-final status change
+--   WorkflowRunCompleted(run, prior_status)            -- run reached a final status, once per attempt;
+--       -- notifications mails the trigger user once per failed attempt when
+--       -- run.notify_email (decided: notifications 4)
+--   WorkflowJobAttemptStarted(job)                     -- a job was created or re-run
+--   WorkflowJobStatusChanged(job, prior_status)        -- non-final job status change
+--   WorkflowJobCompleted(job, prior_status)            -- job reached a final status
+--   JobCommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
+--       -- creator = the Actions bot; code reacts and records the CommitStatus
+--       -- exactly as the commit-status API does
+--   IdTokenIssued(task, audience, expires_at)
+--   ScheduledWorkflowDisabledForInactivity(repository, workflow_file)
+--       -- notifications tells the repository's admins
+--
+--   ZombieTaskSweepFinished()           -- administration: the stop_zombie_tasks run is done
+--   EndlessTaskSweepFinished()          -- administration: the stop_endless_tasks run is done
+--   AbandonedJobSweepFinished()         -- administration: the cancel_abandoned_jobs run is done
+--   LingeringLogSweepFinished()         -- administration: the transfer_lingering_logs run is done
+--   ScheduleSweepFinished()             -- administration: the start_schedule_tasks run is done
+--   ActionsCleanupSweepFinished()       -- administration: the cleanup_actions run is done
+--   TrustedContributorSweepFinished()   -- administration: the actions_action_user run is done
+--   OfflineRunnerSweepFinished()        -- administration: the cleanup_offline_runners run is done
+-- Reacts to:
+--   code/PushReceived(push)                     -- push; also refreshes schedules on default branch
+--   code/RefCreated(repository, pusher, ref_kind, ref_name, commit_sha)  -- create
+--   code/RefDeleted(repository, pusher, ref_kind, ref_name)              -- delete
+--   repositories/MirrorSyncPushed(repository, ref_name, commits)          -- push (pull-mirror sync, doer: owner)
+--   repositories/MirrorRefCreated(repository, ref_name)                   -- create (pull-mirror sync, doer: owner)
+--   repositories/MirrorRefDeleted(repository, ref_name)                   -- delete (pull-mirror sync, doer: owner)
+--   code/DefaultBranchChanged(repository, old_name, new_name, by)        -- re-detect schedules
+--   code/BranchRenamed(repository, from_name, to_name, by)               -- re-detect schedules
+--   repositories/RepositoryForked(source, fork, doer)       -- fork (on the source)
+--   repositories/RepositoryArchived(repository, doer)       -- drop schedules, cancel scheduled runs
+--   repositories/RepositoryUnarchived(repository, doer)     -- re-detect schedules
+--   repositories/RepoUnitDisabled(repository, kind)         -- actions unit off: drop schedules
+--   repositories/RepoUnitEnabled(repository, kind)          -- actions unit on: re-detect schedules
+--   repositories/RepositoryDeleted(repository, doer)        -- remove all actions data
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions),
+--   organizations/OrganizationDeleted(organization)         -- remove owner-scoped data
+--   accounts/UserBlocked(blocker, blocked)                  -- revoke the blocked user's trust
+--   issues/IssueOpened(issue, mentions), issues/IssueTitleChanged(issue, doer, old_title),
+--   issues/IssueContentChanged(issue, doer, old_content),
+--   issues/IssueClosed(issue, doer, comment), issues/IssueReopened(issue, doer, comment),
+--   pulls/PullRequestClosed(pull_request, doer), pulls/PullRequestReopened(pull_request, doer),
+--   issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment),
+--   issues/IssueMilestoneChanged(issue, doer, old_milestone),
+--   issues/IssueLabelsChanged(issue, doer, added, removed), issues/IssueLabelsCleared(issue, doer)
+--   issues/IssueCommentCreated(issue, comment, doer, mentions),
+--   issues/IssueCommentEdited(comment, doer, old_content), issues/IssueCommentDeleted(comment, issue, doer)
+--   pulls/PullRequestOpened(pull_request), pulls/PullRequestSynchronized(pull_request, doer, deploy_key),
+--   pulls/PullRequestMerged(pull_request, merger), pulls/ReviewSubmitted(review),
+--   pulls/ReviewRequested(pull_request, requester, reviewer),
+--   pulls/ReviewRequestRemoved(pull_request, doer, reviewer),
+--   pulls/PullRequestTargetBranchChanged(pull_request, doer, old_base_branch)
+--   releases/ReleasePublished(release), releases/ReleaseUpdated(release, doer),
+--   releases/ReleaseDeleted(release, doer), releases/ReleaseUnpublished(release, doer)
+--   packages/PackageVersionCreated(version, publisher), packages/PackageVersionDeleted(version, package, doer)
+--   wiki/WikiPageCreated(repository, doer, page), wiki/WikiPageEdited(repository, doer, page),
+--   wiki/WikiPageDeleted(repository, doer, page)
+--   administration scheduled tasks (cron "run now" and the timer alike):
+--   ZombieActionsTaskStopDue(), EndlessActionsTaskStopDue(),
+--   AbandonedActionsJobCancellationDue(), LingeringActionsLogTransferDue(),
+--   ActionsScheduleStartDue(), ActionsCleanupDue(), ActionsUserCleanupDue(),
+--   OfflineRunnerCleanupDue(older_than, global_scope_only). Each sweep emits the
+--   same per-item internal trigger as the matching temporal rule, so the work
+--   is described once, in the rule that consumes that trigger.
+--
+-- Read-only mode: every rule a person triggers here (approving runs, trust,
+-- runners, registration tokens, secrets, variables, cancelling, re-running,
+-- deleting, prioritising, dispatching, enabling and disabling workflows,
+-- deleting artifacts) is refused while access/InstanceWriteGate.read_only,
+-- except the instance scope's runners and variables, which are managed from
+-- the site administration console (decided: administration 3; admin pages
+-- stay writable). The runner protocol and the running job's own requests are
+-- not people's writes and are not gated here; a job's git pushes go through
+-- code's gate.
+--
+-- Black boxes standing for other modules' contracts:
+--   can_read_actions(user, repository)  = access/can_read(user, repository, actions)
+--   can_write_actions(user, repository) = access/can_write(user, repository, actions)
+--   is_repo_admin(user, repository)     = access/is_repo_admin(user, repository)
+--       (local two-argument names: the journey walker cannot evaluate a qualified
+--       call or an enum-literal argument)
+--   quota_allows_artifacts(repository) = quota/quota_allows(<the repository
+--       owner's QuotaAccount>, size_assets_artifacts, null): QuotaGate
+--       gate_artifact_upload, charged to the repository owner. The size of an
+--       artifact is not known when it is created (it is reported on
+--       finalisation), so no incoming size is counted (quota 2 applies where
+--       the size is known up front).
+-- Provided to other modules:
+--   the automatic token of a running task (Task.token_is_usable) stands for
+--   the repository task.job.run.repository and nothing else (decided: access
+--   6); packages' job_repository(credential) is that repository, and
+--   Task.token_repository_access is "read" for fork pull-request runs.
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./repositories.allium" as repositories
+use "./access.allium" as access
+use "./code.allium" as code
+use "./issues.allium" as issues
+use "./pulls.allium" as pulls
+use "./releases.allium" as releases
+use "./packages.allium" as packages
+use "./wiki.allium" as wiki
+use "./quota.allium" as quota
+use "./administration.allium" as administration
+use "./keys.allium" as keys
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- One `workflow_dispatch` input declared by a workflow.
+-- from: services/actions/workflows.go:50
+value DispatchInput {
+    key: String
+    description: String?
+    required: Boolean
+    default_value: String?
+    input_type: String            -- string | boolean | choice | number | environment
+}
+
+-- What the workflow parser produces for one job of a run before it is stored.
+-- A matrix job or a reusable-workflow call expands into several definitions.
+-- from: services/actions/job.go:153
+value JobDefinition {
+    key: String                   -- the `jobs.<key>` identifier
+    namespace: String             -- non-empty for jobs expanded from a reusable workflow
+    name: String
+    needs: Set<String>
+    runs_on: Set<String>
+    is_incomplete: Boolean        -- matrix / runs-on / with depend on outputs of needed jobs
+    if_statically_false: Boolean  -- `if:` evaluated server-side to false
+    is_workflow_call_outer: Boolean  -- caller of a reusable workflow; its work is in child jobs
+    oidc_requested: Boolean       -- `enable-openid-connect: true`
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The protocol a runner speaks to fetch work and report back.
+-- from: routers/api/actions/runner/runner.go:40
+contract RunnerProtocol {
+    register: (registration_token: String, name: String, labels: Set<String>, version: String, ephemeral: Boolean) -> Runner
+    declare: (labels: Set<String>, version: String) -> Runner
+    fetch_task: (capacity: Integer, request_key: String?) -> Set<Task>
+    update_task: (task: Task, result: ActionStatus?, outputs: Set<TaskOutput>) -> Task
+    update_log: (task: Task, from_index: Integer, row_count: Integer, no_more: Boolean) -> Integer
+
+    @invariant AuthenticatedByRunnerToken
+        -- Every call except register carries the runner's identity and its
+        -- runner token; a wrong token is indistinguishable from an unknown runner.
+        -- Every authenticated call refreshes the runner's last_online_at;
+        -- update_task and update_log also refresh last_active_at.
+
+    @invariant RequestKeyIdempotence
+        -- A fetch that carries a request key returns, on retry with the same
+        -- key from the same runner, exactly the tasks assigned under that key
+        -- (with freshly minted task tokens) instead of assigning new ones.
+        -- Concurrent fetches with one key are refused until the first ends.
+
+    @invariant LogAppendOnly
+        -- update_log appends rows from the acknowledged index; rows already
+        -- acknowledged are ignored and the response carries the new
+        -- acknowledged index. After no_more the log is archived and further
+        -- rows are refused.
+
+    @invariant OutputsWriteOnce
+        -- An output key is recorded once per task; later values for the same
+        -- key are ignored. Keys over 255 characters and values over 1 MiB are
+        -- dropped. The response lists the keys already stored.
+}
+
+-- The workflow parser the rebuild must supply (GitHub Actions YAML dialect).
+-- from: services/actions/notifier_helper.go:423
+contract WorkflowParser {
+    job_definitions: (repository: repositories/Repository, workflow_file: String, commit_sha: String) -> Set<JobDefinition>
+    matching_workflows: (repository: repositories/Repository, event: TriggeringEvent, activity: String?, ref: String, commit_sha: String?, pull_request: pulls/PullRequest?) -> Set<Workflow>
+
+    @invariant ExpressionContext
+        -- Expressions see the git context (repository, ref, sha, event
+        -- payload, actor, run number/attempt), `vars`, dispatch `inputs`,
+        -- and — once needed jobs are done — `needs.<id>.outputs/result`.
+        -- `secrets` are never available to server-side evaluation.
+
+    @invariant ReusableWorkflowsArePublicOrLocal
+        -- `uses:` of a reusable workflow resolves a path in the same commit,
+        -- or `owner/repo/path@ref` on the same instance when owner and
+        -- repository are public; anything else is left to the runner.
+}
+
+-- The artifact upload/download protocol used from inside a running job.
+-- decided (actions 6): both the v1-v3 protocol (actions/upload-artifact@v3)
+-- and v4 are served; they share this contract.
+-- from: routers/api/actions/artifactsv4.go:1
+contract ArtifactProtocol {
+    create_artifact: (name: String, expires_at: Timestamp?) -> Artifact
+    upload_content: (artifact: Artifact, bytes: Integer) -> Artifact
+    finalize_artifact: (artifact: Artifact, size: Integer) -> Artifact
+    list_artifacts: (name_filter: String?) -> Set<Artifact>
+    download_url: (artifact: Artifact) -> String
+
+    @invariant ScopedToRun
+        -- A task only sees and writes artifacts of its own run, and only
+        -- while the task is running.
+
+    @invariant SignedTransferUrls
+        -- Upload and download URLs are signed, bound to the task and the
+        -- artifact, and expire; the transfer requests themselves carry no
+        -- other credentials.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Status shared by runs, jobs, tasks and steps.
+-- from: models/actions/status.go:17
+enum ActionStatus { waiting | blocked | running | success | failure | cancelled | skipped }
+
+-- The repository event that may start workflows (the webhook event kinds
+-- Actions understands; see webhooks/HookEventKind).
+-- from: modules/actions/github.go:30
+enum TriggeringEvent {
+    push | create | delete | fork
+    | issues | issue_assign | issue_label | issue_milestone
+    | issue_comment | pull_request_comment
+    | pull_request | pull_request_sync | pull_request_assign | pull_request_label
+    | pull_request_milestone | pull_request_review_request
+    | pull_request_review_approved | pull_request_review_rejected | pull_request_review_comment
+    | release | package | wiki | schedule | workflow_dispatch
+}
+
+-- Event names a workflow lists under `on:`.
+-- from: modules/actions/github.go:12
+enum WorkflowEvent {
+    push | create | delete | fork | issues | issue_comment
+    | pull_request | pull_request_target | pull_request_review | pull_request_review_comment
+    | release | registry_package | gollum | schedule | workflow_dispatch | workflow_call
+}
+
+-- How a run behaves relative to other runs in its concurrency group.
+-- from: models/actions/run.go:31
+enum ConcurrencyMode { unlimited | queue_behind | cancel_in_progress }
+
+-- Where runners, secrets, variables and registration tokens live.
+-- from: models/actions/runner.go:25
+enum ScopeKind { instance | user | organization | repository }
+
+-- from: models/actions/artifact.go:22
+enum ArtifactStatus { upload_pending | upload_confirmed | expired | pending_deletion | deleted }
+
+-- Why a run failed before any job could execute.
+-- from: models/actions/pre_execution_errors.go:21
+enum PreExecutionError {
+    event_detection_error | job_parsing_error
+    | incomplete_matrix_missing_job | incomplete_matrix_missing_output | incomplete_matrix_unknown_cause
+    | incomplete_runs_on_missing_job | incomplete_runs_on_missing_output
+    | incomplete_runs_on_missing_matrix_dimension | incomplete_runs_on_unknown_cause
+    | incomplete_with_missing_job | incomplete_with_missing_output
+    | incomplete_with_missing_matrix_dimension | incomplete_with_unknown_cause
+    | unknown_job_in_needs
+}
+
+-- from: modules/setting/actions.go:72
+enum LogCompression { none | zstd }
+
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The owner of runners, secrets, variables and registration tokens: the
+-- whole instance, one user, one organization or one repository. Exactly one
+-- of owner_user / owner_org / repository is set unless kind = instance.
+-- from: models/actions/runner.go:25
+entity ActionsScope {
+    kind: ScopeKind
+    owner_user: accounts/User?
+    owner_org: organizations/Organization?
+    repository: repositories/Repository?
+
+    runners: Runner with scope = this
+    secrets: Secret with scope = this
+    variables: Variable with scope = this
+    registration_tokens: RunnerRegistrationToken with scope = this
+
+    active_registration_tokens: registration_tokens where is_active = true
+
+    invariant ExactlyOneOwner {
+        (kind = instance implies owner_user = null and owner_org = null and repository = null)
+        and (kind = user implies owner_user != null and owner_org = null and repository = null)
+        and (kind = organization implies owner_org != null and owner_user = null and repository = null)
+        and (kind = repository implies repository != null and owner_user = null and owner_org = null)
+    }
+}
+
+-- A workflow file found in one of the workflow directories of a repository.
+-- Only the first existing directory of .forgejo/workflows, .gitea/workflows,
+-- .github/workflows is used; files ending .yml or .yaml (recursively) count.
+-- The disabled flag is per repository and per file name.
+-- from: modules/actions/workflows.go:59
+entity Workflow {
+    repository: repositories/Repository
+    file_name: String             -- e.g. build.yml; identifies the workflow
+    directory: String             -- e.g. .forgejo/workflows
+    name: String?                 -- `name:`; defaults to the path
+    events: Set<WorkflowEvent>
+    has_dispatch_trigger: Boolean -- `workflow_dispatch` is among the events
+    has_schedule_trigger: Boolean -- `schedule` is among the events
+    dispatch_inputs: Set<DispatchInput>
+    is_disabled: Boolean
+
+    path: directory + "/" + file_name
+}
+
+-- One execution of one workflow file for one event. Its status is the
+-- aggregate of its jobs' statuses.
+-- from: models/actions/run.go:44
+entity WorkflowRun {
+    repository: repositories/Repository
+    index: Integer                -- per-repository run number, starts at 1
+    title: String                 -- `run-name:` or first line of the commit message; max 255
+    workflow_file: String
+    workflow_directory: String
+    -- decided: requests 1 — a run a deploy-key push started records the key
+    -- and no user; every other run has a user (the Actions bot for schedules)
+    trigger_user: accounts/User?  -- the Actions bot for scheduled runs; null for a deploy-key push
+    trigger_deploy_key: keys/DeployKey?
+    event: TriggeringEvent
+    trigger_event: WorkflowEvent  -- the `on:` entry that matched
+    activity: String?             -- e.g. opened, synchronize, labeled
+    ref: String
+    commit_sha: String
+    workflow_source_sha: String?  -- base-branch commit for pull_request_target
+    schedule: Schedule?
+    inputs: Set<String>           -- dispatch inputs as key=value
+    status: ActionStatus
+    created_at: Timestamp
+    started_at: Timestamp?
+    stopped_at: Timestamp?
+    previous_attempts_duration: Duration
+    attempt: Integer
+    notify_email: Boolean         -- workflow `enable-email-notifications: true`
+
+    -- pull request trust
+    pull_request: pulls/PullRequest?
+    pull_request_poster: accounts/User?
+    is_fork_pull_request: Boolean
+    needs_approval: Boolean
+    approved_by: accounts/User?
+
+    concurrency_group: String     -- case-insensitive
+    concurrency_mode: ConcurrencyMode
+
+    pre_execution_error: PreExecutionError?
+    pre_execution_error_details: String?
+    has_permissions_warning: Boolean   -- a job declares `permissions:` which is not honoured
+
+    priority: Integer             -- -128..127; higher is dispatched first
+    prioritized: Boolean          -- a user asked for this run to go first
+    jobs_expanded: Boolean        -- the job graph has been materialised
+
+    jobs: Job with run = this
+    artifacts: Artifact with run = this
+
+    pending_jobs: jobs where status in {waiting, blocked, running}
+
+    is_valid: pre_execution_error = null
+    is_done: status in {success, failure, cancelled, skipped}
+    can_be_rerun: is_valid and is_done
+    is_scheduled: trigger_event = schedule
+    is_dispatched: trigger_event = workflow_dispatch
+    secrets_withheld: is_fork_pull_request and trigger_event != pull_request_target
+
+    aggregated_status:
+        if jobs.count > 0 and jobs.all(j => j.status = skipped): skipped
+        else if jobs.count > 0 and jobs.all(j => j.status in {success, skipped}): success
+        else if jobs.any(j => j.status = running): running
+        else if jobs.any(j => j.status = waiting): waiting
+        else if jobs.any(j => j.status = blocked): blocked
+        else if jobs.any(j => j.status = cancelled): cancelled
+        else: failure
+    status_is_stale: aggregated_status != status
+    awaiting_job_expansion: not jobs_expanded and pre_execution_error = null
+    awaiting_failure_record: not jobs_expanded and pre_execution_error != null
+
+    invariant PriorityRange { priority >= -128 and priority <= 127 }
+}
+
+-- One job of a run (one entry under `jobs:`, or one matrix combination, or
+-- one job of an expanded reusable workflow).
+-- from: models/actions/run_job.go:46
+entity Job {
+    run: WorkflowRun
+    key: String
+    namespace: String
+    name: String                  -- max 255
+    needs: Set<String>
+    runs_on: Set<String>          -- labels a runner must all carry
+    status: ActionStatus
+    attempt: Integer              -- starts at 1, incremented by each re-run
+    handle: String                -- identifies this attempt; a runner may ask for it explicitly
+    started_at: Timestamp?
+    stopped_at: Timestamp?
+    status_changed_at: Timestamp
+    is_incomplete: Boolean
+    is_workflow_call_outer: Boolean
+    oidc_requested: Boolean
+    is_assigned: Boolean          -- a task exists for the current attempt
+
+    tasks: Task with job = this
+
+    -- The jobs this one needs: the run's jobs of the same namespace whose
+    -- key is listed in `needs`.
+    needed_jobs: run.jobs where namespace = this.namespace and key in this.needs
+    needs_done: needed_jobs.all(j => j.is_done)
+    needs_succeeded: needed_jobs.all(j => j.status in {success, skipped})
+    all_needs_skipped: needs.count > 0 and needed_jobs.all(j => j.status = skipped)
+    is_done: status in {success, failure, cancelled, skipped}
+    ready_to_unblock: status = blocked and needs_done and not run.needs_approval
+
+    transitions status {
+        waiting -> running
+        waiting -> cancelled
+        waiting -> failure
+        blocked -> waiting
+        blocked -> skipped
+        blocked -> success
+        blocked -> failure
+        blocked -> cancelled
+        running -> success
+        running -> failure
+        running -> cancelled
+        running -> skipped
+        success -> waiting
+        success -> blocked
+        failure -> waiting
+        failure -> blocked
+        cancelled -> waiting
+        cancelled -> blocked
+        skipped -> waiting
+        skipped -> blocked
+    }
+}
+
+-- One attempt of a job handed to one runner. Its token is the job's
+-- automatic token (FORGEJO_TOKEN), valid only while the task runs.
+-- from: models/actions/task.go:22
+entity Task {
+    job: Job
+    runner: Runner
+    attempt: Integer
+    status: ActionStatus
+    started_at: Timestamp
+    stopped_at: Timestamp?
+    last_activity_at: Timestamp
+    token: String                 -- secret; only the hash is kept
+    request_key: String?
+    is_fork_pull_request: Boolean
+    oidc_enabled: Boolean
+
+    -- logs
+    log_length: Integer           -- lines
+    log_size: Integer             -- bytes
+    log_archived: Boolean         -- moved from the live buffer to (compressed) storage
+    log_expired: Boolean          -- removed after the retention period
+
+    steps: TaskStep with task = this
+    outputs: TaskOutput with task = this
+
+    is_stopped: stopped_at != null
+    token_is_usable: status = running
+    token_repository_access: if is_fork_pull_request: "read" else: "write"
+    runtime_token_cache_scope: "write"
+}
+
+-- One step of a task, as listed in the job definition.
+-- from: models/actions/task_step.go:14
+entity TaskStep {
+    task: Task
+    index: Integer
+    name: String                  -- max 255
+    status: ActionStatus
+    started_at: Timestamp?
+    stopped_at: Timestamp?
+    log_index: Integer
+    log_length: Integer
+    summary: String?              -- GITHUB_STEP_SUMMARY markdown, at most 1 MiB
+}
+
+-- A job output reported by the runner (`jobs.<id>.outputs`).
+-- from: models/actions/task_output.go:16
+entity TaskOutput {
+    task: Task
+    key: String                   -- at most 255 characters
+    value: String                 -- at most 1 MiB
+}
+
+-- A machine that executes jobs. It belongs to a scope and can only pick jobs
+-- of repositories inside that scope.
+-- from: models/actions/runner.go:36
+entity Runner {
+    scope: ActionsScope
+    name: String                  -- max 255, need not be unique
+    description: String?
+    version: String?
+    labels: Set<String>
+    is_ephemeral: Boolean         -- deleted after its single task completes
+    token: String                 -- secret; only the hash is kept
+    created_at: Timestamp
+    last_online_at: Timestamp?
+    last_active_at: Timestamp?
+    has_taken_task: Boolean       -- ever been assigned a task
+    is_busy: Boolean              -- currently has a running task
+
+    tasks: Task with runner = this
+
+    health:
+        if last_online_at = null: offline
+        else if last_online_at + config.runner_offline_after <= now: offline
+        else if last_active_at = null: idle
+        else if last_active_at + config.runner_idle_after <= now: idle
+        else: active
+    is_online: health in {active, idle}
+    has_used_its_single_task: is_ephemeral and has_taken_task
+
+    serves(repo): scope.kind = instance
+        or (scope.kind = repository and scope.repository = repo)
+        or (scope.kind = user and repo.owner_user = scope.owner_user)
+        or (scope.kind = organization and repo.owner_org = scope.owner_org)
+}
+
+-- A shared secret runners present to register themselves into a scope.
+-- Creating a new one invalidates the previous ones of the same scope; it can
+-- be used any number of times while active and younger than
+-- config.registration_token_lifetime (decided actions 4; Forgejo's never expired).
+-- from: models/actions/runner_token.go:27
+entity RunnerRegistrationToken {
+    scope: ActionsScope
+    token: String
+    is_active: Boolean
+    created_at: Timestamp
+}
+
+-- An encrypted value made available to jobs as `secrets.NAME`. Never shown
+-- again after it is set. Instance-wide secrets do not exist.
+-- from: models/secret/secret.go:37
+entity Secret {
+    scope: ActionsScope
+    name: String                  -- stored upper-case
+    value: String                 -- write-only; encrypted at rest
+    created_at: Timestamp
+
+    invariant NotInstanceWide { scope.kind != instance }
+}
+
+-- A plain configuration value made available to jobs as `vars.NAME`.
+-- from: models/actions/variable.go:29
+entity Variable {
+    scope: ActionsScope
+    name: String                  -- stored upper-case
+    value: String
+    created_at: Timestamp
+    updated_at: Timestamp?
+}
+
+-- A named bundle of files uploaded by a job, downloadable until it expires.
+-- from: models/actions/artifact.go:35
+entity Artifact {
+    run: WorkflowRun
+    name: String
+    uploaded_by: Task
+    size: Integer                 -- bytes as uploaded
+    compressed_size: Integer      -- bytes stored (counts towards the owner's artifacts quota)
+    status: ArtifactStatus
+    created_at: Timestamp
+    expires_at: Timestamp
+
+    is_downloadable: status = upload_confirmed
+    is_listed: status in {upload_confirmed, expired}
+
+    transitions status {
+        upload_pending -> upload_confirmed
+        upload_pending -> pending_deletion
+        upload_confirmed -> expired
+        upload_confirmed -> pending_deletion
+        expired -> pending_deletion
+        pending_deletion -> deleted
+        terminal: deleted
+    }
+}
+
+-- A scheduled workflow registered from the default branch's head commit.
+-- All schedules of a repository are replaced whenever the default branch moves.
+-- from: models/actions/schedule.go:19
+entity Schedule {
+    repository: repositories/Repository
+    workflow_file: String
+    workflow_directory: String
+    title: String
+    ref: String
+    commit_sha: String
+    created_at: Timestamp
+
+    specs: ScheduleSpec with schedule = this
+}
+
+-- One `cron:` entry of a scheduled workflow.
+-- from: models/actions/schedule_spec.go:20
+entity ScheduleSpec {
+    schedule: Schedule
+    cron: String                  -- 5-field cron or @descriptor; may start with TZ= / CRON_TZ=
+    time_zone: String?            -- `timezone:`; UTC when absent
+    next_run_at: Timestamp
+    previous_run_at: Timestamp?
+}
+
+-- A pull-request poster a maintainer chose to always trust in a repository,
+-- so their fork pull requests run without approval.
+-- from: models/actions/user.go:17
+entity TrustedContributor {
+    user: accounts/User
+    repository: repositories/Repository
+    trusted_with_pull_requests: Boolean
+    last_access_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [actions] ENABLED
+    actions_enabled: Boolean = true
+    -- [actions] LOG_RETENTION_DAYS (values <= 0 mean the default)
+    log_retention: Duration = 365.days
+    -- [actions] LOG_COMPRESSION
+    log_compression: LogCompression = zstd
+    -- [actions] ARTIFACT_RETENTION_DAYS (values <= 0 mean the default);
+    -- decided (actions 3): only the default, never a cap on what a job asks for
+    artifact_retention: Duration = 90.days
+    -- [actions] DEFAULT_ACTIONS_URL: base for `uses:` without a host
+    default_actions_url: String = "https://data.forgejo.org"
+    -- [actions] ZOMBIE_TASK_TIMEOUT: running task without any update
+    zombie_task_timeout: Duration = 10.minutes
+    -- [actions] ENDLESS_TASK_TIMEOUT: running task that never ends
+    endless_task_timeout: Duration = 3.hours
+    -- [actions] ABANDONED_JOB_TIMEOUT: waiting/blocked job no runner picked
+    abandoned_job_timeout: Duration = 24.hours
+    -- [actions] SKIP_WORKFLOW_STRINGS: in commit message or PR title, suppresses runs
+    skip_workflow_strings: Set<String> = {"[skip ci]", "[ci skip]", "[no ci]", "[skip actions]", "[actions skip]"}
+    -- [actions] LIMIT_DISPATCH_INPUTS
+    limit_dispatch_inputs: Integer = 100
+    -- [actions] CONCURRENCY_GROUP_QUEUE_ENABLED: false lets queue_behind runs run in parallel
+    concurrency_group_queue_enabled: Boolean = true
+    -- [actions] ID_TOKEN_EXPIRATION_TIME (seconds)
+    id_token_lifetime: Duration = 1.hour
+    -- decided (actions 4): registration tokens expire after this lifetime
+    registration_token_lifetime: Duration = 1.hour
+    -- decided (actions 7): pruning finished runs, off by default
+    run_pruning_enabled: Boolean = false
+    run_retention: Duration = 365.days
+    -- decided (actions 8): disabling schedules of inactive repositories, off by default
+    schedule_inactivity_disable_enabled: Boolean = false
+    schedule_inactivity_period: Duration = 60.days
+
+    -- fixed behaviour (not configurable in Forgejo)
+    runner_offline_after: Duration = 1.minute
+    runner_idle_after: Duration = 10.seconds
+    runtime_token_lifetime: Duration = 24.hours
+    trusted_contributor_expiry: Duration = 90.days
+    max_title_length: Integer = 255
+    max_name_length: Integer = 255
+    max_output_key_length: Integer = 255
+    max_output_value_bytes: Integer = 1048576
+    max_step_summary_bytes: Integer = 1048576
+    max_log_line_bytes: Integer = 65536
+    lingering_log_age: Duration = 24.hours
+
+    -- [cron.*] background jobs (owned by administration/CronTask; schedules here)
+    stop_zombie_tasks_interval: Duration = 5.minutes
+    stop_endless_tasks_interval: Duration = 30.minutes
+    cancel_abandoned_jobs_interval: Duration = 6.hours
+    start_schedule_tasks_interval: Duration = 1.minute
+    -- [cron.cleanup_offline_runners] ENABLED / OLDER_THAN / GLOBAL_SCOPE_ONLY
+    offline_runner_cleanup_enabled: Boolean = false
+    offline_runner_cleanup_age: Duration = 24.hours
+    offline_runner_cleanup_global_only: Boolean = true
+}
+
+------------------------------------------------------------
+-- Rules: event intake (other modules' triggers become workflow events)
+------------------------------------------------------------
+
+-- Each pushed branch or tag is a `push` event on its new head.
+-- from: services/actions/notifier.go:560
+rule PushStartsWorkflows {
+    when: code/PushReceived(push)
+    ensures:
+        for update in push.ref_updates where new_sha != null and ref_kind in {branch_ref, tag_ref}:
+            ForgeEventObserved(repository: push.repository, doer: push.pusher, event: push, activity: null, ref: full_ref_name(update), commit_sha: update.new_sha, pull_request: null, deploy_key: push.deploy_key)
+            if update.ref_kind = branch_ref and update.ref_name = push.repository.default_branch:
+                SchedulesNeedRefresh(repository: push.repository)
+    @guidance
+        -- Pushes by the Actions bot never start workflows (see
+        -- DetectWorkflowRuns) but still refresh schedules, because a
+        -- scheduled job may itself push to the default branch.
+        -- Pull-mirror syncs are handled by MirrorSyncStartsWorkflows.
+}
+
+-- from: services/actions/notifier.go:610
+rule RefCreationStartsWorkflows {
+    when: code/RefCreated(repository, pusher, ref_kind, ref_name, commit_sha)
+    requires: ref_kind in {branch_ref, tag_ref}
+    ensures: ForgeEventObserved(repository: repository, doer: pusher, event: create, activity: null, ref: qualified_ref(ref_kind, ref_name), commit_sha: commit_sha, pull_request: null, deploy_key: null)
+}
+
+-- `delete` runs workflows from the default branch.
+-- from: services/actions/notifier.go:628
+rule RefDeletionStartsWorkflows {
+    when: code/RefDeleted(repository, pusher, ref_kind, ref_name)
+    requires: ref_kind in {branch_ref, tag_ref}
+    ensures: ForgeEventObserved(repository: repository, doer: pusher, event: delete, activity: null, ref: qualified_ref(ref_kind, ref_name), commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- Pull-mirror syncs start the same push / create / delete workflows as user
+-- pushes, with the repository owner as doer. A synced ref is a full ref name.
+-- mirror_pusher(repository): the owning user or organisation account
+-- (repositories/mirror_pusher); head_commit_sha(commits): the sync's head
+-- commit, pinned so a concurrent push cannot substitute a newer commit;
+-- ref_head_sha(repository, ref_name): the commit the ref now points to.
+-- from: services/actions/notifier.go:645
+-- from: services/mirror/mirror_pull.go:600
+rule MirrorSyncStartsWorkflows {
+    when: repositories/MirrorSyncPushed(repository, ref_name, commits)
+    ensures: ForgeEventObserved(repository: repository, doer: mirror_pusher(repository), event: push, activity: null, ref: ref_name, commit_sha: head_commit_sha(commits), pull_request: null, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:681
+rule MirrorRefCreationStartsWorkflows {
+    when: repositories/MirrorRefCreated(repository, ref_name)
+    ensures: ForgeEventObserved(repository: repository, doer: mirror_pusher(repository), event: create, activity: null, ref: ref_name, commit_sha: ref_head_sha(repository, ref_name), pull_request: null, deploy_key: null)
+}
+
+-- `delete` runs workflows from the default branch.
+-- from: services/actions/notifier.go:686
+rule MirrorRefDeletionStartsWorkflows {
+    when: repositories/MirrorRefDeleted(repository, ref_name)
+    ensures: ForgeEventObserved(repository: repository, doer: mirror_pusher(repository), event: delete, activity: null, ref: ref_name, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- `fork` fires on the source repository and runs from its default branch.
+-- from: services/actions/notifier.go:410
+rule ForkStartsWorkflows {
+    when: repositories/RepositoryForked(source, fork, doer)
+    ensures: ForgeEventObserved(repository: source, doer: doer, event: fork, activity: null, ref: "refs/heads/" + source.default_branch, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- Issue events run from the default branch. Pull requests are opened by pulls.
+-- from: services/actions/notifier.go:41
+rule IssueOpenedStartsWorkflows {
+    when: issues/IssueOpened(issue, mentions)
+    requires: not issue.is_pull
+    ensures: ForgeEventObserved(repository: issue.repository, doer: issue.poster, event: issues, activity: "opened", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- Title edits: `edited` on issues, or on pull_request for a PR.
+-- from: services/actions/notifier.go:62
+rule IssueTitleChangeStartsWorkflows {
+    when: issues/IssueTitleChanged(issue, doer, old_title)
+    ensures: IssueEditedForActions(issue: issue, editor: doer)
+}
+
+-- from: services/actions/notifier.go:69
+rule IssueContentChangeStartsWorkflows {
+    when: issues/IssueContentChanged(issue, doer, old_content)
+    ensures: IssueEditedForActions(issue: issue, editor: doer)
+}
+
+-- from: services/actions/notifier.go:75
+rule IssueEditedStartsWorkflows {
+    when: IssueEditedForActions(issue, editor)
+    ensures:
+        if issue.is_pull:
+            ForgeEventObserved(repository: issue.repository, doer: editor, event: pull_request, activity: "edited", ref: null, commit_sha: null, pull_request: issue.pull_request, deploy_key: null)
+        else:
+            ForgeEventObserved(repository: issue.repository, doer: editor, event: issues, activity: "edited", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:114
+rule IssueClosedStartsWorkflows {
+    when: issues/IssueClosed(issue, doer, comment)
+    ensures:
+        if issue.is_pull:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request, activity: "closed", ref: null, commit_sha: null, pull_request: issue.pull_request, deploy_key: null)
+            PullRequestClosedForActions(pull_request: issue.pull_request)
+        else:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issues, activity: "closed", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:114
+rule IssueReopenedStartsWorkflows {
+    when: issues/IssueReopened(issue, doer, comment)
+    ensures:
+        if issue.is_pull:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request, activity: "reopened", ref: null, commit_sha: null, pull_request: issue.pull_request, deploy_key: null)
+        else:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issues, activity: "reopened", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- pulls never emits issues/IssueClosed / IssueReopened for a pull request; a
+-- PR's close / reopen arrives as pulls/PullRequestClosed / PullRequestReopened
+-- (doer null when a repository deletion closed it: its runs go with the repository).
+-- from: services/actions/notifier.go:114
+rule PullRequestClosedStartsWorkflows {
+    when: pulls/PullRequestClosed(pull_request, doer)
+    requires: doer != null
+    ensures: ForgeEventObserved(repository: pull_request.issue.repository, doer: doer, event: pull_request, activity: "closed", ref: null, commit_sha: null, pull_request: pull_request, deploy_key: null)
+    ensures: PullRequestClosedForActions(pull_request: pull_request)
+}
+
+-- from: services/actions/notifier.go:114
+rule PullRequestReopenedStartsWorkflows {
+    when: pulls/PullRequestReopened(pull_request, doer)
+    ensures: ForgeEventObserved(repository: pull_request.issue.repository, doer: doer, event: pull_request, activity: "reopened", ref: null, commit_sha: null, pull_request: pull_request, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:169
+rule AssigneeChangeStartsWorkflows {
+    when: issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)
+    let activity = if removed: "unassigned" else: "assigned"
+    ensures:
+        if issue.is_pull:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request_assign, activity: activity, ref: null, commit_sha: null, pull_request: issue.pull_request, deploy_key: null)
+        else:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issue_assign, activity: activity, ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:188
+rule MilestoneChangeStartsWorkflows {
+    when: issues/IssueMilestoneChanged(issue, doer, old_milestone)
+    let activity = if issue.milestone = null: "demilestoned" else: "milestoned"
+    ensures:
+        if issue.is_pull:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request_milestone, activity: activity, ref: null, commit_sha: null, pull_request: issue.pull_request, deploy_key: null)
+        else:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issue_milestone, activity: activity, ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- Label changes match activity types `labeled` / `unlabeled`.
+-- from: services/actions/notifier.go:206
+rule LabelChangeStartsWorkflows {
+    when: issues/IssueLabelsChanged(issue, doer, added, removed)
+    let activity = if added.count > 0: "labeled" else: "unlabeled"
+    ensures:
+        if issue.is_pull:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request_label, activity: activity, ref: null, commit_sha: null, pull_request: issue.pull_request, deploy_key: null)
+        else:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issue_label, activity: activity, ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:206
+rule LabelsClearedStartsWorkflows {
+    when: issues/IssueLabelsCleared(issue, doer)
+    ensures:
+        if issue.is_pull:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request_label, activity: "unlabeled", ref: null, commit_sha: null, pull_request: issue.pull_request, deploy_key: null)
+        else:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issue_label, activity: "unlabeled", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- Comments match `issue_comment` (types created/edited/deleted) on issues
+-- and pull requests alike; they run from the default branch.
+-- from: services/actions/notifier.go:275
+rule CommentCreatedStartsWorkflows {
+    when: issues/IssueCommentCreated(issue, comment, doer, mentions)
+    ensures:
+        if issue.is_pull:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request_comment, activity: "created", ref: null, commit_sha: null, pull_request: issue.pull_request, deploy_key: null)
+        else:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issue_comment, activity: "created", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:287
+rule CommentEditedStartsWorkflows {
+    when: issues/IssueCommentEdited(comment, doer, old_content)
+    ensures:
+        if comment.issue.is_pull:
+            ForgeEventObserved(repository: comment.issue.repository, doer: doer, event: pull_request_comment, activity: "edited", ref: null, commit_sha: null, pull_request: comment.issue.pull_request, deploy_key: null)
+        else:
+            ForgeEventObserved(repository: comment.issue.repository, doer: doer, event: issue_comment, activity: "edited", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:302
+rule CommentDeletedStartsWorkflows {
+    when: issues/IssueCommentDeleted(comment, issue, doer)
+    ensures:
+        if issue.is_pull:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: pull_request_comment, activity: "deleted", ref: null, commit_sha: null, pull_request: issue.pull_request, deploy_key: null)
+        else:
+            ForgeEventObserved(repository: issue.repository, doer: doer, event: issue_comment, activity: "deleted", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- The pull request's head commit at the time of the event is used, never a
+-- later one rediscovered asynchronously.
+-- from: services/actions/notifier.go:365
+rule PullRequestOpenedStartsWorkflows {
+    when: pulls/PullRequestOpened(pull_request)
+    ensures: ForgeEventObserved(repository: pull_request.base_repository, doer: pull_request.issue.poster, event: pull_request, activity: "opened",
+        ref: pull_ref(pull_request), commit_sha: pull_request.head_commit_sha, pull_request: pull_request, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:725
+rule PullRequestSynchronizedStartsWorkflows {
+    when: pulls/PullRequestSynchronized(pull_request, doer, deploy_key)
+    ensures: ForgeEventObserved(repository: pull_request.base_repository, doer: doer, event: pull_request_sync, activity: "synchronize",
+        ref: pull_ref(pull_request), commit_sha: pull_request.head_commit_sha, pull_request: pull_request, deploy_key: deploy_key)
+}
+
+-- A merge is a `closed` pull_request event on the merge commit.
+-- from: services/actions/notifier.go:519
+rule PullRequestMergedStartsWorkflows {
+    when: pulls/PullRequestMerged(pull_request, merger)
+    ensures: ForgeEventObserved(repository: pull_request.base_repository, doer: merger, event: pull_request, activity: "closed",
+        ref: merge_commit_of(pull_request), commit_sha: merge_commit_of(pull_request), pull_request: pull_request, deploy_key: null)
+}
+
+-- Approve / request changes / comment reviews; activity `submitted`/`edited`.
+-- from: services/actions/notifier.go:438
+rule ReviewStartsWorkflows {
+    when: pulls/ReviewSubmitted(review)
+    ensures:
+        if review.kind = approve:
+            ForgeEventObserved(repository: review.pull_request.base_repository, doer: review.reviewer, event: pull_request_review_approved,
+                activity: "submitted", ref: review.commit_sha, commit_sha: review.commit_sha, pull_request: review.pull_request, deploy_key: null)
+        else if review.kind = request_changes:
+            ForgeEventObserved(repository: review.pull_request.base_repository, doer: review.reviewer, event: pull_request_review_rejected,
+                activity: "submitted", ref: review.commit_sha, commit_sha: review.commit_sha, pull_request: review.pull_request, deploy_key: null)
+        else:
+            ForgeEventObserved(repository: review.pull_request.base_repository, doer: review.reviewer, event: pull_request_review_comment,
+                activity: "submitted", ref: review.commit_sha, commit_sha: review.commit_sha, pull_request: review.pull_request, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:486
+rule ReviewRequestStartsWorkflows {
+    when: pulls/ReviewRequested(pull_request, requester, reviewer)
+    ensures: ForgeEventObserved(repository: pull_request.base_repository, doer: requester, event: pull_request_review_request, activity: "review_requested",
+        ref: pull_ref(pull_request), commit_sha: null, pull_request: pull_request, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:486
+rule ReviewRequestRemovalStartsWorkflows {
+    when: pulls/ReviewRequestRemoved(pull_request, doer, reviewer)
+    ensures: ForgeEventObserved(repository: pull_request.base_repository, doer: doer, event: pull_request_review_request, activity: "review_request_removed",
+        ref: pull_ref(pull_request), commit_sha: null, pull_request: pull_request, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:754
+rule TargetBranchChangeStartsWorkflows {
+    when: pulls/PullRequestTargetBranchChanged(pull_request, doer, old_base_branch)
+    ensures: ForgeEventObserved(repository: pull_request.base_repository, doer: doer, event: pull_request, activity: "edited",
+        ref: pull_ref(pull_request), commit_sha: null, pull_request: pull_request, deploy_key: null)
+}
+
+-- Release events run on the release's tag; `updated` matches type `edited`.
+-- from: services/actions/notifier_helper.go:520
+rule ReleasePublishedStartsWorkflows {
+    when: releases/ReleasePublished(release)
+    ensures: ForgeEventObserved(repository: release.repository, doer: release.publisher, event: release, activity: "published",
+        ref: qualified_ref(tag_ref, release.tag_name), commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:696
+rule ReleaseUpdatedStartsWorkflows {
+    when: releases/ReleaseUpdated(release, doer)
+    ensures: ForgeEventObserved(repository: release.repository, doer: doer, event: release, activity: "edited", ref: qualified_ref(tag_ref, release.tag_name), commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:701
+rule ReleaseDeletedStartsWorkflows {
+    when: releases/ReleaseDeleted(release, doer)
+    ensures: ForgeEventObserved(repository: release.repository, doer: doer, event: release, activity: "deleted", ref: qualified_ref(tag_ref, release.tag_name), commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- decided (releases 2, for actions): un-publishing a release starts `release`
+-- workflows of type `unpublished`, as GitHub does; Forgejo had no such event.
+-- It runs on the release's tag, which an edit keeps. When the tag itself
+-- vanished (no doer) there is no ref to read workflows from, so nothing runs.
+rule ReleaseUnpublishedStartsWorkflows {
+    when: releases/ReleaseUnpublished(release, doer)
+    requires: doer != null
+    ensures: ForgeEventObserved(repository: release.repository, doer: doer, event: release, activity: "unpublished", ref: qualified_ref(tag_ref, release.tag_name), commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- `registry_package` (type `published` / `deleted`), only for packages
+-- linked to a repository.
+-- from: services/actions/notifier_helper.go:540
+rule PackagePublishedStartsWorkflows {
+    when: packages/PackageVersionCreated(version, publisher)
+    requires: version.package.repository != null
+    ensures: ForgeEventObserved(repository: version.package.repository, doer: publisher, event: package, activity: "published", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:715
+rule PackageDeletedStartsWorkflows {
+    when: packages/PackageVersionDeleted(version, package, doer)
+    requires: package.repository != null
+    ensures: ForgeEventObserved(repository: package.repository, doer: doer, event: package, activity: "deleted", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- Wiki edits match `gollum` and run from the default branch.
+-- from: services/actions/notifier.go:785
+rule WikiCreatedStartsWorkflows {
+    when: wiki/WikiPageCreated(repository, doer, page)
+    ensures: ForgeEventObserved(repository: repository, doer: doer, event: wiki, activity: "created", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:797
+rule WikiEditedStartsWorkflows {
+    when: wiki/WikiPageEdited(repository, doer, page)
+    ensures: ForgeEventObserved(repository: repository, doer: doer, event: wiki, activity: "edited", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+-- from: services/actions/notifier.go:809
+rule WikiDeletedStartsWorkflows {
+    when: wiki/WikiPageDeleted(repository, doer, page)
+    ensures: ForgeEventObserved(repository: repository, doer: doer, event: wiki, activity: "deleted", ref: null, commit_sha: null, pull_request: null, deploy_key: null)
+}
+
+------------------------------------------------------------
+-- Rules: workflow discovery and run creation
+------------------------------------------------------------
+
+-- The heart of event-driven runs. For the event's commit (or the default
+-- branch for default-branch events) every workflow whose `on:` matches the
+-- event and its filters gets a run.
+-- from: services/actions/notifier_helper.go:142
+rule DetectWorkflowRuns {
+    when: ForgeEventObserved(repository, doer, event, activity, ref, commit_sha, pull_request, deploy_key)
+    requires: config.actions_enabled
+    requires: repository.units.any(u => u.kind = actions and u.enabled)
+    requires: not repository.is_empty
+    requires: not repository.is_archived
+    requires: not is_actions_bot(doer)
+    requires: event in {push, pull_request, pull_request_sync}
+        implies not skip_marker_present(commit_sha, pull_request, config.skip_workflow_strings)
+    requires: event = pull_request_sync
+        implies not pull_request_run_exists_for_commit(repository, commit_sha)
+    let effective_ref = if runs_from_default_branch(event): "refs/heads/" + repository.default_branch else: ref
+    let needs_approval = pull_request != null and not runs_from_default_branch(event)
+        and pull_request.is_fork
+        and not is_trusted_contributor(pull_request.issue.poster, repository)
+        and not is_trusted_contributor(doer, repository)
+    ensures:
+        for workflow in matching_workflows(repository, event, activity, effective_ref, commit_sha, pull_request)
+                where not is_disabled:
+            WorkflowRunRequested(workflow: workflow, doer: doer, deploy_key: deploy_key, event: event, activity: activity, ref: effective_ref, commit_sha: commit_sha, pull_request: pull_request,
+                needs_approval: needs_approval and not is_pull_request_target(workflow, event))
+    @guidance
+        -- runs_from_default_branch: delete, fork, issues (all kinds),
+        -- issue_comment, pull_request_comment, wiki, schedule, workflow_dispatch.
+        -- Filters (matching_workflows): push branches/branches-ignore/tags/
+        -- tags-ignore/paths/paths-ignore (paths ignored for tags; when both
+        -- branch and tag filters exist only one family must match);
+        -- pull_request(_target) types (default opened/reopened/synchronize),
+        -- branches against the base branch, paths against the merge base;
+        -- issues/issue_comment/release/registry_package/pull_request_review
+        -- `types` with glob matching and the activity renames
+        -- (synchronized->synchronize, label_updated->labeled,
+        -- label_cleared->unlabeled, updated->edited, created->published,
+        -- reviewed->submitted|edited). A workflow whose `on:` cannot be parsed
+        -- still yields a run that fails with event_detection_error.
+        -- pull_request_target workflows are read from the base branch head
+        -- and never need approval (they run the base branch's code).
+        -- When the poster is untrusted but the doer is trusted, a
+        -- non-synchronize event reads workflows from the base branch instead
+        -- of the (possibly modified) head.
+        -- Trust: implicit for a non-fork pull request or a user with write
+        -- access to the Actions unit; explicit via TrustedContributor (never
+        -- for restricted users).
+}
+
+-- from: services/actions/notifier_helper.go:363
+rule CreateWorkflowRun {
+    when: WorkflowRunRequested(workflow, doer, deploy_key, event, activity, ref, commit_sha, pull_request, needs_approval)
+    ensures: WorkflowRun.created(
+        repository: workflow.repository,
+        index: next_run_index(workflow.repository),
+        title: run_title(workflow, commit_sha),
+        workflow_file: workflow.file_name,
+        workflow_directory: workflow.directory,
+        trigger_user: doer,
+        trigger_deploy_key: deploy_key,
+        event: event,
+        trigger_event: workflow_trigger(workflow, event),
+        activity: activity,
+        ref: ref,
+        commit_sha: commit_sha,
+        workflow_source_sha: workflow_source_commit(workflow, pull_request),
+        schedule: null,
+        inputs: {},
+        status: waiting,
+        created_at: now,
+        started_at: null,
+        stopped_at: null,
+        previous_attempts_duration: 0.seconds,
+        attempt: 1,
+        notify_email: workflow_notifies_by_email(workflow),
+        pull_request: pull_request,
+        pull_request_poster: pull_request?.issue.poster,
+        is_fork_pull_request: pull_request != null and pull_request.is_fork,
+        needs_approval: needs_approval,
+        approved_by: null,
+        concurrency_group: concurrency_group_for_event(workflow, event, ref),
+        concurrency_mode: concurrency_mode_for_event(workflow, event),
+        pre_execution_error: workflow_pre_execution_error(workflow, event),
+        pre_execution_error_details: null,
+        has_permissions_warning: declares_permissions(workflow),
+        priority: 0,
+        prioritized: false,
+        jobs_expanded: false
+    )
+    @guidance
+        -- Concurrency: `concurrency.group` (case-insensitive) and
+        -- `cancel-in-progress`. Without a group the default group is
+        -- "<ref>_<workflow>_<trigger>__auto". Without cancel-in-progress,
+        -- push and pull_request_sync runs cancel in progress, others are
+        -- unlimited; cancel-in-progress=false with an explicit group queues
+        -- behind; cancel-in-progress=false without a group is unlimited.
+        -- The run title is `run-name:` when it evaluates non-empty, else the
+        -- first line of the commit message; at most 255 characters.
+}
+
+-- A valid run gets its jobs. Jobs with `needs`, with inputs still unknown,
+-- or in a run awaiting approval start blocked; a job whose `if:` is false
+-- server-side is skipped; the rest wait for a runner.
+-- from: services/actions/job.go:153
+rule ExpandRunIntoJobs {
+    when: run: WorkflowRun.awaiting_job_expansion
+    ensures:
+        run.jobs_expanded = true
+        if run.concurrency_mode = cancel_in_progress:
+            ConcurrencyGroupCancellationRequested(run: run)
+        for definition in job_definitions(run.repository, run.workflow_file, run.commit_sha):
+            Job.created(
+                run: run,
+                key: definition.key,
+                namespace: definition.namespace,
+                name: definition.name,
+                needs: definition.needs,
+                runs_on: definition.runs_on,
+                status: initial_job_status(definition, run.needs_approval),
+                attempt: 1,
+                handle: new_handle(),
+                started_at: null,
+                stopped_at: null,
+                status_changed_at: now,
+                is_incomplete: definition.is_incomplete,
+                is_workflow_call_outer: definition.is_workflow_call_outer,
+                oidc_requested: definition.oidc_requested,
+                is_assigned: false
+            )
+        WorkflowRunAttemptStarted(run: run)
+        RunConsistencyCheckRequested(run: run)
+    @guidance
+        -- initial_job_status: blocked when the definition has needs, is
+        -- incomplete, or the run needs approval; else skipped when its `if:`
+        -- is statically false; else waiting.
+        -- Job definitions come from the workflow at the run's source commit,
+        -- with variables, dispatch inputs and git context available to
+        -- expressions. Local reusable workflows (`uses: ./.forgejo/...`) and
+        -- same-instance reusable workflows (`owner/repo/path@ref`, public
+        -- owners and public repositories only) are expanded into namespaced
+        -- jobs when the calling job has no `runs-on`. Names are cut at 255.
+        -- WorkflowJobAttemptStarted is emitted for each job except incomplete ones.
+        -- A new run with cancel-in-progress cancels the rest of its group
+        -- (services/actions/notifier_helper.go:440).
+}
+
+-- A run that could not be parsed still appears, failed, with one failed job
+-- named after the workflow file.
+-- from: services/actions/notifier_helper.go:417
+rule RecordPreExecutionFailure {
+    when: run: WorkflowRun.awaiting_failure_record
+    ensures:
+        run.jobs_expanded = true
+        if run.concurrency_mode = cancel_in_progress:
+            ConcurrencyGroupCancellationRequested(run: run)
+        Job.created(
+            run: run,
+            key: run.workflow_file,
+            namespace: "",
+            name: run.workflow_file,
+            needs: {},
+            runs_on: {},
+            status: failure,
+            attempt: 1,
+            handle: new_handle(),
+            started_at: null,
+            stopped_at: now,
+            status_changed_at: now,
+            is_incomplete: false,
+            is_workflow_call_outer: false,
+            oidc_requested: false,
+            is_assigned: false
+        )
+        WorkflowRunAttemptStarted(run: run)
+}
+
+-- Checks that would otherwise leave a job blocked forever fail the run:
+-- `needs` naming an unknown job, a matrix depending on a job not in
+-- `needs`, `runs-on` naming a matrix dimension that does not exist.
+-- from: services/actions/run.go:178
+rule CheckRunConsistency {
+    when: RunConsistencyCheckRequested(run)
+    let problem = consistency_problem(run.repository, run.workflow_file, run.commit_sha)
+    requires: problem != null
+    ensures: RunFailedBeforeExecution(run: run, error: problem)
+}
+
+-- from: services/actions/run.go:154
+rule FailRunBeforeExecution {
+    when: RunFailedBeforeExecution(run, error)
+    requires: run.pre_execution_error = null
+    ensures:
+        run.pre_execution_error = error
+        RunKillRequested(run: run, as_failure: true)
+}
+
+-- Every other run of the same repository and concurrency group that still
+-- has pending jobs is cancelled.
+-- from: services/actions/schedule_tasks.go:245
+rule CancelOtherRunsInConcurrencyGroup {
+    when: ConcurrencyGroupCancellationRequested(run)
+    ensures:
+        for other in WorkflowRuns where repository = run.repository
+                and concurrency_group = run.concurrency_group
+                and pending_jobs.count > 0:
+            if other != run:
+                RunKillRequested(run: other, as_failure: false)
+}
+
+-- Stop every unfinished job (and its task) of a run: cancelled, or failed
+-- when the run failed before execution.
+-- from: services/actions/run.go:85
+rule KillRun {
+    when: RunKillRequested(run, as_failure)
+    ensures:
+        for job in run.jobs where status in {waiting, blocked, running}:
+            if as_failure:
+                job.status = failure
+            else:
+                job.status = cancelled
+            job.stopped_at = now
+            job.status_changed_at = now
+            WorkflowJobCompleted(job: job, prior_status: job.status)
+            for task in job.tasks where status = running:
+                TaskStopRequested(task: task, as_failure: as_failure)
+        run.needs_approval = false
+}
+
+-- from: services/actions/task.go:222
+rule StopTask {
+    when: TaskStopRequested(task, as_failure)
+    requires: task.status = running
+    ensures:
+        if as_failure:
+            task.status = failure
+        else:
+            task.status = cancelled
+        task.stopped_at = now
+        task.runner.is_busy = false
+        for step in task.steps where status in {waiting, blocked, running}:
+            if as_failure:
+                step.status = failure
+            else:
+                step.status = cancelled
+            step.stopped_at = now
+        if task.runner.is_ephemeral:
+            not exists task.runner
+}
+
+-- The run's status always follows its jobs.
+-- from: models/actions/run.go:313
+rule RunStatusFollowsJobs {
+    when: run: WorkflowRun.status_is_stale
+    let prior = run.status
+    ensures:
+        run.status = run.aggregated_status
+        if run.aggregated_status in {success, failure, cancelled, skipped}:
+            run.stopped_at = now
+            WorkflowRunCompleted(run: run, prior_status: prior)
+        else:
+            WorkflowRunStatusChanged(run: run, prior_status: prior)
+    @guidance
+        -- Aggregation: all skipped -> skipped; all success/skipped ->
+        -- success; any running -> running; any waiting -> waiting; any
+        -- blocked -> blocked; any cancelled -> cancelled; otherwise failure.
+        -- A run finishing makes queued runs of its concurrency group eligible.
+}
+
+------------------------------------------------------------
+-- Rules: job dependency graph
+------------------------------------------------------------
+
+-- All needed jobs are done: a regular job becomes waiting, unless its `if:`
+-- (default `success()`) is false — then it is skipped.
+-- from: services/actions/job_emitter.go:155
+rule BlockedJobBecomesWaiting {
+    when: job: Job.ready_to_unblock
+    requires: not job.is_workflow_call_outer
+    requires: not job.is_incomplete
+    requires: evaluate_if(job)
+    ensures:
+        job.status = waiting
+        job.status_changed_at = now
+        WorkflowJobStatusChanged(job: job, prior_status: blocked)
+}
+
+-- from: services/actions/job_emitter.go:351
+rule BlockedJobIsSkipped {
+    when: job: Job.ready_to_unblock
+    requires: not job.is_workflow_call_outer
+    requires: not job.is_incomplete
+    requires: not evaluate_if(job)
+    ensures:
+        job.status = skipped
+        job.stopped_at = now
+        job.status_changed_at = now
+        WorkflowJobCompleted(job: job, prior_status: blocked)
+}
+
+-- A job whose matrix / runs-on / `with:` needed outputs of other jobs is
+-- re-parsed once they are done and replaced by the jobs it expands to. If
+-- it still cannot be resolved the run fails (or the job is skipped when the
+-- missing values come from skipped jobs).
+-- from: services/actions/job_emitter.go:257
+rule IncompleteJobExpands {
+    when: job: Job.ready_to_unblock
+    requires: job.is_incomplete
+    let outcome = expand_incomplete_job(job)
+    ensures:
+        if outcome.skipped:
+            job.status = skipped
+            job.stopped_at = now
+            job.status_changed_at = now
+            WorkflowJobCompleted(job: job, prior_status: blocked)
+        else if outcome.error != null:
+            RunFailedBeforeExecution(run: job.run, error: outcome.error)
+        else:
+            for definition in outcome.definitions:
+                Job.created(
+                    run: job.run,
+                    key: definition.key,
+                    namespace: definition.namespace,
+                    name: definition.name,
+                    needs: definition.needs,
+                    runs_on: definition.runs_on,
+                    status: initial_job_status(definition, false),
+                    attempt: 1,
+                    handle: new_handle(),
+                    started_at: null,
+                    stopped_at: null,
+                    status_changed_at: now,
+                    is_incomplete: definition.is_incomplete,
+                    is_workflow_call_outer: definition.is_workflow_call_outer,
+                    oidc_requested: definition.oidc_requested,
+                    is_assigned: false
+                )
+            not exists job
+}
+
+-- A reusable-workflow caller job finishes when its inner jobs do.
+-- from: services/actions/job_emitter.go:176
+rule WorkflowCallOuterJobFinishes {
+    when: job: Job.ready_to_unblock
+    requires: job.is_workflow_call_outer
+    requires: not job.is_incomplete
+    ensures:
+        if not job.needs_succeeded:
+            job.status = failure
+        else if job.all_needs_skipped:
+            job.status = skipped
+        else:
+            job.status = success
+        job.stopped_at = now
+        job.status_changed_at = now
+        WorkflowJobCompleted(job: job, prior_status: blocked)
+}
+
+------------------------------------------------------------
+-- Rules: pull-request approval and contributor trust
+------------------------------------------------------------
+
+-- Approving releases the run: jobs without `needs` start waiting.
+-- from: services/actions/run.go:106
+rule ApproveRun {
+    when: RunApproved(run, approver)
+    requires: run.needs_approval
+    ensures:
+        for job in run.jobs where status = blocked and needs.count = 0:
+            job.status = waiting
+            job.status_changed_at = now
+            WorkflowJobStatusChanged(job: job, prior_status: blocked)
+        run.needs_approval = false
+        run.approved_by = approver
+}
+
+-- "Approve once": every run of this pull request awaiting approval.
+-- from: services/actions/trust.go:300
+rule UserApprovesPullRequestRuns {
+    when: UserApprovesPullRequestRunsOnce(user, pull_request)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_delegate_actions_trust(user, pull_request.base_repository)
+    ensures:
+        for run in WorkflowRuns where pull_request = pull_request and needs_approval = true:
+            RunApproved(run: run, approver: user)
+}
+
+-- "Always trust": remember the poster and approve all their pending runs.
+-- from: services/actions/trust.go:255
+rule UserAlwaysTrustsPoster {
+    when: UserAlwaysTrustsPullRequestPoster(user, pull_request)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_delegate_actions_trust(user, pull_request.base_repository)
+    let poster = pull_request.issue.poster
+    ensures: TrustedContributor.created(
+        user: poster,
+        repository: pull_request.base_repository,
+        trusted_with_pull_requests: true,
+        last_access_at: now
+    )
+    ensures:
+        for run in WorkflowRuns where repository = pull_request.base_repository
+                and pull_request_poster = poster and needs_approval = true:
+            RunApproved(run: run, approver: user)
+}
+
+-- "Deny": cancel every unfinished run of this pull request.
+-- from: services/actions/trust.go:285
+rule UserDeniesPullRequestRuns {
+    when: UserDeniesPullRequestRuns(user, pull_request)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_delegate_actions_trust(user, pull_request.base_repository)
+    ensures:
+        for run in WorkflowRuns where pull_request = pull_request
+                and status in {waiting, blocked, running}:
+            RunKillRequested(run: run, as_failure: false)
+}
+
+-- "Revoke": forget the poster and cancel all their unfinished runs.
+-- from: services/actions/trust.go:240
+rule UserRevokesPosterTrust {
+    when: UserRevokesPullRequestPosterTrust(user, pull_request)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_delegate_actions_trust(user, pull_request.base_repository)
+    let poster = pull_request.issue.poster
+    ensures:
+        for tc in TrustedContributors where user = poster and repository = pull_request.base_repository:
+            not exists tc
+        for run in WorkflowRuns where repository = pull_request.base_repository
+                and pull_request_poster = poster and status in {waiting, blocked, running}:
+            RunKillRequested(run: run, as_failure: false)
+}
+
+-- Closing a pull request cancels runs still waiting for approval.
+-- from: services/actions/notifier.go:141
+rule ClosedPullRequestCancelsUnapprovedRuns {
+    when: PullRequestClosedForActions(pull_request)
+    ensures:
+        for run in WorkflowRuns where pull_request = pull_request and needs_approval = true:
+            RunKillRequested(run: run, as_failure: false)
+}
+
+-- Explicit trust lapses when it has not been relied upon for 90 days.
+-- from: models/actions/user.go:91
+rule TrustedContributorExpires {
+    when: tc: TrustedContributor.last_access_at + config.trusted_contributor_expiry <= now
+    ensures: TrustedContributorLapsed(trusted_contributor: tc)
+    @guidance
+        -- last_access_at is refreshed (at most daily) whenever the trust is
+        -- consulted for a pull-request event. Swept weekly by cron
+        -- (administration/ActionsUserCleanupDue).
+}
+
+-- from: models/actions/user.go:91
+rule RevokeLapsedTrust {
+    when: TrustedContributorLapsed(trusted_contributor)
+    requires: exists trusted_contributor
+    ensures: not exists trusted_contributor
+}
+
+------------------------------------------------------------
+-- Rules: runners
+------------------------------------------------------------
+
+-- A runner registers itself with an active registration token. The token
+-- stays usable for further registrations until it is rotated or expires.
+-- from: routers/api/actions/runner/runner.go:47
+-- decided (actions 4): registration tokens expire after a configurable
+-- lifetime (default 1 hour) and are reusable until then.
+rule RunnerRegisters {
+    when: RunnerRegistersWithToken(registration_token, name, labels, version, is_ephemeral)
+    requires: registration_token.is_active
+    requires: registration_token.created_at + config.registration_token_lifetime > now
+    requires: name != ""
+    ensures: Runner.created(
+        scope: registration_token.scope,
+        name: name,
+        description: null,
+        version: version,
+        labels: labels,
+        is_ephemeral: is_ephemeral,
+        token: new_secret_token(),
+        created_at: now,
+        last_online_at: null,
+        last_active_at: null,
+        has_taken_task: false,
+        is_busy: false
+    )
+    @guidance
+        -- The name is cut at 255 characters. The response returns the
+        -- runner's identity and token exactly once.
+        -- An offline registration path (CLI with a shared secret) creates or
+        -- updates a runner whose identity derives from that secret.
+}
+
+-- An administrator pre-creates a runner and is shown its token once, for
+-- the runner to be configured with (no registration token needed).
+-- from: routers/web/shared/actions/runners.go:252
+rule UserCreatesRunner {
+    when: UserCreatesRunnerInScope(user, scope, name, description, is_ephemeral)
+    requires: scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage_actions_scope(user, scope)
+    requires: valid_runner_name(name)
+    ensures: Runner.created(
+        scope: scope,
+        name: name,
+        description: description,
+        version: null,
+        labels: {},
+        is_ephemeral: is_ephemeral,
+        token: new_secret_token(),
+        created_at: now,
+        last_online_at: null,
+        last_active_at: null,
+        has_taken_task: false,
+        is_busy: false
+    )
+    @guidance
+        -- valid_runner_name: non-empty, at most 255 characters.
+}
+
+-- Every authenticated call: the runner announces its labels and version.
+-- from: routers/api/actions/runner/runner.go:124
+rule RunnerDeclaresCapabilities {
+    when: RunnerDeclares(runner, labels, version)
+    ensures:
+        runner.labels = labels
+        runner.version = version
+        runner.last_online_at = now
+}
+
+-- from: routers/web/shared/actions/runners.go:319
+rule UserEditsRunner {
+    when: UserEditsRunnerDetails(user, runner, name, description)
+    requires: runner.scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage_actions_scope(user, runner.scope)
+    requires: valid_runner_name(name)
+    ensures:
+        runner.name = name
+        runner.description = description
+}
+
+-- Rotating the runner token disconnects the runner until it is
+-- reconfigured with the new token, shown once.
+-- from: routers/web/shared/actions/runners.go:374
+rule UserRegeneratesRunnerToken {
+    when: UserRegeneratesRunnerSecret(user, runner)
+    requires: runner.scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage_actions_scope(user, runner.scope)
+    ensures: runner.token = new_secret_token()
+}
+
+-- from: routers/web/shared/actions/runners.go:407
+rule UserDeletesRunner {
+    when: UserDeletesRunnerFromScope(user, runner)
+    requires: runner.scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage_actions_scope(user, runner.scope)
+    ensures: not exists runner
+    @guidance
+        -- Tasks already assigned to the runner keep running until they time
+        -- out as zombies. A deleted runner's identity is never reused.
+}
+
+-- Issue a fresh registration token and invalidate the scope's older ones.
+-- The runners page and API issue one automatically when none exists or the
+-- active one has expired.
+-- from: models/actions/runner_token.go:60
+rule UserResetsRegistrationToken {
+    when: UserRequestsNewRegistrationToken(user, scope)
+    requires: scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage_actions_scope(user, scope)
+    ensures:
+        for old in scope.registration_tokens:
+            old.is_active = false
+        RunnerRegistrationToken.created(scope: scope, token: new_secret_token(), is_active: true, created_at: now)
+}
+
+-- Ephemeral runners that already ran their task are deleted by the daily
+-- clean-up even if the immediate deletion was missed.
+-- from: services/actions/cleanup.go:155
+rule UsedEphemeralRunnerRemoved {
+    when: runner: Runner.has_used_its_single_task
+    requires: not runner.is_busy
+    ensures: RunnerRemovalDue(runner: runner)
+}
+
+-- Optional cron: delete runners that have been offline (or never came
+-- online) for longer than the configured age; by default instance runners only.
+-- from: models/actions/runner.go:426
+rule OfflineRunnerRemoved {
+    when: runner: Runner.created_at + config.offline_runner_cleanup_age <= now
+    requires: config.offline_runner_cleanup_enabled
+    requires: runner.last_online_at = null or runner.last_online_at + config.offline_runner_cleanup_age <= now
+    requires: config.offline_runner_cleanup_global_only implies runner.scope.kind = instance
+    ensures: RunnerRemovalDue(runner: runner)
+}
+
+-- One place where a swept runner (used ephemeral or long offline) goes away.
+-- from: services/actions/cleanup.go:155
+rule RemoveSweptRunner {
+    when: RunnerRemovalDue(runner)
+    requires: exists runner
+    ensures: not exists runner
+}
+
+------------------------------------------------------------
+-- Rules: task assignment and runner reports
+------------------------------------------------------------
+
+-- A polling runner is given the highest-priority waiting job it can run:
+-- the job's repository is within the runner's scope, Actions is enabled
+-- there, the runner carries every `runs-on` label, and (with the
+-- concurrency queue) no older pending or running run of the same
+-- concurrency group blocks it.
+-- from: services/actions/task.go:453
+rule RunnerFetchesTask {
+    when: RunnerFetchesTask(runner, job, request_key)
+    requires: job.status = waiting
+    requires: not job.is_assigned
+    requires: runner.scope.kind = instance
+        or (runner.scope.kind = repository and runner.scope.repository = job.run.repository)
+        or (runner.scope.kind = user and job.run.repository.owner_user = runner.scope.owner_user)
+        or (runner.scope.kind = organization and job.run.repository.owner_org = runner.scope.owner_org)
+    requires: job.run.repository.units.any(u => u.kind = actions and u.enabled)
+    requires: runner.labels.count > 0 and job.runs_on.count > 0
+    requires: (job.runs_on - runner.labels).count = 0
+    requires: not (runner.is_ephemeral and runner.has_taken_task)
+    requires: config.concurrency_group_queue_enabled implies not blocked_by_concurrency_group(job.run)
+    ensures: Task.created(
+        job: job,
+        runner: runner,
+        attempt: job.attempt,
+        status: running,
+        started_at: now,
+        stopped_at: null,
+        last_activity_at: now,
+        token: new_secret_token(),
+        request_key: request_key,
+        is_fork_pull_request: job.run.is_fork_pull_request,
+        oidc_enabled: job.oidc_requested and not job.run.secrets_withheld,
+        log_length: 0,
+        log_size: 0,
+        log_archived: false,
+        log_expired: false
+    )
+    ensures:
+        job.status = running
+        job.is_assigned = true
+        job.started_at = now
+        job.status_changed_at = now
+        runner.has_taken_task = true
+        runner.is_busy = true
+        runner.last_online_at = now
+        if job.run.started_at = null:
+            job.run.started_at = now
+        WorkflowJobStatusChanged(job: job, prior_status: waiting)
+    @guidance
+        -- Order: run priority (highest first), then the job's last update,
+        -- then creation order — i.e. FIFO unless a run was prioritised.
+        -- A run is blocked by its concurrency group when another run of the
+        -- same group is running, or is pending with a lower index.
+        -- A runner may ask for a specific job attempt by its handle, and may
+        -- ask for several tasks at once up to its declared capacity.
+        -- The task payload carries the job's workflow, the git context, the
+        -- variables, the secrets (none for fork pull requests other than
+        -- pull_request_target; FORGEJO_TOKEN always), the needed jobs'
+        -- outputs and results, and a runtime token (24h) for artifacts and
+        -- ID tokens. Steps are created from the job definition as waiting.
+}
+
+-- A retried fetch with the same request key gets the same tasks back,
+-- each with a newly minted token.
+-- from: routers/api/actions/runner/runner.go:385
+rule RunnerRecoversTasks {
+    when: RunnerRetriesFetch(runner, request_key)
+    ensures:
+        for task in runner.tasks where request_key = request_key:
+            task.token = new_secret_token()
+        runner.last_online_at = now
+}
+
+-- Progress report without a result: refreshes liveness and step states.
+-- from: services/actions/task.go:323
+rule RunnerReportsProgress {
+    when: RunnerReportsTaskProgress(runner, task)
+    requires: task.runner = runner
+    requires: task.status = running
+    ensures:
+        task.last_activity_at = now
+        runner.last_online_at = now
+        runner.last_active_at = now
+}
+
+-- Final report: task, job and (eventually) run take the result. An
+-- ephemeral runner is deleted as soon as it has reported its result.
+-- from: services/actions/task.go:323
+rule RunnerReportsResult {
+    when: RunnerReportsTaskResult(runner, task, result)
+    requires: task.runner = runner
+    requires: task.status = running
+    requires: result in {success, failure, cancelled, skipped}
+    ensures:
+        task.status = result
+        task.stopped_at = now
+        task.last_activity_at = now
+        task.job.status = result
+        task.job.stopped_at = now
+        task.job.status_changed_at = now
+        WorkflowJobCompleted(job: task.job, prior_status: running)
+        runner.is_busy = false
+        runner.last_online_at = now
+        runner.last_active_at = now
+        if runner.is_ephemeral:
+            not exists runner
+    @guidance
+        -- Reports for a task that is already finished are acknowledged and
+        -- change nothing (the task may have been cancelled meanwhile).
+        -- A finished task makes the job emitter re-check blocked jobs.
+}
+
+-- from: routers/api/actions/runner/runner.go:258
+rule RunnerReportsOutput {
+    when: RunnerReportsTaskOutput(runner, task, key, value)
+    requires: task.runner = runner
+    requires: output_within_limits(key, value)
+    requires: existing_output(task, key) = null
+    ensures: TaskOutput.created(task: task, key: key, value: value)
+    @guidance
+        -- output_within_limits: key at most 255 characters, value at most 1 MiB;
+        -- oversize outputs are silently dropped.
+}
+
+-- from: routers/api/actions/runner/runner.go:300
+rule RunnerAppendsLog {
+    when: RunnerAppendsTaskLog(runner, task, from_index, row_count, byte_count, no_more)
+    requires: task.runner = runner
+    requires: not task.log_archived
+    requires: from_index <= task.log_length
+    let new_rows = from_index + row_count - task.log_length
+    ensures:
+        if new_rows > 0:
+            task.log_length = task.log_length + new_rows
+            task.log_size = task.log_size + byte_count
+        if no_more:
+            task.log_archived = true
+        runner.last_online_at = now
+        runner.last_active_at = now
+    @guidance
+        -- Each line is stored with its timestamp and truncated to 64 KiB.
+        -- Archived logs are compressed with zstd unless LOG_COMPRESSION=none.
+}
+
+-- from: routers/api/actions/runner/runner.go:345
+rule RunnerSubmitsStepSummary {
+    when: RunnerSubmitsStepSummary(runner, step, content)
+    requires: step.task.runner = runner
+    ensures: step.summary = truncate_to_bytes(content, config.max_step_summary_bytes)
+}
+
+------------------------------------------------------------
+-- Rules: users acting on runs and workflows
+------------------------------------------------------------
+
+-- from: routers/web/repo/actions/view.go:633
+rule UserCancelsRun {
+    when: UserCancelsWorkflowRun(user, run)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: can_write_actions(user, run.repository)
+    requires: run.status in {waiting, blocked, running}
+    ensures: RunKillRequested(run: run, as_failure: false)
+}
+
+-- Re-run all jobs of a finished, valid run whose workflow is not disabled.
+-- Artifacts of the previous attempt are discarded.
+-- from: services/actions/rerun.go:50
+rule UserRerunsRun {
+    when: UserRerunsWorkflowRun(user, run)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: can_write_actions(user, run.repository)
+    requires: run.pre_execution_error = null
+    requires: run.status in {success, failure, cancelled, skipped}
+    requires: not workflow_disabled(run.repository, run.workflow_file)
+    ensures:
+        run.previous_attempts_duration = run.previous_attempts_duration + run_duration(run)
+        run.status = waiting
+        run.started_at = null
+        run.stopped_at = null
+        run.attempt = run.attempt + 1
+        run.priority = 0
+        run.prioritized = false
+        for artifact in run.artifacts where status in {upload_pending, upload_confirmed, expired}:
+            artifact.status = pending_deletion
+        for job in run.jobs:
+            job.attempt = job.attempt + 1
+            job.handle = new_handle()
+            job.is_assigned = false
+            job.started_at = null
+            job.stopped_at = null
+            job.status_changed_at = now
+            if job.needs.count > 0:
+                job.status = blocked
+            else:
+                job.status = waiting
+            WorkflowJobAttemptStarted(job: job)
+        WorkflowRunAttemptStarted(run: run)
+}
+
+-- Re-run one finished job plus every job that (transitively) needs it;
+-- unfinished dependants are cancelled first. The chosen job starts waiting
+-- even if it has needs. The whole run's artifacts are discarded.
+-- from: services/actions/rerun.go:118
+rule UserRerunsJob {
+    when: UserRerunsWorkflowJob(user, job)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: can_write_actions(user, job.run.repository)
+    requires: job.run.pre_execution_error = null
+    requires: job.status in {success, failure, cancelled, skipped}
+    requires: not workflow_disabled(job.run.repository, job.run.workflow_file)
+    ensures:
+        for artifact in job.run.artifacts where status in {upload_pending, upload_confirmed, expired}:
+            artifact.status = pending_deletion
+        for dependant in dependants_of(job):
+            JobRerunRequested(job: dependant, keep_blocked: true)
+        JobRerunRequested(job: job, keep_blocked: false)
+        if job.run.status in {success, failure, cancelled, skipped}:
+            job.run.attempt = job.run.attempt + 1
+            WorkflowRunAttemptStarted(run: job.run)
+}
+
+-- from: services/actions/job.go:20
+rule RerunSingleJob {
+    when: JobRerunRequested(job, keep_blocked)
+    ensures:
+        for task in job.tasks where status = running:
+            TaskStopRequested(task: task, as_failure: false)
+        job.attempt = job.attempt + 1
+        job.handle = new_handle()
+        job.is_assigned = false
+        job.started_at = null
+        job.stopped_at = null
+        job.status_changed_at = now
+        if keep_blocked and job.needs.count > 0:
+            job.status = blocked
+        else:
+            job.status = waiting
+        WorkflowJobAttemptStarted(job: job)
+}
+
+-- Only finished runs can be deleted; logs, tasks and artifacts go with it.
+-- from: services/actions/run.go:310
+rule UserDeletesRun {
+    when: UserDeletesWorkflowRun(user, run)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: is_repo_admin(user, run.repository)
+    requires: run.status in {success, failure, cancelled, skipped}
+    ensures:
+        for artifact in run.artifacts where status in {upload_pending, upload_confirmed, expired}:
+            artifact.status = pending_deletion
+        for job in run.jobs:
+            for task in job.tasks:
+                not exists task
+            not exists job
+        not exists run
+}
+
+-- When the instance enables it, finished runs older than the retention age
+-- are deleted exactly as UserDeletesRun deletes them.
+-- decided (actions 7): admin config, off by default (Forgejo keeps run
+-- records forever).
+rule OldRunPruned {
+    when: run: WorkflowRun.stopped_at + config.run_retention <= now
+    requires: config.run_pruning_enabled
+    requires: run.is_done
+    ensures: RunPruneDue(run: run)
+}
+
+rule PruneRun {
+    when: RunPruneDue(run)
+    requires: config.run_pruning_enabled
+    requires: run.is_done
+    ensures:
+        for artifact in run.artifacts where status in {upload_pending, upload_confirmed, expired}:
+            artifact.status = pending_deletion
+        for job in run.jobs:
+            for task in job.tasks:
+                not exists task
+            not exists job
+        not exists run
+    @guidance
+        -- Swept by the daily cleanup_actions cron alongside artifacts and logs.
+}
+
+-- from: services/actions/run.go:345
+rule UserPrioritizesRun {
+    when: UserPrioritizesWorkflowRun(user, run)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: can_write_actions(user, run.repository)
+    requires: run.status in {waiting, blocked}
+    requires: not run.prioritized
+    ensures:
+        run.prioritized = true
+        run.priority = 127
+}
+
+-- from: services/actions/run.go:370
+rule UserDeprioritizesRun {
+    when: UserDeprioritizesWorkflowRun(user, run)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: can_write_actions(user, run.repository)
+    requires: run.prioritized
+    ensures:
+        run.prioritized = false
+        run.priority = 0
+}
+
+-- A disabled workflow starts no event-driven or scheduled runs and cannot
+-- be re-run; a manual dispatch still starts it (decided actions 1).
+-- from: routers/web/repo/actions/view.go:880
+rule UserDisablesWorkflow {
+    when: UserDisablesWorkflowFile(user, workflow)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: is_repo_admin(user, workflow.repository)
+    ensures: workflow.is_disabled = true
+}
+
+-- from: routers/web/repo/actions/view.go:880
+rule UserEnablesWorkflow {
+    when: UserEnablesWorkflowFile(user, workflow)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: is_repo_admin(user, workflow.repository)
+    ensures: workflow.is_disabled = false
+}
+
+-- Manual dispatch of a workflow that declares `workflow_dispatch`, at any
+-- branch or tag. Missing inputs take their defaults; a required input
+-- with neither value nor default refuses the dispatch.
+-- from: services/actions/workflows.go:79
+rule UserDispatchesWorkflow {
+    when: UserDispatchesWorkflowRun(user, workflow, ref, inputs)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: can_write_actions(user, workflow.repository)
+    requires: not workflow.repository.is_archived
+    requires: not workflow.repository.is_empty
+    requires: ref_exists(workflow.repository, ref)
+    requires: workflow.has_dispatch_trigger
+    requires: required_inputs_present(workflow, inputs)
+    requires: inputs.count <= config.limit_dispatch_inputs
+    ensures: WorkflowRun.created(
+        repository: workflow.repository,
+        index: next_run_index(workflow.repository),
+        title: dispatch_title(workflow),
+        workflow_file: workflow.file_name,
+        workflow_directory: workflow.directory,
+        trigger_user: user,
+        trigger_deploy_key: null,
+        event: workflow_dispatch,
+        trigger_event: workflow_dispatch,
+        activity: null,
+        ref: ref,
+        commit_sha: ref_commit(workflow.repository, ref),
+        workflow_source_sha: null,
+        schedule: null,
+        inputs: inputs,
+        status: waiting,
+        created_at: now,
+        started_at: null,
+        stopped_at: null,
+        previous_attempts_duration: 0.seconds,
+        attempt: 1,
+        notify_email: workflow_notifies_by_email(workflow),
+        pull_request: null,
+        pull_request_poster: null,
+        is_fork_pull_request: false,
+        needs_approval: false,
+        approved_by: null,
+        concurrency_group: concurrency_group_for_dispatch(workflow, ref, inputs),
+        concurrency_mode: concurrency_mode_for_dispatch(workflow, inputs),
+        pre_execution_error: null,
+        pre_execution_error_details: null,
+        has_permissions_warning: declares_permissions(workflow),
+        priority: 0,
+        prioritized: false,
+        jobs_expanded: false
+    )
+    @guidance
+        -- required_inputs_present: every input marked required has a value
+        -- or a default. Web: form fields inputs[<key>]; API: JSON inputs map,
+        -- optional return_run_info. Boolean inputs are passed as
+        -- "true"/"false". The title is the workflow `name:` (else its path),
+        -- replaced by `run-name:` when that evaluates non-empty.
+        -- decided (actions 1): dispatching a disabled workflow is allowed;
+        -- disabling stops automatic triggers and re-runs only, so there is
+        -- deliberately no `not workflow.is_disabled` requirement here.
+}
+
+------------------------------------------------------------
+-- Rules: artifacts
+------------------------------------------------------------
+
+-- A running job creates (or re-opens) an artifact of its run with the
+-- instance's default retention.
+-- from: models/actions/artifact.go:58
+rule TaskCreatesArtifact {
+    when: TaskCreatesArtifact(task, name)
+    requires: task.status = running
+    requires: quota_allows_artifacts(task.job.run.repository)
+    ensures: Artifact.created(
+        run: task.job.run,
+        name: name,
+        uploaded_by: task,
+        size: 0,
+        compressed_size: 0,
+        status: upload_pending,
+        created_at: now,
+        expires_at: now + config.artifact_retention
+    )
+}
+
+-- The job may ask for its own retention (in days, or an expiry time).
+-- decided (actions 3): any retention is honoured; ARTIFACT_RETENTION_DAYS
+-- is only the default used by TaskCreatesArtifact.
+-- from: routers/api/actions/artifactsv4.go:284
+rule TaskCreatesArtifactWithRetention {
+    when: TaskCreatesArtifactWithRetention(task, name, retention)
+    requires: task.status = running
+    requires: quota_allows_artifacts(task.job.run.repository)
+    ensures: Artifact.created(
+        run: task.job.run,
+        name: name,
+        uploaded_by: task,
+        size: 0,
+        compressed_size: 0,
+        status: upload_pending,
+        created_at: now,
+        expires_at: now + retention
+    )
+}
+
+-- from: routers/api/actions/artifacts_chunks.go:295
+rule TaskFinalizesArtifact {
+    when: TaskFinalizesArtifact(task, artifact, size)
+    requires: task.status = running
+    requires: artifact.run = task.job.run
+    requires: artifact.status = upload_pending
+    ensures:
+        artifact.status = upload_confirmed
+        artifact.size = size
+        artifact.compressed_size = stored_size(artifact)
+}
+
+-- from: routers/web/repo/actions/view.go:761
+rule UserDeletesArtifact {
+    when: UserDeletesRunArtifact(user, artifact)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: can_write_actions(user, artifact.run.repository)
+    requires: artifact.status = upload_confirmed
+    ensures: artifact.status = pending_deletion
+}
+
+-- from: services/actions/cleanup.go:48
+rule ArtifactExpires {
+    when: artifact: Artifact.expires_at <= now
+    requires: artifact.status = upload_confirmed
+    ensures: ArtifactExpiryDue(artifact: artifact)
+}
+
+-- from: services/actions/cleanup.go:48
+rule ExpireArtifact {
+    when: ArtifactExpiryDue(artifact)
+    requires: artifact.status = upload_confirmed
+    ensures: artifact.status = expired
+    @guidance
+        -- Content is removed from storage; the record stays listed as expired.
+        -- Swept by the daily cleanup_actions cron.
+}
+
+-- from: services/actions/cleanup.go:70
+rule ArtifactPurged {
+    when: artifact: Artifact.status becomes pending_deletion
+    ensures: ArtifactPurgeDue(artifact: artifact)
+}
+
+-- from: services/actions/cleanup.go:70
+rule PurgeArtifact {
+    when: ArtifactPurgeDue(artifact)
+    requires: artifact.status = pending_deletion
+    ensures: artifact.status = deleted
+    @guidance
+        -- Performed by the daily cleanup_actions cron, in batches of 100.
+}
+
+------------------------------------------------------------
+-- Rules: logs
+------------------------------------------------------------
+
+-- from: services/actions/cleanup.go:96
+rule TaskLogsExpire {
+    when: task: Task.stopped_at + config.log_retention <= now
+    requires: not task.log_expired
+    ensures: TaskLogExpiryDue(task: task)
+}
+
+-- from: services/actions/cleanup.go:96
+rule ExpireTaskLog {
+    when: TaskLogExpiryDue(task)
+    requires: not task.log_expired
+    ensures: task.log_expired = true
+}
+
+-- Finished tasks whose runner never said "no more" get their logs archived.
+-- from: services/actions/log.go:25
+rule LingeringLogArchived {
+    when: task: Task.stopped_at + config.lingering_log_age <= now
+    requires: not task.log_archived
+    requires: not task.log_expired
+    ensures: LingeringLogTransferDue(task: task)
+}
+
+-- from: services/actions/log.go:25
+rule ArchiveLingeringLog {
+    when: LingeringLogTransferDue(task)
+    requires: not task.log_archived
+    requires: not task.log_expired
+    ensures: task.log_archived = true
+    @guidance
+        -- Nightly, at most 3000 tasks per pass, paced to spare the storage.
+}
+
+------------------------------------------------------------
+-- Rules: liveness clean-up
+------------------------------------------------------------
+
+-- A running task that has not reported anything for too long fails.
+-- from: services/actions/clear_tasks.go:22
+rule ZombieTaskFails {
+    when: task: Task.last_activity_at + config.zombie_task_timeout <= now
+    requires: task.status = running
+    ensures: TaskTimedOut(task: task)
+}
+
+-- A running task that has run for too long fails even if it reports.
+-- from: services/actions/clear_tasks.go:30
+rule EndlessTaskFails {
+    when: task: Task.started_at + config.endless_task_timeout <= now
+    requires: task.status = running
+    ensures: TaskTimedOut(task: task)
+}
+
+-- from: services/actions/task.go:257
+rule TimedOutTaskFailsItsJob {
+    when: TaskTimedOut(task)
+    requires: task.status = running
+    ensures:
+        task.status = failure
+        task.stopped_at = now
+        task.runner.is_busy = false
+        for step in task.steps where status in {waiting, blocked, running}:
+            step.status = failure
+            step.stopped_at = now
+        task.job.status = failure
+        task.job.stopped_at = now
+        task.job.status_changed_at = now
+        WorkflowJobCompleted(job: task.job, prior_status: running)
+}
+
+-- A job nobody picked up (or that stayed blocked) for too long is
+-- cancelled, unless its run is still waiting for approval.
+-- from: services/actions/clear_tasks.go:85
+rule AbandonedJobCancelled {
+    when: job: Job.status_changed_at + config.abandoned_job_timeout <= now
+    requires: job.status in {waiting, blocked}
+    requires: not job.run.needs_approval
+    ensures: JobAbandoned(job: job)
+}
+
+-- from: services/actions/clear_tasks.go:85
+rule CancelAbandonedJob {
+    when: JobAbandoned(job)
+    requires: job.status in {waiting, blocked}
+    requires: not job.run.needs_approval
+    ensures:
+        job.status = cancelled
+        job.stopped_at = now
+        job.status_changed_at = now
+        WorkflowJobCompleted(job: job, prior_status: waiting)
+}
+
+------------------------------------------------------------
+-- Rules: commit statuses
+------------------------------------------------------------
+
+-- Every job of a push, pull_request(_target) or release run reports a
+-- commit status "<workflow name> / <job name> (<event>)" on the relevant
+-- commit (push head, pull request head, release commit).
+-- from: services/actions/commit_status.go:31
+rule ReportJobCommitStatusOnChange {
+    when: WorkflowJobStatusChanged(job, prior_status)
+    requires: job.run.event in {push, pull_request, pull_request_sync, pull_request_label,
+        pull_request_assign, pull_request_milestone, release}
+    requires: not job.is_incomplete
+    ensures: JobCommitStatusReported(repository: job.run.repository, commit_sha: status_commit(job.run),
+        context: commit_status_context(job), state: commit_state(job.status), target_url: job_link(job),
+        description: commit_status_description(job), creator: actions_bot())
+}
+
+-- from: services/actions/commit_status.go:31
+rule ReportJobCommitStatusOnCompletion {
+    when: WorkflowJobCompleted(job, prior_status)
+    requires: job.run.event in {push, pull_request, pull_request_sync, pull_request_label,
+        pull_request_assign, pull_request_milestone, release}
+    requires: not job.is_incomplete
+    ensures: JobCommitStatusReported(repository: job.run.repository, commit_sha: status_commit(job.run),
+        context: commit_status_context(job), state: commit_state(job.status), target_url: job_link(job),
+        description: commit_status_description(job), creator: actions_bot())
+    @guidance
+        -- success -> success ("Successful in <duration>"), failure and
+        -- cancelled -> failure, skipped -> skipped, waiting/blocked/running ->
+        -- pending ("Waiting to run" / "Blocked by required conditions" /
+        -- "Has started running"). An identical latest status is not repeated.
+}
+
+-- from: services/actions/commit_status.go:31
+rule ReportJobCommitStatusOnAttempt {
+    when: WorkflowJobAttemptStarted(job)
+    requires: job.run.event in {push, pull_request, pull_request_sync, pull_request_label,
+        pull_request_assign, pull_request_milestone, release}
+    requires: not job.is_incomplete
+    ensures: JobCommitStatusReported(repository: job.run.repository, commit_sha: status_commit(job.run),
+        context: commit_status_context(job), state: commit_state(job.status), target_url: job_link(job),
+        description: commit_status_description(job), creator: actions_bot())
+}
+
+------------------------------------------------------------
+-- Rules: OIDC ID tokens
+------------------------------------------------------------
+
+-- A job that enabled OpenID Connect may exchange its runtime token for a
+-- signed ID token describing the run (repository, ref, sha, actor, event,
+-- workflow, run id/number/attempt). The audience defaults to the
+-- repository owner's URL.
+-- from: routers/api/actions/id_token.go:98
+rule TaskRequestsIdToken {
+    when: TaskRequestsIdToken(task, audience)
+    requires: task.status = running
+    requires: task.oidc_enabled
+    ensures: IdTokenIssued(task: task, audience: audience, expires_at: now + config.id_token_lifetime)
+    @guidance
+        -- An empty audience means the repository owner's URL.
+        -- `sub` is "repo:<owner>-<owner_id>/<repo>-<repo_id>:pull_request"
+        -- for pull_request events, else "...:ref:<ref>". Public keys are
+        -- published at a JWKS endpoint with an OpenID discovery document.
+        -- decided (actions 5): this is the only subject format; Forgejo's
+        -- per-repository legacy_forgejo_15 option (no ids) is dropped.
+}
+
+------------------------------------------------------------
+-- Rules: secrets and variables
+------------------------------------------------------------
+
+-- Create a secret, or overwrite the value of the one with that name
+-- (names are case-insensitive).
+-- from: services/secrets/secrets.go:13
+rule UserSetsSecret {
+    when: UserSetsActionsSecret(user, scope, name, value)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage_actions_scope(user, scope)
+    requires: scope.kind != instance
+    requires: valid_secret_name(name)
+    let existing = existing_secret(scope, name)
+    ensures:
+        if existing != null:
+            existing.value = value
+        else:
+            Secret.created(scope: scope, name: upper(name), value: value, created_at: now)
+    @guidance
+        -- valid_secret_name: [A-Za-z_][A-Za-z0-9_]*, not starting with
+        -- FORGEJO_, GITEA_ or GITHUB_ (case-insensitive). Line breaks are
+        -- normalised to \n. The value is encrypted at rest and never
+        -- returned by any interface.
+}
+
+-- from: services/secrets/secrets.go:47
+rule UserDeletesSecret {
+    when: UserDeletesActionsSecret(user, secret)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage_actions_scope(user, secret.scope)
+    ensures: not exists secret
+}
+
+-- from: services/actions/variables.go:17
+rule UserCreatesVariable {
+    when: UserCreatesActionsVariable(user, scope, name, value)
+    requires: scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage_actions_scope(user, scope)
+    requires: valid_variable_name(name)
+    requires: existing_variable(scope, name) = null
+    ensures: Variable.created(scope: scope, name: upper(name), value: value,
+        created_at: now, updated_at: null)
+    @guidance
+        -- valid_variable_name: the secret-name rules, and not "CI".
+        -- Line breaks are normalised to \n.
+}
+
+-- from: services/actions/variables.go:30
+rule UserUpdatesVariable {
+    when: UserUpdatesActionsVariable(user, variable, name, value)
+    requires: variable.scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage_actions_scope(user, variable.scope)
+    requires: valid_variable_name(name)
+    ensures:
+        variable.name = upper(name)
+        variable.value = value
+        variable.updated_at = now
+}
+
+-- from: services/actions/variables.go:47
+rule UserDeletesVariable {
+    when: UserDeletesActionsVariable(user, variable)
+    requires: variable.scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: may_manage_actions_scope(user, variable.scope)
+    ensures: not exists variable
+}
+
+------------------------------------------------------------
+-- Rules: scheduled workflows
+------------------------------------------------------------
+
+-- Re-register a repository's schedules from its default branch head:
+-- all existing schedules are replaced.
+-- from: services/actions/notifier_helper.go:576
+rule RefreshSchedules {
+    when: SchedulesNeedRefresh(repository)
+    requires: config.actions_enabled
+    requires: repository.units.any(u => u.kind = actions and u.enabled)
+    requires: not repository.is_empty
+    requires: not repository.is_archived
+    ensures:
+        for old in Schedules where repository = repository:
+            for spec in old.specs:
+                not exists spec
+            not exists old
+        for workflow in scheduled_workflows(repository):
+            ScheduleRegistrationRequested(workflow: workflow)
+}
+
+-- from: services/actions/notifier_helper.go:600
+rule RegisterSchedule {
+    when: ScheduleRegistrationRequested(workflow)
+    ensures: Schedule.created(
+        repository: workflow.repository,
+        workflow_file: workflow.file_name,
+        workflow_directory: workflow.directory,
+        title: dispatch_title(workflow),
+        ref: "refs/heads/" + workflow.repository.default_branch,
+        commit_sha: default_branch_head(workflow.repository),
+        created_at: now
+    )
+    @guidance
+        -- One ScheduleSpec per `cron:` entry, next_run_at = next match after
+        -- now, in the workflow's `timezone:` (else a TZ=/CRON_TZ= prefix,
+        -- else UTC). Triggered by the Actions bot, never by a person.
+}
+
+-- from: services/actions/notifier.go:600
+rule DefaultBranchChangeRefreshesSchedules {
+    when: code/DefaultBranchChanged(repository, old_name, new_name, by)
+    ensures: SchedulesNeedRefresh(repository: repository)
+}
+
+-- Renaming the default branch re-registers schedules against the new name.
+-- from: services/repository/branch.go:430
+rule DefaultBranchRenameRefreshesSchedules {
+    when: code/BranchRenamed(repository, from_name, to_name, by)
+    requires: to_name = repository.default_branch
+    ensures: SchedulesNeedRefresh(repository: repository)
+}
+
+-- from: routers/web/repo/setting/setting.go:1088
+rule UnarchiveRefreshesSchedules {
+    when: repositories/RepositoryUnarchived(repository, doer)
+    ensures: SchedulesNeedRefresh(repository: repository)
+}
+
+-- from: services/repository/setting.go:38
+rule ActionsUnitEnabledRefreshesSchedules {
+    when: repositories/RepoUnitEnabled(repository, kind)
+    requires: kind = actions
+    ensures: SchedulesNeedRefresh(repository: repository)
+}
+
+-- from: routers/web/repo/setting/setting.go:1065
+rule ArchiveDropsSchedules {
+    when: repositories/RepositoryArchived(repository, doer)
+    ensures: SchedulesDropped(repository: repository)
+}
+
+-- from: services/repository/setting.go:31
+rule ActionsUnitDisabledDropsSchedules {
+    when: repositories/RepoUnitDisabled(repository, kind)
+    requires: kind = actions
+    ensures: SchedulesDropped(repository: repository)
+}
+
+-- Schedules go away and unfinished scheduled runs are cancelled.
+-- from: services/actions/schedule_tasks.go:283
+rule DropSchedules {
+    when: SchedulesDropped(repository)
+    ensures:
+        for old in Schedules where repository = repository:
+            for spec in old.specs:
+                not exists spec
+            not exists old
+        for run in WorkflowRuns where repository = repository and trigger_event = schedule
+                and status in {waiting, blocked, running}:
+            RunKillRequested(run: run, as_failure: false)
+}
+
+-- A due cron entry starts a run of its schedule's workflow, then moves to
+-- its next occurrence at least one minute later.
+-- from: services/actions/schedule_tasks.go:30
+rule ScheduleFires {
+    when: spec: ScheduleSpec.next_run_at <= now
+    ensures: ScheduleSpecDue(spec: spec)
+}
+
+-- A due cron entry of a usable schedule starts its run.
+-- from: services/actions/schedule_tasks.go:30
+rule StartScheduledRun {
+    when: ScheduleSpecDue(spec)
+    requires: not spec.schedule.repository.is_archived
+    requires: spec.schedule.repository.units.any(u => u.kind = actions and u.enabled)
+    requires: not workflow_disabled(spec.schedule.repository, spec.schedule.workflow_file)
+    requires: not schedule_is_broken(spec)
+    requires: not (config.schedule_inactivity_disable_enabled
+        and last_repository_activity(spec.schedule.repository) + config.schedule_inactivity_period <= now)
+    ensures: WorkflowRun.created(
+        repository: spec.schedule.repository,
+        index: next_run_index(spec.schedule.repository),
+        title: spec.schedule.title,
+        workflow_file: spec.schedule.workflow_file,
+        workflow_directory: spec.schedule.workflow_directory,
+        trigger_user: actions_bot(),
+        trigger_deploy_key: null,
+        event: schedule,
+        trigger_event: schedule,
+        activity: null,
+        ref: spec.schedule.ref,
+        commit_sha: spec.schedule.commit_sha,
+        workflow_source_sha: null,
+        schedule: spec.schedule,
+        inputs: {},
+        status: waiting,
+        created_at: now,
+        started_at: null,
+        stopped_at: null,
+        previous_attempts_duration: 0.seconds,
+        attempt: 1,
+        notify_email: schedule_notifies_by_email(spec.schedule),
+        pull_request: null,
+        pull_request_poster: null,
+        is_fork_pull_request: false,
+        needs_approval: false,
+        approved_by: null,
+        concurrency_group: concurrency_group_for_schedule(spec.schedule),
+        concurrency_mode: concurrency_mode_for_schedule(spec.schedule),
+        pre_execution_error: null,
+        pre_execution_error_details: null,
+        has_permissions_warning: false,
+        priority: 0,
+        prioritized: false,
+        jobs_expanded: false
+    )
+    ensures:
+        spec.previous_run_at = spec.next_run_at
+        spec.next_run_at = next_cron_occurrence(spec, now + 1.minute)
+    @guidance
+        -- Checked every minute (start_schedule_tasks cron). Scheduled runs
+        -- report no commit statuses. Inactive repositories: see
+        -- InactivityDisablesScheduledWorkflow.
+}
+
+-- When the instance enables it, a due cron entry of a repository that has
+-- seen no activity for the configured period disables its workflow instead
+-- of running it, and the repository's admins are told.
+-- decided (actions 8): admin config, off by default (GitHub disables after
+-- 60 days; Forgejo never did). A manual dispatch or re-enabling still works.
+rule InactivityDisablesScheduledWorkflow {
+    when: ScheduleSpecDue(spec)
+    requires: config.schedule_inactivity_disable_enabled
+    requires: last_repository_activity(spec.schedule.repository) + config.schedule_inactivity_period <= now
+    requires: not workflow_disabled(spec.schedule.repository, spec.schedule.workflow_file)
+    ensures:
+        for workflow in Workflows where repository = spec.schedule.repository
+                and file_name = spec.schedule.workflow_file:
+            workflow.is_disabled = true
+        ScheduledWorkflowDisabledForInactivity(repository: spec.schedule.repository, workflow_file: spec.schedule.workflow_file)
+    @guidance
+        -- last_repository_activity: the latest push to any branch, or the
+        -- repository's creation when nothing was pushed since. Scheduled runs
+        -- and pushes by the Actions bot do not count as activity.
+}
+
+-- A cron entry that can never produce a run (unparseable cron, unknown
+-- time zone, workflow that no longer parses) disables its workflow.
+-- from: services/actions/schedule_tasks.go:94
+rule BrokenScheduleDisablesWorkflow {
+    when: ScheduleSpecDue(spec)
+    requires: schedule_is_broken(spec)
+    ensures:
+        for workflow in Workflows where repository = spec.schedule.repository
+                and file_name = spec.schedule.workflow_file:
+            workflow.is_disabled = true
+}
+
+------------------------------------------------------------
+-- Rules: deletion cascades
+------------------------------------------------------------
+
+-- from: services/repository/delete.go:172
+rule RepositoryDeletionRemovesActionsData {
+    when: repositories/RepositoryDeleted(repository, doer)
+    ensures:
+        for run in WorkflowRuns where repository = repository:
+            for artifact in run.artifacts:
+                not exists artifact
+            for job in run.jobs:
+                for task in job.tasks:
+                    if task.runner.is_ephemeral:
+                        not exists task.runner
+                    not exists task
+                not exists job
+            not exists run
+        for schedule in Schedules where repository = repository:
+            not exists schedule
+        for scope in ActionsScopes where repository = repository:
+            for runner in scope.runners:
+                not exists runner
+            for secret in scope.secrets:
+                not exists secret
+            for variable in scope.variables:
+                not exists variable
+            for token in scope.registration_tokens:
+                not exists token
+        for tc in TrustedContributors where repository = repository:
+            not exists tc
+        for workflow in Workflows where repository = repository:
+            not exists workflow
+}
+
+-- from: models/actions/runner.go:357
+rule UserDeletionRemovesActionsScope {
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+    ensures:
+        for scope in ActionsScopes where owner_user = user:
+            for runner in scope.runners:
+                not exists runner
+            for secret in scope.secrets:
+                not exists secret
+            for variable in scope.variables:
+                not exists variable
+            for token in scope.registration_tokens:
+                not exists token
+        for tc in TrustedContributors where user = user:
+            not exists tc
+}
+
+-- from: models/actions/runner.go:357
+rule OrganizationDeletionRemovesActionsScope {
+    when: organizations/OrganizationDeleted(organization)
+    ensures:
+        for scope in ActionsScopes where owner_org = organization:
+            for runner in scope.runners:
+                not exists runner
+            for secret in scope.secrets:
+                not exists secret
+            for variable in scope.variables:
+                not exists variable
+            for token in scope.registration_tokens:
+                not exists token
+}
+
+-- Blocking a user revokes the trust they had on the blocker's repositories
+-- and cancels their unfinished pull-request runs there.
+-- from: services/user/block.go:95
+rule BlockingRevokesActionsTrust {
+    when: accounts/UserBlocked(blocker, blocked)
+    ensures:
+        for tc in TrustedContributors where user = blocked and repository.owner_user = blocker:
+            not exists tc
+        for run in WorkflowRuns where pull_request_poster = blocked and repository.owner_user = blocker
+                and status in {waiting, blocked, running}:
+            RunKillRequested(run: run, as_failure: false)
+}
+
+------------------------------------------------------------
+-- Rules: scheduled tasks dispatched by administration
+------------------------------------------------------------
+-- Administration's cron (and its "run now" button) emits one trigger per
+-- task. Each sweep below emits, for every item that is due, the same
+-- internal trigger the matching temporal rule emits, so the work itself is
+-- described once (TimedOutTaskFailsItsJob, CancelAbandonedJob,
+-- ArchiveLingeringLog, StartScheduledRun / BrokenScheduleDisablesWorkflow,
+-- ExpireArtifact, PurgeArtifact, ExpireTaskLog, RemoveSweptRunner,
+-- RevokeLapsedTrust).
+
+-- from: services/cron/tasks_actions.go:30
+rule ZombieTaskSweep {
+    when: administration/ZombieActionsTaskStopDue()
+    ensures:
+        for task in Tasks where status = running and last_activity_at + config.zombie_task_timeout <= now:
+            TaskTimedOut(task: task)
+    ensures: ZombieTaskSweepFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- from: services/cron/tasks_actions.go:40
+rule EndlessTaskSweep {
+    when: administration/EndlessActionsTaskStopDue()
+    ensures:
+        for task in Tasks where status = running and started_at + config.endless_task_timeout <= now:
+            TaskTimedOut(task: task)
+    ensures: EndlessTaskSweepFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- from: services/cron/tasks_actions.go:50
+rule AbandonedJobSweep {
+    when: administration/AbandonedActionsJobCancellationDue()
+    ensures:
+        for job in Jobs where status in {waiting, blocked} and not run.needs_approval
+                and status_changed_at + config.abandoned_job_timeout <= now:
+            JobAbandoned(job: job)
+    ensures: AbandonedJobSweepFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- from: services/cron/tasks_actions.go:60
+rule LingeringLogSweep {
+    when: administration/LingeringActionsLogTransferDue()
+    ensures:
+        for task in Tasks where stopped_at != null and not log_archived and not log_expired
+                and stopped_at + config.lingering_log_age <= now:
+            LingeringLogTransferDue(task: task)
+    ensures: LingeringLogSweepFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- from: services/cron/tasks_actions.go:72
+rule ScheduleSweep {
+    when: administration/ActionsScheduleStartDue()
+    ensures:
+        for spec in ScheduleSpecs where next_run_at <= now:
+            ScheduleSpecDue(spec: spec)
+    ensures: ScheduleSweepFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- Expired and deleted artifacts, expired logs and used ephemeral runners.
+-- from: services/actions/cleanup.go:25
+rule ActionsCleanupSweep {
+    when: administration/ActionsCleanupDue()
+    ensures:
+        for artifact in Artifacts where status = upload_confirmed and expires_at <= now:
+            ArtifactExpiryDue(artifact: artifact)
+        for artifact in Artifacts where status = pending_deletion:
+            ArtifactPurgeDue(artifact: artifact)
+        for task in Tasks where stopped_at != null and not log_expired
+                and stopped_at + config.log_retention <= now:
+            TaskLogExpiryDue(task: task)
+        for runner in Runners where has_used_its_single_task and not is_busy:
+            RunnerRemovalDue(runner: runner)
+        if config.run_pruning_enabled:
+            for run in WorkflowRuns where is_done and stopped_at != null
+                    and stopped_at + config.run_retention <= now:
+                RunPruneDue(run: run)
+    ensures: ActionsCleanupSweepFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- Trust that has not been relied upon within the expiry lapses.
+-- from: services/actions/trust.go:31
+rule TrustedContributorSweep {
+    when: administration/ActionsUserCleanupDue()
+    ensures:
+        for tc in TrustedContributors where last_access_at + config.trusted_contributor_expiry <= now:
+            TrustedContributorLapsed(trusted_contributor: tc)
+    ensures: TrustedContributorSweepFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- The task's own arguments decide the age and whether only instance-wide
+-- runners are swept.
+-- from: services/actions/cleanup.go:166
+rule OfflineRunnerSweep {
+    when: administration/OfflineRunnerCleanupDue(older_than, global_scope_only)
+    ensures:
+        for runner in Runners where created_at + older_than <= now
+                and (last_online_at = null or last_online_at + older_than <= now)
+                and (global_scope_only implies scope.kind = instance):
+            RunnerRemovalDue(runner: runner)
+    ensures: OfflineRunnerSweepFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant UniqueRunIndexPerRepository {
+    for a in WorkflowRuns:
+        for b in WorkflowRuns:
+            a != b and a.repository = b.repository implies a.index != b.index
+}
+
+invariant UniqueSecretNamePerScope {
+    for a in Secrets:
+        for b in Secrets:
+            a != b and a.scope = b.scope implies a.name != b.name
+}
+
+invariant UniqueVariableNamePerScope {
+    for a in Variables:
+        for b in Variables:
+            a != b and a.scope = b.scope implies a.name != b.name
+}
+
+invariant AtMostOneActiveRegistrationTokenPerScope {
+    for s in ActionsScopes:
+        s.active_registration_tokens.count <= 1
+}
+
+invariant UniqueArtifactNamePerRun {
+    for a in Artifacts:
+        for b in Artifacts:
+            a != b and a.run = b.run and a.status != deleted and b.status != deleted implies a.name != b.name
+}
+
+invariant OneTaskPerJobAttempt {
+    for a in Tasks:
+        for b in Tasks:
+            a != b and a.job = b.job implies a.attempt != b.attempt
+}
+
+invariant EphemeralRunnerRunsAtMostOneTask {
+    for r in Runners:
+        r.is_ephemeral implies r.tasks.count <= 1
+}
+
+invariant RunningJobHasRunningTask {
+    for j in Jobs:
+        j.status = running implies j.tasks.any(t => t.attempt = j.attempt)
+}
+
+invariant ApprovalOnlyForPullRequests {
+    for r in WorkflowRuns:
+        r.needs_approval implies r.pull_request != null
+}
+
+invariant OutputKeyUniquePerTask {
+    for a in TaskOutputs:
+        for b in TaskOutputs:
+            a != b and a.task = b.task implies a.key != b.key
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Someone with read access to the Actions unit of the run's repository.
+-- (= access/can_read(user, repository, actions); Actions enabled on the
+-- instance and not globally disabled as a unit.)
+actor RunViewer {
+    within: WorkflowRun
+    identified_by: accounts/User where can_read_actions(this, within.repository)
+}
+
+-- Someone with read access to the Actions unit of the task's repository.
+actor TaskViewer {
+    within: Task
+    identified_by: accounts/User where can_read_actions(this, within.job.run.repository)
+}
+
+-- Someone with read access to the Actions unit of the workflow's repository.
+actor WorkflowViewer {
+    within: Workflow
+    identified_by: accounts/User where can_read_actions(this, within.repository)
+}
+
+-- Whoever may manage a scope's runners, secrets and variables:
+-- may_manage_actions_scope is a site admin for the instance scope, the user
+-- for a user scope, an organization owner for an organization scope, and a
+-- repository admin (is_repo_admin) for a repository scope.
+-- decided (actions 2): repository admins on every path (web and REST alike;
+-- Forgejo's REST API required the repository owner).
+actor ScopeManager {
+    within: ActionsScope
+    identified_by: accounts/User where may_manage_actions_scope(this, within)
+}
+
+-- Whoever may approve or deny a pull request's runs: repository admin, site
+-- admin, or write access to the Actions unit.
+actor TrustDelegate {
+    within: pulls/PullRequest
+    identified_by: accounts/User where may_delegate_actions_trust(this, within.base_repository)
+}
+
+-- A runner that has registered and authenticates with its runner token.
+actor RegisteredRunner {
+    identified_by: Runner where token != ""
+}
+
+-- The holder of a running task's automatic or runtime token (the job itself).
+actor RunningJob {
+    identified_by: Task where status = running
+}
+
+-- A runner agent that is not registered yet; it only holds a registration token.
+actor UnregisteredRunnerAgent {
+    identified_by: RunnerRegistrationToken where is_active = true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The Actions tab of a repository: workflows and their runs.
+-- Web: GET /{owner}/{repo}/actions?workflow=&actor=&status=,
+--      POST /actions/disable|enable?workflow=, POST /actions/manual,
+--      GET /actions/workflows/{file}/badge.svg, /actions/workflows/{file}/runs/latest
+-- API: GET /repos/{o}/{r}/actions/runs (filters event, status, run_number,
+--      head_sha, ref, workflow_id), GET /actions/tasks,
+--      POST /actions/workflows/{file}/dispatches
+-- from: routers/web/web.go:1654
+surface RepositoryWorkflows {
+    facing viewer: WorkflowViewer
+    context workflow: Workflow
+
+    exposes:
+        workflow.file_name
+        workflow.path
+        workflow.name
+        workflow.is_disabled
+        workflow.has_dispatch_trigger
+        workflow.has_schedule_trigger
+        workflow.dispatch_inputs when workflow.has_dispatch_trigger
+        workflow_badge_status(workflow)
+
+    provides:
+        UserDispatchesWorkflowRun(viewer, workflow, ref, inputs)
+            when can_write_actions(viewer, workflow.repository) and workflow.has_dispatch_trigger
+        UserDisablesWorkflowFile(viewer, workflow)
+            when is_repo_admin(viewer, workflow.repository) and not workflow.is_disabled
+        UserEnablesWorkflowFile(viewer, workflow)
+            when is_repo_admin(viewer, workflow.repository) and workflow.is_disabled
+
+    related:
+        WorkflowRunPage(latest_run(workflow)) when latest_run(workflow) != null
+
+    contracts:
+        demands WorkflowParser
+
+    @guidance
+        -- The run list shows, per run: title, workflow, index, event, ref
+        -- (a deleted ref is marked), commit, trigger user, status, duration.
+        -- The badge shows the latest run's status for a workflow (optionally
+        -- per branch / event).
+}
+
+-- One run with its jobs, attempts, logs, summaries and artifacts.
+-- Web: /actions/runs/{index}[/jobs/{j}[/attempt/{n}[/logs]]], POST cancel,
+--      rerun, jobs/{j}/rerun, delete, prioritize, deprioritize,
+--      GET/DELETE artifacts/{name}
+-- API: GET/DELETE /actions/runs/{id}, POST /runs/{id}/cancel|rerun,
+--      GET /runs/{id}/jobs|logs|artifacts, GET /actions/jobs/{id}[/logs],
+--      POST /actions/jobs/{id}/rerun, GET/DELETE /actions/artifacts/{id}[/zip]
+-- from: routers/web/repo/actions/view.go:272
+surface WorkflowRunPage {
+    facing viewer: RunViewer
+    context run: WorkflowRun
+
+    exposes:
+        run.title
+        run.index
+        run.status
+        run.event
+        run.trigger_event
+        run.ref
+        run.commit_sha
+        run.trigger_user
+        run.attempt
+        run.created_at
+        run.started_at
+        run.stopped_at
+        run.is_scheduled
+        run.is_dispatched
+        run.needs_approval
+        run.pre_execution_error when run.pre_execution_error != null
+        run.has_permissions_warning
+        run.prioritized
+        run.secrets_withheld
+        for job in run.jobs:
+            job.name
+            job.status
+            job.attempt
+            job.needs
+            job.runs_on
+            job.started_at
+            job.stopped_at
+        for artifact in run.artifacts:
+            artifact.name when artifact.status in {upload_confirmed, expired}
+            artifact.status when artifact.status in {upload_confirmed, expired}
+            artifact.size when artifact.status = upload_confirmed
+            artifact.expires_at when artifact.status = upload_confirmed
+
+    provides:
+        UserCancelsWorkflowRun(viewer, run)
+            when can_write_actions(viewer, run.repository) and run.status in {waiting, blocked, running}
+        UserRerunsWorkflowRun(viewer, run)
+            when can_write_actions(viewer, run.repository) and run.can_be_rerun
+        UserRerunsWorkflowJob(viewer, job)
+            when can_write_actions(viewer, run.repository)
+        UserDeletesWorkflowRun(viewer, run)
+            when is_repo_admin(viewer, run.repository) and run.is_done
+        UserPrioritizesWorkflowRun(viewer, run)
+            when can_write_actions(viewer, run.repository) and not run.prioritized
+        UserDeprioritizesWorkflowRun(viewer, run)
+            when can_write_actions(viewer, run.repository) and run.prioritized
+        UserDeletesRunArtifact(viewer, artifact)
+            when can_write_actions(viewer, run.repository)
+
+    related:
+        PullRequestActionsTrust(run.pull_request) when run.pull_request != null
+        JobAttemptView(job_latest_task(run)) when job_latest_task(run) != null
+
+    @guidance
+        -- Artifact download (zip) needs only read access and only works for
+        -- upload_confirmed artifacts. Log download serves one attempt's log
+        -- as a text file; a run's logs can be fetched as one zip; expired
+        -- logs are reported as cleaned up. Secrets never appear: the runner
+        -- masks secret values in logs.
+}
+
+-- One attempt of one job: its steps, log and step summaries.
+-- Web: /actions/runs/{index}/jobs/{j}/attempt/{n} (POST returns steps and
+--      log lines from a cursor for live streaming), .../logs (download)
+-- API: GET /actions/jobs/{id}, GET /actions/jobs/{id}/logs
+-- from: routers/web/repo/actions/view.go:272
+surface JobAttemptView {
+    facing viewer: TaskViewer
+    context task: Task
+
+    exposes:
+        task.job.name
+        task.attempt
+        task.status
+        task.started_at
+        task.stopped_at
+        task.runner.name
+        task.log_length when not task.log_expired
+        task.log_size when not task.log_expired
+        for step in task.steps:
+            step.name
+            step.status
+            step.started_at
+            step.stopped_at
+            step.log_length when not task.log_expired
+            step.summary
+
+    @guidance
+        -- Live view: the page polls with a per-step cursor and receives new
+        -- log lines while the task runs; finished logs are read from the
+        -- archive. Expired logs are reported as cleaned up.
+}
+
+-- The trust panel on a pull request whose runs need approval.
+-- Web: POST /{owner}/{repo}/pulls/{index}/action-user-trust (trust=once|always|deny|revoke)
+-- from: routers/web/repo/pull.go:2052
+surface PullRequestActionsTrust {
+    facing maintainer: TrustDelegate
+    context pull_request: pulls/PullRequest
+
+    exposes:
+        pull_request.issue.poster
+        poster_is_trusted(pull_request)
+        runs_awaiting_approval(pull_request)
+
+    provides:
+        UserApprovesPullRequestRunsOnce(maintainer, pull_request)
+        UserAlwaysTrustsPullRequestPoster(maintainer, pull_request)
+        UserDeniesPullRequestRuns(maintainer, pull_request)
+        UserRevokesPullRequestPosterTrust(maintainer, pull_request)
+}
+
+-- Runners, secrets and variables of a scope.
+-- Web: /{owner}/{repo}/settings/actions/{runners,secrets,variables},
+--      /org/{org}/settings/actions/..., /user/settings/actions/...,
+--      /-/admin/actions/{runners,variables} (no instance secrets)
+-- API: /repos/{o}/{r}/actions/{secrets,variables,runners}, /orgs/{org}/actions/...,
+--      /user/actions/..., /admin/actions/runners, .../runners/registration-token,
+--      .../runners/jobs (waiting jobs a runner of this scope could pick)
+-- from: routers/web/web.go:617
+surface ActionsSettings {
+    facing manager: ScopeManager
+    context scope: ActionsScope
+
+    exposes:
+        scope.kind
+        for secret in scope.secrets:
+            secret.name
+            secret.created_at
+        for variable in scope.variables:
+            variable.name
+            variable.value
+            variable.updated_at
+        for runner in scope.runners:
+            runner.name
+            runner.description
+            runner.labels
+            runner.version
+            runner.health
+            runner.is_ephemeral
+            runner.last_online_at
+        inherited_runners(scope)
+        for token in scope.active_registration_tokens:
+            token.token
+
+    provides:
+        UserSetsActionsSecret(manager, scope, name, value) when scope.kind != instance
+        UserDeletesActionsSecret(manager, secret)
+        UserCreatesActionsVariable(manager, scope, name, value)
+        UserUpdatesActionsVariable(manager, variable, name, value)
+        UserDeletesActionsVariable(manager, variable)
+        UserCreatesRunnerInScope(manager, scope, name, description, is_ephemeral)
+        UserEditsRunnerDetails(manager, runner, name, description)
+        UserRegeneratesRunnerSecret(manager, runner)
+        UserDeletesRunnerFromScope(manager, runner)
+        UserRequestsNewRegistrationToken(manager, scope)
+
+    @guarantee SecretValuesNeverShown
+        -- No interface ever returns a secret's value after it is set; it is
+        -- only delivered to runners inside a task payload.
+
+    @guidance
+        -- may_manage_actions_scope: instance -> site admin; user -> that user
+        -- (or a site admin via API); organization -> organization owner;
+        -- repository -> repository admin (web) / owner (API).
+        -- inherited_runners lists runners of wider scopes (instance, owner)
+        -- that can serve this scope, read-only; only runners of exactly this
+        -- scope are editable or deletable. A runner's task history is listed
+        -- on its detail page.
+}
+
+-- The runner protocol (connect-RPC under /api/actions).
+-- from: routers/api/actions/runner/runner.go:40
+surface RunnerService {
+    facing runner: RegisteredRunner
+    context task: Task where runner = runner
+
+    exposes:
+        task.job.run.repository
+        task.job.run.commit_sha
+        task.job.run.ref
+        task.job.run.event
+        task.job.key
+        task.job.runs_on
+        task.token
+        task_secrets(task)
+        task_variables(task)
+        needs_outputs(task)
+
+    provides:
+        RunnerDeclares(runner, labels, version)
+        RunnerFetchesTask(runner, job, request_key)
+        RunnerRetriesFetch(runner, request_key)
+        RunnerReportsTaskProgress(runner, task) when task.status = running
+        RunnerReportsTaskResult(runner, task, result) when task.status = running
+        RunnerReportsTaskOutput(runner, task, key, value)
+        RunnerAppendsTaskLog(runner, task, from_index, row_count, byte_count, no_more)
+            when not task.log_archived
+        RunnerSubmitsStepSummary(runner, step, content)
+
+    contracts:
+        fulfils RunnerProtocol
+
+    @guarantee SecretsWithheldFromForks
+        -- task_secrets is empty for runs from fork pull requests unless the
+        -- trigger is pull_request_target; FORGEJO_TOKEN is always present.
+        -- Inner jobs of a reusable workflow get the caller's secrets when
+        -- `secrets: inherit`, else only those the caller maps explicitly.
+
+    @guidance
+        -- task_variables: instance, then owner, then repository variables,
+        -- later ones overriding earlier ones (repository wins).
+        -- task_secrets: owner secrets overridden by repository secrets.
+}
+
+-- Registration for a runner holding a registration token.
+-- from: routers/api/actions/runner/runner.go:47
+surface RunnerRegistration {
+    facing agent: UnregisteredRunnerAgent
+
+    provides:
+        RunnerRegistersWithToken(agent, name, labels, version, is_ephemeral)
+}
+
+-- What a running job can do with its own credentials: the automatic token
+-- (as FORGEJO_TOKEN against the API, git and LFS) and the runtime token
+-- (artifacts, ID tokens).
+-- API: GET /api/v1/actions/run (the run of the presenting token),
+--      /api/actions_pipeline/... (artifacts v1-3), /twirp/github.actions.results.api.v1.ArtifactService/* (v4),
+--      GET /api/actions/_apis/pipelines/workflows/{run}/idtoken?audience=,
+--      /api/actions/.well-known/openid-configuration, /api/actions/keys
+-- from: models/perm/access/repo_permission.go:143
+surface RunningJobCapabilities {
+    facing job_token: RunningJob
+    context task: Task where status = running
+
+    exposes:
+        task.job.run.index
+        task.job.run.status
+        task.token_repository_access
+        task.runtime_token_cache_scope
+        task.oidc_enabled
+        for artifact in task.job.run.artifacts:
+            artifact.name when artifact.status = upload_confirmed
+            artifact.size when artifact.status = upload_confirmed
+
+    provides:
+        TaskCreatesArtifact(job_token, name)
+        TaskCreatesArtifactWithRetention(job_token, name, retention)
+        TaskFinalizesArtifact(job_token, artifact, size)
+        TaskRequestsIdToken(job_token, audience) when job_token.oidc_enabled
+
+    contracts:
+        fulfils ArtifactProtocol
+
+    @guarantee AutomaticTokenScope
+        -- On its own repository the automatic token acts as the Actions bot
+        -- with write access to every enabled unit, or read access for fork
+        -- pull-request runs (including pull_request_target). Every other
+        -- repository and every organization endpoint refuses it (decided:
+        -- access 6); of packages it reaches only those linked to its own
+        -- repository.
+        -- It stops working the moment the task stops running.
+        -- Pushes made with it do not start workflows.
+
+    @guidance
+        -- The workflow `permissions:` key is not honoured; a run warns about it.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred WorkflowRun.job_definitions    -- see: code.forgejo.org/forgejo/runner act/jobparser (YAML, matrix, reusable workflows)
+deferred Workflow.matching_workflows    -- see: modules/actions/workflows.go detectMatched (event/filter matching)
+deferred ScheduleSpec.next_cron_occurrence  -- see: github.com/gdgvda/cron (5-field cron, @descriptors, TZ=/CRON_TZ= prefixes)

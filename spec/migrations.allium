@@ -1,0 +1,2175 @@
+-- allium: 3
+-- migrations.allium — the repository import ADDON: bring a repository (git
+-- data, wiki, LFS and optionally its issue tracker history) in from another
+-- forge, as a one-off import or as the seed of a pull mirror.
+--
+-- FRAMING: this module does NOT describe core behaviour. Data import is built
+-- as an addon on top of the new system. This file specifies (a) what the
+-- import addon does, and (b) the extension points the core must offer so an
+-- addon can do it — declared below as `contract`s (ImportSink,
+-- ImportedIdentityResolver, OutboundFetchPolicy, BackgroundJobQueue) and
+-- consumed on the CoreHostBoundary surface. Anything the core does on its own
+-- (repository lifecycle, issue model, pull-mirror syncing) is owned by the
+-- core modules and only referenced here.
+--
+-- Scope: creating a repository by importing it from a remote source, the
+--   Migration task that does the work, the per-source adapters and what each
+--   can import, credentials handling, remote-address policy, original-author
+--   preservation and later re-attribution to local accounts, dump-to-archive
+--   and restore-from-archive.
+-- Includes:
+--   - Migration task (queued / running / finished / failed) with progress,
+--     cancel, retry, discard-failed-repository
+--   - SourceProfile per source kind: plain git, Forgejo, Gitea, Gogs, GitHub,
+--     GitLab, GitBucket, Codebase, OneDev, Pagure, Bitbucket Data Center
+--   - what can be imported: git, wiki, LFS, topics, avatar, milestones,
+--     labels, releases + assets, issues, comments, pull requests, reviews,
+--     reactions
+--   - credentials (username+password or token), kept only while needed
+--   - allowed / blocked hosts, local network, unencrypted transports, local
+--     paths
+--   - "migrate as mirror": creating the repository and its pull mirror
+--   - ExternalAuthorship records and re-attribution (on account link, by a
+--     nightly sweep)
+--   - dump-repo (export to the archive format) and restore-repo (CLI and
+--     private API)
+-- Excludes:
+--   - Ongoing pull-mirror synchronisation, push mirrors: owned by
+--     repositories (this module only creates the Mirror at import time)
+--   - The repository deletion mechanics, name validation, per-owner repo
+--     limits: owned by repositories (referenced as black boxes)
+--   - OAuth sign-in and the ExternalLogin record itself: owned by
+--     authentication (this module only reacts to an account being linked)
+--   - Gitea-SDK version quirks (pagination before 1.12, missing reactions
+--     before 1.11, head-SHA fix-ups before 1.14): compatibility workarounds of
+--     one adapter, not domain behaviour
+--   - The F3 (Friendly Forge Format) driver: not present in this code base
+--   - Batch sizes derived from database parameter limits: implementation
+--   - The legacy `uid` field on the API request: backwards compatibility only
+--   - GitHub "www.github.com" host rewriting: adapter detail
+--   - Re-running a task whose repository is already ready just marks it
+--     finished: crash-recovery for a non-atomic completion, not behaviour
+-- Emits:
+--   - MigrationQueued(migration)                 -- job queue picks it up
+--   - MigrationProgressed(migration)             -- progress page refresh
+--   - RepositoryMigrated(repository)             -- releases (sync tags),
+--       webhooks (repository created), activity feed, notifications; the
+--       doer is migrations/Migration{repository}.doer
+--   - MigrationFailed(migration)                 -- progress page, notifications
+--   - MigrationFailureReported(kind, description) -- kind: repo; on a
+--       failed import and on dropped unsafe source data; administration
+--       records it as a SystemNotice
+--   - ImportCompleted(repository, remote_address, has_credentials, interval,
+--       lfs_enabled, lfs_endpoint)            -- repositories finishes the
+--       repository (ready; pull mirror for a mirror import)
+--   - FailedImportDiscarded(repository, doer)   -- repositories deletes the half-made repository
+--                                                (its usual cascade)
+--   - MigratedContentDiscarded(repository)       -- core wipes partially
+--       imported content before a retry
+--   - ExternalAuthorLinked(authorship, user)     -- imported content now
+--       belongs to a local account (feeds, search re-index)
+--   - RelinkSweepCompleted(outcome, message)     -- the nightly re-attribution
+--       sweep finished (administration closes the update_migration_poster_id run)
+-- Reacts to:
+--   - authentication/ExternalLogin.created (an OAuth identity linked to an account)
+--   - administration/MigrationPosterIdUpdateDue()  -- nightly re-attribution
+--       (cron task update_migration_poster_id, @midnight, run at start)
+--   - repositories/RepositoryDeleted(repository, doer) -- the addon's records
+--       about the repository go with it
+-- Every user-initiated write here is refused while the instance is read-only
+-- (access/InstanceWriteGate; decided: administration 3). The operator's
+-- dump-repo / restore-repo commands are not gated: they run on the server.
+--
+-- Black-box predicates. Qualified calls into sibling modules cannot be
+-- simulated, so the predicates this module needs are named locally, each
+-- delegating to its owner:
+--   is_repo_admin(user, repository)        -- access/is_repo_admin
+--   can_read_code(user, repository)        -- access/can_read(user, repository, code)
+--   can_create_in_org(user, org)           -- organizations: Organization.lets_create_repo(user)
+--   is_valid_repo_name(name)               -- repositories name rules
+--   repository_name_free(owner, name)      -- repositories: no repository (or redirect) with that name
+--   within_creation_limit(owner)           -- repositories/accounts per-owner repository limit
+--   quota_allows_new_repository(owner)     -- quota gate_migrate_repository (size_repos_all, target owner)
+--   quota_allows_retry(repository)         -- quota gate_retry_migration (size_repos_all, repository owner)
+--   ghost_user()                           -- accounts: the ghost placeholder account
+--   may_import_local_paths(user)           -- accounts: per-user "may import local paths" right
+--   linked_account_for(kind, host, external_id) -- authentication: owner of an ExternalLogin with that provider kind, provider host and id
+--   source_kind_for_provider(provider)     -- authentication: the forge kind an OAuth provider type speaks (github, gitlab, gitea, ...)
+--   provider_host(source)                  -- authentication: the host an OAuth source authenticates against
+--   host_of(url)                           -- the host part of a URL
+--   assignable_named(repository, names)    -- issues: the local accounts with those names that can be assigned in the repository
+--   resolves_to_assignee(repository, name) -- issues: that name is a local account that can be assigned in the repository
+--   far_future_deadline()                  -- 9999-01-01, Forgejo's "no deadline" milestone value
+--   source_is_private(request)             -- the source repository is private (what dump-repo writes to repo.yml)
+--   is_allowed_remote(url, user)           -- this module's OutboundFetchPolicy, exported for mirrors
+--   resolve_author(migration, identity)    -- ImportedIdentityResolver.resolve / resolve_same_instance
+--   first_present(a, b, c)                 -- the first non-absent timestamp, else now
+--   - (job queue) MigrationDequeued(migration) via CoreHostBoundary
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./repositories.allium" as repositories
+use "./access.allium" as access
+use "./authentication.allium" as authentication
+use "./issues.allium" as issues
+use "./pulls.allium" as pulls
+use "./releases.allium" as releases
+use "./quota.allium" as quota
+use "./administration.allium" as administration
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The per-source adapter process (one "downloader" per source kind) that
+-- talks to the remote forge and feeds items into the import.
+-- from: modules/migration/downloader.go:55
+external entity SourceAdapterProcess {
+    source_kind: SourceKind
+    active: Boolean
+}
+
+-- The core system hosting the addon (job queue, storage, sinks).
+-- from: services/task/task.go:43
+external entity CoreRuntime {
+    addon_installed: Boolean
+}
+
+-- Someone with shell access to the server running `forgejo dump-repo` /
+-- `forgejo restore-repo` (the latter goes through the private API).
+-- from: cmd/restore_repo.go:19
+external entity OperatorShell {
+    has_server_access: Boolean
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A remote address as typed by the user. Credentials are never accepted
+-- inside the URL; they travel separately in SourceCredentials.
+-- from: services/forms/repo_form.go:98
+value RemoteAddress {
+    url: String
+    scheme: AddressScheme
+    host: String
+    embeds_credentials: Boolean
+    is_encrypted: scheme in {https, local_path}
+}
+
+-- from: modules/migration/options.go:15
+value SourceCredentials {
+    username: String?
+    password: String?
+    -- GitHub accepts several comma-separated tokens and rotates between them
+    -- to spread rate limits.
+    token: String?
+    kind: CredentialKind
+}
+
+-- What a user submits on the migration form / POST /repos/migrate.
+-- from: modules/structs/repo.go:376
+value MigrationRequest {
+    source: SourceProfile
+    address: RemoteAddress
+    credentials: SourceCredentials
+    repo_name: String
+    description: String
+    private: Boolean
+    mirror: Boolean
+    -- Pull-mirror interval; the form pre-fills [mirror] DEFAULT_INTERVAL;
+    -- 0 means "never sync automatically". Ignored unless mirror.
+    mirror_interval: Duration
+    wiki: Boolean
+    lfs: Boolean
+    lfs_endpoint: RemoteAddress?
+    -- Selected content. The form offers milestones, labels, issues, pull
+    -- requests and releases; choosing issues or pull requests also selects
+    -- comments and reactions, pull requests also selects reviews, releases
+    -- also selects release assets.
+    wanted: Set<ContentKind>
+}
+
+-- What to restore from an archive. Empty units means everything archived.
+-- from: cmd/restore_repo.go:42
+value RestoreSelection {
+    units: Set<ContentKind>
+    validate: Boolean
+}
+
+-- The identity of a person on the source forge, as carried by imported data.
+-- from: models/user/external_login_user.go (ExternalUserMigrated)
+value ImportedIdentity {
+    -- Opaque: numeric or not, it is matched as a string.
+    -- decided: non-numeric external ids are re-attributed too (migrations 6)
+    external_id: String
+    name: String
+    email: String?
+}
+
+-- from: modules/migration/repo.go:7
+value ImportedRepositoryInfo {
+    name: String
+    owner_name: String
+    description: String
+    website: String?
+    default_branch: String
+    original_url: String
+    clone_address: RemoteAddress
+    avatar_url: String?
+}
+
+-- from: modules/migration/milestone.go:9
+value ImportedMilestone {
+    title: String
+    description: String
+    deadline: Timestamp?
+    created_at: Timestamp?
+    updated_at: Timestamp?
+    closed_at: Timestamp?
+    is_closed: Boolean
+}
+
+-- from: modules/migration/label.go:7
+value ImportedLabel {
+    name: String
+    color: String
+    description: String
+    exclusive: Boolean
+}
+
+-- from: modules/migration/reaction.go:7
+value ImportedReaction {
+    author: ImportedIdentity
+    content: String
+}
+
+-- from: modules/migration/release.go:13
+value ImportedReleaseAsset {
+    name: String
+    size: Integer
+    download_count: Integer
+    created_at: Timestamp?
+}
+
+-- from: modules/migration/release.go:29
+value ImportedRelease {
+    tag_name: String
+    target: String
+    name: String
+    body: String
+    is_draft: Boolean
+    is_prerelease: Boolean
+    publisher: ImportedIdentity
+    created_at: Timestamp?
+    published_at: Timestamp?
+    assets: List<ImportedReleaseAsset>
+}
+
+-- from: modules/migration/issue.go:9
+value ImportedIssue {
+    number: Integer
+    author: ImportedIdentity
+    title: String
+    content: String
+    ref: String?
+    milestone_title: String?
+    label_names: Set<String>
+    is_closed: Boolean
+    is_locked: Boolean
+    created_at: Timestamp?
+    updated_at: Timestamp?
+    closed_at: Timestamp?
+    reactions: List<ImportedReaction>
+    assignee_names: Set<String>
+}
+
+-- from: modules/migration/pullrequest.go:85
+value PullRequestEndpoint {
+    clone_url: String?
+    ref: String?
+    sha: String?
+    owner_name: String
+    repo_name: String
+}
+
+-- from: modules/migration/pullrequest.go:16
+value ImportedPullRequest {
+    number: Integer
+    author: ImportedIdentity
+    title: String
+    content: String
+    milestone_title: String?
+    label_names: Set<String>
+    is_closed: Boolean
+    is_locked: Boolean
+    is_draft: Boolean
+    merged: Boolean
+    merged_at: Timestamp?
+    merge_commit_sha: String?
+    -- Who merged it on the source, when the source says.
+    merged_by: ImportedIdentity?
+    assignee_names: Set<String>
+    head: PullRequestEndpoint
+    base: PullRequestEndpoint
+    created_at: Timestamp?
+    updated_at: Timestamp?
+    closed_at: Timestamp?
+    reactions: List<ImportedReaction>
+    is_fork_pull: Boolean
+    -- Set by the adapter after it validated clone URL, refs and SHAs.
+    ensured_safe: Boolean
+}
+
+-- from: modules/migration/comment.go:16
+value ImportedComment {
+    issue_number: Integer
+    source_index: Integer
+    kind: String
+    author: ImportedIdentity
+    content: String
+    created_at: Timestamp?
+    updated_at: Timestamp?
+    reactions: List<ImportedReaction>
+    reply_to_index: Integer?
+}
+
+-- from: modules/migration/review.go:55
+value ImportedReviewComment {
+    author: ImportedIdentity?
+    content: String
+    tree_path: String
+    diff_hunk: String?
+    line: Integer
+    extra_lines: Integer
+    commit_sha: String?
+    created_at: Timestamp?
+    reactions: List<ImportedReaction>
+}
+
+-- from: modules/migration/review.go:37
+value ImportedReview {
+    issue_number: Integer
+    reviewer: ImportedIdentity
+    official: Boolean
+    commit_sha: String?
+    content: String
+    created_at: Timestamp?
+    state: ImportedReviewState
+    comments: List<ImportedReviewComment>
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- What every source adapter ("downloader") implements. Each fetch may answer
+-- "not supported", which the import treats as "nothing to import", never as
+-- a failure.
+-- from: modules/migration/downloader.go:55
+contract SourceDownloader {
+    get_repo_info: () -> ImportedRepositoryInfo
+    get_topics: () -> List<String>
+    get_milestones: () -> List<ImportedMilestone>
+    get_labels: () -> List<ImportedLabel>
+    get_releases: () -> List<ImportedRelease>
+    get_issues: (page: Integer, per_page: Integer) -> List<ImportedIssue>
+    get_comments: (issue_number: Integer) -> List<ImportedComment>
+    get_all_comments: (page: Integer, per_page: Integer) -> List<ImportedComment>
+    supports_repository_wide_comments: () -> Boolean
+    supports_comment_replies: () -> Boolean
+    get_pull_requests: (page: Integer, per_page: Integer) -> List<ImportedPullRequest>
+    get_reviews: (pull_number: Integer) -> List<ImportedReview>
+    format_clone_address: (address: RemoteAddress, credentials: SourceCredentials) -> RemoteAddress
+
+    @invariant NotSupportedIsEmpty
+        -- A fetch the source cannot answer yields "not supported"; the
+        -- import skips that content kind and carries on.
+
+    @invariant SafePullRequests
+        -- Before yielding a pull request the adapter clears any head clone
+        -- URL that does not share the source's base URL (no open redirect),
+        -- clears SHAs that are not valid object ids and refs that are not
+        -- valid ref names, records each such drop as a notice, and marks the
+        -- pull request ensured_safe. The sink refuses unmarked pull requests.
+
+    @invariant BoundedRetries
+        -- Every remote call is retried on transient failure up to
+        -- config.max_attempts times, waiting config.retry_backoff between
+        -- attempts. Rate-limit responses wait until the limit resets (GitHub
+        -- rotates between multiple tokens, picking the one with the most
+        -- remaining quota).
+
+    @invariant OutboundPolicyApplies
+        -- Every HTTP request an adapter makes (API calls, asset downloads,
+        -- avatar fetches) goes through OutboundFetchPolicy, so allow/block
+        -- lists and the local-network ban hold for redirects and secondary
+        -- URLs too, not only for the address the user typed.
+}
+
+-- The core extension point through which the addon writes imported data.
+-- In Forgejo this is the "local uploader".
+-- from: services/migrations/gitea_uploader.go:63
+contract ImportSink {
+    create_repository_shell: (request: MigrationRequest) -> ImportedRepositoryInfo
+    import_git_data: (info: ImportedRepositoryInfo, wiki: Boolean, lfs: Boolean, lfs_endpoint: RemoteAddress?, mirror: Boolean, mirror_interval: Duration?) -> Boolean
+    save_topics: (topics: List<String>) -> Boolean
+    create_milestones: (items: List<ImportedMilestone>) -> Boolean
+    create_labels: (items: List<ImportedLabel>) -> Boolean
+    create_releases: (items: List<ImportedRelease>) -> Boolean
+    sync_tags_to_releases: () -> Boolean
+    create_issues: (items: List<ImportedIssue>) -> Boolean
+    create_comments: (items: List<ImportedComment>) -> Boolean
+    create_pull_requests: (items: List<ImportedPullRequest>) -> Boolean
+    create_reviews: (items: List<ImportedReview>) -> Boolean
+    reattribute: (source_kind: SourceKind, source_host: String, external_id: String, user: accounts/User) -> Boolean
+    discard_imported_content: (repository: repositories/Repository) -> Boolean
+    finish: (repository: repositories/Repository) -> Boolean
+
+    @invariant PreservesOriginalAuthorship
+        -- Every imported issue, pull request, comment, review, review
+        -- comment, release and reaction is attributed either to a resolved
+        -- local account (ImportedIdentityResolver) or to the ghost
+        -- placeholder user while carrying the original author's name and
+        -- external id, so it can be re-attributed later.
+
+    @invariant PreservesTimestampsAndNumbers
+        -- Imported items keep the source's creation, update, close and
+        -- merge timestamps and the source's issue / pull request numbers.
+        -- After the import the repository's next-number counter is set past
+        -- the highest imported number. Missing timestamps fall back to:
+        -- issue created <- closed <- now; comment created <- parent issue
+        -- created; release created <- published <- now.
+
+    @invariant NoLiveSideEffects
+        -- Writing imported content does not emit the core's live domain
+        -- events (no IssueOpened, no mention notifications, no webhooks per
+        -- item, no activity feed entries). Only the final RepositoryMigrated
+        -- is announced.
+
+    @invariant RefusesUnsafePullRequests
+        -- create_pull_requests rejects any pull request not marked
+        -- ensured_safe by its adapter.
+
+    @invariant StatsRecalculatedOnFinish
+        -- finish recomputes repository counters (issues, pulls, milestones,
+        -- releases, size) and sets the repository status to ready.
+}
+
+-- Resolves a source identity to a local account.
+-- from: services/migrations/gitea_uploader.go:1065
+contract ImportedIdentityResolver {
+    resolve: (source_kind: SourceKind, identity: ImportedIdentity) -> accounts/User
+    resolve_same_instance: (identity: ImportedIdentity) -> accounts/User
+
+    @invariant ResolutionOrder
+        -- When the source is this same instance (original URL starts with
+        -- the instance's own URL) an author resolves to the local account
+        -- with that id only if the name also matches. Otherwise it resolves
+        -- to the local account that has linked an external login whose
+        -- provider speaks this source kind, whose provider host is the
+        -- source's host, and whose external id equals the author's id
+        -- (compared as opaque strings). Otherwise it does not resolve.
+        -- decided: match on kind + host + external id; the OAuth source's
+        -- name no longer has to equal the forge kind (migrations 5, 6)
+}
+
+-- The core's outbound-HTTP gate for addon traffic.
+-- from: services/migrations/allowlist/is_migrate_allowed.go:68
+contract OutboundFetchPolicy {
+    is_address_allowed: (address: RemoteAddress, doer: accounts/User) -> Boolean
+
+    @invariant AllowBlockSemantics
+        -- A host is refused if it (or any address it resolves to) matches
+        -- the blocked list. If an allowed list is configured, a host is
+        -- refused unless it (or a resolved address) matches it. With no
+        -- allowed list, only external (non-private, non-loopback) addresses
+        -- are allowed, unless config.allow_local_networks.
+
+    @invariant DialTimeCheck
+        -- The check is repeated at connection time against the address
+        -- actually dialled, so DNS rebinding cannot reach a blocked host.
+}
+
+-- from: services/task/task.go:61
+contract BackgroundJobQueue {
+    enqueue: (migration: Migration) -> Boolean
+
+    @invariant SurvivesRestart
+        -- Queued migrations persist across restarts and are picked up again.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- from: modules/structs/repo.go:324
+enum SourceKind {
+    plain_git | forgejo | gitea | gogs | github | gitlab | gitbucket
+    | codebase | onedev | pagure | bitbucket_dc
+}
+
+-- Issue-tracker content that can be imported besides git data.
+-- from: modules/migration/options.go:30
+enum ContentKind {
+    milestones | labels | release_items | release_assets | issue_items | comments
+    | pull_requests | reviews | reactions
+}
+
+enum AddressScheme { http | https | git | ssh | local_path | other }
+
+enum CredentialKind { anonymous | username_password | token }
+
+-- What kind of imported item an authorship record is about.
+enum AuthoredContent { on_issue | on_comment | on_reaction | on_release | on_review | on_merge }
+
+-- The progress messages shown while a migration runs.
+-- from: services/migrations/migrate.go:151
+enum ImportStage {
+    git | topics | milestones | labels | release_items | issue_items | pull_requests
+    | comments | finalizing
+}
+
+-- from: modules/migration/review.go:28
+enum ImportedReviewState { pending | approved | changes_requested | commented | review_requested }
+
+-- from: services/task/migrate.go:208, routers/web/repo/migrate.go:74
+enum FailureReason {
+    canceled | authentication_failed | remote_error | rate_limited
+    | two_factor_required | address_not_allowed | name_conflict
+    | repository_limit_reached | quota_exceeded | invalid_source_data
+    | internal_error
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- What a source kind can supply. One default per kind below.
+-- from: modules/structs/repo.go:417
+entity SourceProfile {
+    kind: SourceKind
+    supports: Set<ContentKind>
+    credential_kinds: Set<CredentialKind>
+    imports_topics: Boolean
+    imports_avatar: Boolean
+    -- Comments carry "in reply to" links (rendered as a quote header).
+    comment_replies: Boolean
+    -- Comments are fetched repository-wide rather than per issue.
+    repository_wide_comments: Boolean
+}
+
+-- One repository import. Created together with the target repository, which
+-- sits in status being_migrated until the import finishes.
+-- from: models/admin/task.go:23
+entity Migration {
+    doer: accounts/User
+    repository: repositories/Repository
+    source: SourceProfile
+    -- Where it came from, with any credentials removed. Kept forever.
+    original_url: String
+    -- The source forge's host; imported identities are matched within it.
+    source_host: String
+    -- true when restored from a dump archive rather than fetched live.
+    from_archive: Boolean
+    validate_archive: Boolean
+    wiki: Boolean
+    lfs: Boolean
+    lfs_endpoint: RemoteAddress?
+    mirror: Boolean
+    mirror_interval: Duration
+    content_scope: Set<ContentKind>
+    -- Numbers of the issues and pull requests imported so far; comments and
+    -- reviews may only attach to these.
+    imported_numbers: Set<Integer>
+    status: queued | running | finished | failed
+    -- The address and credentials, encrypted at rest, and only while they
+    -- may still be needed (a failed migration can be retried).
+    source_address: RemoteAddress when status = queued | running | failed
+    credentials: SourceCredentials when status = queued | running | failed
+    stage: ImportStage?
+    -- While git data is being cloned: when the clone gives up.
+    git_deadline: Timestamp?
+    items_processed: Integer
+    message: String?
+    failure_reason: FailureReason when status = failed
+    created_at: Timestamp
+    started_at: Timestamp?
+    ended_at: Timestamp when status = finished | failed
+
+    transitions status {
+        queued -> running
+        queued -> failed
+        running -> finished
+        running -> failed
+        failed -> queued
+        terminal: finished
+    }
+
+    -- Derived
+    is_active: status in {queued, running}
+    can_be_retried: status = failed
+}
+
+-- The original author of one imported item that could not be attributed to
+-- a local account. The item itself is attributed to the ghost placeholder
+-- (or has no publisher, for releases) and shows "originally by <name>";
+-- once the source identity is linked to a local account the item is handed
+-- over to it. The core content entities carry no import fields: this record
+-- is the addon's.
+-- from: models/issues/issue_update.go:634 (original_author / original_author_id)
+entity ExternalAuthorship {
+    repository: repositories/Repository
+    source_kind: SourceKind
+    -- decided: identities are scoped by source host (migrations 5)
+    source_host: String
+    external_id: String
+    external_name: String
+    content: AuthoredContent
+    issue: issues/Issue?
+    comment: issues/Comment?
+    reaction: issues/Reaction?
+    release: releases/Release?
+    review: pulls/Review?
+    -- on_merge: the pull request whose merger this is.
+    pull_request: pulls/PullRequest?
+    status: unlinked | linked
+    linked_user: accounts/User when status = linked
+
+    transitions status {
+        unlinked -> linked
+        terminal: linked
+    }
+}
+
+-- An assignee named by the source who is not a local account that can be
+-- assigned here. Kept by name and shown on the issue; not re-attributed.
+-- decided: assignees resolving to local users with access are imported,
+-- the rest kept as external names (migrations 11)
+-- from: modules/migration/issue.go:27 (Assignees)
+entity ExternalAssignee {
+    repository: repositories/Repository
+    issue: issues/Issue
+    external_name: String
+}
+
+-- A repository exported to the migration archive format on disk.
+-- from: services/migrations/dump.go:53
+entity DumpArchive {
+    directory: String
+    owner_name: String
+    repo_name: String
+    source_kind: SourceKind
+    original_url: String
+    source_host: String
+    -- The source repository's visibility (repo.yml is_private).
+    is_private: Boolean
+    includes_wiki: Boolean
+    contents: Set<ContentKind>
+    status: writing | complete | discarded
+
+    transitions status {
+        writing -> complete
+        writing -> discarded
+        terminal: complete, discarded
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [security] IMPORT_LOCAL_PATHS (admins, or users granted the right, may
+    -- import from a directory on the server)
+    import_local_paths: Boolean = false
+    -- [migrations] MAX_ATTEMPTS
+    max_attempts: Integer = 3
+    -- [migrations] RETRY_BACKOFF (seconds)
+    retry_backoff: Duration = 3.seconds
+    -- [migrations] ALLOWED_DOMAINS (comma-separated host globs / CIDRs; empty
+    -- means "any external host")
+    allowed_domains: String = ""
+    -- [migrations] BLOCKED_DOMAINS
+    blocked_domains: String = ""
+    -- [migrations] ALLOW_LOCALNETWORKS
+    allow_local_networks: Boolean = false
+    -- [migrations] SKIP_TLS_VERIFY
+    skip_tls_verify: Boolean = false
+    -- [migrations] ALLOW_UNENCRYPTED (http:// and git:// sources)
+    allow_unencrypted: Boolean = false
+    -- [migrations] AVATAR_FETCH_TIMEOUT
+    avatar_fetch_timeout: Duration = 60.seconds
+    -- [git.timeout] MIGRATE (clone of repository and wiki)
+    git_clone_timeout: Duration = 600.seconds
+    -- How often a running migration checks whether it was cancelled.
+    cancel_check_interval: Duration = 2.seconds
+    -- Settings owned by repositories that gate an import. Repeated here
+    -- (qualified config cannot be simulated); each must equal the
+    -- repositories/config value of the same name.
+    -- [repository] DISABLE_MIGRATIONS
+    disable_migrations: Boolean = false
+    -- [repository] FORCE_PRIVATE
+    force_private: Boolean = false
+    -- [mirror] ENABLED
+    mirror_enabled: Boolean = true
+    -- [mirror] DISABLE_NEW_PULL
+    disable_new_pull_mirrors: Boolean = false
+    -- [mirror] MIN_INTERVAL
+    mirror_min_interval: Duration = 10.minutes
+    -- [mirror] DEFAULT_INTERVAL
+    mirror_default_interval: Duration = 8.hours
+    -- [lfs] LFS_START_SERVER (LFS import is ignored while it is off)
+    lfs_server_enabled: Boolean = false
+    -- Domain limits users hit
+    max_repo_name_length: Integer = 100
+    max_description_length: Integer = 2048
+    max_title_length: Integer = 255
+    max_topics: Integer = 25
+}
+
+------------------------------------------------------------
+-- Defaults
+------------------------------------------------------------
+
+-- from: services/migrations/git.go:46
+default SourceProfile plain_git_profile = {
+    kind: plain_git, supports: {}, credential_kinds: { anonymous, username_password },
+    imports_topics: false, imports_avatar: false, comment_replies: false,
+    repository_wide_comments: false
+}
+
+-- from: services/migrations/forgejo_downloader.go:14 (same adapter as Gitea)
+default SourceProfile forgejo_profile = {
+    kind: forgejo,
+    supports: { milestones, labels, release_items, release_assets, issue_items, comments, pull_requests, reviews, reactions },
+    credential_kinds: { anonymous, username_password, token },
+    imports_topics: true, imports_avatar: true, comment_replies: false,
+    repository_wide_comments: false
+}
+
+-- from: services/migrations/gitea_downloader.go:37
+default SourceProfile gitea_profile = {
+    kind: gitea,
+    supports: { milestones, labels, release_items, release_assets, issue_items, comments, pull_requests, reviews, reactions },
+    credential_kinds: { anonymous, username_password, token },
+    imports_topics: true, imports_avatar: true, comment_replies: false,
+    repository_wide_comments: false
+}
+
+-- from: services/migrations/gogs.go:36 (no pull requests, no releases)
+default SourceProfile gogs_profile = {
+    kind: gogs,
+    supports: { milestones, labels, issue_items, comments },
+    credential_kinds: { anonymous, username_password, token },
+    imports_topics: false, imports_avatar: true, comment_replies: false,
+    repository_wide_comments: false
+}
+
+-- from: services/migrations/github.go:43
+default SourceProfile github_profile = {
+    kind: github,
+    supports: { milestones, labels, release_items, release_assets, issue_items, comments, pull_requests, reviews, reactions },
+    credential_kinds: { anonymous, username_password, token },
+    imports_topics: true, imports_avatar: false, comment_replies: false,
+    repository_wide_comments: true
+}
+
+-- from: services/migrations/gitbucket.go:30 (GitHub-compatible API without
+-- reactions and reviews)
+default SourceProfile gitbucket_profile = {
+    kind: gitbucket,
+    supports: { milestones, labels, release_items, release_assets, issue_items, comments, pull_requests },
+    credential_kinds: { anonymous, username_password, token },
+    imports_topics: true, imports_avatar: false, comment_replies: false,
+    repository_wide_comments: false
+}
+
+-- from: services/migrations/gitlab.go:43 (merge requests as pull requests,
+-- approvals as reviews, award emoji as reactions)
+default SourceProfile gitlab_profile = {
+    kind: gitlab,
+    supports: { milestones, labels, release_items, release_assets, issue_items, comments, pull_requests, reviews, reactions },
+    credential_kinds: { anonymous, username_password, token },
+    imports_topics: true, imports_avatar: true, comment_replies: false,
+    repository_wide_comments: false
+}
+
+-- from: services/migrations/codebase.go:35
+default SourceProfile codebase_profile = {
+    kind: codebase,
+    supports: { milestones, labels, issue_items, comments, pull_requests },
+    credential_kinds: { username_password },
+    imports_topics: false, imports_avatar: false, comment_replies: false,
+    repository_wide_comments: false
+}
+
+-- from: services/migrations/onedev.go:35
+default SourceProfile onedev_profile = {
+    kind: onedev,
+    supports: { milestones, labels, issue_items, comments, pull_requests, reviews },
+    credential_kinds: { anonymous, username_password },
+    imports_topics: true, imports_avatar: false, comment_replies: false,
+    repository_wide_comments: false
+}
+
+-- from: services/migrations/pagure.go:200 (roadmap as milestones, tags as
+-- labels; with a token only private issues are imported and pull requests
+-- are skipped)
+default SourceProfile pagure_profile = {
+    kind: pagure,
+    supports: { milestones, labels, issue_items, comments, pull_requests },
+    credential_kinds: { anonymous, token },
+    imports_topics: true, imports_avatar: false, comment_replies: false,
+    repository_wide_comments: false
+}
+
+-- from: services/migrations/bitbucketdc.go:39 (pull requests and their
+-- activity only)
+default SourceProfile bitbucket_dc_profile = {
+    kind: bitbucket_dc,
+    supports: { comments, pull_requests, reviews },
+    credential_kinds: { anonymous, username_password, token },
+    imports_topics: false, imports_avatar: false, comment_replies: true,
+    repository_wide_comments: false
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ===== Requesting a migration =====
+
+-- A signed-in user imports a repository into their own namespace (or, as a
+-- site admin, into any user's).
+-- from: routers/web/repo/migrate.go:155
+rule UserRequestsMigration {
+    when: UserRequestsMigration(doer, owner, request)
+
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    requires: not config.disable_migrations
+    requires: owner = doer or doer.is_admin
+    requires: not request.mirror or (config.mirror_enabled and not config.disable_new_pull_mirrors)
+    -- A mirror is a git-level copy: issue tracker content is not offered.
+    -- decided: content selections on a mirror import are refused as a
+    -- validation error rather than silently cleared (migrations 4)
+    requires: not request.mirror or request.wanted.count = 0
+    -- 0 disables periodic sync; otherwise at least the minimum interval.
+    requires: request.mirror_interval = 0.seconds
+        or request.mirror_interval >= config.mirror_min_interval
+    requires: is_valid_repo_name(request.repo_name)
+    requires: length(request.repo_name) <= config.max_repo_name_length
+    requires: length(request.description) <= config.max_description_length
+    requires: repository_name_free(owner, request.repo_name)
+    requires: doer.is_admin or within_creation_limit(owner)
+    requires: quota_allows_new_repository(owner)
+    -- Remote address policy
+    requires: not request.address.embeds_credentials
+    requires: request.address.scheme in {http, https, git, local_path}
+    requires: request.address.scheme not in {http, git} or config.allow_unencrypted
+    requires: request.address.scheme != local_path
+        or (config.import_local_paths
+            and (doer.is_admin or may_import_local_paths(doer))
+            and is_existing_server_directory(request.address))
+    requires: request.address.scheme = local_path or is_allowed_remote(request.address.url, doer)
+    requires: request.lfs_endpoint = null or is_allowed_remote(request.lfs_endpoint.url, doer)
+
+    ensures:
+        let repository = repositories/Repository.created(
+            name: request.repo_name,
+            owner_user: owner,
+            owner_org: null,
+            description: request.description,
+            website: "",
+            original_url: sanitized_url(request.address),
+            is_private: request.private or config.force_private,
+            is_archived: false,
+            is_mirror: request.mirror,
+            is_fork: false,
+            fork_of: null,
+            is_template: false,
+            generated_from: null,
+            is_empty: true,
+            is_fsck_enabled: not request.mirror,
+            close_issues_via_commit_in_any_branch: repositories/config.default_close_issues_via_commits_in_any_branch,
+            default_branch: repositories/config.default_branch,
+            wiki_branch: repositories/config.default_branch,
+            object_format: repositories/config.default_object_format,
+            trust_model: default,
+            avatar: null,
+            git_size: 0,
+            lfs_size: 0,
+            status: being_migrated,
+            created_at: now,
+            updated_at: now
+        )
+        let migration = Migration.created(
+            doer: doer,
+            repository: repository,
+            source: request.source,
+            original_url: sanitized_url(request.address),
+            source_host: request.address.host,
+            from_archive: false,
+            validate_archive: false,
+            source_address: request.address,
+            credentials: request.credentials,
+            wiki: request.wiki,
+            lfs: request.lfs and config.lfs_server_enabled,
+            lfs_endpoint: request.lfs_endpoint,
+            mirror: request.mirror,
+            mirror_interval: request.mirror_interval,
+            content_scope: request.wanted - (request.wanted - request.source.supports),
+            imported_numbers: {},
+            status: queued,
+            items_processed: 0,
+            created_at: now
+        )
+        MigrationQueued(migration: migration)
+
+    @guidance
+        -- Web: GET/POST /repo/migrate?service_type=N (form per source).
+        -- API: POST /repos/migrate (repo scope token), MigrateRepoOptions.
+        -- decided: the API queues like the web form; it answers at once
+        -- with the pending (being_migrated) repository and the task to
+        -- poll, and a failure keeps the repository (migrations 1).
+        -- Credentials are submitted separately from the address; a URL with
+        -- user-info is rejected outright.
+}
+
+-- Same, into an organization the doer may create repositories in.
+-- decided: anyone who may create repositories in the org, on the web and
+-- the API alike (migrations 2)
+-- from: routers/web/repo/repo.go:86 (checkContextUser), routers/api/v1/repo/migrate.go:94
+rule UserRequestsOrgMigration {
+    when: UserRequestsOrgMigration(doer, org, request)
+
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    requires: not config.disable_migrations
+    requires: can_create_in_org(doer, org)
+    requires: not request.mirror or (config.mirror_enabled and not config.disable_new_pull_mirrors)
+    requires: not request.mirror or request.wanted.count = 0
+    -- 0 disables periodic sync; otherwise at least the minimum interval.
+    requires: request.mirror_interval = 0.seconds
+        or request.mirror_interval >= config.mirror_min_interval
+    requires: is_valid_repo_name(request.repo_name)
+    requires: length(request.repo_name) <= config.max_repo_name_length
+    requires: length(request.description) <= config.max_description_length
+    requires: repository_name_free(org, request.repo_name)
+    requires: doer.is_admin or within_creation_limit(org)
+    requires: quota_allows_new_repository(org)
+    requires: not request.address.embeds_credentials
+    requires: request.address.scheme in {http, https, git, local_path}
+    requires: request.address.scheme not in {http, git} or config.allow_unencrypted
+    requires: request.address.scheme != local_path
+        or (config.import_local_paths
+            and (doer.is_admin or may_import_local_paths(doer))
+            and is_existing_server_directory(request.address))
+    requires: request.address.scheme = local_path or is_allowed_remote(request.address.url, doer)
+    requires: request.lfs_endpoint = null or is_allowed_remote(request.lfs_endpoint.url, doer)
+
+    ensures:
+        let repository = repositories/Repository.created(
+            name: request.repo_name,
+            owner_user: null,
+            owner_org: org,
+            description: request.description,
+            website: "",
+            original_url: sanitized_url(request.address),
+            is_private: request.private or config.force_private,
+            is_archived: false,
+            is_mirror: request.mirror,
+            is_fork: false,
+            fork_of: null,
+            is_template: false,
+            generated_from: null,
+            is_empty: true,
+            is_fsck_enabled: not request.mirror,
+            close_issues_via_commit_in_any_branch: repositories/config.default_close_issues_via_commits_in_any_branch,
+            default_branch: repositories/config.default_branch,
+            wiki_branch: repositories/config.default_branch,
+            object_format: repositories/config.default_object_format,
+            trust_model: default,
+            avatar: null,
+            git_size: 0,
+            lfs_size: 0,
+            status: being_migrated,
+            created_at: now,
+            updated_at: now
+        )
+        let migration = Migration.created(
+            doer: doer,
+            repository: repository,
+            source: request.source,
+            original_url: sanitized_url(request.address),
+            source_host: request.address.host,
+            from_archive: false,
+            validate_archive: false,
+            source_address: request.address,
+            credentials: request.credentials,
+            wiki: request.wiki,
+            lfs: request.lfs and config.lfs_server_enabled,
+            lfs_endpoint: request.lfs_endpoint,
+            mirror: request.mirror,
+            mirror_interval: request.mirror_interval,
+            content_scope: request.wanted - (request.wanted - request.source.supports),
+            imported_numbers: {},
+            status: queued,
+            items_processed: 0,
+            created_at: now
+        )
+        MigrationQueued(migration: migration)
+}
+
+-- ===== Running =====
+
+-- The job queue hands the migration to a worker.
+-- from: services/task/migrate.go:279
+rule StartMigration {
+    when: MigrationDequeued(migration)
+
+    requires: migration.status = queued
+
+    ensures: migration.status = running
+    ensures: migration.started_at = now
+    ensures: migration.stage = git
+    ensures: migration.git_deadline = now + config.git_clone_timeout
+    ensures: MigrationProgressed(migration: migration)
+}
+
+-- The adapter reports which stage it is in; shown as the progress message.
+-- Stages run in order: git (repository, wiki, LFS, avatar), topics,
+-- milestones, labels, releases (then remaining tags become releases),
+-- issues (with their comments), pull requests (with comments and reviews),
+-- repository-wide comments, finalizing.
+-- from: services/migrations/migrate.go:151
+rule ImportAdvancesStage {
+    when: ImportStageReached(migration, stage)
+
+    requires: migration.status = running
+
+    ensures: migration.stage = stage
+    ensures: migration.git_deadline = null
+    ensures: migration.items_processed = 0
+    ensures: MigrationProgressed(migration: migration)
+}
+
+-- Cloning the repository (or its wiki) that runs past the git timeout is
+-- abandoned and the migration fails.
+-- from: services/repository/migrate.go:44
+rule GitCloneTimesOut {
+    when: migration: Migration.git_deadline <= now
+
+    requires: migration.status = running
+    requires: migration.stage = git
+
+    ensures: migration.status = failed
+    ensures: migration.failure_reason = remote_error
+    ensures: migration.message = "cloning the repository timed out"
+    ensures: migration.ended_at = now
+    ensures: migration.git_deadline = null
+    ensures: MigrationFailed(migration: migration)
+    ensures: MigrationFailureReported(kind: repo, description: migration.message)
+}
+
+-- "N issues / pull requests migrated so far".
+-- from: services/migrations/migrate.go:310
+rule ImportCountsItems {
+    when: ImportItemsProcessed(migration, count)
+
+    requires: migration.status = running
+    requires: count >= migration.items_processed
+
+    ensures: migration.items_processed = count
+    ensures: MigrationProgressed(migration: migration)
+}
+
+-- The adapter may rewrite the clone address (e.g. to add credentials). The
+-- rewritten address is re-checked; a switch from a remote source to a local
+-- path is refused.
+-- from: services/migrations/migrate.go:129
+rule RejectRewrittenCloneAddress {
+    when: SourceRewroteCloneAddress(migration, address)
+
+    requires: migration.status = running
+    requires: not migration.from_archive
+    requires: not is_allowed_remote(address.url, migration.doer)
+        or (address.scheme = local_path and migration.source_address.scheme != local_path)
+
+    ensures: migration.status = failed
+    ensures: migration.failure_reason = address_not_allowed
+    ensures: migration.message = "the source redirected to a disallowed address"
+    ensures: migration.ended_at = now
+    ensures: MigrationFailed(migration: migration)
+    ensures: MigrationFailureReported(kind: repo, description: migration.message)
+}
+
+-- ===== What gets imported =====
+
+-- Topics: invalid ones dropped, the rest truncated to the per-repo limit.
+-- from: services/migrations/gitea_uploader.go:192
+rule ImportTopics {
+    when: SourceYieldsTopics(migration, topics)
+
+    requires: migration.status = running
+    requires: migration.source.imports_topics or migration.from_archive
+
+    let valid = valid_topics(topics)
+
+    ensures: TopicsImported(
+        repository: migration.repository,
+        topics: first_n(valid, config.max_topics)
+    )
+}
+
+-- A milestone without a deadline gets the far-future deadline Forgejo uses
+-- for "no deadline".
+-- decided: far-future deadline 9999-01-01, as Forgejo stores it (migrations 10)
+-- from: services/migrations/gitea_uploader.go:208
+rule ImportMilestone {
+    when: SourceYieldsMilestone(migration, item)
+
+    requires: migration.status = running
+
+    ensures: issues/Milestone.created(
+        repository: migration.repository,
+        name: item.title,
+        description: item.description,
+        status: if item.is_closed: closed else: open,
+        closed_at: item.closed_at,
+        deadline: if item.deadline = null: far_future_deadline() else: item.deadline,
+        created_at: first_present(item.created_at, item.updated_at, item.deadline),
+        updated_at: first_present(item.updated_at, item.created_at, null)
+    )
+}
+
+-- Invalid colours become white rather than failing the import.
+-- from: services/migrations/gitea_uploader.go:259
+rule ImportLabel {
+    when: SourceYieldsLabel(migration, item)
+
+    requires: migration.status = running
+
+    ensures: issues/Label.created(
+        repository: migration.repository,
+        organization: null,
+        name: item.name,
+        description: item.description,
+        color: if is_valid_color(item.color): normalized_color(item.color) else: "#ffffff",
+        is_exclusive: item.exclusive,
+        created_at: now
+    )
+}
+
+-- Invalid tag / target ref names are blanked. Assets are downloaded through
+-- the outbound policy and stored on this instance. Once all releases are in,
+-- tags without a release get tag-only records (releases reacts to
+-- RepositoryMigrated).
+-- from: services/migrations/gitea_uploader.go:289
+rule ImportRelease {
+    when: SourceYieldsRelease(migration, item)
+
+    requires: migration.status = running
+
+    let publisher = resolve_author(migration, item.publisher)
+
+    ensures:
+        let release = releases/Release.created(
+            repository: migration.repository,
+            tag_name: if is_valid_ref_name(item.tag_name): item.tag_name else: "",
+            target: if is_valid_ref_name(item.target): item.target else: "",
+            title: item.name,
+            note: item.body,
+            publisher: publisher,
+            original_author: if publisher = null: item.publisher.name else: null,
+            state: if item.is_draft: draft else: published,
+            is_prerelease: item.is_prerelease,
+            hide_archive_links: false,
+            num_commits: 0,
+            created_at: first_present(item.created_at, item.published_at, null)
+        )
+        for asset in item.assets:
+            issues/Attachment.created(
+                repository: migration.repository,
+                uploader: if publisher = null: ghost_user() else: publisher,
+                name: asset.name,
+                size: asset.size,
+                issue: null,
+                comment: null,
+                release: release,
+                external_url: null,
+                download_count: asset.download_count,
+                created_at: first_present(asset.created_at, release.created_at, null)
+            )
+        if publisher = null:
+            ExternalAuthorship.created(
+                repository: migration.repository,
+                source_kind: migration.source.kind,
+                source_host: migration.source_host,
+                external_id: item.publisher.external_id,
+                external_name: item.publisher.name,
+                content: on_release,
+                release: release,
+                status: unlinked
+            )
+}
+
+-- Issues keep their number, state, lock, timestamps, labels (matched by
+-- name among imported labels) and milestone (matched by title); reactions
+-- come along. Titles longer than the limit are truncated. Assignees that
+-- are local accounts able to be assigned here are assigned; the others are
+-- kept by name.
+-- decided: assignees imported when they resolve to local users with access,
+-- others kept as external names (migrations 11)
+-- from: services/migrations/gitea_uploader.go:401
+rule ImportIssue {
+    when: SourceYieldsIssue(migration, item)
+
+    requires: migration.status = running
+
+    let author = resolve_author(migration, item.author)
+
+    ensures: migration.imported_numbers = migration.imported_numbers + {item.number}
+    ensures:
+        let issue = issues/Issue.created(
+            repository: migration.repository,
+            index: item.number,
+            poster: if author = null: ghost_user() else: author,
+            title: truncate(item.title, config.max_title_length),
+            content: item.content,
+            content_version: 0,
+            is_pull: false,
+            status: if item.is_closed: closed else: open,
+            closed_at: item.closed_at,
+            is_locked: item.is_locked,
+            ref: if is_valid_ref_name(item.ref): item.ref else: null,
+            milestone: milestone_titled(migration.repository, item.milestone_title),
+            labels: labels_named(migration.repository, item.label_names),
+            assignees: assignable_named(migration.repository, item.assignee_names),
+            created_at: first_present(item.created_at, item.closed_at, null),
+            updated_at: first_present(item.updated_at, item.closed_at, null)
+        )
+        for name in item.assignee_names:
+            if not resolves_to_assignee(migration.repository, name):
+                ExternalAssignee.created(
+                    repository: migration.repository,
+                    issue: issue,
+                    external_name: name
+                )
+        if author = null:
+            ExternalAuthorship.created(
+                repository: migration.repository,
+                source_kind: migration.source.kind,
+                source_host: migration.source_host,
+                external_id: item.author.external_id,
+                external_name: item.author.name,
+                content: on_issue,
+                issue: issue,
+                status: unlinked
+            )
+        for r in item.reactions:
+            ImportedReactionOn(migration: migration, issue: issue, comment: null, reaction: r)
+}
+
+-- Pull requests become an issue (is_pull) plus a pull request whose head and
+-- base are both this repository. An open pull request from a fork has its
+-- head branch fetched from the fork (only if the fork's clone URL shares the
+-- source's base URL) into a branch "<fork owner>/<ref>"; otherwise only the
+-- head commit is pinned. Drafts get the work-in-progress title prefix. A
+-- merged pull request keeps its merge time, merge commit and original
+-- merger: a resolved local account, else the ghost placeholder with an
+-- ExternalAuthorship (on_merge) so it is re-attributed later, else (the
+-- source names no merger) the ghost placeholder alone. Assignees are
+-- handled as for issues. Imported pull requests are then checked for
+-- mergeability like any other.
+-- decided: the merger is the original merger as an external identity, not
+-- the migration doer (migrations 9); assignees imported (migrations 11)
+-- from: services/migrations/gitea_uploader.go:787
+rule ImportPullRequest {
+    when: SourceYieldsPullRequest(migration, item)
+
+    requires: migration.status = running
+    requires: item.ensured_safe
+
+    let author = resolve_author(migration, item.author)
+
+    ensures: migration.imported_numbers = migration.imported_numbers + {item.number}
+    ensures:
+        let issue = issues/Issue.created(
+            repository: migration.repository,
+            index: item.number,
+            poster: if author = null: ghost_user() else: author,
+            title: truncate(with_draft_prefix(item.title, item.is_draft), config.max_title_length),
+            content: item.content,
+            content_version: 0,
+            is_pull: true,
+            status: if item.is_closed: closed else: open,
+            closed_at: item.closed_at,
+            is_locked: item.is_locked,
+            milestone: milestone_titled(migration.repository, item.milestone_title),
+            labels: labels_named(migration.repository, item.label_names),
+            assignees: assignable_named(migration.repository, item.assignee_names),
+            created_at: first_present(item.created_at, item.closed_at, item.merged_at),
+            updated_at: first_present(item.updated_at, item.created_at, null)
+        )
+        for name in item.assignee_names:
+            if not resolves_to_assignee(migration.repository, name):
+                ExternalAssignee.created(
+                    repository: migration.repository,
+                    issue: issue,
+                    external_name: name
+                )
+        if item.merged:
+            let merger = if item.merged_by = null: null else: resolve_author(migration, item.merged_by)
+            let pr = pulls/PullRequest.created(
+                issue: issue,
+                flow: branch,
+                head_repository: migration.repository,
+                head_branch: imported_head_branch(item),
+                base_repository: migration.repository,
+                base_branch: present_or_empty(item.base.ref),
+                head_commit_sha: present_or_empty(item.head.sha),
+                merge_base_sha: if item.base.sha = null: merge_base_of(migration.repository, item.base.ref, item.head.sha) else: item.base.sha,
+                created_at: issue.created_at,
+                status: merged,
+                -- the source does not say which style was used
+                merge_style: merge,
+                merged_commit_sha: present_or_empty(item.merge_commit_sha),
+                merger: if merger = null: ghost_user() else: merger,
+                merged_at: first_present(item.merged_at, issue.updated_at, null),
+                merged_automatically: false,
+                conflicted_files: {},
+                changed_protected_files: {},
+                commits_ahead: 0,
+                commits_behind: 0,
+                allow_maintainer_edit: false
+            )
+            if item.merged_by != null and merger = null:
+                ExternalAuthorship.created(
+                    repository: migration.repository,
+                    source_kind: migration.source.kind,
+                    source_host: migration.source_host,
+                    external_id: item.merged_by.external_id,
+                    external_name: item.merged_by.name,
+                    content: on_merge,
+                    pull_request: pr,
+                    status: unlinked
+                )
+        else:
+            pulls/PullRequest.created(
+                issue: issue,
+                flow: branch,
+                head_repository: migration.repository,
+                head_branch: imported_head_branch(item),
+                base_repository: migration.repository,
+                base_branch: present_or_empty(item.base.ref),
+                head_commit_sha: present_or_empty(item.head.sha),
+                merge_base_sha: if item.base.sha = null: merge_base_of(migration.repository, item.base.ref, item.head.sha) else: item.base.sha,
+                created_at: issue.created_at,
+                -- queued for pulls/CheckMergeability like any new pull request
+                status: checking,
+                check_requested_at: now,
+                conflicted_files: {},
+                changed_protected_files: {},
+                commits_ahead: commits_ahead_of(migration.repository, imported_head_branch(item), migration.repository, present_or_empty(item.base.ref)),
+                commits_behind: commits_behind_of(migration.repository, imported_head_branch(item), migration.repository, present_or_empty(item.base.ref)),
+                allow_maintainer_edit: false
+            )
+        if author = null:
+            ExternalAuthorship.created(
+                repository: migration.repository,
+                source_kind: migration.source.kind,
+                source_host: migration.source_host,
+                external_id: item.author.external_id,
+                external_name: item.author.name,
+                content: on_issue,
+                issue: issue,
+                status: unlinked
+            )
+        for r in item.reactions:
+            ImportedReactionOn(migration: migration, issue: issue, comment: null, reaction: r)
+}
+
+-- The adapter yielded a pull request it had not validated: refused.
+-- from: services/migrations/gitea_uploader.go:671
+rule RefuseUnsafePullRequest {
+    when: SourceYieldsPullRequest(migration, item)
+
+    requires: migration.status = running
+    requires: not item.ensured_safe
+
+    ensures: migration.status = failed
+    ensures: migration.failure_reason = invalid_source_data
+    ensures: migration.message = "pull request was not checked for safety"
+    ensures: migration.ended_at = now
+    ensures: MigrationFailed(migration: migration)
+    ensures: MigrationFailureReported(kind: repo, description: migration.message)
+}
+
+-- Comments attach to an already imported issue / pull request. Close,
+-- reopen, merge and auto-merge events keep their kind but drop text. A
+-- reply gets a quote header linking the parent comment.
+-- from: services/migrations/gitea_uploader.go:485
+rule ImportComment {
+    when: SourceYieldsComment(migration, item)
+
+    requires: migration.status = running
+
+    requires: item.issue_number in migration.imported_numbers
+
+    let parent = issues/Issue{repository: migration.repository, index: item.issue_number}
+    let author = resolve_author(migration, item.author)
+
+    ensures:
+        let comment = issues/Comment.created(
+            issue: parent,
+            poster: if author = null: ghost_user() else: author,
+            kind: comment_kind_named(item.kind),
+            content: imported_comment_content(item),
+            content_version: 0,
+            created_at: first_present(item.created_at, parent.created_at, null),
+            updated_at: first_present(item.updated_at, item.created_at, parent.created_at)
+        )
+        if author = null:
+            ExternalAuthorship.created(
+                repository: migration.repository,
+                source_kind: migration.source.kind,
+                source_host: migration.source_host,
+                external_id: item.author.external_id,
+                external_name: item.author.name,
+                content: on_comment,
+                comment: comment,
+                status: unlinked
+            )
+        for r in item.reactions:
+            ImportedReactionOn(migration: migration, issue: parent, comment: comment, reaction: r)
+}
+
+-- A comment for an issue that was not imported fails the import.
+-- from: services/migrations/gitea_uploader.go:492
+rule RefuseOrphanComment {
+    when: SourceYieldsComment(migration, item)
+
+    requires: migration.status = running
+
+    requires: not (item.issue_number in migration.imported_numbers)
+
+    ensures: migration.status = failed
+    ensures: migration.failure_reason = invalid_source_data
+    ensures: migration.message = "comment belongs to an issue that was not imported"
+    ensures: migration.ended_at = now
+    ensures: MigrationFailed(migration: migration)
+    ensures: MigrationFailureReported(kind: repo, description: migration.message)
+}
+
+-- Reviews attach to an imported pull request. Code comments are kept only
+-- when they carry a diff hunk and the pull request has a merge base; their
+-- patch context is recomputed locally; an invalid commit id is replaced by
+-- the pull request head. A code comment without its own author inherits the
+-- reviewer.
+-- from: services/migrations/gitea_uploader.go:911
+rule ImportReview {
+    when: SourceYieldsReview(migration, item)
+
+    requires: migration.status = running
+
+    requires: item.issue_number in migration.imported_numbers
+
+    let conversation = issues/Issue{repository: migration.repository, index: item.issue_number}
+    let reviewer = resolve_author(migration, item.reviewer)
+    -- Drafts and bare review requests are not imported as reviews.
+    requires: item.state in {approved, changes_requested, commented}
+
+    ensures:
+        let review = pulls/Review.created(
+            pull_request: pulls/PullRequest{issue: conversation},
+            reviewer: if reviewer = null: ghost_user() else: reviewer,
+            status: submitted,
+            kind: if item.state = approved: approve else if item.state = changes_requested: request_changes else: comment,
+            body: item.content,
+            commit_sha: present_or_empty(item.commit_sha),
+            is_official: item.official,
+            is_stale: false,
+            is_dismissed: false,
+            created_at: first_present(item.created_at, conversation.created_at, null),
+            submitted_at: first_present(item.created_at, conversation.created_at, null)
+        )
+        if reviewer = null:
+            ExternalAuthorship.created(
+                repository: migration.repository,
+                source_kind: migration.source.kind,
+                source_host: migration.source_host,
+                external_id: item.reviewer.external_id,
+                external_name: item.reviewer.name,
+                content: on_review,
+                review: review,
+                status: unlinked
+            )
+}
+
+-- from: services/migrations/gitea_uploader.go:463
+rule ImportReaction {
+    when: ImportedReactionOn(migration, issue, comment, reaction)
+
+    let author = resolve_author(migration, reaction.author)
+
+    ensures:
+        let created = issues/Reaction.created(
+            user: if author = null: ghost_user() else: author,
+            issue: issue,
+            comment: comment,
+            emoji: reaction.content,
+            created_at: now
+        )
+        if author = null:
+            ExternalAuthorship.created(
+                repository: migration.repository,
+                source_kind: migration.source.kind,
+                source_host: migration.source_host,
+                external_id: reaction.author.external_id,
+                external_name: reaction.author.name,
+                content: on_reaction,
+                reaction: created,
+                status: unlinked
+            )
+}
+
+-- Data the adapter had to drop (bad SHA, bad ref, foreign clone URL) is
+-- recorded for administrators; the import continues.
+-- from: services/migrations/common.go:16
+rule FlagDroppedSourceData {
+    when: SourceDataDropped(migration, detail)
+
+    requires: migration.status = running
+
+    ensures: MigrationFailureReported(kind: repo, description: detail)
+}
+
+-- ===== Finishing =====
+
+-- Success: counters recomputed, repository ready, secrets gone. A plain
+-- import detaches the source remote (so no credentials survive anywhere); a
+-- mirror import creates the pull mirror, which keeps the remote and its
+-- credentials for future syncs.
+-- from: services/task/migrate.go:229, models/admin/task.go:235
+rule CompleteMigration {
+    when: SourceImportFinished(migration)
+
+    requires: migration.status = running
+    -- Git data is in: the adapter has moved past the clone stage.
+    requires: migration.stage != git
+
+    let address = migration.source_address
+    let creds = migration.credentials
+
+    ensures: migration.status = finished
+    ensures: migration.stage = finalizing
+    ensures: migration.git_deadline = null
+    ensures: migration.ended_at = now
+    ensures: migration.source_address = null
+    ensures: migration.credentials = null
+    ensures: migration.message = null
+    ensures: ImportCompleted(
+        repository: migration.repository,
+        remote_address: sanitized_url(address),
+        has_credentials: creds.kind != anonymous,
+        interval: migration.mirror_interval,
+        lfs_enabled: migration.lfs,
+        lfs_endpoint: url_of(migration.lfs_endpoint)
+    )
+    ensures: RepositoryMigrated(repository: migration.repository)
+    -- Restoring an archive immediately re-attributes what it can.
+    ensures:
+        if migration.from_archive:
+            RelinkPassRequested(scope: migration.repository)
+}
+
+-- Failure: the repository is kept (still being_migrated) so its admins can
+-- read the reason, retry or delete it. The message never contains
+-- credentials.
+-- from: services/task/migrate.go:239
+rule FailMigration {
+    when: SourceImportFailed(migration, reason, detail)
+
+    requires: migration.status = running
+
+    ensures: migration.status = failed
+    ensures: migration.failure_reason = reason
+    ensures: migration.git_deadline = null
+    ensures: migration.message = strip_credentials(detail)
+    ensures: migration.ended_at = now
+    ensures: MigrationFailed(migration: migration)
+    ensures: MigrationFailureReported(
+        kind: repository,
+        description: migration_failure_notice(migration.original_url, strip_credentials(detail))
+    )
+}
+
+-- ===== Cancel, retry, discard =====
+
+-- A repository admin stops a migration. A running import notices within
+-- config.cancel_check_interval and stops; a queued one never starts.
+-- decided: queued and running migrations can both be cancelled (migrations 3)
+-- from: routers/web/repo/migrate.go:296
+rule RepoAdminCancelsMigration {
+    when: RepoAdminCancelsMigration(admin, migration)
+
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    requires: is_repo_admin(admin, migration.repository)
+    requires: migration.status in {queued, running}
+
+    ensures: migration.status = failed
+    ensures: migration.failure_reason = canceled
+    ensures: migration.message = "canceled"
+    ensures: migration.git_deadline = null
+    ensures: migration.ended_at = now
+    ensures: MigrationFailed(migration: migration)
+
+    @guidance
+        -- Web: POST /{owner}/{repo}/settings/migrate/cancel (repo admin).
+}
+
+-- A repository admin, or the user who requested the migration, retries a
+-- failed migration. Partially imported data is wiped first; the repository
+-- record (and its name) is kept. Refused while the owner is over its
+-- repository-size quota.
+-- decided: the requester or a repository admin may retry (migrations 12)
+-- from: services/task/task.go:138, routers/web/repo/migrate.go:270
+rule RepoAdminRetriesMigration {
+    when: RepoAdminRetriesMigration(admin, migration)
+
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    requires: is_repo_admin(admin, migration.repository) or admin = migration.doer
+    requires: migration.status = failed
+    requires: quota_allows_retry(migration.repository)
+
+    ensures: MigratedContentDiscarded(repository: migration.repository)
+    ensures: migration.status = queued
+    ensures: migration.failure_reason = null
+    ensures: migration.ended_at = null
+    ensures: migration.message = null
+    ensures: migration.stage = null
+    ensures: migration.items_processed = 0
+    ensures: migration.imported_numbers = {}
+    ensures: MigrationQueued(migration: migration)
+
+    @guidance
+        -- Web: POST /{owner}/{repo}/settings/migrate/retry (repo admin or
+        -- the requester; the requester also gets it from the task status).
+}
+
+-- A repository admin gives up on a failed migration and deletes the
+-- half-made repository.
+-- decided: requests 2 — through the normal repository deletion cascade:
+-- repositories deletes it, and the migration task goes with it
+-- (ForgetImportRecordsOfDeletedRepository).
+-- from: templates/repo/migrate/migrating.tmpl:39
+rule RepoAdminDiscardsFailedMigration {
+    when: RepoAdminDiscardsFailedMigration(admin, migration)
+
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    requires: is_repo_admin(admin, migration.repository)
+    requires: migration.status = failed
+
+    ensures: FailedImportDiscarded(repository: migration.repository, doer: admin)
+
+    @guidance
+        -- Web: POST /{owner}/{repo}/settings action=delete, offered on the
+        -- migrating page only once the migration failed.
+}
+
+-- Deleting the repository by any route takes the addon's records about it
+-- along: its migration task, authorship records and external assignees.
+-- from: services/repository/delete.go:220
+rule ForgetImportRecordsOfDeletedRepository {
+    when: repositories/RepositoryDeleted(repository, doer)
+
+    ensures:
+        for m in Migrations where repository = repository:
+            not exists m
+        for a in ExternalAuthorships where repository = repository:
+            not exists a
+        for e in ExternalAssignees where repository = repository:
+            not exists e
+}
+
+-- ===== Re-attributing imported content =====
+
+-- When a user links an external login whose provider speaks a forge kind,
+-- every imported item authored by that external id on a source of that kind
+-- at the provider's host is handed over to them. Ids are opaque strings.
+-- decided: match on kind + host + external id, whatever the OAuth source is
+-- named (migrations 5); non-numeric ids are re-attributed too (migrations 6)
+-- from: services/externalaccount/user.go:62
+rule LinkAuthorshipsOnAccountLink {
+    when: login: authentication/ExternalLogin.created
+
+    ensures:
+        for a in ExternalAuthorships where status = unlinked:
+            if a.source_kind = source_kind_for_provider(login.provider)
+                and a.source_host = provider_host(login.source)
+                and a.external_id = login.external_id:
+                AuthorshipClaimed(authorship: a, user: login.user)
+}
+
+-- The nightly cron task (owned and scheduled by administration) catches
+-- links made by any route, and imports that ran after the link was made.
+-- from: services/migrations/update.go:17
+rule NightlyRelink {
+    when: administration/MigrationPosterIdUpdateDue()
+
+    ensures: RelinkPassRequested(scope: null)
+    -- The sweep is reported finished to administration, which closes the
+    -- update_migration_poster_id run (its CronWorkCompleted).
+    ensures: RelinkSweepCompleted(outcome: finished, message: null)
+}
+
+-- One re-attribution pass: every unlinked authorship whose source identity
+-- now belongs to a local account is linked.
+-- from: services/migrations/update.go:30
+rule RelinkPass {
+    when: RelinkPassRequested(scope)
+
+    ensures:
+        for a in ExternalAuthorships where status = unlinked:
+            if linked_account_for(a.source_kind, a.source_host, a.external_id) != null and (scope = null or scope = a.repository):
+                AuthorshipClaimed(authorship: a, user: linked_account_for(a.source_kind, a.source_host, a.external_id))
+}
+
+-- One authorship is claimed by the local account its source identity now
+-- belongs to.
+-- from: services/externalaccount/user.go:76
+rule ClaimAuthorship {
+    when: AuthorshipClaimed(authorship, user)
+
+    requires: authorship.status = unlinked
+
+    ensures: authorship.status = linked
+    ensures: authorship.linked_user = user
+    ensures: ExternalAuthorLinked(authorship: authorship, user: user)
+}
+
+-- The imported item is handed over: the local account becomes its author.
+-- from: models/issues/issue_update.go:635
+rule ReattributeImportedContent {
+    when: ExternalAuthorLinked(authorship, user)
+
+    ensures:
+        if authorship.content = on_issue:
+            authorship.issue.poster = user
+        if authorship.content = on_comment:
+            authorship.comment.poster = user
+        if authorship.content = on_reaction:
+            authorship.reaction.user = user
+        if authorship.content = on_release:
+            authorship.release.publisher = user
+        if authorship.content = on_review:
+            authorship.review.reviewer = user
+        if authorship.content = on_merge:
+            authorship.pull_request.merger = user
+}
+
+-- ===== Dump and restore =====
+
+-- `forgejo dump-repo`: fetch a repository from a source with the same
+-- adapters and write it to the archive format instead of the database. The
+-- allowed/blocked-hosts policy does not apply: it guards user-initiated
+-- migrations, and the operator already has the server.
+-- decided: operators are exempt from the host policy (migrations 8)
+-- from: services/migrations/dump.go:604, cmd/dump_repo.go:28
+rule OperatorDumpsRepository {
+    when: OperatorDumpsRepository(operator, request, directory)
+
+    requires: operator.has_server_access
+
+    ensures: DumpArchive.created(
+        directory: directory,
+        owner_name: request.address.host,
+        repo_name: request.repo_name,
+        source_kind: request.source.kind,
+        original_url: sanitized_url(request.address),
+        source_host: request.address.host,
+        is_private: source_is_private(request),
+        includes_wiki: request.wiki,
+        contents: request.wanted - (request.wanted - request.source.supports),
+        status: writing
+    )
+
+    @guidance
+        -- Archive layout (one directory per owner/repo): repo.yml,
+        -- topic.yml, milestone.yml, label.yml, release.yml with
+        -- release_assets/<tag>/<name>, issue.yml, pull_request.yml,
+        -- comments/<issue>.yml, reviews/<issue>.yml, git/ (bare mirror),
+        -- wiki/. Units flag: wiki, issues, labels, releases, release_assets,
+        -- milestones, pull_requests, comments; empty means everything.
+        -- Credentials are only used to fetch and are never written.
+}
+
+-- from: services/migrations/dump.go:599
+rule ArchiveWriteCompletes {
+    when: ArchiveWriteCompleted(archive)
+
+    requires: archive.status = writing
+
+    ensures: archive.status = complete
+}
+
+-- A failed dump removes the partial directory.
+-- from: services/migrations/dump.go:593
+rule ArchiveWriteFails {
+    when: ArchiveWriteFailed(archive)
+
+    requires: archive.status = writing
+
+    ensures: archive.status = discarded
+}
+
+-- `forgejo restore-repo` (through the private API): import an archive into
+-- a new repository. The archive is local, so the remote-address policy does
+-- not apply; validation against the archive schema is optional. The import
+-- runs as the instance's first site administrator. The repository keeps the
+-- archive's visibility (FORCE_PRIVATE still forces private).
+-- decided: restore keeps the archive's visibility (migrations 7)
+-- from: services/migrations/dump.go:667, routers/private/restore_repo.go:17
+rule OperatorRestoresRepository {
+    when: OperatorRestoresRepository(operator, archive, owner, repo_name, selection)
+
+    requires: operator.has_server_access
+    requires: archive.status = complete
+    requires: repository_name_free(owner, repo_name)
+
+    ensures:
+        let repository = repositories/Repository.created(
+            name: repo_name,
+            owner_user: owner,
+            owner_org: null,
+            description: "",
+            website: "",
+            original_url: archive.original_url,
+            is_private: archive.is_private or config.force_private,
+            is_archived: false,
+            is_mirror: false,
+            is_fork: false,
+            fork_of: null,
+            is_template: false,
+            generated_from: null,
+            is_empty: true,
+            is_fsck_enabled: not false,
+            close_issues_via_commit_in_any_branch: repositories/config.default_close_issues_via_commits_in_any_branch,
+            default_branch: repositories/config.default_branch,
+            wiki_branch: repositories/config.default_branch,
+            object_format: repositories/config.default_object_format,
+            trust_model: default,
+            avatar: null,
+            git_size: 0,
+            lfs_size: 0,
+            status: being_migrated,
+            created_at: now,
+            updated_at: now
+        )
+        let migration = Migration.created(
+            doer: first_site_admin(),
+            repository: repository,
+            source: profile_for(archive.source_kind),
+            original_url: archive.original_url,
+            source_host: archive.source_host,
+            from_archive: true,
+            validate_archive: selection.validate,
+            source_address: archive_address(archive),
+            credentials: anonymous_credentials(),
+            wiki: archive.includes_wiki,
+            lfs: false,
+            lfs_endpoint: null,
+            mirror: false,
+            mirror_interval: config.mirror_default_interval,
+            content_scope: if selection.units.count = 0: archive.contents else: selection.units - (selection.units - archive.contents),
+            imported_numbers: {},
+            status: queued,
+            items_processed: 0,
+            created_at: now
+        )
+        MigrationQueued(migration: migration)
+
+    @guidance
+        -- Private API: POST /api/internal/restore_repo with RepoDir,
+        -- OwnerName, RepoName, Units, Validation. Runs synchronously in
+        -- Forgejo; here it is queued like any other migration.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- One migration per repository.
+invariant OneMigrationPerRepository {
+    for m in Migrations:
+        (Migrations where repository = m.repository).count = 1
+}
+
+-- Until it finishes, the target repository is not usable (no git access, no
+-- pages other than the progress page and settings).
+invariant ActiveMigrationHoldsRepository {
+    for m in Migrations:
+        m.is_active implies m.repository.status = being_migrated
+}
+
+-- A finished migration's repository is ready.
+invariant FinishedMigrationReleasesRepository {
+    for m in Migrations:
+        m.status = finished implies m.repository.status = ready
+}
+
+-- Mirrors carry no issue-tracker content.
+invariant MirrorsAreGitOnly {
+    for m in Migrations:
+        m.mirror implies m.content_scope.count = 0
+}
+
+-- Nothing is imported that the source cannot supply.
+invariant ScopeWithinSourceCapabilities {
+    for m in Migrations:
+        m.from_archive or m.content_scope.all(c => c in m.source.supports)
+}
+
+-- An authorship record points at exactly the kind of item it describes.
+invariant AuthorshipPointsAtItsContent {
+    for a in ExternalAuthorships:
+        (a.content = on_issue implies a.issue != null)
+        and (a.content = on_comment implies a.comment != null)
+        and (a.content = on_reaction implies a.reaction != null)
+        and (a.content = on_release implies a.release != null)
+        and (a.content = on_review implies a.review != null)
+        and (a.content = on_merge implies a.pull_request != null)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Anyone signed in: access/SignedInUser.
+
+actor MigrationRepoAdmin {
+    within: Migration
+    identified_by: accounts/User where is_repo_admin(this, within.repository)
+}
+
+actor MigrationRepoReader {
+    within: Migration
+    identified_by: accounts/User where can_read_code(this, within.repository)
+}
+
+actor MigrationRequester {
+    within: Migration
+    identified_by: accounts/User where this = within.doer
+}
+
+actor SourceAdapter {
+    identified_by: SourceAdapterProcess where active = true
+}
+
+actor CoreHost {
+    identified_by: CoreRuntime where addon_installed = true
+}
+
+actor InstanceOperator {
+    identified_by: OperatorShell where has_server_access = true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The "New migration" page and POST /repos/migrate.
+surface MigrationForm {
+    facing user: access/SignedInUser
+
+    exposes:
+        for p in SourceProfiles:
+            p.kind
+            p.supports
+            p.credential_kinds
+
+    provides:
+        UserRequestsMigration(user, owner, request)
+            when not config.disable_migrations
+        UserRequestsOrgMigration(user, org, request)
+            when not config.disable_migrations
+
+    @guarantee MirrorOptionHiddenWhenDisabled
+        -- When new pull mirrors are disabled the mirror option is not
+        -- offered; when FORCE_PRIVATE is set the private flag is forced on;
+        -- the LFS option is only offered while the LFS server is enabled.
+
+    @guarantee CredentialsNeverInAddress
+        -- Username, password and token are separate inputs. Token input is
+        -- only offered for sources whose profile accepts tokens.
+
+    @guidance
+        -- Web: GET /repo/migrate (source picker), GET
+        -- /repo/migrate?service_type=N&org=ID&mirror=1 (per-source form),
+        -- POST /repo/migrate. API: POST /repos/migrate with service one of
+        -- git, github, gitea, gitlab, gogs, onedev, gitbucket, codebase,
+        -- forgejo, pagure, bitbucketdc; repo_owner names the target owner.
+}
+
+-- What anyone who can read the repository sees while it is being imported
+-- (the repository home page shows this instead of the code).
+surface MigrationProgressPage {
+    facing reader: MigrationRepoReader
+    context migration: Migration
+
+    exposes:
+        migration.status
+        migration.stage
+        migration.items_processed
+        migration.original_url
+
+    related:
+        MigrationAdministration(migration)
+            when is_repo_admin(reader, migration.repository)
+
+    timeout:
+        GitCloneTimesOut
+
+    @guarantee RepositoryInaccessibleWhileImporting
+        -- While being_migrated, every repository page other than home and
+        -- settings redirects home, and git clone/push is refused.
+}
+
+-- The repository admin's controls on the progress page.
+surface MigrationAdministration {
+    facing admin: MigrationRepoAdmin
+    context migration: Migration
+
+    exposes:
+        migration.status
+        migration.stage
+        migration.message
+        migration.original_url
+        migration.items_processed
+
+    provides:
+        RepoAdminCancelsMigration(admin, migration)
+            when migration.is_active
+        RepoAdminRetriesMigration(admin, migration)
+            when migration.status = failed
+        RepoAdminDiscardsFailedMigration(admin, migration)
+            when migration.status = failed
+}
+
+-- The requester's status poll (the progress page polls this).
+surface MigrationTaskStatus {
+    facing requester: MigrationRequester
+    context migration: Migration where doer = requester
+
+    exposes:
+        migration.status
+        migration.stage
+        migration.items_processed
+        migration.message
+        migration.repository
+
+    provides:
+        RepoAdminRetriesMigration(requester, migration)
+            when migration.status = failed
+
+    @guidance
+        -- API: POST /repos/migrate answers with this task and the pending
+        -- repository (decided: migrations 1).
+        -- Web: GET /user/task/{id} (only the requester; others get "does
+        -- not exist").
+}
+
+-- The per-source adapter feeding the import.
+surface SourceAdapterBoundary {
+    facing adapter: SourceAdapter
+
+    provides:
+        ImportStageReached(migration, stage)
+        ImportItemsProcessed(migration, count)
+        SourceRewroteCloneAddress(migration, address)
+        SourceYieldsTopics(migration, topics)
+        SourceYieldsMilestone(migration, item)
+        SourceYieldsLabel(migration, item)
+        SourceYieldsRelease(migration, item)
+        SourceYieldsIssue(migration, item)
+        SourceYieldsPullRequest(migration, item)
+        SourceYieldsComment(migration, item)
+        SourceYieldsReview(migration, item)
+        SourceDataDropped(migration, detail)
+        SourceImportFinished(migration)
+            when adapter.source_kind = migration.source.kind
+        SourceImportFailed(migration, reason, detail)
+            when adapter.source_kind = migration.source.kind
+        ArchiveWriteCompleted(archive)
+        ArchiveWriteFailed(archive)
+
+    contracts:
+        demands SourceDownloader
+
+    @guarantee OnlyScopedContent
+        -- The adapter is only asked for, and only yields, content kinds in
+        -- the migration's content_scope: no milestones unless milestones are
+        -- in scope, no reactions on items unless reactions are, no release
+        -- assets unless release_assets are, and so on. Topics and the
+        -- repository avatar are always fetched where the source has them.
+
+    @guarantee ContentOrder
+        -- Items arrive in stage order: topics, milestones, labels, releases,
+        -- issues (each batch followed by its comments), pull requests (each
+        -- batch followed by comments and reviews), repository-wide comments.
+        -- Labels and milestones therefore exist before the issues that
+        -- reference them, and issues before their comments.
+}
+
+-- What the core must provide to host the addon.
+surface CoreHostBoundary {
+    facing core: CoreHost
+
+    provides:
+        MigrationDequeued(migration)
+            when core.addon_installed
+
+    contracts:
+        demands ImportSink
+        demands ImportedIdentityResolver
+        demands OutboundFetchPolicy
+        demands BackgroundJobQueue
+
+    @guarantee BeingMigratedStatus
+        -- The core supports a repository status "being_migrated" that blocks
+        -- git transport and all pages except home/settings, shows the
+        -- addon's progress page on home, and leaves the repository visible
+        -- to those who could read it.
+
+    @guarantee GhostAndOriginalAuthor
+        -- The core's issues, comments, reviews, releases and reactions can
+        -- carry an original author name for content attributed to the ghost
+        -- placeholder, and render it as "originally by <name> on <source>".
+}
+
+-- `forgejo dump-repo` and `forgejo restore-repo`.
+surface RepositoryArchiveConsole {
+    facing operator: InstanceOperator
+
+    exposes:
+        for a in DumpArchives:
+            a.directory
+            a.status
+            a.contents
+
+    provides:
+        OperatorDumpsRepository(operator, request, directory)
+        OperatorRestoresRepository(operator, archive, owner, repo_name, selection)
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred SourceDownloader.get_issues    -- see: one adapter spec per source (services/migrations/<source>.go)
+deferred is_allowed_remote              -- see: OutboundFetchPolicy.AllowBlockSemantics

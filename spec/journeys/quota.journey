@@ -1,0 +1,336 @@
+-- Journeys through storage quota: administration, the gate, self-service.
+--
+-- Quota is off by default ([quota] ENABLED); these journeys run on an instance
+-- that turned it on, except the last two, which show what turning it off means.
+
+world {
+    cast:
+        root:  accounts/User
+        ada:   accounts/User
+        bob:   accounts/User
+        acct:  QuotaAccount
+    given:
+        quota/config.enabled = true
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+        ada.is_admin = false
+        ada.is_active = true
+        ada.prohibit_login = false
+        bob.is_admin = false
+        bob.is_active = true
+        bob.prohibit_login = false
+        acct.user = ada
+        acct.organization = null
+}
+
+journey AnAdminSetsUpAFreeTier {
+    goal: The site admin defines a 1 GiB limit on repository size, bundles it
+          into a "free" group and puts Ada in it.
+
+    1. she defines the rule
+        root does AdminCreatesQuotaRule(root, "repos-1g", 1_073_741_824, {size_repos_all}) on QuotaAdministration
+            creating rule: QuotaRule
+        then AdminCreatesQuotaRule fires
+        then rule.limit = 1_073_741_824
+
+    2. she creates an empty group
+        root does AdminCreatesQuotaGroup(root, "free", {}) on QuotaAdministration
+            creating group: QuotaGroup
+        then AdminCreatesQuotaGroup fires
+
+    3. she attaches the rule to the group
+        root does AdminAddsRuleToQuotaGroup(root, group, rule) on QuotaAdministration
+            creating link: QuotaGroupRule
+        then link.rule = rule
+
+    4. she assigns Ada to the group
+        root does AdminAddsHolderToQuotaGroup(root, group, acct) on QuotaAdministration
+            creating membership: QuotaGroupMembership
+        then membership.origin = admin_assigned
+        then membership.account = acct
+
+    ends: Ada's repositories are now limited to 1 GiB in total.
+}
+
+journey RuleNamesAreUnique {
+    goal: A second rule with an existing name is refused.
+
+    after: AnAdminSetsUpAFreeTier
+
+    1. she tries to reuse the name
+        root cannot do AdminCreatesQuotaRule(root, "repos-1g", 5, {size_all}) on QuotaAdministration
+
+    ends: The original rule is unchanged.
+}
+
+journey OnlySiteAdminsManageQuota {
+    goal: Ada, an ordinary user, cannot create quota rules or move herself into
+          a more generous group.
+
+    1. she tries to create a rule
+        ada cannot do AdminCreatesQuotaRule(ada, "unlimited", -1, {size_all}) on QuotaAdministration
+
+    ends: Quota is an administrator's decision.
+}
+
+journey APushOverQuotaIsRefused {
+    goal: Ada's repositories already use more than her limit allows. Her next
+          push is refused before anything is written.
+
+    1. the push asks the gate
+        stipulate quota_allows(acct, size_repos_all, null) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, size_repos_all, git_push, null) on QuotaGateReference
+
+    ends: Nothing was stored; she is told her quota is exceeded.
+}
+
+journey AnUploadUnderQuotaGoesThrough {
+    goal: Under her limit, an attachment upload in her repository is admitted.
+
+    1. the upload asks the gate
+        stipulate quota_allows(acct, size_assets_attachments_issues, 2_000_000) = true
+        ada does StorageConsumptionRequested(ada, acct, size_assets_attachments_issues, upload_issue_attachment, 2_000_000) on QuotaGateReference
+        then StorageConsumptionGated fires
+
+    ends: The attachment is stored and charged to the repository owner.
+}
+
+-- Package limits are quota rules (decision packages 6): the admin limits
+-- package storage with a rule on size:assets:packages:all, and the package
+-- registry's upload gate refuses once the owner is over it.
+journey PackageStorageIsLimitedByAQuotaRule {
+    goal: The site admin replaces the old per-owner package size limit with a
+          "packages-500m" rule in a group for Ada; over it, her package
+          upload is refused.
+
+    1. she defines the package rule inside a new group
+        root does AdminCreatesQuotaRule(root, "packages-500m", 524_288_000, {size_assets_packages_all}) on QuotaAdministration
+            creating rule: QuotaRule
+        then AdminCreatesQuotaRule fires
+        then rule.limit = 524_288_000
+
+    2. Ada's package upload over the limit is refused by the gate
+        stipulate quota_allows(acct, size_assets_packages_all, 10_000_000) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, size_assets_packages_all, upload_package, 10_000_000) on QuotaGateReference
+
+    3. a smaller one that fits under it is admitted
+        stipulate quota_allows(acct, size_assets_packages_all, 1_000_000) = true
+        ada does StorageConsumptionRequested(ada, acct, size_assets_packages_all, upload_package, 1_000_000) on QuotaGateReference
+        then StorageConsumptionGated fires
+
+    ends: Package storage is limited by quota alone; packages has no limits of
+          its own.
+}
+
+journey AdaChecksHerOwnStorage {
+    goal: Ada opens her storage overview and sees what she uses; Bob cannot see
+          Ada's figures.
+
+    1. she looks at her usage
+        ada sees acct.usage.all on OwnStorageOverview in acct
+
+    2. bob cannot look at hers
+        bob cannot see acct.usage.all on OwnStorageOverview in acct
+
+    ends: Storage figures are private to their holder (and admins).
+}
+
+journey DeletingARuleDetachesIt {
+    goal: The admin deletes the rule; the group survives without it.
+
+    after: AnAdminSetsUpAFreeTier
+
+    1. she deletes the rule
+        root does AdminDeletesQuotaRule(root, rule) on QuotaAdministration
+        then AdminDeletesQuotaRule fires
+        then link does not exist
+        then rule does not exist
+        then group exists
+
+    2. a subject no rule covers is allowed, so her push goes through
+        stipulate quota_allows(acct, size_repos_all, null) = true
+        ada does StorageConsumptionRequested(ada, acct, size_repos_all, git_push, null) on QuotaGateReference
+        then StorageConsumptionGated fires
+
+    ends: Ada's group no longer limits anything: only a rule that covers a subject
+          can deny it (decision quota 1; the journey used to say uncovered subjects
+          were denied).
+}
+
+journey AnAdminReplacesAdasGroups {
+    goal: The admin moves Ada from "free" to "supporter" in one step.
+
+    after: AnAdminSetsUpAFreeTier
+
+    1. she creates the supporter group
+        root does AdminCreatesQuotaGroup(root, "supporter", {}) on QuotaAdministration
+            creating supporter: QuotaGroup
+
+    2. she replaces Ada's groups
+        root does AdminSetsHolderQuotaGroups(root, acct, {supporter}) on QuotaAdministration
+        then AdminSetsHolderQuotaGroups fires
+        then membership does not exist
+
+    ends: Ada is governed by the supporter group only.
+}
+
+journey SignInGrantsAQuotaGroup {
+    goal: Ada comes back from an OAuth2 provider whose quota-group claim says
+          she is in "sponsors", which the source maps to the "supporter" quota
+          group. She links the identity to her account by signing in.
+          (decided: requests 6 — the quota-group claim arrives in its own event,
+          apart from the groups used for team mapping, of which she has none)
+
+    cast:
+        source:    authentication/AuthSource
+        supporter: QuotaGroup
+        s:         authentication/Session
+
+    given:
+        supporter.name = "supporter"
+        source.kind = oauth2
+        source.is_active = true
+        source.quota_group_map_removal = false
+        s.status = anonymous
+        pid: authentication/ExternalIdentity { source: source, external_id: "ada-sub" }
+        s.pending_external_identity = pid
+        ada.prohibit_login = false
+        login: authentication/UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+
+    1. she links the identity and authentication hands over her groups
+        stipulate s.pending_external_identity.groups = {}
+        stipulate s.pending_external_identity.quota_groups = {"sponsors"}
+        stipulate password_matches(ada, "correct horse battery") = true
+        stipulate login.has_second_factor = false
+        stipulate quota_groups_mapped_from(source, {"sponsors"}) = {supporter}
+        stipulate quota_groups_mapped_from_unclaimed(source, {"sponsors"}) = {}
+        stipulate teams_mapped_from(source, {}) = {}
+        stipulate teams_unmapped_from(source, ada, {}) = {}
+        stipulate is_numeric_id("ada-sub") = false
+        s does VisitorLinksPendingIdentityBySignIn(s, ada, "correct horse battery", false) on SignInPage
+            creating granted: QuotaGroupMembership
+        then VisitorLinksPendingIdentityBySignIn fires
+        then LoginSourceSyncsQuotaGroups fires
+        then granted.origin = login_source_sync
+        then granted.group = supporter
+
+    ends: Ada is in the supporter group because her identity provider says so.
+}
+
+journey AnUploadThatWouldOvershootIsRefused {
+    goal: Ada is 1 MB under her attachment limit. A 5 MB attachment would take her
+          past it, so it is refused before anything is stored; a 500 KB one fits
+          and goes through. The incoming size counts, not just what she uses now.
+
+    1. the 5 MB upload asks the gate with its size
+        stipulate quota_allows(acct, size_assets_attachments_issues, 5_000_000) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, size_assets_attachments_issues, upload_issue_attachment, 5_000_000) on QuotaGateReference
+        then StorageConsumptionGated does not fire
+
+    2. the 500 KB upload fits
+        stipulate quota_allows(acct, size_assets_attachments_issues, 500_000) = true
+        ada does StorageConsumptionRequested(ada, acct, size_assets_attachments_issues, upload_issue_attachment, 500_000) on QuotaGateReference
+        then StorageConsumptionGated fires
+
+    ends: No single upload takes Ada over her limit (decision quota 2).
+}
+
+journey AManualMirrorSyncIsGatedLikeAPush {
+    goal: Ada's pull mirror is over the git quota (repositories plus LFS plus
+          wikis). Her manual sync asks the gate on size:git:all, as a push does,
+          and is refused.
+
+    1. the sync asks the gate
+        stipulate quota_allows(acct, size_git_all, null) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, size_git_all, sync_mirror_manually, null) on QuotaGateReference
+
+    ends: A mirror cannot grow past the limit a push respects (decision quota 6).
+}
+
+journey WithQuotaOffThereIsNothingToManage {
+    goal: On an instance that never turned quota on, the site admin finds no
+          quota administration: creating a rule is refused.
+
+    given:
+        quota/config.enabled = false
+
+    1. she tries to define a rule
+        root cannot do AdminCreatesQuotaRule(root, "repos-1g", 1_073_741_824, {size_repos_all}) on QuotaAdministration
+        then AdminCreatesQuotaRule does not fire
+
+    ends: No rule exists; quota is not something this instance does.
+}
+
+journey WithQuotaOffNothingIsGated {
+    goal: With quota off, Ada's push is admitted even though her usage would
+          be over any limit, and she has no storage overview to look at.
+
+    given:
+        quota/config.enabled = false
+
+    1. the push asks the gate and goes through
+        stipulate quota_allows(acct, size_repos_all, null) = false
+        ada does StorageConsumptionRequested(ada, acct, size_repos_all, git_push, null) on QuotaGateReference
+        then StorageConsumptionGated fires
+
+    2. there is no storage overview
+        ada cannot see acct.usage.all on OwnStorageOverview in acct
+
+    ends: Nothing is measured against a limit while quota is off.
+}
+
+-- decided: follow-up 2 (quota gains count subjects next to the byte subjects)
+journey AnAdminLimitsHowManyRepositoriesAndPackagesAdaOwns {
+    goal: The site admin limits Ada to 3 repositories and 10 packages with
+          count rules. A rule mixing a count with bytes is refused. At her
+          repository limit, a fourth repository is refused by the gate; a new
+          package, still under its own limit, goes through.
+
+    1. she defines a repository-count rule
+        root does AdminCreatesQuotaRule(root, "repos-3", 3, {count_repos}) on QuotaAdministration
+            creating repos_rule: QuotaRule
+        then AdminCreatesQuotaRule fires
+        then repos_rule.limit = 3
+
+    2. and a package-count rule
+        root does AdminCreatesQuotaRule(root, "packages-10", 10, {count_packages}) on QuotaAdministration
+            creating pkg_rule: QuotaRule
+        then AdminCreatesQuotaRule fires
+
+    3. a rule mixing a count and a byte subject is refused
+        root cannot do AdminCreatesQuotaRule(root, "mixed", 3, {count_repos, size_repos_all}) on QuotaAdministration
+
+    4. at three repositories, creating a fourth is refused
+        stipulate quota_allows(acct, count_repos, 1) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, count_repos, create_repository, 1) on QuotaGateReference
+        then StorageConsumptionGated does not fire
+
+    5. a new package still fits under the package count
+        stipulate quota_allows(acct, count_packages, 1) = true
+        ada does StorageConsumptionRequested(ada, acct, count_packages, create_package, 1) on QuotaGateReference
+        then StorageConsumptionGated fires
+
+    ends: How many repositories and packages a holder owns is limited by
+          quota rules, alongside how many bytes they use.
+}
+
+-- decided: follow-up 2 (LIMIT_TOTAL_OWNER_COUNT restored as a default count rule)
+journey TheDefaultPackageVersionCountApplies {
+    goal: The operator sets the built-in package-version count to 100 (the
+          former LIMIT_TOTAL_OWNER_COUNT). Ada has no quota groups; at 100
+          versions her next version is refused.
+
+    given:
+        quota/config.default_package_versions = 100
+
+    1. the default count rule is in force
+        then quota/config.default_package_versions = 100
+
+    2. her 101st version is refused
+        stipulate quota_allows(acct, count_package_versions, 1) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, count_package_versions, create_package_version, 1) on QuotaGateReference
+
+    ends: Holders without groups are held to the instance's package-version
+          count, as LIMIT_TOTAL_OWNER_COUNT did.
+}

@@ -1,0 +1,578 @@
+-- Journeys through webhooks.allium: managing webhooks at each level, and
+-- following one delivery from the queue to its outcome and on to cleanup.
+
+world {
+    cast:
+        ada:   accounts/User
+        bob:   accounts/User
+        root:  accounts/User
+        cfg:   WebhookConfig
+    given:
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.is_admin = false
+        bob.is_active = true
+        bob.prohibit_login = false
+        bob.is_admin = false
+        root.is_active = true
+        root.prohibit_login = false
+        root.is_admin = true
+        cfg.kind = forgejo
+        cfg.target_url = "https://ci.example.com/hook"
+        cfg.http_method = post
+        cfg.content_type = json
+        cfg.secret = "s3cret"
+        cfg.authorization_header = "Bearer t0ken"
+        cfg.event_mode = push_only
+}
+
+-- Personal webhooks ------------------------------------------------------
+
+journey AdaAddsAPersonalWebhook {
+    goal: Ada wants her CI server told about pushes to any repository she
+          owns. She adds a personal webhook with a secret and an
+          Authorization header; her list shows where it points but never
+          shows either back (decided: webhooks 7, the header is write-only).
+
+    1. her settings are valid
+        stipulate cfg.is_valid = true
+
+    2. she adds the webhook in her user settings
+        ada does UserCreatesOwnWebhook(ada, cfg, true) on UserWebhookSettings
+            creating hook: Webhook
+        then UserCreatesOwnWebhook fires
+        then hook.scope = per_owner
+        then hook.owner_user = ada
+        then hook.is_active = true
+        then hook.last_status = none
+
+    3. the list shows the target, not the secret
+        ada sees hook.config.target_url on UserWebhookSettings
+        ada cannot see hook.config.secret on UserWebhookSettings
+        ada cannot see hook.config.authorization_header on UserWebhookSettings
+
+    ends: Ada has an active personal webhook; nothing about it leaks a credential.
+}
+
+journey BobCannotEditAdasWebhook {
+    goal: Bob found the id of Ada's personal webhook and tries to point it at
+          his own server. Only the owner may manage a personal webhook.
+
+    given:
+        hook: Webhook { scope: per_owner, owner_user: ada, config: cfg, is_active: true, needs_reauthorization: false, last_status: none }
+
+    1. his edit is refused
+        stipulate cfg.is_valid = true
+        bob cannot do ManagerEditsWebhook(bob, hook, cfg, true) on UserWebhookSettings
+
+    2. and he cannot delete it either
+        bob cannot do ManagerDeletesWebhook(bob, hook) on UserWebhookSettings
+
+    ends: Ada's webhook is untouched.
+}
+
+-- Instance-level webhooks -------------------------------------------------
+
+journey AdminAddsASystemWebhook {
+    goal: The site administrator wants an audit service to receive every
+          event on the instance, so she adds a system webhook.
+
+    1. the settings are valid
+        stipulate cfg.is_valid = true
+
+    2. she adds it from site administration
+        root does AdminCreatesSystemWebhook(root, cfg, true) on AdminWebhookSettings
+            creating hook: Webhook
+        then AdminCreatesSystemWebhook fires
+        then hook.scope = system
+        then hook.is_admin_level = true
+        then hook.is_active = true
+
+    3. it is listed among the instance's webhooks
+        root sees hook.config.target_url on AdminWebhookSettings
+
+    ends: Every event on the instance will now also reach the audit service.
+}
+
+journey OrdinaryUserCannotAddInstanceWebhooks {
+    goal: Bob is not a site administrator. Neither a system webhook nor a
+          default webhook is his to create.
+
+    1. the settings would be valid
+        stipulate cfg.is_valid = true
+
+    2. a system webhook is refused
+        bob cannot do AdminCreatesSystemWebhook(bob, cfg, true) on AdminWebhookSettings
+
+    3. so is a default webhook
+        bob cannot do AdminCreatesDefaultWebhook(bob, cfg, true) on AdminWebhookSettings
+
+    ends: Only site administrators shape instance-wide webhooks.
+}
+
+journey AdminAddsADefaultWebhook {
+    goal: The administrator wants every new repository to come with a
+          webhook to the company chat. A default webhook is a template: it is
+          stored but never fires itself.
+
+    1. the settings are valid
+        stipulate cfg.is_valid = true
+
+    2. she adds a default webhook
+        root does AdminCreatesDefaultWebhook(root, cfg, true) on AdminWebhookSettings
+            creating hook: Webhook
+        then AdminCreatesDefaultWebhook fires
+        then hook.scope = default
+        then hook.can_fire = false
+
+    ends: New repositories will each receive a copy of this webhook.
+}
+
+-- Repository and organization webhooks -------------------------------------
+
+journey RepoAdminAddsACiWebhook {
+    goal: Ada administers a repository and wants her CI told about every
+          push to it.
+
+    cast:
+        repo: repositories/Repository
+
+    1. she administers the repository
+        stipulate is_repo_admin(ada, repo) = true
+        stipulate cfg.is_valid = true
+
+    2. she adds a repository webhook
+        ada does RepoAdminCreatesWebhook(ada, repo, cfg, true) on RepoWebhookSettings
+            creating hook: Webhook
+        then RepoAdminCreatesWebhook fires
+        then hook.scope = per_repository
+        then hook.repository = repo
+
+    3. it shows in the repository's settings
+        ada sees hook.config.target_url on RepoWebhookSettings in repo
+
+    ends: Pushes to this repository will be announced to the CI server.
+}
+
+journey RepoWriterCannotAddWebhooks {
+    goal: Bob can push to the repository but does not administer it, so
+          webhook settings are closed to him.
+
+    cast:
+        repo: repositories/Repository
+
+    1. his attempt is refused
+        stipulate is_repo_admin(bob, repo) = false
+        stipulate cfg.is_valid = true
+        bob cannot do RepoAdminCreatesWebhook(bob, repo, cfg, true) on RepoWebhookSettings
+
+    ends: Only repository administrators manage repository webhooks.
+}
+
+journey OrgMemberCannotAddOrgWebhooks {
+    goal: Bob is a member of the organization but not an owner; the
+          organization's webhooks are for owners.
+
+    cast:
+        org: organizations/Organization
+
+    1. his attempt is refused
+        stipulate is_org_owner(org, bob) = false
+        stipulate cfg.is_valid = true
+        bob cannot do OrgOwnerCreatesWebhook(bob, org, cfg, true) on OrgWebhookSettings
+
+    ends: Organization webhooks stay with its owners.
+}
+
+-- A delivery's life ----------------------------------------------------------
+
+journey AdaRedeliversAndTheReceiverAccepts {
+    goal: Ada's CI was down when a push was announced. She redelivers the
+          failed delivery from the history; a fresh delivery is queued and
+          sent, the CI answers 200, and the webhook shows green again.
+
+    cast:
+        ci: ReceivingService
+
+    given:
+        ci.base_url = "https://ci.example.com"
+        hook: Webhook { scope: per_owner, owner_user: ada, config: cfg, is_active: true, needs_reauthorization: false, last_status: failed }
+        old: HookDelivery { webhook: hook, delivery_id: "d-1", event: push, payload: "{}", is_test: false, status: failed, sent_at: null, finished_at: null }
+
+    1. she redelivers it, and it is sent at once
+        stipulate host_allowed("external", "https://ci.example.com/hook") = true
+        ada does ManagerRedeliversDelivery(ada, old) on UserWebhookSettings
+            creating again: HookDelivery
+        then ManagerRedeliversDelivery fires
+        then DispatchQueuedDelivery fires
+        then again.event = push
+        then again.status = sending
+
+    2. the CI answers 200
+        ci does ReceiverResponds(again, 200, {}, "ok") on HookReceiverEndpoint
+        then ReceiverAnswers fires
+        then again.status = succeeded
+        then hook.last_status = succeeded
+
+    3. the old attempt stays in the history alongside the new one
+        then old.status = failed
+        ada sees again.status on UserWebhookSettings
+
+    ends: The event reached the CI server under a new delivery id.
+}
+
+journey AWeekLaterTheHistoryIsCleanedUp {
+    goal: Delivery history is kept for a week by default; the nightly
+          cleanup removes finished deliveries older than that.
+
+    after: AdaRedeliversAndTheReceiverAccepts
+
+    1. eight days pass
+        after 8.days
+        then CleanupDeliveriesOlderThan fires
+        then again does not exist
+
+    ends: Only recent history is kept.
+}
+
+journey ASlowReceiverTimesOut {
+    goal: The receiver takes longer than the delivery timeout to answer. A
+          timeout counts as a network error, so the delivery is retried with
+          backoff; after the third attempt also times out it is recorded as
+          failed (updated for decided webhooks 9: Forgejo never retried).
+
+    given:
+        hook: Webhook { scope: per_owner, owner_user: ada, config: cfg, is_active: true, needs_reauthorization: false, last_status: none }
+        old: HookDelivery { webhook: hook, delivery_id: "d-1", event: push, payload: "{}", is_test: false, status: succeeded, sent_at: null, finished_at: null }
+
+    1. a redelivery is sent
+        stipulate host_allowed("external", "https://ci.example.com/hook") = true
+        stipulate backoff_delay(10.seconds, 1) = 10.seconds
+        stipulate backoff_delay(10.seconds, 2) = 20.seconds
+        ada does ManagerRedeliversDelivery(ada, old) on UserWebhookSettings
+            creating again: HookDelivery
+        then again.status = sending
+
+        then again.attempts = 1
+
+    2. no answer within the timeout: a retry is scheduled
+        after 6.seconds
+        then DeliveryTimesOut fires
+        then again.status = retrying
+        then hook.last_status = none
+
+    3. after the backoff the second attempt is sent
+        after 10.seconds
+        then RetryDeliveryAfterBackoff fires
+        then again.status = sending
+        then again.attempts = 2
+
+    4. it times out too
+        after 6.seconds
+        then again.status = retrying
+
+    5. the wait doubles before the third attempt
+        after 20.seconds
+        then again.status = sending
+        then again.attempts = 3
+
+    6. the last attempt times out and the delivery fails
+        after 6.seconds
+        then DeliveryTimesOut fires
+        then again.status = failed
+        then hook.last_status = failed
+
+    ends: Three attempts were made under one delivery id; only a manual
+          redelivery would try again.
+}
+
+journey AnInactiveWebhookSendsNothing {
+    goal: Ada paused her webhook. No delivery is created for it at all: a
+          redelivery or a test is refused, and its last status stays as it
+          was (updated for decided webhooks 1: Forgejo recorded a skipped
+          delivery and marked the webhook failed).
+
+    given:
+        hook: Webhook { scope: per_owner, owner_user: ada, config: cfg, is_active: false, needs_reauthorization: false, last_status: succeeded }
+        old: HookDelivery { webhook: hook, delivery_id: "d-1", event: push, payload: "{}", is_test: false, status: succeeded, sent_at: null, finished_at: null }
+
+    1. redelivering is refused
+        ada cannot do ManagerRedeliversDelivery(ada, old) on UserWebhookSettings
+
+    2. so is a test
+        ada cannot do ManagerTestsWebhook(ada, hook) on UserWebhookSettings
+        then hook.last_status = succeeded
+
+    ends: An inactive webhook never contacts its receiver and keeps its status.
+}
+
+journey AnInternalAddressIsRefused {
+    goal: Bob points his personal webhook at an address inside the server's
+          network. The host allow-list (external hosts only, by default)
+          refuses it, and the delivery fails without a request being made.
+
+    given:
+        bobcfg: WebhookConfig { kind: forgejo, target_url: "http://10.0.0.5/admin", http_method: post, content_type: json, event_mode: push_only }
+        hook: Webhook { scope: per_owner, owner_user: bob, config: bobcfg, is_active: true, needs_reauthorization: false, last_status: none }
+        old: HookDelivery { webhook: hook, delivery_id: "d-9", event: push, payload: "{}", is_test: false, status: succeeded, sent_at: null, finished_at: null }
+
+    1. the redelivery is refused at the gate
+        stipulate host_allowed("external", "http://10.0.0.5/admin") = false
+        bob does ManagerRedeliversDelivery(bob, old) on UserWebhookSettings
+            creating again: HookDelivery
+        then DispatchQueuedDelivery fires
+        then again.status = failed
+        then hook.last_status = failed
+
+    ends: Webhooks cannot be used to probe the server's private network.
+}
+
+journey DeletingAWebhookDropsItsHistory {
+    goal: Ada no longer uses the CI server; deleting the webhook removes it
+          and every delivery it made.
+
+    given:
+        hook: Webhook { scope: per_owner, owner_user: ada, config: cfg, is_active: true, needs_reauthorization: false, last_status: succeeded }
+        old: HookDelivery { webhook: hook, delivery_id: "d-1", event: push, payload: "{}", is_test: false, status: succeeded, sent_at: null, finished_at: null }
+
+    1. she deletes it
+        ada does ManagerDeletesWebhook(ada, hook) on UserWebhookSettings
+        then ManagerDeletesWebhook fires
+        then hook does not exist
+        then old does not exist
+
+    ends: Nothing of the webhook remains.
+}
+
+-- Retries ------------------------------------------------------------------
+
+journey AFlakyReceiverIsRetried {
+    goal: Ada's CI answers 503 while it restarts. The delivery is retried,
+          once the backoff has passed, under the same delivery id, and the
+          CI then accepts it (decided: webhooks 9).
+
+    cast:
+        ci: ReceivingService
+
+    given:
+        ci.base_url = "https://ci.example.com"
+        hook: Webhook { scope: per_owner, owner_user: ada, config: cfg, is_active: true, needs_reauthorization: false, last_status: none }
+        old: HookDelivery { webhook: hook, delivery_id: "d-1", event: push, payload: "{}", is_test: false, status: failed, sent_at: null, finished_at: null }
+
+    1. the redelivery is sent
+        stipulate host_allowed("external", "https://ci.example.com/hook") = true
+        stipulate backoff_delay(10.seconds, 1) = 10.seconds
+        ada does ManagerRedeliversDelivery(ada, old) on UserWebhookSettings
+            creating again: HookDelivery
+        then again.status = sending
+
+    2. the CI answers 503: a retry is scheduled
+        ci does ReceiverResponds(again, 503, {}, "restarting") on HookReceiverEndpoint
+        then ReceiverAnswers fires
+        then again.status = retrying
+        then hook.last_status = none
+
+    3. the second attempt is sent after the backoff
+        after 10.seconds
+        then RetryDeliveryAfterBackoff fires
+        then again.status = sending
+
+    4. and accepted
+        ci does ReceiverResponds(again, 200, {}, "ok") on HookReceiverEndpoint
+        then again.status = succeeded
+        then again.attempts = 2
+        then hook.last_status = succeeded
+
+    ends: A short outage of the receiver loses nothing.
+}
+
+journey AClientErrorIsNotRetried {
+    goal: The receiver answers 404: the address is wrong, so trying again
+          would not help. The delivery fails at once (decided: webhooks 9,
+          only network errors and 5xx answers are retried).
+
+    cast:
+        ci: ReceivingService
+
+    given:
+        ci.base_url = "https://ci.example.com"
+        hook: Webhook { scope: per_owner, owner_user: ada, config: cfg, is_active: true, needs_reauthorization: false, last_status: none }
+        old: HookDelivery { webhook: hook, delivery_id: "d-1", event: push, payload: "{}", is_test: false, status: failed, sent_at: null, finished_at: null }
+
+    1. the redelivery is answered 404
+        stipulate host_allowed("external", "https://ci.example.com/hook") = true
+        ada does ManagerRedeliversDelivery(ada, old) on UserWebhookSettings
+            creating again: HookDelivery
+        ci does ReceiverResponds(again, 404, {}, "not found") on HookReceiverEndpoint
+        then again.status = failed
+        then hook.last_status = failed
+
+    ends: Only failures that may pass are retried.
+}
+
+-- Test deliveries at every level ------------------------------------------
+
+journey AdaTestsHerPersonalWebhook {
+    goal: Ada wants to check her personal webhook reaches her CI. Testing is
+          offered at every level, not only for repository webhooks
+          (decided: webhooks 11). Bob may not test her webhook.
+
+    given:
+        hook: Webhook { scope: per_owner, owner_user: ada, config: cfg, is_active: true, needs_reauthorization: false, last_status: none }
+
+    1. Bob is refused
+        bob cannot do ManagerTestsWebhook(bob, hook) on UserWebhookSettings
+
+    2. Ada sends a test delivery
+        stipulate host_allowed("external", "https://ci.example.com/hook") = true
+        ada does ManagerTestsWebhook(ada, hook) on UserWebhookSettings
+            creating probe: HookDelivery
+        then ManagerTestsWebhook fires
+        then probe.is_test = true
+        then probe.event = push
+        then probe.status = sending
+
+    ends: Her webhook has been exercised without a real push.
+}
+
+journey AdminTestsASystemWebhook {
+    goal: The administrator tests the instance's audit webhook.
+
+    given:
+        hook: Webhook { scope: system, config: cfg, is_active: true, needs_reauthorization: false, last_status: none }
+
+    1. a test delivery is queued and sent
+        stipulate host_allowed("external", "https://ci.example.com/hook") = true
+        root does ManagerTestsWebhook(root, hook) on AdminWebhookSettings
+            creating probe: HookDelivery
+        then probe.is_test = true
+        then probe.status = sending
+
+    2. Bob cannot test it
+        bob cannot do ManagerTestsWebhook(bob, hook) on AdminWebhookSettings
+
+    ends: System webhooks can be checked like any other.
+}
+
+-- The instance-wide delivery log ------------------------------------------
+
+journey AdminBrowsesEveryDelivery {
+    goal: A repository's webhook keeps failing. The administrator finds its
+          deliveries in the instance-wide delivery log, which lists every
+          webhook's deliveries, not only system ones (decided: webhooks 8).
+
+    cast:
+        repo: repositories/Repository
+
+    given:
+        hook: Webhook { scope: per_repository, repository: repo, config: cfg, is_active: true, needs_reauthorization: false, last_status: failed }
+        old: HookDelivery { webhook: hook, delivery_id: "d-7", event: push, payload: "{}", is_test: false, status: failed, sent_at: null, finished_at: null }
+
+    1. she sees the repository webhook's delivery in the log
+        root sees old.status on InstanceDeliveryLog
+        root sees old.webhook on InstanceDeliveryLog
+
+    ends: Delivery problems anywhere on the instance are visible to the admin.
+}
+
+-- Copies of default webhooks -----------------------------------------------
+
+journey ACopiedWebhookMustBeReauthorised {
+    goal: A repository received a copy of a default webhook that carried an
+          Authorization header. The header is not copied, so the copy does
+          not fire, nor can Ada test it, until a manager re-authorises it by
+          editing it (decided: webhooks 5).
+
+    cast:
+        repo: repositories/Repository
+
+    given:
+        hook: Webhook { scope: per_repository, repository: repo, config: cfg, is_active: true, needs_reauthorization: true, last_status: none }
+
+    1. the copy cannot fire, nor be tested
+        then hook.can_fire = false
+        stipulate is_repo_admin(ada, repo) = true
+        ada cannot do ManagerTestsWebhook(ada, hook) on RepoWebhookSettings
+
+    ends: A credential is never handed silently to a new repository.
+}
+
+-- Kinds offer only the events they can render --------------------------------
+
+journey SourcehutBuildsCannotChooseIssueEvents {
+    goal: Ada sets up a SourceHut builds hook and tries to tick issue events.
+          The form offers only the events the kind can render, so such a
+          configuration is not valid (decided: webhooks 2).
+
+    cast:
+        shcfg: WebhookConfig
+
+    given:
+        shcfg.kind = sourcehut_builds
+        shcfg.target_url = "https://builds.sr.ht/query"
+        shcfg.http_method = post
+        shcfg.content_type = json
+        shcfg.authorization_header = "Bearer t0ken"
+        shcfg.event_mode = choose_events
+        shcfg.chosen_events = {issues}
+
+    1. the configuration is refused
+        stipulate kind_supports_choice(sourcehut_builds, issues) = false
+        then shcfg.is_valid = false
+        ada cannot do UserCreatesOwnWebhook(ada, shcfg, true) on UserWebhookSettings
+
+    ends: No hook is stored that could never deliver its events.
+}
+
+-- Owners going away -----------------------------------------------------------
+
+journey ADeletedAccountTakesItsWebhooks {
+    goal: Ada deletes her account. Her personal webhooks go with it, along
+          with their delivery history (decided: webhooks 6; Forgejo left them
+          behind).
+
+    given:
+        ada.kind = individual
+        hook: Webhook { scope: per_owner, owner_user: ada, config: cfg, is_active: true, needs_reauthorization: false, last_status: succeeded }
+        old: HookDelivery { webhook: hook, delivery_id: "d-1", event: push, payload: "{}", is_test: false, status: succeeded, sent_at: null, finished_at: null }
+
+    1. she deletes her account
+        stipulate accounts/deletion_disabled_for(ada) = false
+        stipulate accounts/owns_packages(ada) = false
+        stipulate accounts/owns_repositories(ada) = false
+        stipulate accounts/belongs_to_organizations(ada) = false
+        stipulate password_matches(ada, "my password") = true
+        ada does UserDeletesOwnAccount(ada, "my password") on OwnAccountSettings
+        then RemoveWebhooksOfDeletedUser fires
+        then hook does not exist
+        then old does not exist
+
+    ends: Nothing of Ada's webhooks outlives her account.
+}
+
+-- Read-only mode freezes repository, organisation and user webhooks; the
+-- site administration console keeps working.
+-- decided: administration 3
+journey ReadOnlyModeFreezesRepositoryWebhooks {
+    goal: During maintenance Ada cannot add a webhook to the repository she
+          administers, while the site admin can still add a system webhook.
+
+    cast:
+        gate: access/InstanceWriteGate
+        repo: repositories/Repository
+    given:
+        gate.read_only = true
+
+    1. ada's repository webhook is refused
+        stipulate is_repo_admin(ada, repo) = true
+        stipulate cfg.is_valid = true
+        ada cannot do RepoAdminCreatesWebhook(ada, repo, cfg, true) on RepoWebhookSettings
+
+    2. the admin console still adds a system webhook
+        root does AdminCreatesSystemWebhook(root, cfg, true) on AdminWebhookSettings
+            creating hook: Webhook
+        then AdminCreatesSystemWebhook fires
+        then hook.scope = system
+
+    ends: Only the admin console changed anything.
+}

@@ -1,0 +1,996 @@
+-- Journeys through Forgejo Actions: dispatching and running a workflow,
+-- runners registering and picking work, maintainers gating fork pull
+-- requests, secrets staying secret, and the clean-up the clock performs.
+--
+-- Notes for readers of the report: permissions are black-box policies
+-- (can_read_actions, can_write_actions, is_repo_admin,
+-- may_manage_actions_scope, may_delegate_actions_trust) and are stated with
+-- `stipulate`. Collections (labels, needs, runs_on) are stipulated where a
+-- step needs them. The repository's Actions unit is a cast RepoUnit in the
+-- world, so every journey here runs with Actions enabled.
+
+world {
+    cast:
+        ada:        accounts/User
+        repo:       repositories/Repository
+        site:       ActionsScope
+        repo_scope: ActionsScope
+        actions_unit: repositories/RepoUnit
+    given:
+        actions_unit.repository = repo
+        actions_unit.kind = actions
+        actions_unit.enabled = true
+        repo.is_archived = false
+        repo.is_empty = false
+        repo.default_branch = "main"
+        repo.owner_user = ada
+        repo.owner_org = null
+        site.kind = instance
+        site.owner_user = null
+        site.owner_org = null
+        site.repository = null
+        repo_scope.kind = repository
+        repo_scope.repository = repo
+        repo_scope.owner_user = null
+        repo_scope.owner_org = null
+}
+
+-- The everyday path: somebody presses "Run workflow", a runner picks the
+-- job up, reports success, and the run turns green.
+journey ADispatchedWorkflowRunsToSuccess {
+    goal: Ada dispatches a workflow by hand; an instance runner with the
+          right label takes its only job, runs it and reports success; the
+          run follows its job to success.
+
+    cast:
+        build:  Workflow
+        runner: Runner
+        job:    Job
+
+    given:
+        build.repository = repo
+        build.file_name = "build.yml"
+        build.directory = ".forgejo/workflows"
+        build.has_dispatch_trigger = true
+        build.is_disabled = false
+        runner.scope = site
+        runner.is_ephemeral = false
+        runner.has_taken_task = false
+        runner.token = "runner-secret"
+
+    1. she dispatches the workflow on main
+        stipulate can_read_actions(ada, repo) = true
+        stipulate can_write_actions(ada, repo) = true
+        stipulate ref_exists(repo, "refs/heads/main") = true
+        stipulate ref_commit(repo, "refs/heads/main") = "c0ffee"
+        stipulate required_inputs_present(build, {}) = true
+        stipulate concurrency_mode_for_dispatch(build, {}) = unlimited
+        stipulate job_definitions(repo, "build.yml", "c0ffee") = {}
+        stipulate consistency_problem(repo, "build.yml", "c0ffee") = null
+        ada does UserDispatchesWorkflowRun(ada, build, "refs/heads/main", {}) on RepositoryWorkflows
+            creating run: WorkflowRun
+        then UserDispatchesWorkflow fires
+        then run.status = waiting
+        then run.trigger_user = ada
+        then run.event = workflow_dispatch
+        then run.commit_sha = "c0ffee"
+        then run.jobs_expanded = false
+
+    2. its job graph is materialised
+        -- An `after` cannot name what it creates, so the run's one job is the
+        -- cast `job`, described here rather than parsed from the workflow.
+        stipulate job.run = run
+        stipulate job.status = waiting
+        stipulate job.attempt = 1
+        stipulate job.is_assigned = false
+        stipulate job.needs = {}
+        stipulate job.runs_on = {"docker"}
+        stipulate job.oidc_requested = false
+        stipulate job.is_incomplete = false
+        stipulate job.status_changed_at = now
+        stipulate run.aggregated_status = waiting
+        after 1.second
+        then ExpandRunIntoJobs fires
+        then run.jobs_expanded = true
+
+    3. a runner carrying the docker label takes the run's job
+        stipulate runner.labels = {"docker", "amd64"}
+        stipulate blocked_by_concurrency_group(run) = false
+        runner does RunnerFetchesTask(runner, job, null) on RunnerService
+            creating task: Task
+        then RunnerFetchesTask fires
+        then task.status = running
+        then task.runner = runner
+        then task.attempt = 1
+        then job.status = running
+        then job.is_assigned = true
+        then runner.is_busy = true
+
+    4. the runner reports success
+        runner does RunnerReportsTaskResult(runner, task, success) on RunnerService
+        then RunnerReportsResult fires
+        then task.status = success
+        then job.status = success
+        then runner.is_busy = false
+
+    5. the run follows its job
+        stipulate run.aggregated_status = success
+        stipulate run.status_is_stale = true
+        after 1.second
+        then RunStatusFollowsJobs fires
+        then run.status = success
+        ada sees run.status on WorkflowRunPage in run
+        ada sees job.status on WorkflowRunPage in run
+
+    ends: The run is green, the runner is free again, and the job carries a
+          finished task whose logs are kept for the retention period.
+}
+
+-- A reader can watch runs but not steer them.
+journey AReaderCannotCancelOrDispatch {
+    goal: Bob can read the Actions tab of the repository but has no write
+          access to it; he can see a running run but neither cancel it nor
+          dispatch a new one.
+
+    cast:
+        bob:   accounts/User
+        run:   WorkflowRun
+        build: Workflow
+
+    given:
+        run.repository = repo
+        run.jobs_expanded = true
+        run.pre_execution_error = null
+        run.status = running
+        build.repository = repo
+        build.has_dispatch_trigger = true
+        build.is_disabled = false
+
+    1. he looks at the run
+        stipulate can_read_actions(bob, repo) = true
+        stipulate can_write_actions(bob, repo) = false
+        bob sees run.status on WorkflowRunPage in run
+
+    2. he tries to cancel it
+        bob cannot do UserCancelsWorkflowRun(bob, run) on WorkflowRunPage
+
+    3. he tries to dispatch a new one
+        stipulate ref_exists(repo, "refs/heads/main") = true
+        bob cannot do UserDispatchesWorkflowRun(bob, build, "refs/heads/main", {}) on RepositoryWorkflows
+
+    ends: Nothing changed; the run is still running.
+}
+
+-- A run still in progress cannot be re-run, even by a writer; once it is
+-- finished it can.
+journey ARunningRunCannotBeRerunUntilItFinishes {
+    goal: Ada wants to re-run a run that has not finished yet; that is
+          refused. After she cancels it, the re-run goes through and starts
+          a second attempt.
+
+    cast:
+        run: WorkflowRun
+        job: Job
+
+    given:
+        run.repository = repo
+        run.status = running
+        run.event = workflow_dispatch
+        run.attempt = 1
+        run.workflow_file = "build.yml"
+        run.pre_execution_error = null
+        run.needs_approval = false
+        run.prioritized = false
+        run.jobs_expanded = true
+        run.previous_attempts_duration = 0.seconds
+        job.run = run
+        job.status = waiting
+        job.attempt = 1
+        job.is_assigned = false
+        job.is_incomplete = false
+
+    1. the re-run is refused while it runs
+        stipulate job.needs = {}
+        stipulate can_read_actions(ada, repo) = true
+        stipulate can_write_actions(ada, repo) = true
+        stipulate workflow_disabled(repo, "build.yml") = false
+        ada cannot do UserRerunsWorkflowRun(ada, run) on WorkflowRunPage
+
+    2. she cancels it instead
+        ada does UserCancelsWorkflowRun(ada, run) on WorkflowRunPage
+        then UserCancelsRun fires
+        then KillRun fires
+        then job.status = cancelled
+
+    3. the run follows its cancelled job
+        stipulate run.aggregated_status = cancelled
+        stipulate run.status_is_stale = true
+        after 1.second
+        then RunStatusFollowsJobs fires
+        then run.status = cancelled
+
+    4. now the re-run starts a second attempt
+        stipulate run.status_is_stale = false
+        stipulate run_duration(run) = 0.seconds
+        ada does UserRerunsWorkflowRun(ada, run) on WorkflowRunPage
+        then UserRerunsRun fires
+        then run.status = waiting
+        then run.attempt = 2
+        then job.attempt = 2
+        then job.status = waiting
+        then job.is_assigned = false
+
+    ends: The run is on its second attempt with its job waiting again.
+}
+
+-- A runner joins with the scope's registration token, and a runner without
+-- the requested label is never given the job.
+journey ARunnerRegistersAndOnlyGetsJobsItCanRun {
+    goal: A machine registers into the repository with the token shown in
+          the settings; a runner that lacks the label a job asks for is not
+          given that job.
+
+    cast:
+        token:   RunnerRegistrationToken
+        runner:  Runner
+        run:     WorkflowRun
+        gpu_job: Job
+
+    given:
+        token.scope = repo_scope
+        token.is_active = true
+        token.created_at = now
+        runner.scope = repo_scope
+        runner.is_ephemeral = false
+        runner.has_taken_task = false
+        runner.token = "runner-secret"
+        run.repository = repo
+        run.jobs_expanded = true
+        run.pre_execution_error = null
+        gpu_job.run = run
+        gpu_job.status = waiting
+        gpu_job.attempt = 1
+        gpu_job.is_assigned = false
+
+    1. the agent registers with the active token
+        token does RunnerRegistersWithToken(token, "builder-1", {"docker"}, "v12.0.0", false) on RunnerRegistration
+            creating registered: Runner
+        then RunnerRegisters fires
+        then registered.scope = repo_scope
+        then registered.name = "builder-1"
+        then registered.is_ephemeral = false
+
+    2. a runner without the gpu label cannot take the gpu job
+        stipulate runner.labels = {"docker"}
+        stipulate gpu_job.runs_on = {"gpu"}
+        stipulate blocked_by_concurrency_group(run) = false
+        runner cannot do RunnerFetchesTask(runner, gpu_job, null) on RunnerService
+
+    ends: The new runner is registered in the repository scope; the gpu job
+          keeps waiting for a runner that carries the gpu label.
+}
+
+-- Rotating the registration token invalidates the old one.
+journey RotatingTheRegistrationToken {
+    goal: Ada, a repository admin, resets the registration token; an agent
+          still holding the old token can no longer register. Bob, who is not
+          an admin, cannot reset it.
+
+    cast:
+        bob:       accounts/User
+        old_token: RunnerRegistrationToken
+
+    given:
+        old_token.scope = repo_scope
+        old_token.is_active = true
+        old_token.created_at = now
+
+    1. bob is not allowed to reset it
+        stipulate may_manage_actions_scope(bob, repo_scope) = false
+        bob cannot do UserRequestsNewRegistrationToken(bob, repo_scope) on ActionsSettings
+
+    2. ada resets the token
+        stipulate may_manage_actions_scope(ada, repo_scope) = true
+        ada does UserRequestsNewRegistrationToken(ada, repo_scope) on ActionsSettings
+            creating fresh: RunnerRegistrationToken
+        then UserResetsRegistrationToken fires
+        then old_token.is_active = false
+        then fresh.is_active = true
+        ada sees fresh.token on ActionsSettings in repo_scope
+
+    3. the old token is refused
+        old_token cannot do RunnerRegistersWithToken(old_token, "late", {"docker"}, "v12.0.0", false) on RunnerRegistration
+
+    ends: Only the fresh token registers runners into the repository.
+}
+
+-- An ephemeral runner does one job and is gone.
+journey AnEphemeralRunnerRunsOneJob {
+    goal: An ephemeral runner picks one job and is deleted as soon as it
+          reports the result.
+
+    cast:
+        runner: Runner
+        run:    WorkflowRun
+        job:    Job
+
+    given:
+        runner.scope = site
+        runner.is_ephemeral = true
+        runner.has_taken_task = false
+        runner.token = "one-shot"
+        run.repository = repo
+        run.started_at = null
+        run.jobs_expanded = true
+        run.pre_execution_error = null
+        run.event = workflow_dispatch
+        run.is_fork_pull_request = false
+        job.run = run
+        job.status = waiting
+        job.attempt = 1
+        job.is_assigned = false
+        job.oidc_requested = false
+        job.is_incomplete = false
+
+    1. it takes the job
+        stipulate runner.labels = {"docker"}
+        stipulate job.runs_on = {"docker"}
+        stipulate blocked_by_concurrency_group(run) = false
+        runner does RunnerFetchesTask(runner, job, null) on RunnerService
+            creating task: Task
+        then task.status = running
+        then runner.has_taken_task = true
+
+    2. it reports failure and disappears
+        runner does RunnerReportsTaskResult(runner, task, failure) on RunnerService
+        then task.status = failure
+        then job.status = failure
+        then runner does not exist
+
+    ends: The job failed; the ephemeral runner no longer exists.
+}
+
+-- A fork pull request from an untrusted contributor waits for approval.
+journey AMaintainerApprovesAForkPullRequestRun {
+    goal: Carl, who has never contributed, opens a pull request from his
+          fork. Its run waits for approval; Carl cannot approve it himself;
+          Ada approves it once and the job becomes waiting for a runner.
+
+    cast:
+        carl: accounts/User
+        pr:   pulls/PullRequest
+        run:  WorkflowRun
+        job:  Job
+
+    given:
+        pr.base_repository = repo
+        run.repository = repo
+        run.jobs_expanded = true
+        run.pre_execution_error = null
+        run.event = pull_request
+        run.pull_request = pr
+        run.pull_request_poster = carl
+        run.is_fork_pull_request = true
+        run.needs_approval = true
+        run.status = blocked
+        job.run = run
+        job.status = blocked
+        job.is_incomplete = false
+
+    1. carl cannot approve his own run
+        stipulate job.needs = {}
+        stipulate may_delegate_actions_trust(carl, repo) = false
+        carl cannot do UserApprovesPullRequestRunsOnce(carl, pr) on PullRequestActionsTrust
+
+    2. ada approves it once
+        stipulate may_delegate_actions_trust(ada, repo) = true
+        -- The job's waiting status is reported on the pull request's head
+        -- commit, which exists.
+        stipulate status_commit(run) = "f00d"
+        stipulate commit_exists(repo, "f00d") = true
+        stipulate full_sha(repo, "f00d") = "f00d"
+        ada does UserApprovesPullRequestRunsOnce(ada, pr) on PullRequestActionsTrust
+        then UserApprovesPullRequestRuns fires
+        then ApproveRun fires
+        then ReportJobCommitStatusOnChange fires
+        then run.needs_approval = false
+        then run.approved_by = ada
+        then job.status = waiting
+
+    ends: The fork's run proceeds; Carl is not trusted for future pull requests.
+}
+
+-- Secrets are write-only.
+journey SecretsAreSetButNeverShown {
+    goal: Ada adds a repository secret. The settings page lists its name;
+          nobody, including Ada, is shown its value. Bob, who does not
+          administer the repository, cannot add one.
+
+    cast:
+        bob: accounts/User
+
+    1. she adds a secret
+        stipulate may_manage_actions_scope(ada, repo_scope) = true
+        stipulate valid_secret_name("deploy_key") = true
+        stipulate existing_secret(repo_scope, "deploy_key") = null
+        stipulate upper("deploy_key") = "DEPLOY_KEY"
+        ada does UserSetsActionsSecret(ada, repo_scope, "deploy_key", "s3cr3t") on ActionsSettings
+            creating secret: Secret
+        then UserSetsSecret fires
+        then secret.scope = repo_scope
+        then secret.name = "DEPLOY_KEY"
+
+    2. she sees its name but never its value
+        ada sees secret.name on ActionsSettings in repo_scope
+        ada cannot see secret.value on ActionsSettings in repo_scope
+
+    3. bob cannot add secrets here
+        stipulate may_manage_actions_scope(bob, repo_scope) = false
+        bob cannot do UserSetsActionsSecret(bob, repo_scope, "other", "x") on ActionsSettings
+
+    ends: The secret exists, readable only by jobs of this repository.
+}
+
+-- Instance-wide secrets do not exist.
+journey NoInstanceWideSecrets {
+    goal: A site administrator tries to create a secret for the whole
+          instance; that is refused, while an instance variable is accepted.
+
+    cast:
+        root: accounts/User
+
+    1. the instance secret is refused
+        stipulate may_manage_actions_scope(root, site) = true
+        stipulate valid_secret_name("token") = true
+        root cannot do UserSetsActionsSecret(root, site, "token", "x") on ActionsSettings
+
+    2. an instance variable is fine
+        stipulate valid_variable_name("registry") = true
+        stipulate existing_variable(site, "registry") = null
+        root does UserCreatesActionsVariable(root, site, "registry", "registry.example.org") on ActionsSettings
+            creating variable: Variable
+        then UserCreatesVariable fires
+        then variable.scope = site
+        then variable.value = "registry.example.org"
+        root sees variable.value on ActionsSettings in site
+
+    ends: Instance-wide configuration is possible only as plain variables.
+}
+
+-- A task that stops talking is failed by the clock.
+journey ASilentTaskBecomesAZombie {
+    goal: A runner takes a job and then vanishes without reporting. After
+          the zombie timeout the task and its job fail.
+
+    cast:
+        runner: Runner
+        run:    WorkflowRun
+        job:    Job
+
+    given:
+        runner.scope = site
+        runner.is_ephemeral = false
+        runner.has_taken_task = false
+        runner.token = "runner-secret"
+        run.repository = repo
+        run.event = workflow_dispatch
+        run.is_fork_pull_request = false
+        run.started_at = null
+        run.jobs_expanded = true
+        run.pre_execution_error = null
+        run.needs_approval = false
+        job.run = run
+        job.status = waiting
+        job.attempt = 1
+        job.is_assigned = false
+        job.oidc_requested = false
+        job.is_incomplete = false
+
+    1. the runner takes the job
+        stipulate runner.labels = {"docker"}
+        stipulate job.runs_on = {"docker"}
+        stipulate blocked_by_concurrency_group(run) = false
+        stipulate run.status_is_stale = false
+        runner does RunnerFetchesTask(runner, job, null) on RunnerService
+            creating task: Task
+        then task.status = running
+
+    2. five minutes of silence is not yet a zombie
+        after 5.minutes
+        then task.status = running
+
+    3. after ten minutes it is
+        after 6.minutes
+        then ZombieTaskFails fires
+        then TimedOutTaskFailsItsJob fires
+        then task.status = failure
+        then job.status = failure
+
+    ends: The job failed with a timed-out task; the run fails with it.
+}
+
+-- Artifacts expire on their own.
+journey AnArtifactExpires {
+    goal: A job uploads an artifact with the default retention; after 90
+          days it is no longer downloadable, and its size is no longer
+          shown, but it is still listed as expired.
+
+    cast:
+        runner: Runner
+        run:    WorkflowRun
+        job:    Job
+        task:   Task
+
+    given:
+        runner.scope = site
+        runner.is_ephemeral = false
+        runner.token = "runner-secret"
+        run.repository = repo
+        run.event = workflow_dispatch
+        run.is_fork_pull_request = false
+        run.needs_approval = false
+        run.jobs_expanded = true
+        run.pre_execution_error = null
+        job.run = run
+        job.status = running
+        job.status_changed_at = now
+        task.job = job
+        task.runner = runner
+        task.status = running
+        task.started_at = now
+        task.last_activity_at = now
+        task.stopped_at = null
+        task.log_archived = false
+        task.log_expired = false
+
+    1. the job uploads and finalises an artifact, then finishes
+        stipulate quota_allows_artifacts(repo) = true
+        task does TaskCreatesArtifact(task, "dist") on RunningJobCapabilities
+            creating artifact: Artifact
+        then TaskCreatesArtifact fires
+        then artifact.status = upload_pending
+        task does TaskFinalizesArtifact(task, artifact, 2048) on RunningJobCapabilities
+        then artifact.status = upload_confirmed
+        then artifact.run = run
+        then artifact.size = 2048
+        runner does RunnerReportsTaskResult(runner, task, success) on RunnerService
+        then task.status = success
+        then job.status = success
+
+    2. eighty-nine days later it is still there
+        after 89.days
+        then artifact.status = upload_confirmed
+
+    3. on day ninety it expires
+        after 2.days
+        then ArtifactExpires fires
+        then artifact.status = expired
+        ada cannot see artifact.size on WorkflowRunPage in run
+
+    ends: The artifact's content is gone; the run lists it as expired.
+}
+
+-- A cron schedule starts runs by itself.
+journey AScheduleFires {
+    goal: A scheduled workflow registered from the default branch fires when
+          its next occurrence arrives, starting a run as the Actions bot.
+
+    cast:
+        schedule: Schedule
+        spec:     ScheduleSpec
+        bot:      accounts/User
+
+    given:
+        schedule.repository = repo
+        schedule.workflow_file = "nightly.yml"
+        schedule.workflow_directory = ".forgejo/workflows"
+        schedule.title = "nightly"
+        schedule.ref = "refs/heads/main"
+        schedule.commit_sha = "abc123"
+        spec.schedule = schedule
+        spec.cron = "@daily"
+
+    1. the clock reaches the next occurrence
+        stipulate spec.next_run_at = now
+        stipulate workflow_disabled(repo, "nightly.yml") = false
+        stipulate schedule_is_broken(spec) = false
+        stipulate actions_bot() = bot
+        stipulate concurrency_mode_for_schedule(schedule) = unlimited
+        stipulate job_definitions(repo, "nightly.yml", "abc123") = {}
+        stipulate consistency_problem(repo, "nightly.yml", "abc123") = null
+        -- The sweep that notices the due entry runs a minute later and asks
+        -- for the occurrence after the next minute: for @daily, a day on.
+        stipulate next_cron_occurrence(spec, now + 2.minutes) = now + 1.day
+        after 1.minute
+        then ScheduleFires fires
+
+    ends: A scheduled run exists for the nightly workflow and the schedule
+          points at its next occurrence.
+}
+
+-- Abandoned waiting jobs are cancelled after a day.
+journey AJobNobodyPicksUpIsAbandoned {
+    goal: A job waits for a label no runner has. A day later it is
+          cancelled instead of waiting forever.
+
+    cast:
+        run: WorkflowRun
+        job: Job
+
+    given:
+        run.repository = repo
+        run.event = workflow_dispatch
+        run.needs_approval = false
+        run.jobs_expanded = true
+        run.pre_execution_error = null
+        job.run = run
+        job.attempt = 1
+        job.status = waiting
+        job.is_incomplete = false
+
+    1. the job is waiting
+        stipulate job.needs = {}
+        stipulate job.runs_on = {"riscv"}
+        stipulate job.status_changed_at = now
+        stipulate run.status_is_stale = false
+        after 23.hours
+        then job.status = waiting
+
+    2. after a full day it is cancelled
+        after 2.hours
+        then AbandonedJobCancelled fires
+        then job.status = cancelled
+
+    ends: The job and therefore the run are cancelled.
+}
+
+-- Finished logs are kept for the retention period, then removed.
+journey LogsExpireAfterTheRetentionPeriod {
+    goal: A job finishes; its log stays readable for a year and is then
+          cleaned up, after which the run page no longer offers it.
+
+    cast:
+        runner: Runner
+        run:    WorkflowRun
+        job:    Job
+
+    given:
+        runner.scope = site
+        runner.is_ephemeral = false
+        runner.has_taken_task = false
+        runner.token = "runner-secret"
+        run.repository = repo
+        run.event = workflow_dispatch
+        run.is_fork_pull_request = false
+        run.started_at = null
+        run.jobs_expanded = true
+        run.pre_execution_error = null
+        run.needs_approval = false
+        job.run = run
+        job.status = waiting
+        job.attempt = 1
+        job.is_assigned = false
+        job.oidc_requested = false
+        job.is_incomplete = false
+
+    1. the job runs and finishes, uploading its log
+        stipulate can_read_actions(ada, repo) = true
+        stipulate runner.labels = {"docker"}
+        stipulate job.runs_on = {"docker"}
+        stipulate blocked_by_concurrency_group(run) = false
+        stipulate run.status_is_stale = false
+        runner does RunnerFetchesTask(runner, job, null) on RunnerService
+            creating task: Task
+        runner does RunnerAppendsTaskLog(runner, task, 0, 120, 4096, true) on RunnerService
+        then RunnerAppendsLog fires
+        then task.log_length = 120
+        then task.log_archived = true
+        runner does RunnerReportsTaskResult(runner, task, success) on RunnerService
+        then task.status = success
+        ada sees task.status on JobAttemptView in task
+
+    2. a year passes and the log is removed
+        after 366.days
+        then TaskLogsExpire fires
+        then task.log_expired = true
+        ada cannot see task.log_length on JobAttemptView in task
+
+    ends: The task record remains with its status; its log is gone.
+}
+
+-- decided (actions 4): a registration token serves several runners within
+-- its lifetime and is refused once it has expired.
+journey ARegistrationTokenExpiresAfterAnHour {
+    goal: Two machines register into the repository with the same token
+          within the hour; a third, an hour later, is refused and needs a
+          fresh token.
+
+    cast:
+        token: RunnerRegistrationToken
+
+    given:
+        token.scope = repo_scope
+        token.is_active = true
+        token.created_at = now
+
+    1. two runners register with the same token
+        token does RunnerRegistersWithToken(token, "builder-1", {"docker"}, "v12.0.0", false) on RunnerRegistration
+            creating first: Runner
+        then RunnerRegisters fires
+        then first.scope = repo_scope
+        after 30.minutes
+        token does RunnerRegistersWithToken(token, "builder-2", {"docker"}, "v12.0.0", false) on RunnerRegistration
+            creating second: Runner
+        then RunnerRegisters fires
+        then second.scope = repo_scope
+
+    2. after an hour the token is refused
+        after 31.minutes
+        token cannot do RunnerRegistersWithToken(token, "builder-3", {"docker"}, "v12.0.0", false) on RunnerRegistration
+
+    3. ada issues a fresh one, which works
+        stipulate may_manage_actions_scope(ada, repo_scope) = true
+        ada does UserRequestsNewRegistrationToken(ada, repo_scope) on ActionsSettings
+            creating fresh: RunnerRegistrationToken
+        then UserResetsRegistrationToken fires
+        then token.is_active = false
+        fresh does RunnerRegistersWithToken(fresh, "builder-3", {"docker"}, "v12.0.0", false) on RunnerRegistration
+            creating third: Runner
+        then RunnerRegisters fires
+        then third.scope = repo_scope
+
+    ends: Two runners joined on the first token, the third on a fresh one.
+}
+
+-- decided (actions 1): disabling a workflow stops its automatic runs, but a
+-- writer can still start it by hand.
+journey ADisabledWorkflowCanStillBeDispatched {
+    goal: Ada, a repository admin, disables the build workflow; she can
+          still dispatch it manually and a run starts.
+
+    cast:
+        build: Workflow
+
+    given:
+        build.repository = repo
+        build.file_name = "build.yml"
+        build.directory = ".forgejo/workflows"
+        build.has_dispatch_trigger = true
+        build.is_disabled = false
+
+    1. she disables it
+        stipulate is_repo_admin(ada, repo) = true
+        stipulate can_read_actions(ada, repo) = true
+        stipulate can_write_actions(ada, repo) = true
+        ada does UserDisablesWorkflowFile(ada, build) on RepositoryWorkflows
+        then UserDisablesWorkflow fires
+        then build.is_disabled = true
+
+    2. a manual dispatch still starts a run
+        stipulate ref_exists(repo, "refs/heads/main") = true
+        stipulate required_inputs_present(build, {}) = true
+        ada does UserDispatchesWorkflowRun(ada, build, "refs/heads/main", {}) on RepositoryWorkflows
+            creating run: WorkflowRun
+        then UserDispatchesWorkflow fires
+        then run.event = workflow_dispatch
+        then run.status = waiting
+
+    ends: The workflow stays disabled for events, and the dispatched run waits for a runner.
+}
+
+-- decided (actions 7): with pruning switched on, finished runs older than
+-- the retention age disappear with their artifacts.
+journey OldRunsArePrunedWhenEnabled {
+    goal: The instance prunes runs after a year. A finished run is kept for
+          the year and then deleted, its artifact queued for deletion.
+
+    cast:
+        run:      WorkflowRun
+        artifact: Artifact
+
+    given:
+        config.run_pruning_enabled = true
+        run.repository = repo
+        run.status = success
+        run.stopped_at = now
+        run.jobs_expanded = true
+        run.pre_execution_error = null
+        run.needs_approval = false
+        artifact.run = run
+        artifact.status = expired
+
+    1. after eleven months the run is still there
+        stipulate run.status_is_stale = false
+        after 330.days
+        then run.status = success
+
+    2. after a year it is pruned
+        after 36.days
+        then OldRunPruned fires
+        then PruneRun fires
+        then artifact.status = pending_deletion
+
+    ends: The run record is gone; its artifact is purged by the next clean-up.
+}
+
+-- decided (actions 8): with inactivity disabling switched on, a schedule of
+-- a repository nobody touched for the period disables its workflow instead
+-- of running.
+journey AnInactiveRepositoryStopsItsSchedule {
+    goal: The instance disables schedules after 60 days of inactivity. The
+          nightly workflow of a repository untouched for longer is disabled
+          when its cron comes due, no run starts, and the admins are told.
+
+    cast:
+        schedule: Schedule
+        spec:     ScheduleSpec
+        nightly:  Workflow
+
+    given:
+        config.schedule_inactivity_disable_enabled = true
+        schedule.repository = repo
+        schedule.workflow_file = "nightly.yml"
+        schedule.workflow_directory = ".forgejo/workflows"
+        schedule.title = "nightly"
+        schedule.ref = "refs/heads/main"
+        schedule.commit_sha = "abc123"
+        spec.schedule = schedule
+        spec.cron = "@daily"
+        nightly.repository = repo
+        nightly.file_name = "nightly.yml"
+        nightly.is_disabled = false
+
+    1. the cron comes due in a repository idle for 61 days
+        stipulate spec.next_run_at = now
+        stipulate last_repository_activity(repo) = now - 61.days
+        stipulate workflow_disabled(repo, "nightly.yml") = false
+        stipulate schedule_is_broken(spec) = false
+        after 1.minute
+        then ScheduleFires fires
+        then InactivityDisablesScheduledWorkflow fires
+        then StartScheduledRun does not fire
+        then nightly.is_disabled = true
+
+    ends: The nightly workflow is disabled and no scheduled run was started.
+}
+
+-- releases now announces un-publishing; actions reacts with a `release`
+-- event of type `unpublished` on the release's tag (GitHub has the same
+-- type). When the tag itself vanished there is no doer and nothing runs.
+-- (Workflow matching is a black box the walker cannot settle for an enum
+-- argument, so this repository keeps its Actions unit switched off and the
+-- story stops at the event.)
+journey UnpublishingAReleaseIsAWorkflowEvent {
+    goal: Ada turns the published v1.0 back into a draft, and Actions hears
+          a release event of type unpublished. When the tag of v2.0 vanishes
+          in a sync, no release event reaches Actions.
+
+    cast:
+        rel:  releases/Release
+        gone: releases/Release
+
+    given:
+        actions_unit.enabled = false
+        repo.is_mirror = false
+        rel.repository = repo
+        rel.tag_name = "v1.0"
+        rel.title = "One"
+        rel.state = published
+        rel.commit_sha = "abc123"
+        rel.publisher = ada
+        gone.repository = repo
+        gone.tag_name = "v2.0"
+        gone.state = published
+        gone.commit_sha = "def456"
+        gone.publisher = ada
+
+    1. she un-publishes v1.0 and Actions is told
+        stipulate can_write_releases(ada, repo) = true
+        stipulate qualified_ref(tag_ref, "v1.0") = "refs/tags/v1.0"
+        stipulate release_quota_allows(repo) = true
+        ada does UserEditsRelease(ada, repo, rel, "One", "Notes", true, false, false) on ReleaseManagement
+        then UserUnpublishesRelease fires
+        then rel.state = draft
+        then ReleaseUnpublishedStartsWorkflows fires
+
+    2. a vanished tag un-publishes v2.0 without a doer; no workflow event
+        stipulate can_write_code(ada, repo) = true
+        ada does TagVanished(repo, "v2.0") on TagReconciliation
+        then TagDisappears fires
+        then gone.state = draft
+        then ReleaseUnpublishedStartsWorkflows does not fire
+
+    ends: v1.0 raised a release event of type unpublished; v2.0's vanished tag raised none.
+}
+
+-- Read-only mode freezes a repository's Actions settings; the instance
+-- scope, managed from the admin console, keeps working.
+-- decided: administration 3
+journey ReadOnlyModeFreezesRepositoryActionsSettings {
+    goal: During maintenance Ada cannot add a repository secret; the site
+          admin can still add an instance variable.
+
+    cast:
+        gate: access/InstanceWriteGate
+        root: accounts/User
+    given:
+        gate.read_only = true
+        root.is_admin = true
+
+    1. ada's repository secret is refused
+        stipulate may_manage_actions_scope(ada, repo_scope) = true
+        stipulate valid_secret_name("deploy_key") = true
+        stipulate existing_secret(repo_scope, "deploy_key") = null
+        ada cannot do UserSetsActionsSecret(ada, repo_scope, "deploy_key", "s3cr3t") on ActionsSettings
+
+    2. the instance variable goes through
+        stipulate may_manage_actions_scope(root, site) = true
+        stipulate valid_variable_name("registry") = true
+        stipulate existing_variable(site, "registry") = null
+        stipulate upper("registry") = "REGISTRY"
+        root does UserCreatesActionsVariable(root, site, "registry", "registry.example.org") on ActionsSettings
+            creating var: Variable
+        then UserCreatesVariable fires
+        then var.name = "REGISTRY"
+
+    ends: Repository settings wait for the end of maintenance; the admin console does not.
+}
+
+-- decided: requests 1. A run that a deploy-key push started records the key
+-- and has no user behind it, so when it fails the repository's admins are
+-- mailed instead of a trigger user.
+journey ADeployKeyRunFailureMailsTheAdmins {
+    goal: The ci deploy key pushed to main and the push started a run. Its
+          only job fails. Nobody triggered the run as a person, so ada, who
+          administers the repository, is mailed about the failure.
+
+    cast:
+        ci_key: keys/SshKey
+        ci:     keys/DeployKey
+        run:    WorkflowRun
+        job:    Job
+
+    given:
+        notifications/config.mailer_enabled = true
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.email_notifications = enabled
+        ci_key.kind = deploy
+        ci.repository = repo
+        ci.key = ci_key
+        ci.name = "ci"
+        ci.access = read_write
+        run.repository = repo
+        run.status = running
+        run.event = push
+        run.attempt = 1
+        run.workflow_file = "build.yml"
+        run.notify_email = true
+        run.trigger_user = null
+        run.trigger_deploy_key = ci
+        run.pre_execution_error = null
+        run.needs_approval = false
+        run.prioritized = false
+        run.jobs_expanded = true
+        run.previous_attempts_duration = 0.seconds
+        job.run = run
+        job.status = failure
+        job.attempt = 1
+        job.is_assigned = false
+        job.is_incomplete = false
+
+    1. the run follows its failed job and the admins are told
+        stipulate run.aggregated_status = failure
+        stipulate run.status_is_stale = true
+        stipulate notifications/is_failure(failure) = true
+        stipulate notifications/repository_admins(repo) = {ada}
+        stipulate notifications/mail_eligible(ada, false) = true
+        after 1.second
+        then RunStatusFollowsJobs fires
+        then run.status = failure
+        then MailOnDeployKeyRunFailed fires
+        then MailOnActionsRunFailed does not fire
+
+    ends: Ada, the repository's admin, has a mail about the failed run; no
+          user was credited with starting it.
+}

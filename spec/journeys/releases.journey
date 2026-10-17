@@ -1,0 +1,506 @@
+-- Journeys through releases.allium: writing, publishing, hiding, tagging and
+-- downloading releases.
+
+world {
+    cast:
+        ada:  accounts/User
+        bob:  accounts/User
+        repo: repositories/Repository
+    given:
+        repo.is_archived = false
+        repo.is_empty = false
+        repo.is_mirror = false
+        repo.default_branch = "main"
+        repo.owner_user = ada
+        repo.owner_org = null
+        -- None of these stories is about CI: Actions is off on this instance,
+        -- so a release event starts no workflow.
+        actions/config.actions_enabled = false
+        -- ada manages releases, bob reads them, and the quota has room
+        can_write_releases(ada, repo) = true
+        can_read_releases(bob, repo) = true
+        release_quota_allows(repo) = true
+        -- main's head, where releases cut from main are tagged
+        commit_of(repo, "main") = "m41n00"
+        commit_count_of(repo, "main") = 10
+}
+
+-- The happy path: a maintainer cuts v1.0 straight from main.
+journey MaintainerPublishesAReleaseOnANewTag {
+    goal: Ada maintains the project. She writes release notes for v1.0, tags
+          main in the same step, and anyone who can read the repository finds
+          the release on the Releases page.
+
+    1. she publishes v1.0 from main
+        stipulate is_valid_tag_name("v1.0") = true
+        stipulate may_control_tag(ada, repo, "v1.0") = true
+        stipulate target_resolves(repo, "main") = true
+        ada does UserCreatesRelease(ada, repo, "v1.0", "main", "First stable", "Notes", false, false, false) on ReleaseManagement
+            creating rel: Release
+        then UserCreatesPublishedRelease fires
+        then rel.state = published
+        then rel.publisher = ada
+        then rel.commit_sha = "m41n00"
+        -- code creates the tag on main's head as an internal tag push by ada
+        then ReleaseTagIsCreated fires
+        then TagCreatedByPush fires
+
+    2. a reader finds it
+        bob sees rel.tag_name on ReleaseCatalogue in repo
+        bob sees rel.note on ReleaseCatalogue in repo
+
+    ends: v1.0 exists as a git tag on main and as a published release that
+          readers can see.
+}
+
+-- Drafts are invisible until published.
+journey ADraftStaysHiddenUntilPublished {
+    goal: Ada prepares v2.0 as a draft while she collects notes. Bob, who can
+          only read, must not see it; once she publishes it, he does.
+
+    1. she saves a draft for a tag that does not exist yet
+        stipulate is_valid_tag_name("v2.0") = true
+        ada does UserCreatesRelease(ada, repo, "v2.0", "main", "Two", "WIP", true, false, false) on ReleaseManagement
+            creating rel: Release
+        then UserCreatesDraftRelease fires
+        then rel.state = draft
+        then rel.commit_sha = null
+
+    2. bob cannot see it, ada can
+        bob cannot see rel.tag_name on ReleaseCatalogue in repo
+        ada sees rel.state on ReleaseManagement in repo
+
+    3. she publishes it, which creates the tag
+        stipulate may_control_tag(ada, repo, "v2.0") = true
+        stipulate target_resolves(repo, "main") = true
+        ada does UserEditsRelease(ada, repo, rel, "Two", "Final notes", false, false, false) on ReleaseManagement
+        then UserPublishesDraftRelease fires
+        then rel.state = published
+        then rel.note = "Final notes"
+
+    4. now bob sees it
+        bob sees rel.tag_name on ReleaseCatalogue in repo
+
+    ends: v2.0 is published with its tag; it was never visible while a draft.
+}
+
+-- A reader is refused.
+journey AReaderCannotWriteReleases {
+    goal: Bob can read the repository but has no write access to releases.
+          He cannot create a release.
+
+    1. he tries to create one
+        stipulate can_write_releases(bob, repo) = false
+        bob cannot do UserCreatesRelease(bob, repo, "v9", "main", "Nope", "", false, false, false) on ReleaseManagement
+
+    ends: Nothing was created.
+}
+
+-- Tag protection stops a writer from publishing on a protected tag name.
+journey AProtectedTagNameBlocksPublishing {
+    goal: Releases on tags matching v* are reserved for release managers.
+          Ada can write releases but is not allowed to create such a tag.
+
+    1. she tries to publish v3.0
+        stipulate is_valid_tag_name("v3.0") = true
+        stipulate may_control_tag(ada, repo, "v3.0") = false
+        stipulate target_resolves(repo, "main") = true
+        ada cannot do UserCreatesRelease(ada, repo, "v3.0", "main", "Three", "", false, false, false) on ReleaseManagement
+
+    2. she may still prepare it as a draft
+        ada does UserCreatesRelease(ada, repo, "v3.0", "main", "Three", "", true, false, false) on ReleaseManagement
+            creating rel: Release
+        then rel.state = draft
+
+    ends: The draft waits for someone allowed to create the protected tag.
+}
+
+-- Archived repositories are frozen.
+journey AnArchivedRepositoryRefusesReleaseChanges {
+    goal: The repository has been archived. Even its maintainer cannot edit
+          an existing release.
+
+    cast:
+        rel: Release
+    given:
+        repo.is_archived = true
+        rel.repository = repo
+        rel.state = published
+        rel.commit_sha = "abc123"
+
+    1. she tries to edit the notes
+        ada cannot do UserEditsRelease(ada, repo, rel, "Title", "New notes", false, false, false) on ReleaseManagement
+
+    2. deleting it is frozen too (decided releases 8)
+        ada cannot do UserDeletesRelease(ada, repo, rel) on ReleaseManagement
+        then rel.state = published
+
+    ends: The release is unchanged.
+}
+
+-- A tag pushed from the command line, then written up as a release.
+journey APushedTagGetsReleaseNotesLater {
+    goal: Ada pushes tag v4.0 from her machine. It shows up as a bare tag;
+          later she writes release notes for it on the web.
+
+    1. the push is observed
+        stipulate can_write_code(ada, repo) = true
+        ada does TagObserved(repo, "v4.0", "c0ffee", ada, "2026-10-01", "v4.0", "") on TagReconciliation
+            creating rel: Release
+        then TagAppearsWithoutRecord fires
+        then rel.state = tag_only
+        then rel.commit_sha = "c0ffee"
+
+    2. a reader does not see a release for a bare tag
+        bob cannot see rel.tag_name on ReleaseCatalogue in repo
+
+    3. ada writes the release on the existing tag
+        ada does UserCreatesRelease(ada, repo, "v4.0", "", "Four", "Notes", false, false, false) on ReleaseManagement
+        then UserCreatesReleaseOnExistingTag fires
+        then rel.state = published
+        bob sees rel.tag_name on ReleaseCatalogue in repo
+
+    ends: The same record that tracked the bare tag is now a published release.
+}
+
+-- A second release for the same tag is refused.
+journey ATagCarriesOnlyOneRelease {
+    goal: v1.0 already has a release. Writing another one for the same tag
+          is refused.
+
+    cast:
+        rel: Release
+    given:
+        rel.repository = repo
+        rel.tag_name = "v1.0"
+        rel.state = published
+        rel.commit_sha = "abc123"
+
+    1. she tries again
+        stipulate is_valid_tag_name("v1.0") = true
+        stipulate may_control_tag(ada, repo, "v1.0") = true
+        stipulate target_resolves(repo, "main") = true
+        ada cannot do UserCreatesRelease(ada, repo, "v1.0", "main", "Again", "", false, false, false) on ReleaseManagement
+
+    ends: There is still exactly one record for v1.0.
+}
+
+-- Deleting a release keeps the tag; deleting the tag removes everything.
+-- The release must go first: code refuses deleting a tag that still carries a
+-- published release (decided releases 6).
+journey DeletingAReleaseKeepsItsTag {
+    goal: Ada deletes the v1.0 release because the notes were wrong. The tag
+          stays as a bare tag. Later the tag is deleted too, and the record
+          follows it.
+
+    cast:
+        rel: Release
+    given:
+        rel.repository = repo
+        rel.tag_name = "v1.0"
+        rel.state = published
+        rel.commit_sha = "abc123"
+
+    1. she deletes the release only
+        ada does UserDeletesRelease(ada, repo, rel) on ReleaseManagement
+        then UserDeletesRelease fires
+        then rel.state = tag_only
+        then rel.commit_sha = "abc123"
+
+    2. later the tag itself is deleted (code's tags page), and the bare record goes
+        stipulate can_write_code(ada, repo) = true
+        ada does TagVanished(repo, "v1.0") on TagReconciliation
+        then TagDisappears fires
+        then rel does not exist
+
+    ends: Neither the release nor the tag remain.
+}
+
+-- A tag found missing by reconciliation demotes its release to a draft;
+-- the tag coming back republishes it. (A push or the tags page cannot delete
+-- a tag with a published release — decided releases 6 — so this is a sync
+-- finding the tag gone, e.g. a repaired repository or a mirror upstream.)
+journey ATagThatGoesAwayAndComesBack {
+    goal: A tag resync finds that tag v5.0 is gone from git. The release is
+          not lost: it becomes a draft waiting for its tag, and webhooks hear
+          it was un-published. When the tag is pushed again the release is
+          published again.
+
+    cast:
+        rel:  Release
+    given:
+        rel.repository = repo
+        rel.tag_name = "v5.0"
+        rel.state = published
+        rel.commit_sha = "aaa111"
+        rel.publisher = ada
+
+    1. the tag disappears
+        stipulate can_write_code(ada, repo) = true
+        ada does TagVanished(repo, "v5.0") on TagReconciliation
+        then TagDisappears fires
+        then rel.state = draft
+        then rel.commit_sha = null
+        then ReleaseUnpublishedRaisesHookEvent fires
+
+    2. readers no longer see it
+        bob cannot see rel.tag_name on ReleaseCatalogue in repo
+
+    3. the tag is pushed again on a new commit
+        ada does TagObserved(repo, "v5.0", "bbb222", ada, "2026-10-02", "v5.0", "") on TagReconciliation
+        then ReleaseTagArrives fires
+        then rel.state = published
+        then rel.commit_sha = "bbb222"
+        then ReleasePublishedRaisesHookEvent fires
+
+    ends: The release survived its tag being re-created and points at the new commit.
+}
+
+-- Assets: external links are not counted, stored files are.
+journey DownloadsAreCountedForStoredAssetsOnly {
+    goal: v1.0 offers a stored tarball and a link to a mirror. Bob downloads
+          both; only the stored file's counter moves.
+
+    cast:
+        rel:     Release
+        tarball: issues/Attachment
+        link:    issues/Attachment
+    given:
+        rel.repository = repo
+        rel.state = published
+        rel.commit_sha = "abc123"
+        tarball.repository = repo
+        tarball.release = rel
+        tarball.external_url = null
+        tarball.download_count = 3
+        link.repository = repo
+        link.release = rel
+        link.external_url = "https://mirror.example/v1.0.tar.gz"
+        link.download_count = 0
+
+    1. he downloads the tarball
+        stipulate can_write_releases(bob, repo) = false
+        bob does VisitorDownloadsReleaseAsset(bob, repo, tarball) on ReleaseCatalogue
+        then tarball.download_count = 4
+
+    2. he follows the mirror link
+        bob does VisitorDownloadsReleaseAsset(bob, repo, link) on ReleaseCatalogue
+        then link.download_count = 0
+
+    3. he sees the counts
+        bob sees tarball.download_count on ReleaseCatalogue in repo
+
+    ends: The stored asset counted one more download; the link counted none.
+}
+
+-- Assets of a draft cannot be fetched by readers.
+journey ADraftsAssetsAreNotDownloadable {
+    goal: Ada attached a binary to a draft. Bob guesses its URL; the download
+          is refused because, for him, the draft does not exist.
+
+    cast:
+        rel:   Release
+        asset: issues/Attachment
+    given:
+        rel.repository = repo
+        rel.state = draft
+        asset.repository = repo
+        asset.release = rel
+        asset.external_url = null
+        asset.download_count = 0
+
+    1. he tries to download it
+        stipulate can_write_releases(bob, repo) = false
+        bob cannot do VisitorDownloadsReleaseAsset(bob, repo, asset) on ReleaseCatalogue
+
+    ends: The counter is still zero and Bob learned nothing.
+}
+
+-- Adding an external link to a release.
+journey AMaintainerLinksAnExternalAsset {
+    goal: Ada's binaries are hosted on a CDN. She adds a link to the release
+          instead of uploading.
+
+    cast:
+        rel: Release
+    given:
+        rel.repository = repo
+        rel.state = published
+        rel.commit_sha = "abc123"
+
+    1. she adds the link
+        stipulate is_valid_url("https://cdn.example/app.zip") = true
+        ada does UserAddsExternalAsset(ada, repo, rel, "app.zip", "https://cdn.example/app.zip") on ReleaseManagement
+            creating link: issues/Attachment
+        then UserAddsExternalAsset fires
+        then link.external_url = "https://cdn.example/app.zip"
+        then link.download_count = 0
+
+    2. an invalid URL is refused
+        stipulate is_valid_url("not a url") = false
+        ada cannot do UserAddsExternalAsset(ada, repo, rel, "bad", "not a url") on ReleaseManagement
+
+    ends: The release offers app.zip from the CDN.
+}
+
+-- Un-publishing, retargeting the draft, and publishing again.
+journey AMaintainerUnpublishesAndRetargetsARelease {
+    goal: Ada published v6.0 on the wrong commit. A published release's tag is
+          fixed, so she first un-publishes it (subscribers hear about it), then
+          moves the draft to a new tag v6.0.1, leaving v6.0 as a bare tag, and
+          publishes again.
+
+    cast:
+        rel: Release
+    given:
+        rel.repository = repo
+        rel.tag_name = "v6.0"
+        rel.title = "Six"
+        rel.state = published
+        rel.commit_sha = "ccc333"
+        rel.num_commits = 12
+        rel.publisher = ada
+
+    1. she cannot retarget it while it is published (decided releases 4)
+        stipulate is_valid_tag_name("v6.0.1") = true
+        ada cannot do UserRetargetsRelease(ada, repo, rel, "v6.0.1", "main") on ReleaseManagement
+
+    2. she un-publishes it (decided releases 2)
+        ada does UserEditsRelease(ada, repo, rel, "Six", "Notes", true, false, false) on ReleaseManagement
+        then UserUnpublishesRelease fires
+        then rel.state = draft
+        then ReleaseUnpublishedRaisesHookEvent fires
+        then RecordReleaseUnpublished fires
+        bob cannot see rel.tag_name on ReleaseCatalogue in repo
+
+    3. now the draft can move to a new tag; the old tag stays as a bare tag
+        ada does UserRetargetsRelease(ada, repo, rel, "v6.0.1", "main") on ReleaseManagement
+            creating old: Release
+        then UserRetargetsDraftRelease fires
+        then rel.tag_name = "v6.0.1"
+        then rel.commit_sha = null
+        then old.tag_name = "v6.0"
+        then old.state = tag_only
+        then old.commit_sha = "ccc333"
+
+    4. publishing again creates v6.0.1 and announces it (decided releases 1)
+        stipulate may_control_tag(ada, repo, "v6.0.1") = true
+        stipulate target_resolves(repo, "main") = true
+        ada does UserEditsRelease(ada, repo, rel, "Six", "Notes", false, false, false) on ReleaseManagement
+        then UserPublishesDraftRelease fires
+        then rel.state = published
+        then ReleasePublishedRaisesHookEvent fires
+
+    ends: v6.0.1 is published; v6.0 remains as a bare tag.
+}
+
+-- Re-publishing a draft whose tag still exists is a publication too.
+journey RepublishingADraftWithItsTagIsAnnounced {
+    goal: Ada un-published v7.0 for a moment to fix the notes. Its tag never
+          went away. Publishing it again is announced as a publication, not
+          as an edit.
+
+    cast:
+        rel: Release
+    given:
+        rel.repository = repo
+        rel.tag_name = "v7.0"
+        rel.state = draft
+        rel.commit_sha = "ddd444"
+        rel.publisher = ada
+
+    1. she publishes it again
+        ada does UserEditsRelease(ada, repo, rel, "Seven", "Fixed notes", false, false, false) on ReleaseManagement
+        then UserPublishesDraftRelease fires
+        then rel.state = published
+        then rel.commit_sha = "ddd444"
+        then ReleasePublishedRaisesHookEvent fires
+        then RecordReleasePublished fires
+        bob sees rel.tag_name on ReleaseCatalogue in repo
+
+    ends: v7.0 is published again on the same tag and subscribers were told.
+}
+
+-- A draft that never had a tag leaves nothing behind when deleted.
+journey DeletingANeverTaggedDraftRemovesIt {
+    goal: Ada abandons the v8.0 draft before ever publishing it. Deleting it
+          removes the record entirely (decided releases 5).
+
+    cast:
+        rel: Release
+    given:
+        rel.repository = repo
+        rel.tag_name = "v8.0"
+        rel.state = draft
+        rel.commit_sha = null
+
+    1. she deletes the draft
+        ada does UserDeletesRelease(ada, repo, rel) on ReleaseManagement
+        then UserDeletesRelease fires
+        then rel does not exist
+
+    ends: No release and no tag record for v8.0 remain.
+}
+
+-- The size limit holds on the API too.
+journey AnOversizedAssetIsRefusedOnEveryPath {
+    goal: Ada uploads a 3 GiB image to v1.0 through the API. The instance
+          allows 2048 MiB per file, so it is refused even though the API has
+          no upload widget (decided releases 7); a small file goes through.
+
+    cast:
+        rel: Release
+    given:
+        rel.repository = repo
+        rel.state = published
+        rel.commit_sha = "abc123"
+
+    1. the oversized upload is refused
+        stipulate file_type_allowed("disk.img", "", "") = true
+        stipulate asset_quota_allows(repo, 3221225472) = true
+        ada cannot do UserUploadsReleaseAsset(ada, repo, rel, "disk.img", 3221225472, "") on ReleaseManagement
+
+    2. a small one is accepted
+        stipulate file_type_allowed("app.zip", "", "") = true
+        stipulate asset_quota_allows(repo, 1048576) = true
+        ada does UserUploadsReleaseAsset(ada, repo, rel, "app.zip", 1048576, "") on ReleaseManagement
+            creating zip: issues/Attachment
+        then UserUploadsReleaseAsset fires
+        then zip.size = 1048576
+
+    ends: Only the file within the limit is attached.
+}
+
+-- Pull mirrors' releases follow upstream only.
+journey APullMirrorsReleasesAreReadOnly {
+    goal: The repository is a pull mirror of an upstream project. Its releases
+          come from upstream tags; Ada, though she owns the mirror, cannot
+          write, edit or delete releases on it (decided releases 10). A sync
+          still brings in upstream's new tag.
+
+    cast:
+        rel: Release
+    given:
+        repo.is_mirror = true
+        rel.repository = repo
+        rel.tag_name = "v1.0"
+        rel.state = published
+        rel.commit_sha = "abc123"
+
+    1. she cannot create a release
+        stipulate is_valid_tag_name("v2.0") = true
+        ada cannot do UserCreatesRelease(ada, repo, "v2.0", "main", "Two", "", true, false, false) on ReleaseManagement
+
+    2. nor edit or delete the mirrored one
+        ada cannot do UserEditsRelease(ada, repo, rel, "Mine", "My notes", false, false, false) on ReleaseManagement
+        ada cannot do UserDeletesRelease(ada, repo, rel) on ReleaseManagement
+
+    3. upstream's new tag still arrives with the sync
+        stipulate can_write_code(ada, repo) = true
+        ada does TagObserved(repo, "v2.0", "eee555", null, "2026-10-03", "v2.0", "") on TagReconciliation
+            creating up: Release
+        then TagAppearsWithoutRecord fires
+        then up.state = tag_only
+
+    ends: The mirror's release records match upstream's tags and nothing else.
+}

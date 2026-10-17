@@ -1,0 +1,1014 @@
+-- Journeys through keys.allium: the SSH and GPG keys people register, the
+-- deploy keys repositories hand out, what the forge concludes from a commit
+-- signature, and when the forge signs its own commits.
+
+world {
+    cast:
+        ada:   accounts/User
+        bob:   accounts/User
+        root:  accounts/User
+    given:
+        ada.name = "ada"
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.is_admin = false
+        login_source_of(ada) = null
+        ada.primary_email = "ada@example.org"
+        bob.name = "bob"
+        bob.is_active = true
+        bob.prohibit_login = false
+        bob.is_admin = false
+        login_source_of(bob) = null
+        bob.primary_email = "bob@example.org"
+        root.name = "root"
+        root.is_active = true
+        root.prohibit_login = false
+        root.is_admin = true
+        login_source_of(root) = null
+}
+
+-- The happy path: a personal SSH key is registered and shows up on her keys page.
+journey AdaAddsAnSshKey {
+    goal: Ada wants to push over SSH from her laptop. She pastes her ed25519
+          public key into her key settings and sees it listed with its
+          fingerprint.
+
+    1. she pastes her public key
+        stipulate manages_own_ssh_keys(ada) = true
+        stipulate length("laptop") = 6
+        stipulate ssh_parse_outcome("ssh-ed25519 AAAAada ada@laptop") = valid
+        stipulate ssh_key_algorithm("ssh-ed25519 AAAAada ada@laptop") = ed25519
+        stipulate ssh_key_bits("ssh-ed25519 AAAAada ada@laptop") = 256
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAada ada@laptop") = "SHA256:ada-laptop"
+        stipulate ssh_normalised("ssh-ed25519 AAAAada ada@laptop") = "ssh-ed25519 AAAAada ada@laptop"
+        ada does UserAddsSshKey(ada, "laptop", "ssh-ed25519 AAAAada ada@laptop") on KeySettings
+            creating laptop: SshKey
+        then UserAddsSshKey fires
+        then laptop.kind = personal
+        then laptop.owner = ada
+        then laptop.fingerprint = "SHA256:ada-laptop"
+        then laptop.is_verified = false
+
+    2. it is on her keys page
+        ada sees laptop.fingerprint on OwnSshKey in laptop
+        ada sees laptop.is_verified on OwnSshKey in laptop
+
+    ends: Ada has one unverified personal SSH key.
+}
+
+-- Proving possession: she signs the token with the key.
+journey AdaProvesSheHoldsHerKey {
+    goal: Ada wants the green "verified" mark on her key so her SSH-signed
+          commits verify. She asks for a token, signs it with ssh-keygen and
+          pastes the signature.
+
+    cast:
+        laptop: SshKey
+
+    given:
+        laptop.kind = personal
+        laptop.owner = ada
+        laptop.name = "laptop"
+        laptop.content = "ssh-ed25519 AAAAada ada@laptop"
+        laptop.fingerprint = "SHA256:ada-laptop"
+        laptop.algorithm = ed25519
+        laptop.bits = 256
+        laptop.auth_source = null
+        laptop.is_verified = false
+        laptop.last_used_at = null
+
+    1. she asks for a token
+        stipulate new_verification_token(ada) = "token-1"
+        ada does UserRequestsVerificationToken(ada) on KeySettings
+            creating challenge: VerificationChallenge
+        then challenge.status = open
+        ada sees challenge.token on VerificationTokenView in challenge
+
+    2. she signs it and pastes the signature
+        stipulate ssh_signs_token(laptop, "sshsig-1", "token-1") = true
+        stipulate manages_own_ssh_keys(ada) = true
+        ada does UserVerifiesSshKey(ada, laptop, challenge, "sshsig-1") on OwnSshKey
+        then laptop.is_verified = true
+
+    ends: Ada's laptop key is verified.
+}
+
+-- The token is short-lived: a signature arriving after it lapsed is refused.
+journey TheTokenRunsOut {
+    goal: Ada asks for a token, gets distracted, and comes back five minutes
+          later with a signature. The token has lapsed; she has to ask again.
+
+    cast:
+        laptop: SshKey
+
+    given:
+        laptop.kind = personal
+        laptop.owner = ada
+        laptop.name = "laptop"
+        laptop.content = "ssh-ed25519 AAAAada ada@laptop"
+        laptop.fingerprint = "SHA256:ada-laptop"
+        laptop.algorithm = ed25519
+        laptop.bits = 256
+        laptop.auth_source = null
+        laptop.is_verified = false
+        laptop.last_used_at = null
+
+    1. she asks for a token
+        stipulate new_verification_token(ada) = "token-2"
+        ada does UserRequestsVerificationToken(ada) on KeySettings
+            creating challenge: VerificationChallenge
+        then challenge.status = open
+
+    2. five minutes pass
+        after 5.minutes
+        then VerificationChallengeExpires fires
+        then challenge.status = expired
+
+    3. her late signature is refused
+        stipulate ssh_signs_token(laptop, "sshsig-late", "token-2") = true
+        stipulate manages_own_ssh_keys(ada) = true
+        ada cannot do UserVerifiesSshKey(ada, laptop, challenge, "sshsig-late") on OwnSshKey
+        then laptop.is_verified = false
+
+    ends: The key is still unverified; Ada must sign a fresh token.
+}
+
+-- The key policy: weak or wrong keys never get registered.
+journey AWeakKeyIsTurnedAway {
+    goal: Bob tries an old 2048-bit RSA key, then a DSA key, then by mistake
+          pastes his private key. Each is refused.
+
+    1. a 2048-bit RSA key is too short
+        stipulate manages_own_ssh_keys(bob) = true
+        stipulate length("old") = 3
+        stipulate ssh_parse_outcome("ssh-rsa AAAAold bob@old") = valid
+        stipulate ssh_key_algorithm("ssh-rsa AAAAold bob@old") = rsa
+        stipulate ssh_key_bits("ssh-rsa AAAAold bob@old") = 2048
+        stipulate ssh_fingerprint("ssh-rsa AAAAold bob@old") = "SHA256:bob-old"
+        bob cannot do UserAddsSshKey(bob, "old", "ssh-rsa AAAAold bob@old") on KeySettings
+
+    2. DSA is not allowed at all
+        stipulate ssh_parse_outcome("ssh-dss AAAAdsa bob@dsa") = valid
+        stipulate ssh_key_algorithm("ssh-dss AAAAdsa bob@dsa") = dsa
+        stipulate ssh_key_bits("ssh-dss AAAAdsa bob@dsa") = 1024
+        stipulate ssh_fingerprint("ssh-dss AAAAdsa bob@dsa") = "SHA256:bob-dsa"
+        bob cannot do UserAddsSshKey(bob, "old", "ssh-dss AAAAdsa bob@dsa") on KeySettings
+
+    3. a private key is refused
+        stipulate ssh_parse_outcome("-----BEGIN OPENSSH PRIVATE KEY-----") = private_key
+        stipulate ssh_key_algorithm("-----BEGIN OPENSSH PRIVATE KEY-----") = ed25519
+        stipulate ssh_key_bits("-----BEGIN OPENSSH PRIVATE KEY-----") = 256
+        stipulate ssh_fingerprint("-----BEGIN OPENSSH PRIVATE KEY-----") = "SHA256:secret"
+        bob cannot do UserAddsSshKey(bob, "old", "-----BEGIN OPENSSH PRIVATE KEY-----") on KeySettings
+
+    ends: Bob has no keys; nothing he pasted was stored.
+}
+
+-- A key belongs to one person, and only they (or an admin) can remove it.
+journey AdasKeyIsHers {
+    goal: Bob copied Ada's public key from her profile and tries to register
+          it as his own, then tries to remove it from her account. Neither
+          works. A site administrator can remove it.
+
+    cast:
+        laptop: SshKey
+
+    given:
+        laptop.kind = personal
+        laptop.owner = ada
+        laptop.name = "laptop"
+        laptop.content = "ssh-ed25519 AAAAada ada@laptop"
+        laptop.fingerprint = "SHA256:ada-laptop"
+        laptop.algorithm = ed25519
+        laptop.bits = 256
+        laptop.auth_source = null
+        laptop.is_verified = false
+        laptop.last_used_at = null
+
+    1. bob cannot claim her key
+        stipulate manages_own_ssh_keys(bob) = true
+        stipulate length("borrowed") = 8
+        stipulate ssh_parse_outcome("ssh-ed25519 AAAAada ada@laptop") = valid
+        stipulate ssh_key_algorithm("ssh-ed25519 AAAAada ada@laptop") = ed25519
+        stipulate ssh_key_bits("ssh-ed25519 AAAAada ada@laptop") = 256
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAada ada@laptop") = "SHA256:ada-laptop"
+        bob cannot do UserAddsSshKey(bob, "borrowed", "ssh-ed25519 AAAAada ada@laptop") on KeySettings
+
+    2. bob cannot delete it
+        bob cannot do UserDeletesSshKey(bob, laptop) on OwnSshKey
+
+    3. the administrator can
+        stipulate manages_own_ssh_keys(root) = true
+        root does UserDeletesSshKey(root, laptop) on OwnSshKey
+        then UserDeletesSshKey fires
+        then laptop does not exist
+
+    ends: The key is gone; Bob never had it.
+}
+
+-- Deploy keys: one key material, many repositories, per-repository access.
+journey ACiKeyForTwoRepositories {
+    goal: Ada administers two repositories and wants her CI to clone one and
+          push to the other with the same key. She adds it read-only to the
+          first and read-write to the second, then retires it.
+
+    cast:
+        app:  repositories/Repository
+        site: repositories/Repository
+
+    given:
+        app.is_archived = false
+        app.is_mirror = false
+        site.is_archived = false
+        site.is_mirror = false
+
+    1. she adds it read-only to the app repository
+        stipulate is_repo_admin(ada, app) = true
+        stipulate length("ci") = 2
+        stipulate ssh_parse_outcome("ssh-ed25519 AAAAci ci@runner") = valid
+        stipulate ssh_key_algorithm("ssh-ed25519 AAAAci ci@runner") = ed25519
+        stipulate ssh_key_bits("ssh-ed25519 AAAAci ci@runner") = 256
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAci ci@runner") = "SHA256:ci"
+        stipulate ssh_normalised("ssh-ed25519 AAAAci ci@runner") = "ssh-ed25519 AAAAci ci@runner"
+        ada does RepoAdminAddsDeployKey(ada, app, "ci", "ssh-ed25519 AAAAci ci@runner", read_only) on RepositoryDeployKeys
+            creating app_grant: DeployKey
+        then app_grant.access = read_only
+        then app_grant.repository = app
+        then app_grant.key.kind = deploy
+
+    2. and read-write to the site repository, sharing the key
+        stipulate is_repo_admin(ada, site) = true
+        ada does RepoAdminAddsDeployKey(ada, site, "ci", "ssh-ed25519 AAAAci ci@runner", read_write) on RepositoryDeployKeys
+            creating site_grant: DeployKey
+        then site_grant.access = read_write
+        then site_grant.key = app_grant.key
+
+    3. she sees the grant on the app repository's settings
+        ada sees app_grant.access on RepositoryDeployKey in app_grant
+
+    4. she retires it from the app repository; the site keeps it
+        ada does RepoAdminDeletesDeployKey(ada, app_grant) on RepositoryDeployKey
+        then app_grant does not exist
+        then site_grant exists
+
+    ends: Only the site repository still accepts the CI key, read-write.
+}
+
+-- Permission refusals on deploy keys, and personal keys cannot double as deploy keys.
+journey DeployKeysAreForRepositoryAdmins {
+    goal: Bob can read Ada's repository but does not administer it; he tries
+          to add a deploy key. Ada, who does, tries to reuse her personal
+          laptop key as a deploy key.
+
+    cast:
+        laptop: SshKey
+        app:    repositories/Repository
+
+    given:
+        laptop.kind = personal
+        laptop.owner = ada
+        laptop.name = "laptop"
+        laptop.content = "ssh-ed25519 AAAAada ada@laptop"
+        laptop.fingerprint = "SHA256:ada-laptop"
+        laptop.algorithm = ed25519
+        laptop.bits = 256
+        laptop.auth_source = null
+        laptop.is_verified = false
+        laptop.last_used_at = null
+
+    1. bob is not an administrator
+        stipulate is_repo_admin(bob, app) = false
+        stipulate length("bob-ci") = 6
+        stipulate ssh_parse_outcome("ssh-ed25519 AAAAbob bob@ci") = valid
+        stipulate ssh_key_algorithm("ssh-ed25519 AAAAbob bob@ci") = ed25519
+        stipulate ssh_key_bits("ssh-ed25519 AAAAbob bob@ci") = 256
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAbob bob@ci") = "SHA256:bob-ci"
+        bob cannot do RepoAdminAddsDeployKey(bob, app, "bob-ci", "ssh-ed25519 AAAAbob bob@ci", read_write) on RepositoryDeployKeys
+
+    2. a personal key cannot become a deploy key
+        stipulate is_repo_admin(ada, app) = true
+        stipulate length("laptop") = 6
+        stipulate ssh_parse_outcome("ssh-ed25519 AAAAada ada@laptop") = valid
+        stipulate ssh_key_algorithm("ssh-ed25519 AAAAada ada@laptop") = ed25519
+        stipulate ssh_key_bits("ssh-ed25519 AAAAada ada@laptop") = 256
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAada ada@laptop") = "SHA256:ada-laptop"
+        ada cannot do RepoAdminAddsDeployKey(ada, app, "laptop", "ssh-ed25519 AAAAada ada@laptop", read_only) on RepositoryDeployKeys
+
+    ends: No deploy key was added.
+}
+
+-- GPG: an unverified key is accepted when it carries one of her activated addresses.
+journey AdaAddsHerGpgKey {
+    goal: Ada uploads her GPG public key, whose identity is her confirmed
+          address, then proves she holds it.
+
+    1. she uploads the armored key
+        stipulate manages_own_gpg_keys(ada) = true
+        stipulate gpg_armored_key_parses("ARMORED-ADA") = true
+        stipulate gpg_primary_key_id("ARMORED-ADA") = "AAAA1111BBBB2222"
+        stipulate gpg_identity_emails("ARMORED-ADA") = {"ada@example.org"}
+        stipulate has_activated_identity(ada, {"ada@example.org"}) = true
+        stipulate gpg_subkey_ids("ARMORED-ADA") = {}
+        ada does UserAddsGpgKey(ada, "ARMORED-ADA") on KeySettings
+            creating gpg: GpgKey
+        then UserAddsGpgKeyMatchedByEmail fires
+        then gpg.key_id = "AAAA1111BBBB2222"
+        then gpg.owner = ada
+        then gpg.is_verified = false
+
+    2. she proves she holds it
+        stipulate new_verification_token(ada) = "token-3"
+        ada does UserRequestsVerificationToken(ada) on KeySettings
+            creating challenge: VerificationChallenge
+        stipulate gpg_key_signs_token(gpg, "pgpsig-1", "token-3") = true
+        ada does UserVerifiesGpgKey(ada, gpg, challenge, "pgpsig-1") on OwnGpgKey
+        then gpg.is_verified = true
+        ada sees gpg.key_id on OwnGpgKey in gpg
+
+    ends: Ada's GPG key is registered and verified.
+}
+
+-- The email rule, and how a signature lifts it.
+journey AKeyForAnotherAddressNeedsASignature {
+    goal: Bob's GPG key carries only his work address, which is not on his
+          account. The plain upload is refused; uploading it together with a
+          signature of his token succeeds and the key is verified at once.
+
+    1. the plain upload is refused
+        stipulate manages_own_gpg_keys(bob) = true
+        stipulate gpg_armored_key_parses("ARMORED-BOB") = true
+        stipulate gpg_primary_key_id("ARMORED-BOB") = "BBBB3333CCCC4444"
+        stipulate gpg_identity_emails("ARMORED-BOB") = {"bob@work.example"}
+        stipulate has_activated_identity(bob, {"bob@work.example"}) = false
+        bob cannot do UserAddsGpgKey(bob, "ARMORED-BOB") on KeySettings
+
+    2. with a signed token it goes through
+        stipulate new_verification_token(bob) = "token-4"
+        bob does UserRequestsVerificationToken(bob) on KeySettings
+            creating challenge: VerificationChallenge
+        stipulate gpg_signs_token("ARMORED-BOB", "pgpsig-bob", "token-4") = true
+        stipulate gpg_token_signer_key_id("ARMORED-BOB", "pgpsig-bob") = "BBBB3333CCCC4444"
+        stipulate gpg_subkey_ids("ARMORED-BOB") = {}
+        bob does UserAddsSignedGpgKey(bob, "ARMORED-BOB", challenge, "pgpsig-bob") on KeySettings
+            creating gpg: GpgKey
+        then UserAddsGpgKeyProvenBySignature fires
+        then gpg.is_verified = true
+
+    ends: Bob's key is registered and verified even though its address is not his.
+}
+
+-- Signature verification and trust under the default (collaborator) model.
+journey HerSignedCommitIsTrusted {
+    goal: Ada pushes a commit signed with her verified GPG key to a repository
+          she collaborates on. Readers see a green, trusted badge; someone
+          who cannot read the repository sees nothing.
+
+    cast:
+        app:   repositories/Repository
+        forge: ForgeSubsystem
+        gpg:   GpgKey
+        carol: accounts/User
+
+    given:
+        forge.name = "code"
+        gpg.owner = ada
+        gpg.key_id = "AAAA1111BBBB2222"
+        gpg.is_verified = true
+        gpg.primary = null
+        gpg.is_revoked = false
+        gpg.expires_at = null
+
+    1. the commit page asks for the verification
+        stipulate committer_account("ada@example.org") = ada
+        stipulate gpg_signature_readable("PGPSIG-COMMIT") = true
+        stipulate gpg_signature_issuer("PGPSIG-COMMIT") = "AAAA1111BBBB2222"
+        stipulate registered_gpg_key_that_signed("PGPSIG-COMMIT") = gpg
+        stipulate gpg.is_usable_for_signatures = true
+        stipulate credited_email(gpg, "ada@example.org") = "ada@example.org"
+        stipulate repository_trust_model(app) = collaborator
+        stipulate is_owner_member_or_collaborator(ada, app) = true
+        forge does SignatureVerificationRequested(app, commit, "c0ffee", "ada@example.org", openpgp, "PGPSIG-COMMIT") on SigningService
+            creating check: CommitVerification
+        then VerifyOpenPgpSignature fires
+        then check.result = verified
+        then check.signer = ada
+        then AssessSignatureTrust fires
+        then check.trust = trusted
+
+    2. a reader sees the badge
+        stipulate can_read_code(bob, app) = true
+        bob sees check.trust on SignatureBadge in check
+
+    3. someone without access to the repository does not
+        stipulate can_read_code(carol, app) = false
+        carol cannot see check.signer on SignatureBadge in check
+
+    ends: The commit shows as verified and trusted to those who can read it.
+}
+
+-- A valid signature by someone who is neither the committer nor a collaborator.
+journey SomeoneElsesSignatureIsUnmatched {
+    goal: A commit claims Ada as committer but is signed by Bob's key; Bob is
+          not a collaborator. The signature is valid, so the commit is
+          verified — but the badge says the signer does not match.
+
+    cast:
+        app:   repositories/Repository
+        forge: ForgeSubsystem
+        bobs:  GpgKey
+
+    given:
+        forge.name = "code"
+        bobs.owner = bob
+        bobs.key_id = "BBBB3333CCCC4444"
+        bobs.is_verified = true
+        bobs.primary = null
+        bobs.is_revoked = false
+        bobs.expires_at = null
+
+    1. the verification is requested
+        stipulate committer_account("ada@example.org") = ada
+        stipulate gpg_signature_readable("PGPSIG-BOB") = true
+        stipulate gpg_signature_issuer("PGPSIG-BOB") = "BBBB3333CCCC4444"
+        stipulate registered_gpg_key_that_signed("PGPSIG-BOB") = bobs
+        stipulate bobs.is_usable_for_signatures = true
+        stipulate credited_email(bobs, "ada@example.org") = "bob@example.org"
+        stipulate repository_trust_model(app) = collaborator
+        stipulate is_owner_member_or_collaborator(bob, app) = false
+        forge does SignatureVerificationRequested(app, commit, "badc0de", "ada@example.org", openpgp, "PGPSIG-BOB") on SigningService
+            creating check: CommitVerification
+        then check.result = verified
+        then check.signer = bob
+        then check.trust = unmatched
+
+    ends: The commit is verified but flagged as signed by someone else.
+}
+
+-- A signature naming a known key that the key did not make is a warning.
+journey AForgedSignatureRaisesAWarning {
+    goal: A commit carries a signature claiming to come from Ada's key id, but
+          her key does not validate it.
+
+    cast:
+        app:   repositories/Repository
+        forge: ForgeSubsystem
+        gpg:   GpgKey
+
+    given:
+        forge.name = "code"
+        gpg.owner = ada
+        gpg.key_id = "AAAA1111BBBB2222"
+
+    1. the verification is requested
+        stipulate committer_account("ada@example.org") = ada
+        stipulate gpg_signature_readable("PGPSIG-FORGED") = true
+        stipulate gpg_signature_issuer("PGPSIG-FORGED") = "AAAA1111BBBB2222"
+        stipulate registered_gpg_key_that_signed("PGPSIG-FORGED") = null
+        stipulate instance_gpg_key_signed(app, "PGPSIG-FORGED") = false
+        forge does SignatureVerificationRequested(app, commit, "f00d", "ada@example.org", openpgp, "PGPSIG-FORGED") on SigningService
+            creating check: CommitVerification
+        then check.result = warning
+        then check.reason = probable_bad_signature
+        then AssessSignatureTrust does not fire
+
+    ends: The commit shows a red warning badge.
+}
+
+-- Keys supplied by a directory are managed there.
+journey TheDirectoryManagesHerKeys {
+    goal: Ada's company directory publishes her SSH key. On the directory sync
+          it appears on her account, marked as managed; she cannot delete it.
+          When the directory drops it, it disappears from her account.
+
+    cast:
+        corp:  authentication/AuthSource
+        corp_settings: authentication/AuthSourceSettings
+
+    given:
+        corp.name = "corp"
+        corp.kind = ldap_bind_dn
+        corp.is_active = true
+        corp.sync_enabled = true
+        corp.provides_ssh_keys = true
+        -- the directory's group lookup is off: the sync asserts no groups
+        corp.settings = corp_settings
+        corp_settings.groups_enabled = false
+        login: authentication/UserLogin { user: ada, source: corp, login_name: "ada", has_password: false, must_change_password: false }
+        entry: authentication/DirectoryEntry { source: corp, username: "ada", email: "ada@example.org", is_admin: false, is_restricted: false, ssh_public_keys: {"ssh-ed25519 AAAAcorp ada@corp"} }
+
+    1. the directory reports her key on the sync
+        stipulate ssh_parse_outcome("ssh-ed25519 AAAAcorp ada@corp") = valid
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAcorp ada@corp") = "SHA256:corp"
+        stipulate ssh_key_algorithm("ssh-ed25519 AAAAcorp ada@corp") = ed25519
+        stipulate ssh_key_bits("ssh-ed25519 AAAAcorp ada@corp") = 256
+        stipulate ssh_normalised("ssh-ed25519 AAAAcorp ada@corp") = "ssh-ed25519 AAAAcorp ada@corp"
+        stipulate presented_public_lines({"ssh-ed25519 AAAAcorp ada@corp"}) = {"ssh-ed25519 AAAAcorp"}
+        stipulate without_comment("ssh-ed25519 AAAAcorp ada@corp") = "ssh-ed25519 AAAAcorp"
+        root does AdminRunsExternalUserSync(root) on AuthSourceAdministration
+            creating corp_key: SshKey
+        then LdapSourceSynchronised fires
+        then AddExternallySuppliedSshKeys fires
+        then corp_key.auth_source = corp
+        then corp_key.owner = ada
+
+    2. she cannot remove it herself
+        stipulate manages_own_ssh_keys(ada) = true
+        ada cannot do UserDeletesSshKey(ada, corp_key) on OwnSshKey
+
+    3. the directory stops publishing it
+        stipulate entry.ssh_public_keys = {}
+        stipulate presented_public_lines({}) = {}
+        root does AdminRunsExternalUserSync(root) on AuthSourceAdministration
+        then RemoveWithdrawnExternalSshKeys fires
+        then corp_key does not exist
+
+    ends: Ada's SSH keys follow the directory.
+}
+
+-- Instance signing: web edits are signed only for people who meet the policy.
+journey WebEditsAreSignedForKeyHolders {
+    goal: Under the default CRUD_ACTIONS policy (pubkey, twofa, parentsigned),
+          the forge signs Ada's web edit — she has a key and 2FA and the
+          parent is verified — but not Bob's, who has no key.
+
+    cast:
+        app:    repositories/Repository
+        forge:  ForgeSubsystem
+        policy: SigningPolicy
+
+    given:
+        forge.name = "web-editor"
+        policy.operation = web_edit
+        policy.mode = conditional
+        policy.requires_registered_key = true
+        policy.requires_two_factor = true
+        policy.requires_parent_signed = true
+        policy.requires_base_signed = false
+        policy.requires_head_signed = false
+        policy.requires_commits_signed = false
+        policy.requires_approval = false
+
+    1. ada's edit is signed
+        stipulate instance_signing_key_available(app) = true
+        stipulate has_registered_key(ada) = true
+        stipulate has_two_factor(ada) = true
+        stipulate instance_signing_name(app) = "Forge"
+        stipulate instance_signing_email(app) = "forge@example.org"
+        forge does WebEditSigningRequested(ada, app, true) on SigningService
+            creating signed: SigningDecision
+        then signed.will_sign = true
+        then signed.signer_email = "forge@example.org"
+
+    2. bob's edit is not
+        stipulate has_registered_key(bob) = false
+        forge does WebEditSigningRequested(bob, app, true) on SigningService
+            creating unsigned: SigningDecision
+        then unsigned.will_sign = false
+        then unsigned.refusal = no_registered_key
+
+    ends: Ada's commit carries the instance signature; Bob's is unsigned.
+}
+
+-- Principals are off unless the instance trusts a certificate authority.
+journey PrincipalsAreOffByDefault {
+    goal: Ada's company issues SSH certificates, but this instance has no
+          trusted CA configured, so she cannot register a principal and a
+          certificate does not log her in.
+
+    cast:
+        forge: ForgeSubsystem
+
+    given:
+        forge.name = "ssh"
+
+    1. she cannot register a principal
+        stipulate trimmed("ada") = "ada"
+        stipulate is_single_line("ada") = true
+        ada cannot do UserAddsPrincipal(ada, "ada") on KeySettings
+
+    2. a certificate is not accepted
+        forge cannot do SshClientPresentsCertificate("conn-1", "CERT-ADA") on SshKeyResolution
+
+    ends: Certificate login stays off until an administrator trusts a CA.
+}
+
+-- SSH authentication resolves a presented key to the registered key.
+journey HerKeyOpensTheDoor {
+    goal: Ada runs git clone over SSH. The transport asks which key she holds;
+          it is her laptop key. After the clone the key is marked as used.
+
+    cast:
+        laptop: SshKey
+        forge:  ForgeSubsystem
+        app:    repositories/Repository
+
+    given:
+        laptop.kind = personal
+        laptop.owner = ada
+        laptop.name = "laptop"
+        laptop.content = "ssh-ed25519 AAAAada ada@laptop"
+        laptop.fingerprint = "SHA256:ada-laptop"
+        laptop.algorithm = ed25519
+        laptop.bits = 256
+        laptop.auth_source = null
+        laptop.is_verified = false
+        laptop.last_used_at = null
+        forge.name = "ssh"
+
+    1. the transport resolves her key
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAada ada@laptop") = "SHA256:ada-laptop"
+        forge does SshClientPresentsPublicKey("conn-2", "ssh-ed25519 AAAAada ada@laptop") on SshKeyResolution
+        then AuthenticateSshPublicKey fires
+
+    2. an unknown key is turned away
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAstranger x@y") = "SHA256:stranger"
+        forge cannot do SshClientPresentsPublicKey("conn-3", "ssh-ed25519 AAAAstranger x@y") on SshKeyResolution
+
+    3. the clone completes and the key is marked used
+        forge does SshKeyUsedForRepository(laptop, app) on SshKeyResolution
+        then RecordSshKeyUse fires
+        then laptop.has_been_used = true
+
+    ends: Ada's laptop key shows as recently used.
+}
+
+-- Decided (keys 1): with SSH disabled, personal keys still register for
+-- commit signing, but deploy keys, which only serve SSH access, are refused.
+journey SshIsOffButSigningKeysStay {
+    goal: The instance has SSH turned off. Ada still adds her SSH key so her
+          SSH-signed commits verify, but she cannot hand her CI a deploy key.
+
+    cast:
+        app: repositories/Repository
+
+    given:
+        config.ssh_disabled = true
+        app.is_archived = false
+        app.is_mirror = false
+
+    1. her personal key is accepted for signing
+        stipulate manages_own_ssh_keys(ada) = true
+        stipulate length("signing") = 7
+        stipulate ssh_parse_outcome("ssh-ed25519 AAAAsign ada@sign") = valid
+        stipulate ssh_key_algorithm("ssh-ed25519 AAAAsign ada@sign") = ed25519
+        stipulate ssh_key_bits("ssh-ed25519 AAAAsign ada@sign") = 256
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAsign ada@sign") = "SHA256:ada-sign"
+        stipulate ssh_normalised("ssh-ed25519 AAAAsign ada@sign") = "ssh-ed25519 AAAAsign ada@sign"
+        ada does UserAddsSshKey(ada, "signing", "ssh-ed25519 AAAAsign ada@sign") on KeySettings
+            creating signing: SshKey
+        then signing.kind = personal
+
+    2. a deploy key is refused
+        stipulate is_repo_admin(ada, app) = true
+        stipulate length("ci") = 2
+        stipulate ssh_parse_outcome("ssh-ed25519 AAAAci ci@runner") = valid
+        stipulate ssh_key_algorithm("ssh-ed25519 AAAAci ci@runner") = ed25519
+        stipulate ssh_key_bits("ssh-ed25519 AAAAci ci@runner") = 256
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAci ci@runner") = "SHA256:ci"
+        ada cannot do RepoAdminAddsDeployKey(ada, app, "ci", "ssh-ed25519 AAAAci ci@runner", read_only) on RepositoryDeployKeys
+
+    ends: Ada can sign with her key; no SSH access was handed out.
+}
+
+-- Decided (keys 7): archived repositories take no deploy keys; mirrors take
+-- read-only ones only.
+journey ArchivedAndMirroredRepositoriesLimitDeployKeys {
+    goal: Ada administers an archived repository and a pull mirror. She cannot
+          add a deploy key to the archive, nor a writable one to the mirror;
+          a read-only one on the mirror is fine.
+
+    cast:
+        attic:  repositories/Repository
+        mirror: repositories/Repository
+
+    given:
+        attic.is_archived = true
+        attic.is_mirror = false
+        mirror.is_archived = false
+        mirror.is_mirror = true
+
+    1. the archive refuses any deploy key
+        stipulate is_repo_admin(ada, attic) = true
+        stipulate length("ci") = 2
+        stipulate ssh_parse_outcome("ssh-ed25519 AAAAci ci@runner") = valid
+        stipulate ssh_key_algorithm("ssh-ed25519 AAAAci ci@runner") = ed25519
+        stipulate ssh_key_bits("ssh-ed25519 AAAAci ci@runner") = 256
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAci ci@runner") = "SHA256:ci"
+        stipulate ssh_normalised("ssh-ed25519 AAAAci ci@runner") = "ssh-ed25519 AAAAci ci@runner"
+        ada cannot do RepoAdminAddsDeployKey(ada, attic, "ci", "ssh-ed25519 AAAAci ci@runner", read_only) on RepositoryDeployKeys
+
+    2. the mirror refuses a writable one
+        stipulate is_repo_admin(ada, mirror) = true
+        ada cannot do RepoAdminAddsDeployKey(ada, mirror, "ci", "ssh-ed25519 AAAAci ci@runner", read_write) on RepositoryDeployKeys
+
+    3. but takes a read-only one
+        ada does RepoAdminAddsDeployKey(ada, mirror, "ci", "ssh-ed25519 AAAAci ci@runner", read_only) on RepositoryDeployKeys
+            creating grant: DeployKey
+        then grant.access = read_only
+        then grant.repository = mirror
+
+    ends: The mirror can be cloned by CI; nothing can push through a deploy key.
+}
+
+-- Decided (keys 2): directory keys must meet the key policy; a weak one is
+-- skipped and reported.
+journey AWeakDirectoryKeyIsSkipped {
+    goal: Ada's company directory still publishes her old 2048-bit RSA key.
+          On the sync it is not added to her account; the operator is told.
+
+    cast:
+        corp:  authentication/AuthSource
+        corp_settings: authentication/AuthSourceSettings
+
+    given:
+        corp.name = "corp"
+        corp.kind = ldap_bind_dn
+        corp.is_active = true
+        corp.sync_enabled = true
+        corp.provides_ssh_keys = true
+        -- the directory's group lookup is off: the sync asserts no groups
+        corp.settings = corp_settings
+        corp_settings.groups_enabled = false
+        login: authentication/UserLogin { user: ada, source: corp, login_name: "ada", has_password: false, must_change_password: false }
+        entry: authentication/DirectoryEntry { source: corp, username: "ada", email: "ada@example.org", is_admin: false, is_restricted: false, ssh_public_keys: {"ssh-rsa AAAAweak ada@old"} }
+
+    1. the sync skips the weak key
+        stipulate ssh_parse_outcome("ssh-rsa AAAAweak ada@old") = valid
+        stipulate ssh_fingerprint("ssh-rsa AAAAweak ada@old") = "SHA256:weak"
+        stipulate ssh_key_algorithm("ssh-rsa AAAAweak ada@old") = rsa
+        stipulate ssh_key_bits("ssh-rsa AAAAweak ada@old") = 2048
+        stipulate presented_public_lines({"ssh-rsa AAAAweak ada@old"}) = {"ssh-rsa AAAAweak"}
+        root does AdminRunsExternalUserSync(root) on AuthSourceAdministration
+            creating weak: SshKey
+        then AddExternallySuppliedSshKeys fires
+        then weak does not exist
+
+    ends: Ada has no key from the directory until it publishes a compliant one.
+}
+
+-- Decided (keys 3): SSH signatures go through the same trust model as GPG
+-- ones, collaborator check included.
+journey AnSshSignatureFromAnOutsiderIsUntrusted {
+    goal: Bob signs his own commit with his verified SSH key and it lands in
+          Ada's repository, where he is not a collaborator. The signature is
+          valid, so the commit is verified — but not trusted.
+
+    cast:
+        app:   repositories/Repository
+        forge: ForgeSubsystem
+        bobs:  SshKey
+
+    given:
+        forge.name = "code"
+        bobs.kind = personal
+        bobs.owner = bob
+        bobs.name = "desk"
+        bobs.content = "ssh-ed25519 AAAAbob bob@desk"
+        bobs.fingerprint = "SHA256:bob-desk"
+        bobs.algorithm = ed25519
+        bobs.bits = 256
+        bobs.auth_source = null
+        bobs.is_verified = true
+        bobs.last_used_at = null
+
+    1. the verification is requested
+        stipulate committer_account("bob@example.org") = bob
+        stipulate registered_ssh_key_that_signed("SSHSIG-BOB") = bobs
+        stipulate repository_trust_model(app) = collaborator
+        stipulate is_owner_member_or_collaborator(bob, app) = false
+        forge does SignatureVerificationRequested(app, commit, "5ca1ab1e", "bob@example.org", ssh, "SSHSIG-BOB") on SigningService
+            creating check: CommitVerification
+        then VerifySshSignature fires
+        then check.result = verified
+        then check.signer = bob
+        then AssessSignatureTrust fires
+        then check.trust = untrusted
+
+    ends: The commit shows a yellow "verified, untrusted" badge, as a GPG signature would.
+}
+
+-- Decided (keys 4): verification knows about expiry and revocation.
+journey SignaturesOutliveTheKeysValidity {
+    goal: Ada's GPG key expired on day 10. A commit she signed on day 5 stays
+          verified; one dated day 12 is not. Bob revoked his key; his
+          signatures no longer verify at all.
+
+    cast:
+        app:   repositories/Repository
+        forge: ForgeSubsystem
+        gpg:   GpgKey
+        bobs:  GpgKey
+
+    given:
+        forge.name = "code"
+        gpg.owner = ada
+        gpg.key_id = "AAAA1111BBBB2222"
+        gpg.is_verified = true
+        gpg.primary = null
+        gpg.is_revoked = false
+        gpg.expires_at = 10.days
+        bobs.owner = bob
+        bobs.key_id = "BBBB3333CCCC4444"
+        bobs.is_verified = true
+        bobs.primary = null
+        bobs.is_revoked = true
+        bobs.expires_at = null
+
+    1. a signature made while the key was valid stays verified
+        stipulate committer_account("ada@example.org") = ada
+        stipulate gpg_signature_readable("PGPSIG-DAY5") = true
+        stipulate gpg_signature_issuer("PGPSIG-DAY5") = "AAAA1111BBBB2222"
+        stipulate registered_gpg_key_that_signed("PGPSIG-DAY5") = gpg
+        stipulate gpg_signature_created_at("PGPSIG-DAY5") = 5.days
+        stipulate gpg.is_usable_for_signatures = true
+        stipulate credited_email(gpg, "ada@example.org") = "ada@example.org"
+        stipulate repository_trust_model(app) = collaborator
+        stipulate is_owner_member_or_collaborator(ada, app) = true
+        forge does SignatureVerificationRequested(app, commit, "da7e05", "ada@example.org", openpgp, "PGPSIG-DAY5") on SigningService
+            creating early: CommitVerification
+        then early.result = verified
+        then early.signer = ada
+
+    2. one dated after expiry is not
+        stipulate gpg_signature_readable("PGPSIG-DAY12") = true
+        stipulate gpg_signature_issuer("PGPSIG-DAY12") = "AAAA1111BBBB2222"
+        stipulate registered_gpg_key_that_signed("PGPSIG-DAY12") = gpg
+        stipulate gpg_signature_created_at("PGPSIG-DAY12") = 12.days
+        forge does SignatureVerificationRequested(app, commit, "da7e12", "ada@example.org", openpgp, "PGPSIG-DAY12") on SigningService
+            creating late: CommitVerification
+        then late.result = unverified
+        then late.reason = key_expired
+        then AssessSignatureTrust does not fire
+
+    3. a revoked key verifies nothing
+        stipulate committer_account("bob@example.org") = bob
+        stipulate gpg_signature_readable("PGPSIG-REVOKED") = true
+        stipulate gpg_signature_issuer("PGPSIG-REVOKED") = "BBBB3333CCCC4444"
+        stipulate registered_gpg_key_that_signed("PGPSIG-REVOKED") = bobs
+        stipulate bobs.is_usable_for_signatures = true
+        forge does SignatureVerificationRequested(app, commit, "dead", "bob@example.org", openpgp, "PGPSIG-REVOKED") on SigningService
+            creating revoked: CommitVerification
+        then revoked.result = unverified
+        then revoked.reason = key_revoked
+
+    ends: Old commits keep their badge; nothing new verifies with a dead key.
+}
+
+-- Decided (keys 6): proving possession does not need the manage-keys flag.
+journey VerifyingAGpgKeyWithoutManagingKeys {
+    goal: The administrator froze Ada's key list (she may not manage GPG
+          keys), but she can still prove she holds the key already on it.
+
+    cast:
+        gpg: GpgKey
+
+    given:
+        gpg.owner = ada
+        gpg.key_id = "AAAA1111BBBB2222"
+        gpg.is_verified = false
+        gpg.primary = null
+
+    1. she cannot add another key
+        stipulate manages_own_gpg_keys(ada) = false
+        ada cannot do UserAddsGpgKey(ada, "ARMORED-OTHER") on KeySettings
+
+    2. but she can verify the one she has
+        stipulate new_verification_token(ada) = "token-5"
+        ada does UserRequestsVerificationToken(ada) on KeySettings
+            creating challenge: VerificationChallenge
+        stipulate gpg_key_signs_token(gpg, "pgpsig-5", "token-5") = true
+        ada does UserVerifiesGpgKey(ada, gpg, challenge, "pgpsig-5") on OwnGpgKey
+        then gpg.is_verified = true
+
+    ends: The key set is unchanged; Ada's key is now verified.
+}
+
+-- Decided (keys 5): a fingerprint lookup names the owner only to those who
+-- may see the owner's profile, and never turns up deploy keys.
+journey WhoOwnsThisKey {
+    goal: Bob finds a public key fingerprint in a log and looks it up. It is
+          Ada's, and her profile is public, so he learns it is hers. The CI
+          deploy key's fingerprint tells him nothing; the site administrator
+          sees both.
+
+    cast:
+        laptop: SshKey
+        ci:     SshKey
+
+    given:
+        ada.visibility = public
+        laptop.kind = personal
+        laptop.owner = ada
+        laptop.name = "laptop"
+        laptop.content = "ssh-ed25519 AAAAada ada@laptop"
+        laptop.fingerprint = "SHA256:ada-laptop"
+        laptop.algorithm = ed25519
+        laptop.bits = 256
+        laptop.auth_source = null
+        laptop.is_verified = false
+        laptop.last_used_at = null
+        ci.kind = deploy
+        ci.owner = null
+        ci.name = "ci"
+        ci.content = "ssh-ed25519 AAAAci ci@runner"
+        ci.fingerprint = "SHA256:ci"
+        ci.algorithm = ed25519
+        ci.bits = 256
+        ci.auth_source = null
+        ci.is_verified = false
+        ci.last_used_at = null
+
+    1. bob learns who owns the personal key
+        bob sees laptop.owner on SshKeyFingerprintLookup in laptop
+
+    2. the deploy key is not found
+        bob cannot see ci.fingerprint on SshKeyFingerprintLookup in ci
+
+    3. the administrator sees both
+        root sees laptop.owner on SshKeyFingerprintLookup in laptop
+        root sees ci.fingerprint on SshKeyFingerprintLookup in ci
+
+    ends: Key ownership is as visible as the owner's profile, no more.
+}
+
+-- Decided (keys 9): every principal on a certificate is tried.
+journey TheSecondPrincipalLetsHerIn {
+    goal: Ada's certificate lists "ops" and "ada". "ops" is registered to a
+          deactivated account; "ada" is hers. Login falls through to "ada"
+          instead of stopping at "ops". A certificate whose only registered
+          principal belongs to the deactivated account is refused.
+
+    cast:
+        forge: ForgeSubsystem
+        ops:   SshKey
+        mine:  SshKey
+        gone:  accounts/User
+
+    given:
+        config.trusted_user_ca_keys_configured = true
+        forge.name = "ssh"
+        gone.name = "gone"
+        gone.is_active = false
+        gone.prohibit_login = false
+        ops.kind = principal
+        ops.owner = gone
+        ops.name = "ops"
+        ops.content = "ops"
+        ops.fingerprint = null
+        mine.kind = principal
+        mine.owner = ada
+        mine.name = "ada"
+        mine.content = "ada"
+        mine.fingerprint = null
+
+    1. her certificate authenticates through its second principal
+        stipulate is_user_certificate("CERT-OPS-ADA") = true
+        stipulate certificate_signed_by_trusted_ca("CERT-OPS-ADA") = true
+        stipulate acceptable_principal_for("CERT-OPS-ADA") = mine
+        stipulate certificate_valid_for("CERT-OPS-ADA", "ada") = true
+        forge does SshClientPresentsCertificate("conn-4", "CERT-OPS-ADA") on SshKeyResolution
+        then AuthenticateSshCertificate fires
+
+    2. a certificate whose only registered principal is the deactivated account's is refused
+        stipulate is_user_certificate("CERT-OPS") = true
+        stipulate certificate_signed_by_trusted_ca("CERT-OPS") = true
+        stipulate acceptable_principal_for("CERT-OPS") = null
+        forge cannot do SshClientPresentsCertificate("conn-5", "CERT-OPS") on SshKeyResolution
+
+    ends: Ada is in as herself; the deactivated account's principal opens nothing.
+}
+
+-- Decided (administration 3): read-only mode refuses key changes too.
+journey ReadOnlyModeRefusesNewKeys {
+    goal: The instance is read-only for a backup. Ada tries to register a new
+          SSH key and is refused; her existing key stays listed.
+
+    cast:
+        gate:   access/InstanceWriteGate
+        laptop: SshKey
+
+    given:
+        gate.read_only = true
+        laptop.kind = personal
+        laptop.owner = ada
+        laptop.name = "laptop"
+        laptop.fingerprint = "SHA256:ada-laptop"
+        laptop.is_verified = false
+
+    1. she cannot add a key
+        stipulate manages_own_ssh_keys(ada) = true
+        stipulate length("desktop") = 7
+        stipulate ssh_parse_outcome("ssh-ed25519 AAAAdesk ada@desk") = valid
+        stipulate ssh_key_algorithm("ssh-ed25519 AAAAdesk ada@desk") = ed25519
+        stipulate ssh_key_bits("ssh-ed25519 AAAAdesk ada@desk") = 256
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAdesk ada@desk") = "SHA256:ada-desk"
+        ada cannot do UserAddsSshKey(ada, "desktop", "ssh-ed25519 AAAAdesk ada@desk") on KeySettings
+
+    2. nor delete the one she has
+        ada cannot do UserDeletesSshKey(ada, laptop) on OwnSshKey
+
+    3. her key is still listed
+        ada sees laptop.fingerprint on OwnSshKey in laptop
+
+    ends: Her keys are as they were before the instance went read-only.
+}

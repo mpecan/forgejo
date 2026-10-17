@@ -1,0 +1,2772 @@
+-- allium: 3
+-- discovery.allium — how things are found and summarised: explore, search, indexers, insights, sitemap.
+--
+-- Scope: Every read path that lets a party *find* something they did not
+--   navigate to directly, and every summary computed over a repository's
+--   history. Search is always filtered to what the viewer may read; the read
+--   rules themselves live in access.allium and are only referenced here.
+--
+-- Includes:
+--   - The instance directory: explore pages for repositories, users,
+--     organizations and code; the restrictions on them (sign-in requirement,
+--     per-page disable switches, global code-unit disable).
+--   - Repository search (web explore, profile/star/watch listings, JSON
+--     pickers, REST `/repos/search`) with keyword, topic, language,
+--     archived/fork/mirror/template/private facets, "relevant only", sorts.
+--   - User and organization search (explore, REST `/users/search`, user
+--     pickers), including the email-match privacy rule.
+--   - Code search: per-repository, per-owner and instance-wide; the code
+--     indexer (bleve / elasticsearch / zoekt), its eligibility rules
+--     (repo kinds, include/exclude globs, vendored, size, binary), its
+--     incremental refresh on pushes to the default branch, and the git-grep
+--     fallback when no indexer is configured.
+--   - The issue indexer (bleve / elasticsearch / meilisearch / db) and issue
+--     search: keyword query language, filters, sort orders, per-repository
+--     lists and cross-repository dashboards ("Issues", "Pull requests",
+--     "Milestones"), and the REST `/repos/issues/search`.
+--   - Re-index requests (site admin, per repository) and the scheduled full
+--     issue-index rebuild.
+--   - Repository insights: pulse (activity over a period), top committers,
+--     contributors graph, code frequency, recent commits.
+--   - User profile overview tabs (README from the `.profile` repository,
+--     repositories, stars, watching, followers, following).
+--   - Mention / assignee autocomplete candidates and the user picker.
+--   - Topic search, sitemap (index + pages), robots policy, `?go-get=1`
+--     import metadata.
+--   - The miscellaneous REST surface: markup rendering (with the
+--     sanitisation guarantee), version, gitignore / license / label
+--     template catalogues.
+--
+-- Excludes:
+--   - Who may read what (access.allium) — referenced through the local
+--     predicates listed below.
+--   - Storing language statistics (repositories.allium owns LanguageStat);
+--     this module decides *when* they are recomputed, measures them, and
+--     exposes the primary language as a search facet.
+--   - Activity feeds, heatmaps, RSS/Atom, the home dashboard feed
+--     (notifications.allium owns them); the profile "activity" tab is theirs.
+--   - Organization home page and team/member listings (organizations.allium).
+--   - Admin user/repo/org management lists (administration.allium) even
+--     though they reuse the search machinery.
+--   - Wiki content search (wiki.allium).
+--   - NodeInfo / WebFinger (federation.allium); signing-key endpoints
+--     (keys.allium); `/actions/run` (actions.allium); `/api/v1/settings/*`
+--     (administration.allium).
+--   - The detailed sanitiser allow-list and every markup renderer
+--     (markdown extensions, org-mode, csv, asciicast, external renderers):
+--     deferred to a markup specification; only the guarantee is kept here.
+--   - Gitea-compatibility aliases: legacy `fuzzy=true` query flag, legacy
+--     `DISABLE_SANITIZER`, the `gitea_codes` / `gitea_issues` index names,
+--     index storage paths and connection strings (pure infrastructure).
+--   - Search result highlighting/formatting and pagination link headers
+--     (presentation).
+--
+-- Emits:
+--   - LanguageStatsComputed(repository, commit_sha, sizes)
+--       -- repositories replaces the repository's LanguageStat rows
+--   - CodeIndexRefreshed(repository, commit_sha)
+--       -- informational: the code index now reflects that default-branch commit
+--   - IndexerStartupFailed(kind)
+--       -- administration records a SystemNotice for site admins (decided: discovery 4)
+--   - CodeSearchAnswered(search), ContributorStatsGenerationStarted(repository, revision),
+--     TemplateRead(client, template), IssueIndexRebuildStarted(service)
+--       -- internal / informational
+--
+--   IssueIndexRebuildTaskFinished()     -- administration: the rebuild_issue_indexer run is done
+-- Reacts to:
+--   - code/CommitsPushed(repository, branch_name, ...)   -- default-branch pushes
+--       (including mirror syncs) refresh the code index and language statistics
+--   - code/DefaultBranchChanged(repository, old_name, new_name, by)
+--   - repositories/RepositoryCreated, RepositoryAdopted, RepositoryDeleted,
+--     RepositoryVisibilityChanged (repository, doer)
+--   - migrations/RepositoryMigrated(repository)
+--   - issues/IssueOpened, IssueClosed, IssueReopened, IssueDeleted,
+--     IssueTitleChanged, IssueContentChanged, IssueRefChanged,
+--     IssueLabelsChanged, IssueLabelsCleared, IssueMilestoneChanged,
+--     IssueAssigneeChanged, IssueCommentCreated, IssueCommentEdited,
+--     IssueCommentDeleted
+--   - pulls/PullRequestClosed(pull_request, doer), PullRequestReopened(pull_request, doer),
+--     pulls/PullRequestOpened(pull_request), PullRequestMerged(pull_request, merger),
+--     PullRequestAutoMerged(pull_request, merger), ReviewSubmitted(review),
+--     ReviewRequested(pull_request, requester, reviewer),
+--     ReviewRequestRemoved(pull_request, doer, reviewer),
+--     PullRequestCodeCommented(pull_request, comment),
+--     ReviewCommentEdited(pull_request, comment), ReviewCommentDeleted(pull_request, comment)
+--   - administration/IssueIndexRebuildDue()   -- the cron task (and "run now")
+--
+-- Black-box predicates. Qualified calls into sibling modules cannot yet be
+-- simulated, so the predicates this module needs are named locally, each
+-- delegating to its owner:
+--   can_read_code(user?, repository)      -- access/can_read(user, repository, code)
+--   can_read_issues(user?, repository)    -- access/can_read(user, repository, issues)
+--   can_read_pulls(user?, repository)     -- access/can_read(user, repository, pull_requests)
+--   can_read_releases(user?, repository)  -- access/can_read(user, repository, releases)
+--   can_see_repository(user?, repository)   -- access/has_any_access
+--   can_list_repository(user?, repository)  -- access/can_list: has_any_access
+--       without the site-admin grant on private repositories; every search
+--       result and listing passes it (decided: follow-up 1)
+--   can_see_profile(viewer?, user)          -- access/can_see_profile
+--   can_see_owner(viewer?, owner)           -- access/can_see_owner_user
+--   is_org_member(user, organization)       -- organizations membership
+--   user search lists exactly the accounts whose profile the viewer may see
+--       (can_see_profile; decided: discovery 2)
+--   listable_organization(org, viewer?)     -- same rule applied to organizations
+-- Singletons are reached through accessors: directory(), code_search_service(),
+-- issue_index_service(). Other free-standing calls are query black boxes whose
+-- meaning is given in the comment of the rule that uses them.
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./repositories.allium" as repositories
+use "./access.allium" as access
+use "./code.allium" as code
+use "./issues.allium" as issues
+use "./pulls.allium" as pulls
+use "./releases.allium" as releases
+use "./migrations.allium" as migrations
+use "./projects.allium" as projects
+use "./administration.allium" as administration
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- One line of a code search hit, with its line number. The matched range is
+-- highlighted; one line of context is shown either side of a match.
+value CodeHitLine {
+    number: Integer
+    text: String
+}
+
+-- Aggregate git statistics over a period on one branch.
+-- from: modules/git/repo_stats.go:20
+value CodeActivity {
+    author_count: Integer
+    commit_count: Integer
+    commit_count_all_branches: Integer
+    changed_files: Integer
+    additions: Integer
+    deletions: Integer
+}
+
+-- A committer in the "top authors" list. A committer whose email matches no
+-- account is shown by commit name only, with the ghost avatar.
+-- from: models/activities/repo_activity.go:23
+value ActivityAuthor {
+    name: String
+    account: accounts/User?
+    commits: Integer
+}
+
+-- One week of a contributor's history (weeks start on Sunday).
+-- from: services/repository/contributors_graph.go:39
+value ContributorWeek {
+    week_start: Timestamp
+    additions: Integer
+    deletions: Integer
+    commits: Integer
+}
+
+-- One contributor series in the contributors graph. Commits are attributed
+-- to an account by author email (primary or any verified address); unknown
+-- emails stay as a name-only series. The special series "total" is the sum.
+value ContributorSeries {
+    name: String
+    account: accounts/User?
+    total_commits: Integer
+    weeks: List<ContributorWeek>
+}
+
+-- A parsed term of the issue search query language (see IssueSearch).
+-- from: modules/indexer/issues/internal/qstring.go:27
+value QueryToken {
+    term: String
+    occurrence: must | should | must_not
+    exact: Boolean        -- "quoted phrase" (no fuzzy matching)
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- from: models/repo/search.go:36
+enum RepoSortOrder {
+    newest | oldest
+    | recent_update | least_update
+    | alphabetically | reverse_alphabetically
+    | size | reverse_size
+    | git_size | reverse_git_size
+    | lfs_size | reverse_lfs_size
+    | most_stars | fewest_stars
+    | most_forks | fewest_forks
+}
+
+-- Only newest/oldest/alphabetically/reverse_alphabetically are offered on the
+-- explore users/organizations pages; the rest are admin listing orders.
+-- from: routers/web/explore/user.go:155
+enum UserSortOrder {
+    newest | oldest
+    | alphabetically | reverse_alphabetically
+    | recent_update | least_update
+    | last_login | reverse_last_login
+}
+
+-- Narrowing facets for a repository search. Opposite pairs are mutually
+-- exclusive; absent from the set means "either".
+-- from: models/repo/repo_list.go:130
+enum RepoFacet {
+    archived | not_archived
+    | fork | not_fork
+    | mirror | not_mirror
+    | template | not_template
+    | private | public
+    | collaborative_only    -- repos the subject does not own but has access to
+    | owned_only            -- API `exclusive`
+    | topic_only            -- keyword matches topic names exactly
+    | relevant_only         -- hide forks unless asked; hide empty; require activity (see config.relevant_activity_window)
+}
+
+-- What a repository listing is about.
+enum RepoSearchScope {
+    explore                -- everything the viewer can read
+    | owned_by             -- repositories of `subject` (profile "Repositories" tab, API `uid`)
+    | starred_by           -- profile "Stars" tab, API `starredBy`
+    | watched_by           -- profile "Watching" tab
+}
+
+enum UserSearchScope {
+    explore                -- /explore/users
+    | api                  -- REST /users/search (also matches email)
+    | picker               -- /user/search_candidates (active users only)
+}
+
+-- Lifecycle of an indexer backend.
+enum BackendStatus { starting | ready | unavailable }
+
+-- Lifecycle of a queued indexing job.
+enum JobStatus { queued | completed | skipped }
+
+-- Lifecycle of a job that is never skipped.
+enum DrainStatus { queued | drained }
+
+enum CodeIndexerKind { bleve | elasticsearch | zoekt }
+
+enum IssueIndexerKind { bleve | elasticsearch | meilisearch | db }
+
+-- Which repository kinds the code indexer covers (REPO_INDEXER_REPO_TYPES).
+enum RepoKindForIndex { sources | forks | mirrors | templates }
+
+-- exact: the phrase as typed; union: any of the words; fuzzy: approximate
+-- word match (only when enabled, otherwise downgraded to union); regexp:
+-- only with the git-grep fallback.
+-- from: routers/web/repo/search.go:24
+enum CodeSearchMode { exact | union | fuzzy | regexp }
+
+enum CodeSearchScope { instance | owner | repository }
+
+-- from: modules/indexer/issues/internal/model.go:140
+enum IssueSortOrder {
+    relevance
+    | latest | oldest
+    | recent_update | least_update
+    | most_comment | least_comment
+    | near_due_date | far_due_date
+}
+
+enum IssueStateFilter { open | closed | all }
+
+enum IssueKindFilter { issues_only | pulls_only | both }
+
+-- How the viewer is involved; `your_repositories` means "in repositories I
+-- own or collaborate on", `all` means no involvement filter.
+-- from: routers/web/user/home.go:423
+enum InvolvementFilter {
+    all
+    | your_repositories
+    | created_by
+    | assigned
+    | mentioned
+    | review_requested
+    | reviewed_by
+}
+
+enum IssueSearchScope {
+    repository             -- one repository's issue or PR list
+    | dashboard            -- /issues, /pulls for the signed-in user
+    | organization         -- /org/{org}/issues|pulls (optionally one team)
+    | api                  -- REST /repos/issues/search
+}
+
+-- from: routers/web/repo/activity.go:31
+enum ActivityPeriod { daily | halfweekly | weekly | monthly | quarterly | semiyearly | yearly }
+
+-- from: routers/web/user/profile.go:173
+enum ProfileTab { overview | repositories | stars | watching | followers | following }
+
+enum SitemapSection { users | repositories }
+
+-- from: routers/common/markup.go:44
+enum MarkupMode {
+    markdown               -- raw markdown, no repository metas
+    | comment              -- markdown as an issue comment (hard line breaks, issue refs)
+    | gfm                  -- markdown as a document
+    | file                 -- pick renderer by `file_path` extension
+}
+
+-- How output of external (non-built-in) renderers is delivered.
+enum RenderContentMode { sanitized | no_sanitizer | iframe }
+
+enum TemplateKind { gitignore | license | label_set }
+
+enum CloneProtocol { https | ssh }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The instance's public directory: explore area, sitemap, robots policy and
+-- the public version string. A single instance exists, reached through the
+-- black-box accessor `directory()`. Its switches are initialised from config
+-- at start-up.
+-- from: modules/setting/service.go:104
+entity Directory {
+    require_signin_view: Boolean              -- [service] REQUIRE_SIGNIN_VIEW (whole instance)
+    explore_require_signin: Boolean           -- [service.explore] REQUIRE_SIGNIN_VIEW
+    users_page_disabled: Boolean
+    organizations_page_disabled: Boolean
+    code_page_disabled: Boolean
+    code_unit_globally_disabled: Boolean      -- repositories: code unit disabled instance-wide
+    sitemap_enabled: Boolean
+    milestones_dashboard_enabled: Boolean
+    custom_robots_policy: String?             -- operator-supplied robots policy file
+    version: String                           -- running application version
+
+    -- Derived
+    explore_requires_signin: require_signin_view or explore_require_signin
+    robots_policy: custom_robots_policy ?? default_robots_policy()
+}
+
+-- The code indexer. Only one exists (`code_search_service()`). When
+-- `enabled` is false, repository code search falls back to git grep and the
+-- instance/owner code search pages are unavailable.
+-- from: modules/indexer/code/indexer.go:111
+entity CodeSearchService {
+    enabled: Boolean                          -- REPO_INDEXER_ENABLED
+    kind: CodeIndexerKind
+    fuzzy_enabled: Boolean                    -- REPO_INDEXER_FUZZY_ENABLED
+    status: BackendStatus
+    started_at: Timestamp
+
+    entries: CodeIndexEntry with service = this
+
+    transitions status {
+        starting -> ready
+        starting -> unavailable
+        ready -> unavailable
+        unavailable -> ready
+    }
+
+    -- Derived
+    is_available: enabled and status = ready
+}
+
+-- The issue indexer. Always present (`issue_index_service()`); the `db`
+-- kind answers keyword searches straight from the issue store.
+-- from: modules/indexer/issues/indexer.go:65
+entity IssueIndexService {
+    kind: IssueIndexerKind
+    status: BackendStatus
+    started_at: Timestamp
+    last_full_rebuild_at: Timestamp?
+
+    documents: IssueIndexDocument with service = this
+
+    transitions status {
+        starting -> ready
+        starting -> unavailable
+        ready -> unavailable
+        unavailable -> ready
+    }
+
+    -- Derived
+    is_available: status = ready
+}
+
+-- The code index's knowledge of one repository: which default-branch commit
+-- it reflects. A repository with no entry has never been indexed.
+-- from: models/repo/repo_indexer.go:27
+entity CodeIndexEntry {
+    service: CodeSearchService
+    repository: repositories/Repository
+    commit_sha: String
+    indexed_at: Timestamp
+
+    documents: CodeIndexDocument with entry = this
+}
+
+-- One indexed file at the entry's commit. Binary (non-text) files keep their
+-- path searchable but carry no content.
+-- from: modules/indexer/code/bleve/bleve.go:143
+entity CodeIndexDocument {
+    entry: CodeIndexEntry
+    path: String
+    language: String?
+    content_indexed: Boolean
+    updated_at: Timestamp
+}
+
+-- The last default-branch commit for which language statistics were
+-- computed. Recomputing for the same commit is skipped.
+-- from: modules/indexer/stats/db.go:35
+entity LanguageStatsMark {
+    repository: repositories/Repository
+    commit_sha: String
+}
+
+-- The searchable projection of one issue or pull request. Every field below
+-- is refreshed whenever the issue, its comments, labels, assignees,
+-- milestone, project, reviews or the repository's visibility change.
+-- from: modules/indexer/issues/internal/model.go:13
+entity IssueIndexDocument {
+    service: IssueIndexService
+    issue: issues/Issue
+    repository: repositories/Repository
+    is_public: Boolean                        -- repository is not private
+    title: String
+    content: String
+    comments: List<String>                    -- non-empty conversation and review (code) comments
+                                              -- decided: discovery 7 (Forgejo indexed conversation comments only)
+    is_pull: Boolean
+    is_closed: Boolean
+    labels: Set<issues/Label>
+    milestone: issues/Milestone?
+    project: projects/Project?
+    project_column: projects/ProjectColumn?
+    poster: accounts/User
+    assignees: Set<accounts/User>
+    mentioned: Set<accounts/User>
+    reviewed_by: Set<accounts/User>
+    review_requested: Set<accounts/User>
+    subscribers: Set<accounts/User>
+    created_at: Timestamp
+    updated_at: Timestamp
+    deadline: Timestamp?
+    comment_count: Integer
+}
+
+-- Units of indexing work. Each queue is unique: at most one pending job per
+-- target. Jobs whose processing fails are retried until they succeed; a job
+-- is never silently dropped.
+
+-- Bring one repository's code index up to its default-branch head.
+-- from: modules/indexer/code/indexer.go:134
+entity CodeIndexJob {
+    repository: repositories/Repository
+    status: JobStatus
+    queued_at: Timestamp
+
+    transitions status {
+        queued -> completed
+        queued -> skipped
+        terminal: completed, skipped
+    }
+}
+
+-- Recompute one repository's language statistics.
+-- from: modules/indexer/stats/queue.go
+entity LanguageStatsJob {
+    repository: repositories/Repository
+    status: JobStatus
+    queued_at: Timestamp
+
+    transitions status {
+        queued -> completed
+        queued -> skipped
+        terminal: completed, skipped
+    }
+}
+
+-- Refresh or remove one issue's document.
+-- from: modules/indexer/issues/indexer.go:173
+entity IssueIndexJob {
+    issue: issues/Issue
+    action: index | remove
+    status: DrainStatus
+    queued_at: Timestamp
+
+    transitions status {
+        queued -> drained
+        terminal: drained
+    }
+}
+
+-- Re-queue or remove every issue document of a repository.
+-- from: modules/indexer/issues/util.go:132
+entity RepositoryIssuesJob {
+    repository: repositories/Repository
+    action: reindex | remove
+    status: DrainStatus
+    queued_at: Timestamp
+
+    transitions status {
+        queued -> drained
+        terminal: drained
+    }
+}
+
+-- A repository listing request and its answer.
+-- from: routers/web/explore/repo.go:37
+entity RepositorySearch {
+    viewer: accounts/User?
+    scope: RepoSearchScope
+    subject: accounts/User?                   -- owner / starrer / watcher for non-explore scopes
+    keyword: String
+    language: String?                         -- primary language filter
+    facets: Set<RepoFacet>
+    include_description: Boolean
+    sort: RepoSortOrder
+    page: Integer
+    page_size: Integer
+    results: List<repositories/Repository>
+    total: Integer
+    searched_at: Timestamp
+}
+
+-- A user directory/picker request.
+-- from: models/user/search.go:20
+entity UserSearch {
+    viewer: accounts/User?
+    scope: UserSearchScope
+    keyword: String
+    sort: UserSortOrder
+    match_email: Boolean
+    page_size: Integer
+    results: List<accounts/User>
+    total: Integer
+}
+
+-- An organization directory request.
+-- from: routers/web/explore/org.go:15
+entity OrganizationSearch {
+    viewer: accounts/User?
+    keyword: String
+    sort: UserSortOrder
+    page_size: Integer
+    results: List<organizations/Organization>
+    total: Integer
+}
+
+-- A code search and its hits.
+-- from: routers/web/explore/code.go:25
+entity CodeSearch {
+    viewer: accounts/User?
+    scope: CodeSearchScope
+    owner: accounts/User?                     -- scope = owner
+    repository: repositories/Repository?      -- scope = repository
+    ref_name: String?                         -- git-grep fallback only: branch or tag searched (null = default branch)
+    keyword: String
+    language: String?
+    path: String?                             -- restrict to paths containing this
+    requested_mode: CodeSearchMode
+    effective_mode: CodeSearchMode
+    used_index: Boolean                       -- false = git grep fallback
+    index_unavailable: Boolean                -- shown as a warning, results may be empty
+    total: Integer
+    hits: CodeSearchHit with search = this
+    languages: List<String>                   -- language facet counts of the hits
+}
+
+-- from: modules/indexer/code/internal/model.go:66
+entity CodeSearchHit {
+    search: CodeSearch
+    repository: repositories/Repository
+    path: String
+    commit_sha: String
+    language: String?
+    lines: List<CodeHitLine>
+}
+
+-- An issue/pull-request listing or search.
+-- from: routers/web/user/home.go:374
+entity IssueSearch {
+    viewer: accounts/User?
+    scope: IssueSearchScope
+    repository: repositories/Repository?          -- scope = repository
+    context_owner: accounts/User?                 -- dashboard user
+    context_org: organizations/Organization?      -- scope = organization
+    context_team: organizations/Team?
+    keyword: String
+    tokens: List<QueryToken>
+    kind: IssueKindFilter
+    state: IssueStateFilter
+    involvement: InvolvementFilter
+    labels: Set<issues/Label>?                    -- must carry all of these
+    excluded_labels: Set<issues/Label>?
+    no_label_only: Boolean
+    milestones: Set<issues/Milestone>?
+    no_milestone_only: Boolean
+    project: projects/Project?
+    poster: accounts/User?
+    assignee: accounts/User?
+    no_assignee_only: Boolean
+    mentioned: accounts/User?
+    review_requested_of: accounts/User?
+    reviewed_by: accounts/User?
+    updated_after: Timestamp?
+    updated_before: Timestamp?
+    include_all_public: Boolean                   -- also search public repos the viewer has no explicit role in
+    searchable_repositories: Set<repositories/Repository>
+    sort: IssueSortOrder
+    page: Integer
+    page_size: Integer
+    used_index: Boolean                           -- false when keyword is empty (listing from the store)
+    index_unavailable: Boolean
+    results: List<issues/Issue>
+    open_count: Integer
+    closed_count: Integer
+}
+
+-- The cross-repository milestones overview (/milestones).
+-- from: routers/web/user/home.go:145
+entity MilestoneOverview {
+    viewer: accounts/User
+    context_org: organizations/Organization?
+    keyword: String
+    show_closed: Boolean
+    repositories: Set<repositories/Repository>
+    milestones: List<issues/Milestone>
+}
+
+-- Topic search for pickers and the API.
+-- from: models/repo/topic.go:145
+entity TopicSearch {
+    keyword: String
+    results: List<repositories/Topic>         -- most-used first
+}
+
+-- Autocomplete candidates offered while composing in a repository.
+-- from: routers/web/repo/issue.go:3793
+entity MentionCandidates {
+    viewer: accounts/User
+    repository: repositories/Repository
+    issue: issues/Issue?
+    users: Set<accounts/User>
+    teams: Set<organizations/Team>
+}
+
+-- A repository pulse for a period.
+-- from: models/activities/repo_activity.go:32
+entity ActivityReport {
+    viewer: accounts/User?
+    repository: repositories/Repository
+    period: ActivityPeriod
+    from: Timestamp
+    until: Timestamp
+    includes_releases: Boolean
+    includes_issues: Boolean
+    includes_pulls: Boolean
+    includes_code: Boolean
+    merged_pulls: Set<pulls/PullRequest>
+    opened_pulls: Set<pulls/PullRequest>
+    opened_issues: Set<issues/Issue>
+    closed_issues: Set<issues/Issue>
+    unresolved_issues: Set<issues/Issue>
+    published_releases: Set<releases/Release>
+    code: CodeActivity?
+    top_authors: List<ActivityAuthor>
+
+    -- Derived
+    active_pull_count: merged_pulls.count + opened_pulls.count
+    active_issue_count: opened_issues.count + closed_issues.count
+}
+
+-- Contributor statistics for one revision. Expensive: generated in the
+-- background on first request, served while fresh, then discarded.
+-- from: services/repository/contributors_graph.go:84
+entity ContributorStats {
+    repository: repositories/Repository
+    revision: String
+    status: generating | ready | failed
+    requested_at: Timestamp
+    series: List<ContributorSeries> when status = ready
+    generated_at: Timestamp when status = ready
+    expires_at: Timestamp when status = ready | failed
+
+    transitions status {
+        generating -> ready
+        generating -> failed
+        terminal: ready, failed
+    }
+}
+
+-- A profile page view.
+-- from: routers/web/user/profile.go:60
+entity ProfileView {
+    viewer: accounts/User?
+    subject: accounts/User
+    requested_tab: ProfileTab
+    tab: ProfileTab
+    has_profile_readme: Boolean
+    shows_private: Boolean                     -- viewer is the subject or a site admin (repositories listed still pass can_list_repository; decided: follow-up 1)
+    default_sort: RepoSortOrder                -- used by repository tabs when no sort is chosen (decided: discovery 6)
+    repositories: List<repositories/Repository>
+    people: List<accounts/User>                -- followers / following tabs
+    total: Integer
+}
+
+-- A sitemap document.
+-- from: routers/web/home.go:92
+entity SitemapDocument {
+    is_index: Boolean
+    section: SitemapSection?
+    page: Integer
+    entry_count: Integer
+}
+
+-- The answer to `?go-get=1` on any `/{owner}/{repo}...` path.
+-- from: routers/web/goget.go:20
+entity GoImportAnswer {
+    owner_name: String
+    repo_name: String
+    import_path: String                        -- host[/subpath]/owner/repo (".git" suffix trimmed)
+    clone_url: String
+    source_branch: String
+    insecure_hint: Boolean                     -- instance served over plain HTTP
+}
+
+-- A markup rendering request (REST /markup, /markdown, /markdown/raw and the
+-- web preview).
+-- from: routers/common/markup.go:28
+entity MarkupRendering {
+    requester: accounts/User
+    mode: MarkupMode
+    text: String
+    context_path: String?
+    file_path: String?
+    is_wiki: Boolean
+    repository: repositories/Repository?
+    html: String
+}
+
+-- A built-in template offered at repository creation and through the API.
+-- from: routers/api/v1/misc/gitignore.go:17
+entity TemplateFile {
+    kind: TemplateKind
+    name: String
+    content: String
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [service] / [service.explore]
+    require_signin_view: Boolean = false
+    explore_require_signin_view: Boolean = false
+    explore_disable_users_page: Boolean = false
+    explore_disable_organizations_page: Boolean = false
+    explore_disable_code_page: Boolean = false
+    show_milestones_dashboard_page: Boolean = true
+
+    -- [other]
+    enable_sitemap: Boolean = true
+
+    -- [ui]
+    explore_page_size: Integer = 20                    -- EXPLORE_PAGING_NUM
+    sitemap_page_size: Integer = 20                    -- SITEMAP_PAGING_NUM
+    issue_page_size: Integer = 20                      -- ISSUE_PAGING_NUM
+    code_search_page_size: Integer = 20                -- REPO_SEARCH_PAGING_NUM
+    picker_page_size: Integer = 20                     -- MEMBERS_PAGING_NUM
+    profile_repo_page_size: Integer = 15               -- [ui.user] REPO_PAGING_NUM
+    explore_default_sort: RepoSortOrder = recent_update -- EXPLORE_PAGING_DEFAULT_SORT
+    -- decided: discovery 6 (profile tabs have their own default sort,
+    -- independent of explore_default_sort; Forgejo reused the explore one).
+    profile_default_sort: RepoSortOrder = recent_update
+    -- decided: discovery 8 (relevance comes from activity, not the avatar):
+    -- a repository is active when it was updated, or its owner signed in,
+    -- within this window. Not a Forgejo setting.
+    relevant_activity_window: Duration = 180.days
+    only_show_relevant_repos: Boolean = false          -- ONLY_SHOW_RELEVANT_REPOS
+    search_repo_description: Boolean = true           -- SEARCH_REPO_DESCRIPTION
+    show_user_email: Boolean = true                    -- SHOW_USER_EMAIL
+
+    -- [api]
+    api_default_page_size: Integer = 30
+    api_max_page_size: Integer = 50
+
+    -- [indexer] code
+    repo_indexer_enabled: Boolean = false
+    repo_indexer_kind: CodeIndexerKind = bleve
+    repo_indexer_repo_types: Set<RepoKindForIndex> = { sources, forks, mirrors, templates }
+    repo_indexer_fuzzy_enabled: Boolean = false
+    repo_indexer_include: String = ""                   -- comma-separated globs, lower-cased
+    repo_indexer_exclude: String = ""
+    repo_indexer_exclude_vendored: Boolean = true
+    max_indexer_file_size: Integer = 1048576            -- bytes; larger files are not indexed
+
+    -- [indexer] issues
+    issue_indexer_kind: IssueIndexerKind = bleve
+    indexer_startup_timeout: Duration = 30.seconds      -- STARTUP_TIMEOUT; 0 disables
+
+    -- [cron.rebuild_issue_indexer]
+    rebuild_issue_indexer_enabled: Boolean = false
+    rebuild_issue_indexer_interval: Duration = 365.days -- schedule @annually
+
+    -- git-grep fallback (fixed by Forgejo, not app.ini)
+    grep_max_result_files: Integer = 50
+    grep_max_matches_per_file: Integer = 20
+    grep_context_lines: Integer = 1
+
+    -- insights
+    activity_top_authors: Integer = 10
+    contributor_stats_ttl: Duration = 16.hours          -- [cache] ITEM_TTL
+
+    -- [repository]
+    go_get_clone_url_protocol: CloneProtocol = https    -- GO_GET_CLONE_URL_PROTOCOL
+    default_branch_name: String = "main"                -- [repository] DEFAULT_BRANCH
+
+    -- [markup]
+    render_content_mode: RenderContentMode = sanitized  -- per external renderer RENDER_CONTENT_MODE
+    custom_url_schemes: String = ""                     -- [markdown] CUSTOM_URL_SCHEMES
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+------------------------------------------------------------
+-- Explore: repositories
+------------------------------------------------------------
+
+-- The single repository-listing operation behind explore, profile tabs, the
+-- JSON picker and REST /repos/search.
+--
+-- Keyword: comma-separated alternatives; each alternative matches a
+-- repository whose name contains it, or whose topic name contains it, or
+-- (when include_description) whose description contains it. A keyword of
+-- the form "owner/name" also matches by owner and name, and such results
+-- are ordered owner-matches first. With the topic_only facet an alternative
+-- must equal a topic name exactly.
+-- from: routers/web/explore/repo.go:37
+rule ViewerSearchesRepositories {
+    when: ViewerSearchesRepositories(viewer, scope, subject, keyword, language, facets, sort)
+    let dir = directory()
+    requires: viewer != null or not (dir.require_signin_view or dir.explore_require_signin)
+    requires: scope = explore or subject != null
+    let found = repository_search(viewer, scope, subject, keyword, language, facets, sort)
+    ensures: RepositorySearch.created(
+        viewer: viewer,
+        scope: scope,
+        subject: subject,
+        keyword: keyword,
+        language: language,
+        facets: facets,
+        include_description: config.search_repo_description,
+        sort: sort,
+        page: 1,
+        page_size: config.explore_page_size,
+        results: found,
+        total: repository_search_total(viewer, scope, subject, keyword, language, facets),
+        searched_at: now
+    )
+    @guidance
+        -- Web: GET /explore/repos (q, sort, topic, language, archived, fork,
+        --   mirror, template, private, only_show_relevant, page);
+        --   GET /{user}?tab=repositories|stars|watching (same filters);
+        --   GET /repo/search (JSON picker: q, uid, priority_owner_id,
+        --   team_id, topic, private, starredBy, includeDesc, template,
+        --   exclusive, mode=source|fork|mirror|collaborative, archived).
+        -- API: GET /api/v1/repos/search (same as the JSON picker, plus
+        --   sort=alpha|created|updated|size|git_size|lfs_size|id|stars|forks
+        --   and order=asc|desc). An unknown mode, sort or order is rejected.
+        -- `priority_owner_id` orders that owner's repositories first;
+        -- `team_id` restricts to one team's repositories.
+        -- An unknown `sort` on web pages falls back to recent_update; an
+        -- empty one uses config.explore_default_sort.
+        -- Page sizes: explore = explore_page_size, profile tabs =
+        -- profile_repo_page_size, API = limit capped at api_max_page_size.
+        -- The explore page adds relevant_only by default when
+        -- config.only_show_relevant_repos is on (overridable per request).
+        -- relevant_only hides forks (unless fork is asked for) and empty
+        -- repositories, and keeps only active ones: updated, or owned by an
+        -- account that signed in, within config.relevant_activity_window.
+        -- decided: discovery 8 (avatar dropped; Forgejo required a
+        -- description, topic or avatar). from: models/repo/repo_list.go:130
+        -- The JSON picker (/repo/search) requires sign-in.
+}
+
+------------------------------------------------------------
+-- Explore: users and organizations
+------------------------------------------------------------
+
+-- Keyword matches (case-insensitively) the login name or full name, and in
+-- the API scope also the email address — but an email only matches when it
+-- is not kept private, or belongs to the viewer, or the viewer is a site
+-- admin. Only individual accounts are listed — never remote fediverse
+-- people (kind activitypub), who appear only where they act; the explore and
+-- picker scopes list only activated accounts. The accounts listed are exactly
+-- those whose profile the viewer may see (can_see_profile), so a private
+-- account's followers find it too.
+-- decided: discovery 2 (user search unified with profile visibility; Forgejo
+-- hid private accounts from everyone but admins, self and org co-members).
+-- decided: discovery 3 (the API search stays available to signed-in users
+-- when the explore users page is disabled; only the public directory goes).
+-- decided: federation 10 (remote people are excluded from the user explore
+-- page and searches; Forgejo listed their materialised accounts).
+-- from: routers/web/explore/user.go:121
+rule ViewerSearchesUsers {
+    when: ViewerSearchesUsers(viewer, scope, keyword, sort)
+    let dir = directory()
+    requires: viewer != null or not (dir.require_signin_view or dir.explore_require_signin)
+    requires: scope != explore or not dir.users_page_disabled
+    requires: scope != api or not dir.users_page_disabled or viewer != null
+    requires: scope = api or sort in { newest, oldest, alphabetically, reverse_alphabetically }
+    requires: not contains_nul(keyword)
+    let found = user_search(viewer, scope, keyword, sort)
+    ensures: UserSearch.created(
+        viewer: viewer,
+        scope: scope,
+        keyword: keyword,
+        sort: sort,
+        match_email: scope = api,
+        page_size: config.explore_page_size,
+        results: found,
+        total: user_search_total(viewer, scope, keyword)
+    )
+    @guidance
+        -- Web: GET /explore/users (q, sort, page; sitemap pages reuse it);
+        --   GET /user/search_candidates (q) — picker for collaborators,
+        --   team members, assignees; page size picker_page_size.
+        -- API: GET /api/v1/users/search (q, uid, sort, page, limit). The
+        --   pseudo-ids of the ghost user and the actions bot answer with that
+        --   single pseudo-account. A token restricted to public resources
+        --   lists only public accounts.
+        -- When the users page is disabled the API search answers "not found"
+        -- to anonymous clients only.
+        -- An unsupported sort on the explore page is "not found".
+}
+
+-- Anonymous visitors see only public organizations; signed-in users also
+-- see limited ones and private ones they belong to; restricted users see
+-- only organizations they belong to; site admins see all.
+-- from: routers/web/explore/org.go:15
+rule ViewerExploresOrganizations {
+    when: ViewerExploresOrganizations(viewer, keyword, sort)
+    let dir = directory()
+    requires: viewer != null or not (dir.require_signin_view or dir.explore_require_signin)
+    requires: not dir.organizations_page_disabled
+    requires: sort in { newest, oldest, alphabetically, reverse_alphabetically }
+    let found = organization_search(viewer, keyword, sort)
+    ensures: OrganizationSearch.created(
+        viewer: viewer,
+        keyword: keyword,
+        sort: sort,
+        page_size: config.explore_page_size,
+        results: found,
+        total: organization_search_total(viewer, keyword)
+    )
+    @guidance
+        -- Web: GET /explore/organizations (q, sort, page). A disabled page
+        -- redirects to /explore/repos.
+}
+
+------------------------------------------------------------
+-- Topics, templates, version
+------------------------------------------------------------
+
+-- Topic names containing the keyword, most-used first.
+-- from: routers/web/explore/topic.go:16
+rule ClientSearchesTopics {
+    when: ClientSearchesTopics(client, keyword)
+    let dir = directory()
+    requires: client != null or not (dir.require_signin_view or dir.explore_require_signin)
+    ensures: TopicSearch.created(keyword: keyword, results: topic_search(keyword))
+    @guidance
+        -- Web: GET /explore/topics/search (q, page, limit).
+        -- API: GET /api/v1/topics/search (q, page, limit).
+}
+
+-- from: routers/api/v1/misc/gitignore.go:30
+rule ClientReadsTemplate {
+    when: ClientReadsTemplate(client, kind, name)
+    let template = TemplateFile{kind: kind, name: name}
+    requires: exists template
+    ensures: TemplateRead(client: client, template: template)
+    @guidance
+        -- API: GET /gitignore/templates, /gitignore/templates/{name},
+        --   /licenses, /licenses/{name}, /label/templates,
+        --   /label/templates/{name}. Listings are public; operator-supplied
+        --   custom templates override built-in ones of the same name.
+}
+
+------------------------------------------------------------
+-- Code search
+------------------------------------------------------------
+
+-- Instance-wide code search across every repository whose code the viewer
+-- can read. Site admins get no search-specific bypass: hits follow normal read
+-- access (can_read_code), exactly as for any other viewer, and come only from
+-- repositories the viewer may be shown (can_list_repository), so a private
+-- repository an admin holds no role in is never a hit.
+-- decided: discovery 5 (admin code search covers readable repositories only).
+-- decided: follow-up 1 (admins keep read of every repository, but search
+-- does not surface private repositories they have no role in).
+-- from: routers/web/explore/code.go:25
+rule ViewerSearchesAllCode {
+    when: ViewerSearchesAllCode(viewer, keyword, language, path, mode)
+    let dir = directory()
+    let service = code_search_service()
+    requires: viewer != null or not (dir.require_signin_view or dir.explore_require_signin)
+    requires: service.enabled
+    requires: not dir.code_page_disabled
+    requires: not dir.code_unit_globally_disabled
+    requires: keyword != ""
+    ensures:
+        let search = CodeSearch.created(
+            viewer: viewer,
+            scope: instance,
+            keyword: keyword,
+            language: language,
+            path: path,
+            requested_mode: mode,
+            effective_mode: mode,
+            used_index: true,
+            index_unavailable: service.status != ready,
+            total: code_search_total(viewer, null, null, keyword, language, path, mode),
+            languages: code_search_languages(viewer, null, null, keyword, mode)
+        )
+        if mode = regexp or (mode = fuzzy and not service.fuzzy_enabled):
+            search.effective_mode = union
+        CodeSearchAnswered(search: search)
+    @guidance
+        -- Web: GET /explore/code (q, l, path, mode=exact|union|fuzzy, page).
+        -- Disabled page or no indexer: redirect to /explore/repos.
+        -- Hits of repositories deleted since indexing are dropped.
+        -- An empty keyword shows the empty search form (no search).
+}
+
+-- Code search across one owner's repositories (profile "Code" tab).
+-- from: routers/web/user/code.go:24
+rule ViewerSearchesOwnerCode {
+    when: ViewerSearchesOwnerCode(viewer, owner, keyword, language, path, mode)
+    let service = code_search_service()
+    requires: service.enabled
+    requires: can_see_owner(viewer, owner)
+    requires: keyword != ""
+    ensures:
+        let search = CodeSearch.created(
+            viewer: viewer,
+            scope: owner,
+            owner: owner,
+            keyword: keyword,
+            language: language,
+            path: path,
+            requested_mode: mode,
+            effective_mode: mode,
+            used_index: true,
+            index_unavailable: service.status != ready,
+            total: code_search_total(viewer, owner, null, keyword, language, path, mode),
+            languages: code_search_languages(viewer, owner, null, keyword, mode)
+        )
+        if mode = regexp or (mode = fuzzy and not service.fuzzy_enabled):
+            search.effective_mode = union
+        CodeSearchAnswered(search: search)
+    @guidance
+        -- Web: GET /{owner}/-/code (q, l, path, mode, page). Without an
+        -- indexer this page redirects to the owner's profile.
+}
+
+-- Code search in one repository using the index.
+-- from: routers/web/repo/search.go:65
+rule ReaderSearchesRepositoryCodeIndexed {
+    when: ReaderSearchesRepositoryCode(viewer, repository, ref_name, keyword, path, mode)
+    let service = code_search_service()
+    requires: can_read_code(viewer, repository)
+    requires: service.enabled
+    requires: keyword != ""
+    ensures:
+        let search = CodeSearch.created(
+            viewer: viewer,
+            scope: repository,
+            repository: repository,
+            keyword: keyword,
+            path: path,
+            requested_mode: mode,
+            effective_mode: mode,
+            used_index: true,
+            index_unavailable: service.status != ready,
+            total: code_search_total(viewer, null, repository, keyword, null, path, mode),
+            languages: code_search_languages(viewer, null, repository, keyword, mode)
+        )
+        if mode = regexp or (mode = fuzzy and not service.fuzzy_enabled):
+            search.effective_mode = union
+        CodeSearchAnswered(search: search)
+    @guidance
+        -- Web: GET /{owner}/{repo}/search (q, l, path, mode, page). The index
+        -- only knows the default branch, so `ref_name` is ignored here.
+}
+
+-- Code search in one repository without an index: git grep over the chosen
+-- branch or tag (default branch when none is chosen). Case-insensitive.
+-- Binary files are skipped. At most grep_max_result_files files and
+-- grep_max_matches_per_file matches per file are reported, with
+-- grep_context_lines lines of context. Global include/exclude patterns
+-- still apply; when both a global include pattern and a `path` are given,
+-- only paths satisfying both are searched. Fuzzy is not offered; regexp is.
+-- from: routers/web/repo/search.go:134
+rule ReaderSearchesRepositoryCodeByGrep {
+    when: ReaderSearchesRepositoryCode(viewer, repository, ref_name, keyword, path, mode)
+    let service = code_search_service()
+    requires: can_read_code(viewer, repository)
+    requires: not service.enabled
+    requires: keyword != ""
+    ensures:
+        let search = CodeSearch.created(
+            viewer: viewer,
+            scope: repository,
+            repository: repository,
+            ref_name: ref_name,
+            keyword: keyword,
+            path: path,
+            requested_mode: mode,
+            effective_mode: mode,
+            used_index: false,
+            index_unavailable: false,
+            total: grep_total(repository, ref_name, keyword, path, mode),
+            languages: []
+        )
+        if mode = fuzzy:
+            search.effective_mode = exact
+        CodeSearchAnswered(search: search)
+    @guidance
+        -- Web: GET /{owner}/{repo}/search, /search/branch/{branch},
+        --   /search/tag/{tag} (the latter two only exist without an indexer).
+}
+
+------------------------------------------------------------
+-- Code index maintenance
+------------------------------------------------------------
+
+-- from: modules/indexer/code/indexer.go:111
+-- A start-up that completes after the timeout still brings the indexer up.
+-- decided: discovery 4.
+rule CodeIndexerStarts {
+    when: CodeIndexerStartupCompleted(service, index_was_empty)
+    requires: service.status in { starting, unavailable }
+    ensures: service.status = ready
+    ensures:
+        if index_was_empty:
+            for repository in all_repositories():
+                CodeIndexRefreshRequested(repository: repository)
+    @guidance
+        -- A freshly created index is populated by queueing every existing
+        -- repository (newest first), after forgetting any recorded index
+        -- marks. Repositories created meanwhile are queued by their own events.
+}
+
+-- An indexer that is not ready within the startup timeout is declared
+-- unavailable and site admins are told (IndexerStartupFailed becomes a system
+-- notice); the instance keeps serving, with code search reporting the index
+-- as unavailable until the indexer finishes starting.
+-- decided: discovery 4 (degrade instead of terminating the process).
+-- from: modules/indexer/code/indexer.go:264
+rule CodeIndexerStartupTimesOut {
+    when: service: CodeSearchService.started_at + config.indexer_startup_timeout <= now
+    requires: service.status = starting
+    requires: service.enabled
+    ensures: service.status = unavailable
+    ensures: IndexerStartupFailed(kind: service.kind)
+    @guidance
+        -- Forgejo terminates the process here; this rebuild does not.
+}
+
+-- from: modules/indexer/code/indexer.go:298
+rule CodeIndexerBecomesUnreachable {
+    when: CodeIndexerHealthChanged(service, reachable)
+    requires: service.status = ready
+    requires: not reachable
+    ensures: service.status = unavailable
+}
+
+rule CodeIndexerRecovers {
+    when: CodeIndexerHealthChanged(service, reachable)
+    requires: service.status = unavailable
+    requires: reachable
+    ensures: service.status = ready
+}
+
+-- A push to the default branch (direct or via mirror sync) refreshes the
+-- code index and language statistics. Pushes to other branches or tags
+-- refresh language statistics only if they moved the default branch
+-- (they do not).
+-- from: services/indexer/notify.go:117
+rule DefaultBranchPushRefreshesIndexes {
+    when: code/CommitsPushed(repository, branch_name, pusher, old_sha, new_sha, is_force, deploy_key)
+    requires: branch_name = repository.default_branch
+    requires: new_sha != null
+    ensures: CodeIndexRefreshRequested(repository: repository)
+    ensures: LanguageStatsRefreshQueued(repository: repository)
+}
+
+-- from: services/indexer/notify.go:155
+rule DefaultBranchChangeRefreshesIndexes {
+    when: code/DefaultBranchChanged(repository, old_name, new_name, by)
+    requires: not repository.is_empty
+    ensures: CodeIndexRefreshRequested(repository: repository)
+    ensures: LanguageStatsRefreshQueued(repository: repository)
+}
+
+-- from: services/indexer/notify.go:93
+rule MigratedRepositoryIsIndexed {
+    when: migrations/RepositoryMigrated(repository)
+    ensures:
+        if not repository.is_empty:
+            CodeIndexRefreshRequested(repository: repository)
+    ensures: LanguageStatsRefreshQueued(repository: repository)
+    ensures: RepositoryIssuesReindexRequested(repository: repository)
+}
+
+-- Adopting unadopted repositories on disk behaves like a migration.
+-- from: services/indexer/notify.go:32
+rule AdoptedRepositoryIsIndexed {
+    when: repositories/RepositoryAdopted(repository, doer)
+    ensures:
+        if not repository.is_empty:
+            CodeIndexRefreshRequested(repository: repository)
+    ensures: LanguageStatsRefreshQueued(repository: repository)
+    ensures: RepositoryIssuesReindexRequested(repository: repository)
+}
+
+-- Deleting a repository removes all its code and issue documents.
+-- from: services/indexer/notify.go:80
+rule DeletedRepositoryLeavesIndexes {
+    when: repositories/RepositoryDeleted(repository, doer)
+    let entry = CodeIndexEntry{repository: repository}
+    ensures:
+        if exists entry:
+            for d in entry.documents:
+                not exists d
+            not exists entry
+    ensures: RepositoryIssuesJob.created(repository: repository, action: remove, status: queued, queued_at: now)
+}
+
+-- A refresh request enqueues at most one pending code job per repository.
+-- from: modules/indexer/code/indexer.go:307
+rule QueueCodeIndexJob {
+    when: CodeIndexRefreshRequested(repository)
+    -- REPO_INDEXER_ENABLED; with the indexer off nothing is queued
+    requires: config.repo_indexer_enabled
+    requires: not exists CodeIndexJob{repository: repository, status: queued}
+    ensures: CodeIndexJob.created(repository: repository, status: queued, queued_at: now)
+}
+
+-- Bring the repository's index in line with its default-branch head.
+-- Repositories whose kind is not listed in config.repo_indexer_repo_types
+-- (black box repository_kind_indexed) are skipped:
+-- forks, mirrors and templates each need their kind listed; anything else
+-- counts as a source repository. The first indexing, or a head that no
+-- longer descends from the indexed commit (force push), rebuilds the
+-- repository's documents from scratch; otherwise only added, modified,
+-- renamed and deleted paths are touched.
+-- from: modules/indexer/code/indexer.go:44
+rule CodeIndexJobRuns {
+    when: job: CodeIndexJob.queued_at <= now
+    requires: job.status = queued
+    requires: code_search_service().status = ready
+    let repository = job.repository
+    let head = default_branch_head(repository)
+    let entry = CodeIndexEntry{repository: repository}
+    ensures:
+        if not repository_kind_indexed(repository):
+            job.status = skipped
+        else:
+            job.status = completed
+            if exists entry:
+                entry.commit_sha = head
+                entry.indexed_at = now
+            else:
+                CodeIndexEntry.created(
+                    service: code_search_service(),
+                    repository: repository,
+                    commit_sha: head,
+                    indexed_at: now
+                )
+            CodeIndexRefreshed(repository: repository, commit_sha: head)
+    @guidance
+        -- Documents after the job are exactly the files of `head` for which
+        -- is_indexable_file(path, size) holds (see invariant
+        -- CodeIndexMirrorsDefaultBranch). Files above max_indexer_file_size
+        -- are removed from the index; non-text files keep only their path;
+        -- content is converted to UTF-8 dropping invalid bytes; the
+        -- language is detected from name and content.
+        -- A job that fails (indexer error, git error) stays queued and is
+        -- retried; an indexer that is not ready fails every job.
+}
+
+------------------------------------------------------------
+-- Language statistics refresh
+------------------------------------------------------------
+
+-- from: modules/indexer/stats/indexer.go
+rule QueueLanguageStatsJob {
+    when: LanguageStatsRefreshQueued(repository)
+    requires: not exists LanguageStatsJob{repository: repository, status: queued}
+    ensures: LanguageStatsJob.created(repository: repository, status: queued, queued_at: now)
+}
+
+-- Empty repositories and repositories whose default-branch head was already
+-- measured are skipped; otherwise repositories recomputes the statistics.
+-- from: modules/indexer/stats/db.go:29
+rule LanguageStatsJobRuns {
+    when: job: LanguageStatsJob.queued_at <= now
+    requires: job.status = queued
+    let repository = job.repository
+    let head = default_branch_head(repository)
+    let mark = LanguageStatsMark{repository: repository}
+    ensures:
+        if repository.is_empty:
+            job.status = skipped
+        else if exists mark and mark.commit_sha = head:
+            job.status = skipped
+        else:
+            job.status = completed
+            if exists mark:
+                mark.commit_sha = head
+            else:
+                LanguageStatsMark.created(repository: repository, commit_sha: head)
+            LanguageStatsComputed(repository: repository, commit_sha: head, sizes: language_sizes(repository, head))
+}
+
+------------------------------------------------------------
+-- Issue index maintenance
+------------------------------------------------------------
+
+-- from: modules/indexer/issues/indexer.go:65
+-- decided: discovery 4 (a late start-up still brings the indexer up).
+rule IssueIndexerStarts {
+    when: IssueIndexerStartupCompleted(service, index_was_empty)
+    requires: service.status in { starting, unavailable }
+    ensures: service.status = ready
+    ensures:
+        if index_was_empty:
+            IssueIndexRebuildStarted(service: service)
+}
+
+-- Same degradation as the code indexer: issue keyword search reports
+-- unavailable until the indexer is ready; admins get a system notice.
+-- decided: discovery 4.
+-- from: modules/indexer/issues/indexer.go:147
+rule IssueIndexerStartupTimesOut {
+    when: service: IssueIndexService.started_at + config.indexer_startup_timeout <= now
+    requires: service.status = starting
+    ensures: service.status = unavailable
+    ensures: IndexerStartupFailed(kind: service.kind)
+}
+
+rule IssueIndexerBecomesUnreachable {
+    when: IssueIndexerHealthChanged(service, reachable)
+    requires: service.status = ready
+    requires: not reachable
+    ensures: service.status = unavailable
+}
+
+rule IssueIndexerRecovers {
+    when: IssueIndexerHealthChanged(service, reachable)
+    requires: service.status = unavailable
+    requires: reachable
+    ensures: service.status = ready
+}
+
+-- A full rebuild walks every repository and re-queues all of its issues.
+-- from: modules/indexer/issues/indexer.go:221
+rule IssueIndexRebuildQueuesEverything {
+    when: IssueIndexRebuildStarted(service)
+    ensures: service.last_full_rebuild_at = now
+    ensures:
+        for repository in all_repositories():
+            RepositoryIssuesReindexRequested(repository: repository)
+}
+
+-- Scheduled full rebuild (cron task `rebuild_issue_indexer`, off by default).
+-- from: services/cron/tasks_extended.go:210
+rule ScheduledIssueIndexRebuild {
+    when: service: IssueIndexService.last_full_rebuild_at + config.rebuild_issue_indexer_interval <= now
+    requires: config.rebuild_issue_indexer_enabled
+    requires: service.status = ready
+    ensures: IssueIndexRebuildStarted(service: service)
+}
+
+-- The administration cron task `rebuild_issue_indexer` (timer or "run now")
+-- starts the same full rebuild as the schedule above.
+-- from: services/cron/tasks_extended.go:210
+rule IssueIndexRebuildTaskRuns {
+    when: administration/IssueIndexRebuildDue()
+    requires: issue_index_service().status = ready
+    ensures: IssueIndexRebuildTaskFinished()   -- decided: requests 5 (the owner reports the run done)
+    ensures: IssueIndexRebuildStarted(service: issue_index_service())
+}
+
+-- When IssueIndexRebuildTaskRuns cannot do its work the run is still reported done, so it never
+-- stays running (decided: requests 5).
+rule IssueIndexRebuildTaskRunsSkipped {
+    when: administration/IssueIndexRebuildDue()
+    requires: not (issue_index_service().status = ready)
+    ensures: IssueIndexRebuildTaskFinished()
+}
+
+-- Newly created repositories (including generated-from-template and forks)
+-- get their issues indexed (templates may carry issues).
+-- from: modules/repository/create.go:305
+rule CreatedRepositoryIssuesIndexed {
+    when: repositories/RepositoryCreated(repository, doer)
+    ensures: RepositoryIssuesReindexRequested(repository: repository)
+}
+
+-- The public/private flag of every issue document follows its repository.
+-- from: modules/repository/create.go:303
+rule VisibilityChangeReindexesIssues {
+    when: repositories/RepositoryVisibilityChanged(repository, doer)
+    ensures: RepositoryIssuesReindexRequested(repository: repository)
+}
+
+rule QueueRepositoryIssuesJob {
+    when: RepositoryIssuesReindexRequested(repository)
+    requires: not exists RepositoryIssuesJob{repository: repository, action: reindex, status: queued}
+    ensures: RepositoryIssuesJob.created(repository: repository, action: reindex, status: queued, queued_at: now)
+}
+
+-- Re-queue every issue of the repository, or drop all of its documents.
+-- from: modules/indexer/issues/util.go:132
+rule RepositoryIssuesJobRuns {
+    when: job: RepositoryIssuesJob.queued_at <= now
+    requires: job.status = queued
+    ensures: job.status = drained
+    ensures:
+        if job.action = reindex:
+            for issue in issues_of(job.repository):
+                IssueReindexRequested(issue: issue)
+        else:
+            for d in issue_documents_of(job.repository):
+                not exists d
+}
+
+-- Every event that changes an indexed field of an issue re-indexes it
+-- (title, body, comments, state, labels, milestone, assignees, reviews,
+-- review requests, merge).
+-- from: services/indexer/notify.go:38
+rule IssueOpenedIsIndexed {
+    when: issues/IssueOpened(issue, mentions)
+    ensures: IssueReindexRequested(issue: issue)
+}
+
+rule IssueClosedIsReindexed {
+    when: issues/IssueClosed(issue, doer, comment)
+    ensures: IssueReindexRequested(issue: issue)
+}
+
+rule IssueReopenedIsReindexed {
+    when: issues/IssueReopened(issue, doer, comment)
+    ensures: IssueReindexRequested(issue: issue)
+}
+
+-- A pull request's close / reopen (pulls never emits IssueClosed for a PR).
+rule PullRequestClosedIsReindexed {
+    when: pulls/PullRequestClosed(pull_request, doer)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
+rule PullRequestReopenedIsReindexed {
+    when: pulls/PullRequestReopened(pull_request, doer)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
+rule IssueTitleChangeIsReindexed {
+    when: issues/IssueTitleChanged(issue, doer, old_title)
+    ensures: IssueReindexRequested(issue: issue)
+}
+
+rule IssueContentChangeIsReindexed {
+    when: issues/IssueContentChanged(issue, doer, old_content)
+    ensures: IssueReindexRequested(issue: issue)
+}
+
+rule IssueRefChangeIsReindexed {
+    when: issues/IssueRefChanged(issue, doer, old_ref)
+    ensures: IssueReindexRequested(issue: issue)
+}
+
+rule IssueLabelsChangeIsReindexed {
+    when: issues/IssueLabelsChanged(issue, doer, added, removed)
+    ensures: IssueReindexRequested(issue: issue)
+}
+
+rule IssueLabelsClearIsReindexed {
+    when: issues/IssueLabelsCleared(issue, doer)
+    ensures: IssueReindexRequested(issue: issue)
+}
+
+rule IssueMilestoneChangeIsReindexed {
+    when: issues/IssueMilestoneChanged(issue, doer, old_milestone)
+    ensures: IssueReindexRequested(issue: issue)
+}
+
+rule IssueAssigneeChangeIsReindexed {
+    when: issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)
+    ensures: IssueReindexRequested(issue: issue)
+}
+
+rule CommentCreatedReindexesIssue {
+    when: issues/IssueCommentCreated(issue, comment, doer, mentions)
+    ensures: IssueReindexRequested(issue: issue)
+}
+
+rule CommentEditedReindexesIssue {
+    when: issues/IssueCommentEdited(comment, doer, old_content)
+    ensures: IssueReindexRequested(issue: comment.issue)
+}
+
+rule CommentDeletedReindexesIssue {
+    when: issues/IssueCommentDeleted(comment, issue, doer)
+    ensures: IssueReindexRequested(issue: issue)
+}
+
+rule PullRequestOpenedIsIndexed {
+    when: pulls/PullRequestOpened(pull_request)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
+rule PullRequestMergedIsReindexed {
+    when: pulls/PullRequestMerged(pull_request, merger)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
+rule PullRequestAutoMergedIsReindexed {
+    when: pulls/PullRequestAutoMerged(pull_request, merger)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
+rule ReviewSubmittedReindexesPull {
+    when: pulls/ReviewSubmitted(review)
+    ensures: IssueReindexRequested(issue: review.pull_request.issue)
+}
+
+-- decided: discovery 7 (review comments are indexed, so a new code comment
+-- re-indexes its pull request).
+rule CodeCommentReindexesPull {
+    when: pulls/PullRequestCodeCommented(pull_request, comment)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
+-- decided: discovery 7 (review comments are indexed, so editing or deleting one
+-- re-indexes its pull request; the deleted comment carries identity only).
+rule ReviewCommentEditedReindexesPull {
+    when: pulls/ReviewCommentEdited(pull_request, comment)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
+rule ReviewCommentDeletedReindexesPull {
+    when: pulls/ReviewCommentDeleted(pull_request, comment)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
+rule ReviewRequestedReindexesPull {
+    when: pulls/ReviewRequested(pull_request, requester, reviewer)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
+rule ReviewRequestRemovedReindexesPull {
+    when: pulls/ReviewRequestRemoved(pull_request, doer, reviewer)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
+-- from: services/indexer/notify.go:88
+rule DeletedIssueLeavesIndex {
+    when: issues/IssueDeleted(issue, doer)
+    requires: not exists IssueIndexJob{issue: issue, action: remove, status: queued}
+    ensures: IssueIndexJob.created(issue: issue, action: remove, status: queued, queued_at: now)
+}
+
+rule QueueIssueJob {
+    when: IssueReindexRequested(issue)
+    requires: not exists IssueIndexJob{issue: issue, action: index, status: queued}
+    ensures: IssueIndexJob.created(issue: issue, action: index, status: queued, queued_at: now)
+}
+
+-- Rebuild the document from the issue's current state; an issue that no
+-- longer exists (or a remove job) drops the document.
+-- from: modules/indexer/issues/indexer.go:173
+rule IssueJobRuns {
+    when: job: IssueIndexJob.queued_at <= now
+    requires: job.status = queued
+    requires: issue_index_service().status = ready
+    let issue = job.issue
+    let doc = IssueIndexDocument{issue: issue}
+    ensures: job.status = drained
+    ensures:
+        if exists doc:
+            not exists doc
+        if job.action = index:
+            IssueIndexDocument.created(
+                service: issue_index_service(),
+                issue: issue,
+                repository: issue.repository,
+                is_public: not issue.repository.is_private,
+                title: issue.title,
+                content: issue_body(issue),
+                comments: issue_comment_texts(issue),
+                is_pull: issue.is_pull,
+                is_closed: issue.status = closed,
+                labels: issue_labels(issue),
+                milestone: issue_milestone(issue),
+                project: issue_project(issue),
+                project_column: issue_project_column(issue),
+                poster: issue.poster,
+                assignees: issue_assignees(issue),
+                mentioned: issue_mentions(issue),
+                reviewed_by: issue_reviewers(issue),
+                review_requested: issue_requested_reviewers(issue),
+                subscribers: issue_subscribers(issue),
+                created_at: issue_created_at(issue),
+                updated_at: issue_updated_at(issue),
+                deadline: issue_deadline(issue),
+                comment_count: issue_comment_texts(issue).count
+            )
+}
+
+------------------------------------------------------------
+-- Re-index requests
+------------------------------------------------------------
+
+-- Site admins can force a repository to be re-indexed.
+-- from: routers/web/repo/setting/setting.go:790
+rule AdminRequestsCodeReindex {
+    when: AdminRequestsReindex(admin, repository, kind)
+    requires: admin.is_admin
+    requires: kind = code
+    requires: code_search_service().enabled
+    ensures: CodeIndexRefreshRequested(repository: repository)
+    @guidance
+        -- Web: POST /{owner}/{repo}/settings action=admin_index
+        --   request_reindex_type=code|stats|issues. Code re-index without an
+        --   indexer is forbidden.
+}
+
+rule AdminRequestsStatsReindex {
+    when: AdminRequestsReindex(admin, repository, kind)
+    requires: admin.is_admin
+    requires: kind = stats
+    ensures: LanguageStatsRefreshQueued(repository: repository)
+}
+
+rule AdminRequestsIssuesReindex {
+    when: AdminRequestsReindex(admin, repository, kind)
+    requires: admin.is_admin
+    requires: kind = issues
+    ensures: RepositoryIssuesReindexRequested(repository: repository)
+}
+
+------------------------------------------------------------
+-- Issue and pull-request search
+------------------------------------------------------------
+
+-- The query language of the keyword box (all scopes):
+--   word        should-match term, fuzzy
+--   +word       must match;   -word   must not match
+--   "a phrase"  exact (non-fuzzy) term; backslash escapes + - \ "
+--   is:open | is:closed | -is:open | -is:closed | is:all   state filter
+--   sort:created|updated|comments|deadline:asc|desc  (anything else: relevance)
+--   modified:>YYYY-MM-DD | modified:<YYYY-MM-DD | modified:YYYY-MM-DD
+--   author:NAME  assignee:NAME  review:NAME  mentions:NAME  (unknown names ignored)
+-- If no term carries + or -, all plain terms become must-match.
+-- Terms match title, body and conversation comments.
+--
+-- An empty keyword lists straight from the issue store (never from the
+-- index), so an issue created a moment ago always appears in plain lists.
+-- from: modules/indexer/issues/indexer.go:333
+rule ReaderListsRepositoryIssues {
+    when: ReaderListsRepositoryIssues(viewer, repository, kind, involvement, keyword, state, sort)
+    requires: kind != both
+    requires: kind = issues_only implies can_read_issues(viewer, repository)
+    requires: kind = pulls_only implies can_read_pulls(viewer, repository)
+    requires: involvement = all or viewer != null
+    requires: not contains_nul(keyword)
+    let service = issue_index_service()
+    ensures: IssueSearch.created(
+        viewer: viewer,
+        scope: repository,
+        repository: repository,
+        keyword: keyword,
+        tokens: parse_issue_query(keyword),
+        kind: kind,
+        state: state,
+        involvement: involvement,
+        no_label_only: false,
+        no_milestone_only: false,
+        no_assignee_only: false,
+        include_all_public: false,
+        searchable_repositories: { repository },
+        sort: sort,
+        page: 1,
+        page_size: config.issue_page_size,
+        used_index: keyword != "",
+        index_unavailable: keyword != "" and service.status != ready,
+        results: issue_search(viewer, { repository }, keyword, kind, state, involvement, sort),
+        open_count: issue_search_count(viewer, { repository }, keyword, kind, open, involvement),
+        closed_count: issue_search_count(viewer, { repository }, keyword, kind, closed, involvement)
+    )
+    @guidance
+        -- Web: GET /{owner}/{repo}/issues and /pulls (q, type=all|
+        --   your_repositories|assigned|created_by|mentioned|review_requested|
+        --   reviewed_by, state=open|closed|all, labels=1,-2 (include/exclude,
+        --   0 = no label), milestone (-1 = none), project, assignee (-1 =
+        --   none), poster, sort, page); GET /{owner}/{repo}/issues/search
+        --   (JSON for pickers); API GET /repos/{owner}/{repo}/issues with
+        --   state, labels, q, type, milestones, since, before, created_by,
+        --   assigned_by, mentioned_by.
+        -- Default sort: latest (newest first). When the index is unavailable
+        -- a keyword search shows a warning instead of results.
+}
+
+-- The signed-in user's cross-repository dashboards (/issues, /pulls) and
+-- organization dashboards (/org/{org}/issues|pulls, optionally per team).
+-- Searchable repositories: those the context owner owns or the viewer
+-- collaborates on (organization: the org's repositories the viewer can
+-- read, restricted to the team's when a team is selected), excluding
+-- archived repositories and repositories with the unit disabled. On their
+-- own dashboard, for every filter except your_repositories, issues in any
+-- public repository also count.
+-- from: routers/web/user/home.go:374
+rule UserViewsPersonalIssueDashboard {
+    when: UserViewsIssueDashboard(viewer, context_org, context_team, kind, involvement, keyword, state, sort)
+    requires: viewer != null
+    requires: viewer.is_active
+    requires: kind != both
+    requires: context_org = null
+    requires: context_team = null
+    let repos = dashboard_repositories(viewer, context_org, context_team, kind)
+    let all_public = involvement != your_repositories
+    let service = issue_index_service()
+    ensures: IssueSearch.created(
+        viewer: viewer,
+        scope: dashboard,
+        context_owner: viewer,
+        context_org: context_org,
+        context_team: context_team,
+        keyword: keyword,
+        tokens: parse_issue_query(keyword),
+        kind: kind,
+        state: state,
+        involvement: involvement,
+        no_label_only: false,
+        no_milestone_only: false,
+        no_assignee_only: false,
+        include_all_public: all_public,
+        searchable_repositories: repos,
+        sort: sort,
+        page: 1,
+        page_size: config.issue_page_size,
+        used_index: keyword != "",
+        index_unavailable: keyword != "" and service.status != ready,
+        results: issue_search(viewer, repos, keyword, kind, state, involvement, sort),
+        open_count: issue_search_count(viewer, repos, keyword, kind, open, involvement),
+        closed_count: issue_search_count(viewer, repos, keyword, kind, closed, involvement)
+    )
+    @guidance
+        -- Web: GET /issues, /pulls (signed-in only), GET /org/{org}/issues,
+        --   /org/{org}/pulls, /org/{org}/issues/{team} …; parameters q, type,
+        --   state, labels (organization labels only on org dashboards),
+        --   project, milestone, assignee, sort (default recent_update), page.
+        -- Default involvement: created_by on the personal dashboard,
+        --   your_repositories on organization dashboards.
+        -- Pull request rows carry approval / change-request / waiting
+        --   review counts and the head's combined commit status.
+}
+
+rule UserViewsOrganizationIssueDashboard {
+    when: UserViewsIssueDashboard(viewer, context_org, context_team, kind, involvement, keyword, state, sort)
+    requires: viewer != null
+    requires: viewer.is_active
+    requires: kind != both
+    requires: context_org != null
+    requires: is_org_member(viewer, context_org) or viewer.is_admin
+    let repos = dashboard_repositories(viewer, context_org, context_team, kind)
+    let service = issue_index_service()
+    ensures: IssueSearch.created(
+        viewer: viewer,
+        scope: organization,
+        context_owner: viewer,
+        context_org: context_org,
+        context_team: context_team,
+        keyword: keyword,
+        tokens: parse_issue_query(keyword),
+        kind: kind,
+        state: state,
+        involvement: involvement,
+        no_label_only: false,
+        no_milestone_only: false,
+        no_assignee_only: false,
+        include_all_public: false,
+        searchable_repositories: repos,
+        sort: sort,
+        page: 1,
+        page_size: config.issue_page_size,
+        used_index: keyword != "",
+        index_unavailable: keyword != "" and service.status != ready,
+        results: issue_search(viewer, repos, keyword, kind, state, involvement, sort),
+        open_count: issue_search_count(viewer, repos, keyword, kind, open, involvement),
+        closed_count: issue_search_count(viewer, repos, keyword, kind, closed, involvement)
+    )
+    @guidance
+        -- Same parameters as the personal dashboard; organization labels are
+        -- offered as filters; default involvement is your_repositories.
+}
+
+-- REST /repos/issues/search across everything the client can see.
+-- from: routers/api/v1/repo/issue.go:35
+rule ClientSearchesIssues {
+    when: ClientSearchesIssues(client, keyword, kind, state, involvement, owner, team, sort)
+    requires: team = null or owner != null
+    requires: involvement != your_repositories
+    requires: involvement = all or client != null
+    let repos = api_issue_search_repositories(client, owner, team)
+    let service = issue_index_service()
+    ensures: IssueSearch.created(
+        viewer: client,
+        scope: api,
+        context_owner: owner,
+        context_team: team,
+        keyword: keyword,
+        tokens: parse_issue_query(keyword),
+        kind: kind,
+        state: state,
+        involvement: involvement,
+        no_label_only: false,
+        no_milestone_only: false,
+        no_assignee_only: false,
+        include_all_public: owner = null,
+        searchable_repositories: repos,
+        sort: sort,
+        page: 1,
+        page_size: config.api_default_page_size,
+        used_index: keyword != "",
+        index_unavailable: keyword != "" and service.status != ready,
+        results: issue_search(client, repos, keyword, kind, state, involvement, sort),
+        open_count: issue_search_count(client, repos, keyword, kind, open, involvement),
+        closed_count: issue_search_count(client, repos, keyword, kind, closed, involvement)
+    )
+    @guidance
+        -- API: GET /api/v1/repos/issues/search (state=open|closed|all
+        --   default open, labels and milestones by name — unknown names
+        --   discarded, q, priority_repo_id, type=issues|pulls, since, before,
+        --   assigned, created, mentioned, review_requested, reviewed, owner,
+        --   team (requires owner), page, limit, sort default latest).
+        -- Unknown owner or team: rejected as a bad request.
+        -- A token limited to public resources searches public repositories only.
+}
+
+-- from: routers/web/user/home.go:145
+rule UserViewsMilestonesDashboard {
+    when: UserViewsMilestonesDashboard(viewer, context_org, keyword, show_closed)
+    requires: viewer != null
+    requires: directory().milestones_dashboard_enabled
+    requires: context_org = null or is_org_member(viewer, context_org) or viewer.is_admin
+    let repos = dashboard_repositories(viewer, context_org, null, issues_only)
+    ensures: MilestoneOverview.created(
+        viewer: viewer,
+        context_org: context_org,
+        keyword: keyword,
+        show_closed: show_closed,
+        repositories: repos,
+        milestones: milestone_search(repos, keyword, show_closed)
+    )
+    @guidance
+        -- Web: GET /milestones, /org/{org}/milestones[/{team}] (repos,
+        --   q, state, sort=nearduedate|furthestduedate|leastcomplete|
+        --   mostcomplete|mostissues|leastissues). Only repositories with
+        --   at least one milestone and the issues unit readable are listed.
+}
+
+------------------------------------------------------------
+-- Autocomplete
+------------------------------------------------------------
+
+-- Users offered for @-mentions: participants of the issue (or none on a new
+-- issue) plus users assignable in the repository. Teams are offered only in
+-- organization repositories: every team for org owners and site admins,
+-- otherwise the viewer's own teams. Entries render as "org/team".
+-- from: routers/web/repo/issue.go:3793
+rule WriterRequestsMentionCandidates {
+    when: WriterRequestsMentionCandidates(viewer, repository, issue)
+    requires: can_read_issues(viewer, repository) or can_read_pulls(viewer, repository)
+    ensures: MentionCandidates.created(
+        viewer: viewer,
+        repository: repository,
+        issue: issue,
+        users: mentionable_users(repository, issue),
+        teams: mentionable_teams(viewer, repository)
+    )
+}
+
+------------------------------------------------------------
+-- Insights
+------------------------------------------------------------
+
+-- Pulse. Each section appears only if the viewer can read its unit; the code
+-- section also needs a non-empty repository. Merged = merged within the
+-- period; proposed = still-open PRs created within the period; opened /
+-- closed issues by creation / closing time; unresolved = open issues
+-- created before the period but updated within it; releases = non-draft
+-- releases created within it. Code statistics cover the default branch
+-- (commit_count_all_branches covers all branches).
+-- from: routers/web/repo/activity.go:21
+rule ReaderViewsActivity {
+    when: ReaderViewsActivity(viewer, repository, period)
+    let can_code = can_read_code(viewer, repository)
+    let can_issues = can_read_issues(viewer, repository)
+    let can_pulls = can_read_pulls(viewer, repository)
+    let can_releases = can_read_releases(viewer, repository)
+    requires: can_code or can_issues or can_pulls or can_releases
+    let from = now - period_length(period)
+    let has_code = can_code and not repository.is_empty
+    ensures:
+        let report = ActivityReport.created(
+            viewer: viewer,
+            repository: repository,
+            period: period,
+            from: from,
+            until: now,
+            includes_releases: can_releases,
+            includes_issues: can_issues,
+            includes_pulls: can_pulls,
+            includes_code: has_code,
+            merged_pulls: merged_pulls_since(repository, from),
+            opened_pulls: opened_pulls_since(repository, from),
+            opened_issues: opened_issues_since(repository, from),
+            closed_issues: closed_issues_since(repository, from),
+            unresolved_issues: unresolved_since(repository, from, can_issues, can_pulls),
+            published_releases: releases_since(repository, from),
+            code: code_activity(repository, from),
+            top_authors: top_authors(repository, from, config.activity_top_authors)
+        )
+        if not can_pulls:
+            report.merged_pulls = {}
+            report.opened_pulls = {}
+        if not can_issues:
+            report.opened_issues = {}
+            report.closed_issues = {}
+        if not can_releases:
+            report.published_releases = {}
+        if not has_code:
+            report.code = null
+            report.top_authors = []
+    @guidance
+        -- Web: GET /{owner}/{repo}/activity[/{period}] with period one of
+        --   daily (24h), halfweekly (72h), weekly (7d, the default and the
+        --   fallback for unknown values), monthly, quarterly, semiyearly,
+        --   yearly (calendar months/years).
+        -- GET /{owner}/{repo}/activity_author_data[/{period}]: the top
+        --   committers JSON (all branches), needs code read and a non-empty
+        --   repository.
+}
+
+-- The contributors graph, code frequency and recent commits views all read
+-- the same per-revision statistics (non-merge commits of the revision's
+-- history, by author, per week). First request starts generation and asks
+-- the client to come back.
+-- from: services/repository/contributors_graph.go:84
+rule ReaderRequestsContributorStats {
+    when: ReaderRequestsContributorStats(viewer, repository, revision)
+    requires: can_read_code(viewer, repository)
+    requires: not repository.is_empty
+    requires: not exists ContributorStats{repository: repository, revision: revision}
+    ensures: ContributorStats.created(
+        repository: repository,
+        revision: revision,
+        status: generating,
+        requested_at: now
+    )
+    ensures: ContributorStatsGenerationStarted(repository: repository, revision: revision)
+    @guidance
+        -- Web: GET /{owner}/{repo}/activity/contributors[/data],
+        --   /activity/code-frequency[/data], /activity/recent-commits[/data].
+        --   While generating (or when another request is already generating
+        --   the same revision) the data endpoints answer "accepted, retry".
+}
+
+-- from: services/repository/contributors_graph.go:230
+rule ContributorStatsComplete {
+    when: ContributorStatsGenerated(stats, succeeded)
+    requires: stats.status = generating
+    requires: succeeded
+    ensures: stats.status = ready
+    ensures: stats.series = contributor_series(stats.repository, stats.revision)
+    ensures: stats.generated_at = now
+    ensures: stats.expires_at = now + config.contributor_stats_ttl
+}
+
+-- A failed generation is remembered (served as an error) until it expires.
+rule ContributorStatsFail {
+    when: ContributorStatsGenerated(stats, succeeded)
+    requires: stats.status = generating
+    requires: not succeeded
+    ensures: stats.status = failed
+    ensures: stats.expires_at = now + config.contributor_stats_ttl
+}
+
+-- Cached statistics are discarded after the cache TTL; the next request
+-- regenerates them.
+-- from: services/repository/contributors_graph.go:311
+rule ContributorStatsExpire {
+    when: stats: ContributorStats.expires_at <= now
+    requires: stats.status in { ready, failed }
+    ensures: not exists stats
+}
+
+------------------------------------------------------------
+-- Profiles
+------------------------------------------------------------
+
+-- A profile is shown only to viewers who may see the account. Without a
+-- usable profile README the overview tab shows repositories. The README is
+-- read from the default branch of the subject's `.profile` repository, and
+-- only when that repository is not a fork, not private, not empty and its
+-- code is readable by the viewer. Listings on every tab are filtered by what
+-- the viewer may see; private repositories appear only to signed-in viewers
+-- with access.
+-- from: routers/web/user/profile.go:60
+rule ViewerOpensProfile {
+    when: ViewerOpensProfile(viewer, subject, tab)
+    requires: can_see_profile(viewer, subject)
+    let readme = has_profile_readme(subject, viewer)
+    ensures:
+        let view = ProfileView.created(
+            viewer: viewer,
+            subject: subject,
+            requested_tab: tab,
+            tab: tab,
+            has_profile_readme: readme,
+            shows_private: viewer != null and (viewer.is_admin or viewer = subject),
+            default_sort: config.profile_default_sort,
+            repositories: profile_repositories(viewer, subject, tab, readme),
+            people: profile_people(viewer, subject, tab),
+            total: profile_total(viewer, subject, tab, readme)
+        )
+        if tab = overview and not readme:
+            view.tab = repositories
+    @guidance
+        -- Web: GET /{username}?tab=overview|repositories|stars|watching|
+        --   followers|following (+ q, sort, language, topic, archived, fork,
+        --   mirror, template, private, page). Followers/following lists use
+        --   profile_repo_page_size. Stars tab is absent when stars are
+        --   disabled instance-wide. The activity/feed tabs belong to
+        --   notifications/federation. Funding links from the profile
+        --   repository are shown with the overview.
+        -- No pinned repositories exist in Forgejo.
+        -- Repository tabs without an explicit sort use
+        -- config.profile_default_sort, not config.explore_default_sort.
+        -- decided: discovery 6.
+}
+
+------------------------------------------------------------
+-- Crawlers: sitemap, robots
+------------------------------------------------------------
+
+-- The sitemap index lists one sitemap page per sitemap_page_size public
+-- active individual users (unless the users page is disabled) and per
+-- sitemap_page_size repositories visible to the requester.
+-- from: routers/web/home.go:92
+rule CrawlerFetchesSitemapIndex {
+    when: CrawlerFetchesSitemapIndex(requester)
+    let dir = directory()
+    requires: dir.sitemap_enabled
+    requires: requester != null or not (dir.require_signin_view or dir.explore_require_signin)
+    ensures: SitemapDocument.created(
+        is_index: true,
+        page: 1,
+        entry_count: sitemap_page_count(requester, users) + sitemap_page_count(requester, repositories)
+    )
+    @guidance
+        -- Web: GET /sitemap.xml.
+}
+
+-- A sitemap page lists profile / repository URLs with their last update.
+-- from: routers/web/explore/repo.go:111
+rule CrawlerFetchesSitemapPage {
+    when: CrawlerFetchesSitemapPage(requester, section, page)
+    let dir = directory()
+    requires: dir.sitemap_enabled
+    requires: requester != null or not (dir.require_signin_view or dir.explore_require_signin)
+    requires: section != users or not dir.users_page_disabled
+    requires: page >= 1
+    ensures: SitemapDocument.created(
+        is_index: false,
+        section: section,
+        page: page,
+        entry_count: sitemap_entries(requester, section, page, config.sitemap_page_size).count
+    )
+    @guidance
+        -- Web: GET /explore/repos/sitemap-{n}.xml, /explore/users/sitemap-{n}.xml.
+}
+
+------------------------------------------------------------
+-- go get
+------------------------------------------------------------
+
+-- Answered for any path with ?go-get=1, whether or not the repository
+-- exists or the requester may read it, so that the go tool can proceed to
+-- authenticate on clone. The branch used for source links is the
+-- repository's default branch only when the requester may see the
+-- repository; for a missing or unreadable one it is the instance default,
+-- so the answer reveals nothing about the real repository.
+-- decided: discovery 1 (Forgejo used the real default branch for anyone).
+-- from: routers/web/goget.go:20
+rule GoToolRequestsImportMeta {
+    when: GoToolRequestsImportMeta(requester, owner_name, repo_name)
+    requires: owner_name != ""
+    requires: trim_git_suffix(repo_name) != ""
+    let repository = repository_named(owner_name, repo_name)
+    ensures: GoImportAnswer.created(
+        owner_name: owner_name,
+        repo_name: repo_name,
+        import_path: go_import_path(owner_name, trim_git_suffix(repo_name)),
+        clone_url: clone_url(owner_name, repo_name, config.go_get_clone_url_protocol),
+        source_branch: if repository != null and can_see_repository(requester, repository): repository.default_branch else: config.default_branch_name,
+        insecure_hint: instance_is_plain_http()
+    )
+    @guidance
+        -- Any GET /{owner}/{repo}[/...]?go-get=1. Response carries
+        --   go-import "<import> git <clone_url>" and go-source "<import> _
+        --   <src/branch/BRANCH>{/dir} <src/branch/BRANCH>{/dir}/{file}#L{line}"
+        --   plus a "go get [--insecure] <import>" hint. Missing owner or
+        --   repo name: "invalid import path".
+}
+
+------------------------------------------------------------
+-- Markup rendering (misc API)
+------------------------------------------------------------
+
+-- Renders text the way the instance renders it in issues, files and wikis.
+-- In `comment` mode with a repository, issue references and mentions are
+-- resolved against that repository; other modes render as a document.
+-- Relative links resolve against `context_path` (made absolute under the
+-- instance URL unless already an http(s) URL).
+-- from: routers/api/v1/misc/markup.go:19
+rule ClientRendersMarkup {
+    when: ClientRendersMarkup(client, mode, text, context_path, file_path, is_wiki, repository)
+    requires: client != null
+    requires: mode != file or renderer_exists_for(file_path)
+    requires: repository = null or can_see_repository(client, repository)
+    ensures: MarkupRendering.created(
+        requester: client,
+        mode: mode,
+        text: text,
+        context_path: context_path,
+        file_path: file_path,
+        is_wiki: is_wiki,
+        repository: repository,
+        html: if text = "": "" else: sanitize(render_markup(mode, text, context_path, file_path, is_wiki, repository))
+    )
+    @guidance
+        -- API: POST /api/v1/markup {Mode, Text, Context, FilePath,
+        --   BranchPath, Wiki}; POST /api/v1/markdown {Mode, Text, Context,
+        --   Wiki}; POST /api/v1/markdown/raw (body is the markdown);
+        --   POST /api/v1/repos/{owner}/{repo}/markup|markdown|markdown/raw
+        --   (repository context). All require an authenticated client.
+        -- Web: POST /-/markup and /{owner}/{repo}/markup (previews).
+        -- Unknown mode or unsupported file extension: unprocessable.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Search never reveals a repository the viewer cannot read.
+invariant RepositorySearchShowsOnlyReadable {
+    for s in RepositorySearches:
+        for r in s.results:
+            can_see_repository(s.viewer, r)
+}
+
+-- Search and listings (explore, profile tabs, the picker, REST search) never
+-- surface a private repository to a site administrator who holds no role in
+-- it: the admin may still open it by name (and that read is audited by
+-- access), but is not shown it.
+-- decided: follow-up 1 (admin read kept, not surfaced in listings)
+invariant RepositorySearchShowsOnlyListable {
+    for s in RepositorySearches:
+        for r in s.results:
+            can_list_repository(s.viewer, r)
+}
+
+-- Profile repository tabs follow the same listing rule: a site admin's
+-- shows_private covers the subject's private repositories only where the
+-- admin holds a role. decided: follow-up 1
+invariant ProfileRepositoriesListable {
+    for v in ProfileViews:
+        for r in v.repositories:
+            can_list_repository(v.viewer, r)
+}
+
+-- Facets are honoured exactly.
+invariant RepositorySearchHonoursFacets {
+    for s in RepositorySearches:
+        for r in s.results:
+            (archived in s.facets implies r.is_archived)
+            and (not_archived in s.facets implies not r.is_archived)
+            and (fork in s.facets implies r.is_fork)
+            and (not_fork in s.facets implies not r.is_fork)
+            and (mirror in s.facets implies r.is_mirror)
+            and (not_mirror in s.facets implies not r.is_mirror)
+            and (template in s.facets implies r.is_template)
+            and (not_template in s.facets implies not r.is_template)
+            and (private in s.facets implies r.is_private)
+            and (public in s.facets implies not r.is_private)
+            and (relevant_only in s.facets implies not r.is_empty)
+            and (relevant_only in s.facets and not (fork in s.facets) implies not r.is_fork)
+}
+
+invariant RepositorySearchPageBounded {
+    for s in RepositorySearches:
+        s.results.count <= s.page_size
+}
+
+-- Users listed are exactly ones whose profile the viewer may see.
+-- decided: discovery 2.
+invariant UserSearchShowsOnlyListable {
+    for s in UserSearches:
+        for u in s.results:
+            can_see_profile(s.viewer, u)
+}
+
+-- decided: federation 10.
+invariant UserSearchExcludesRemotePeople {
+    for s in UserSearches:
+        for u in s.results:
+            u.kind != activitypub
+}
+
+invariant ExploreAndPickerListOnlyActiveUsers {
+
+    for s in UserSearches:
+        for u in s.results:
+            s.scope != api implies u.is_active
+}
+
+invariant OrganizationSearchShowsOnlyListable {
+    for s in OrganizationSearches:
+        for o in s.results:
+            listable_organization(o, s.viewer)
+}
+
+-- Code hits come only from repositories whose code the viewer can read.
+invariant CodeHitsReadable {
+    for h in CodeSearchHits:
+        can_read_code(h.search.viewer, h.repository)
+}
+
+-- decided: follow-up 1 (no hits from private repositories an admin has no role in).
+invariant CodeHitsListable {
+    for h in CodeSearchHits:
+        can_list_repository(h.search.viewer, h.repository)
+}
+
+-- Issue results are readable, and pull requests appear only under the pull
+-- request unit's permission.
+invariant IssueResultsReadable {
+    for s in IssueSearches:
+        for i in s.results:
+            (i.is_pull implies can_read_pulls(s.viewer, i.repository))
+            and (not i.is_pull implies can_read_issues(s.viewer, i.repository))
+}
+
+-- Issue and pull request searches and dashboards list nothing from a
+-- private repository a site administrator holds no role in.
+-- decided: follow-up 1 (admin read kept, not surfaced in listings)
+invariant IssueResultsListable {
+    for s in IssueSearches:
+        for i in s.results:
+            can_list_repository(s.viewer, i.repository)
+}
+
+invariant IssueResultsMatchState {
+    for s in IssueSearches:
+        for i in s.results:
+            (s.state = open implies i.status = open)
+            and (s.state = closed implies i.status = closed)
+}
+
+invariant IssueResultsMatchKind {
+    for s in IssueSearches:
+        for i in s.results:
+            (s.kind = issues_only implies not i.is_pull)
+            and (s.kind = pulls_only implies i.is_pull)
+}
+
+invariant IssueResultsWithinSearchableRepositories {
+    for s in IssueSearches:
+        for i in s.results:
+            i.repository in s.searchable_repositories
+                or (s.include_all_public and not i.repository.is_private)
+}
+
+-- One code index entry per repository; one document per path per entry.
+invariant OneCodeIndexEntryPerRepository {
+    for a in CodeIndexEntries:
+        for b in CodeIndexEntries:
+            (a != b) implies a.repository != b.repository
+}
+
+invariant OneIssueDocumentPerIssue {
+    for a in IssueIndexDocuments:
+        for b in IssueIndexDocuments:
+            (a != b) implies a.issue != b.issue
+}
+
+-- The public flag of an issue document always follows its repository once
+-- pending jobs have drained.
+invariant IssueDocumentVisibilityFollowsRepository {
+    for d in IssueIndexDocuments:
+        (not exists IssueIndexJob{issue: d.issue, action: index, status: queued})
+            implies d.is_public = not d.repository.is_private
+}
+
+-- The queues never hold two pending jobs for the same work.
+invariant CodeIndexQueueIsUnique {
+    for a in CodeIndexJobs:
+        for b in CodeIndexJobs:
+            (a != b and a.status = queued and b.status = queued)
+                implies a.repository != b.repository
+}
+
+invariant LanguageStatsQueueIsUnique {
+    for a in LanguageStatsJobs:
+        for b in LanguageStatsJobs:
+            (a != b and a.status = queued and b.status = queued)
+                implies a.repository != b.repository
+}
+
+invariant IssueIndexQueueIsUnique {
+    for a in IssueIndexJobs:
+        for b in IssueIndexJobs:
+            (a != b and a.status = queued and b.status = queued and a.action = b.action)
+                implies a.issue != b.issue
+}
+
+invariant RepositoryIssuesQueueIsUnique {
+    for a in RepositoryIssuesJobs:
+        for b in RepositoryIssuesJobs:
+            (a != b and a.status = queued and b.status = queued and a.action = b.action)
+                implies a.repository != b.repository
+}
+
+-- Only default-branch content, of eligible files, is ever indexed.
+invariant CodeIndexMirrorsDefaultBranch {
+    for d in CodeIndexDocuments:
+        file_at(d.entry.repository, d.entry.commit_sha, d.path)
+            and is_indexable_path(d.path)
+}
+
+invariant OneContributorStatsPerRevision {
+    for a in ContributorStatses:
+        for b in ContributorStatses:
+            (a != b) implies (a.repository != b.repository or a.revision != b.revision)
+}
+
+invariant TopAuthorsBounded {
+    for r in ActivityReports:
+        r.top_authors.count <= config.activity_top_authors
+}
+
+-- A report never includes a section the viewer cannot read.
+invariant ActivitySectionsRespectUnits {
+    for r in ActivityReports:
+        (not r.includes_pulls implies (r.merged_pulls.count = 0 and r.opened_pulls.count = 0))
+        and (not r.includes_issues implies (r.opened_issues.count = 0 and r.closed_issues.count = 0))
+        and (not r.includes_releases implies r.published_releases.count = 0)
+        and (not r.includes_code implies r.code = null)
+}
+
+-- Rendered markup is always sanitised.
+invariant RenderedMarkupIsSanitised {
+    for m in MarkupRenderings:
+        is_sanitised(m.html)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Signed-in users and site administrators are the shared actors
+-- access/SignedInUser and access/SiteAdmin.
+
+-- An account that can read a given repository's code.
+actor RepositoryReader {
+    within: repositories/Repository
+    identified_by: accounts/User where can_read_code(this, within)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The explore area as seen by anyone (anonymous visitors are represented by
+-- a null viewer in the triggers). Restricted users see only what they have
+-- been explicitly given; anonymous visitors see only public repositories of
+-- public owners.
+surface ExploreDirectory {
+    facing visitor: accounts/User
+
+    context search: RepositorySearch where viewer = visitor
+
+    exposes:
+        search.keyword
+        search.sort
+        search.facets
+        search.total
+        for r in search.results:
+            r.name
+            r.is_archived
+            r.is_fork
+            r.is_mirror
+            r.is_template
+            r.is_private
+
+    provides:
+        ViewerSearchesRepositories(visitor, scope, subject, keyword, language, facets, sort)
+        ViewerSearchesUsers(visitor, scope, keyword, sort)
+        ViewerExploresOrganizations(visitor, keyword, sort)
+        ViewerSearchesAllCode(visitor, keyword, language, path, mode)
+        ClientSearchesTopics(visitor, keyword)
+
+    @guarantee ExploreRespectsSignInRequirement
+        -- When the instance or the explore area requires sign-in, anonymous
+        -- requests to every explore page, the sitemap, the user search API
+        -- and the user picker are refused (redirect to sign-in / 401).
+    @guarantee DisabledPagesRedirect
+        -- A disabled users, organizations or code page redirects to the
+        -- repositories page; the repositories page cannot be disabled.
+    @guidance
+        -- GET /explore -> /explore/repos. Repository rows show owner,
+        -- name, description (sanitised), topics, primary language, stars,
+        -- forks, last update, and archived/fork/mirror/template/private
+        -- badges; the language filter lists primary languages.
+}
+
+surface UserDirectory {
+    facing visitor: accounts/User
+
+    context search: UserSearch where viewer = visitor
+
+    exposes:
+        search.keyword
+        search.total
+        for u in search.results:
+            u.name
+            u.visibility
+
+    provides:
+        ViewerSearchesUsers(visitor, scope, keyword, sort)
+
+    @guarantee EmailOnlyWhenAllowed
+        -- Email addresses are shown on explore only when SHOW_USER_EMAIL is
+        -- on, the viewer is signed in and the address is not kept private
+        -- (always for the viewer's own row and for site admins). Matching by
+        -- email never matches a hidden address.
+}
+
+surface OrganizationDirectory {
+    facing visitor: accounts/User
+
+    context search: OrganizationSearch where viewer = visitor
+
+    exposes:
+        search.keyword
+        search.total
+        for o in search.results:
+            o.name
+            o.visibility
+
+    provides:
+        ViewerExploresOrganizations(visitor, keyword, sort)
+}
+
+surface CodeSearchPage {
+    facing visitor: accounts/User
+
+    context search: CodeSearch where viewer = visitor
+
+    exposes:
+        search.keyword
+        search.effective_mode
+        search.used_index
+        search.index_unavailable
+        search.total
+        search.languages
+        for h in search.hits:
+            h.repository.name
+            h.path
+            h.language
+            h.lines
+
+    provides:
+        ViewerSearchesAllCode(visitor, keyword, language, path, mode)
+        ViewerSearchesOwnerCode(visitor, owner, keyword, language, path, mode)
+        ReaderSearchesRepositoryCode(visitor, repository, ref_name, keyword, path, mode)
+
+    @guarantee ModesOffered
+        -- With an indexer: exact, union, and fuzzy only when fuzzy is
+        -- enabled. Without one: exact, union, regexp (repository scope only).
+}
+
+surface IssueSearchPage {
+    facing visitor: accounts/User
+
+    context search: IssueSearch where viewer = visitor
+
+    exposes:
+        search.keyword
+        search.state
+        search.kind
+        search.involvement
+        search.sort
+        search.open_count
+        search.closed_count
+        search.index_unavailable
+        for i in search.results:
+            i.index
+            i.title
+            i.status
+            i.is_pull
+            i.repository.name
+
+    provides:
+        ReaderListsRepositoryIssues(visitor, repository, kind, involvement, keyword, state, sort)
+        UserViewsIssueDashboard(visitor, context_org, context_team, kind, involvement, keyword, state, sort)
+        ClientSearchesIssues(visitor, keyword, kind, state, involvement, owner, team, sort)
+        UserViewsMilestonesDashboard(visitor, context_org, keyword, show_closed)
+
+    @guarantee FreshListings
+        -- Listing without a keyword reads the issue store directly, so an
+        -- issue appears in lists as soon as it is created even if the index
+        -- lags or is down.
+}
+
+surface RepositoryInsights {
+    facing reader: accounts/User
+
+    context report: ActivityReport where viewer = reader
+
+    exposes:
+        report.period
+        report.from
+        report.until
+        report.active_pull_count
+        report.active_issue_count
+        report.merged_pulls
+        report.opened_pulls
+        report.opened_issues
+        report.closed_issues
+        report.unresolved_issues
+        report.published_releases
+        report.code
+        report.top_authors
+
+    provides:
+        ReaderViewsActivity(reader, repository, period)
+        ReaderRequestsContributorStats(reader, repository, revision)
+
+    timeout:
+        ContributorStatsExpire
+}
+
+surface ContributorGraphs {
+    facing reader: RepositoryReader
+
+    context repository: repositories/Repository
+
+    let stats = ContributorStats{repository: repository, revision: repository.default_branch}
+
+    exposes:
+        stats.status
+        stats.series when stats.status = ready
+        stats.generated_at when stats.status = ready
+
+    provides:
+        ReaderRequestsContributorStats(reader, repository, revision)
+
+    @guidance
+        -- Contributors graph: per-contributor weekly commits with a
+        -- selectable metric (commits / additions / deletions). Code
+        -- frequency: weekly additions vs deletions of the "total" series.
+        -- Recent commits: the last year of weekly commit counts.
+}
+
+surface ProfilePage {
+    facing visitor: accounts/User
+
+    context view: ProfileView where viewer = visitor
+
+    exposes:
+        view.subject.name
+        view.tab
+        view.has_profile_readme
+        view.total
+        for r in view.repositories:
+            r.name
+        for p in view.people:
+            p.name
+
+    provides:
+        ViewerOpensProfile(visitor, subject, tab)
+        ViewerSearchesOwnerCode(visitor, owner, keyword, language, path, mode)
+}
+
+surface ComposerAutocomplete {
+    facing writer: access/SignedInUser
+
+    context candidates: MentionCandidates where viewer = writer
+
+    exposes:
+        for u in candidates.users:
+            u.name
+        for t in candidates.teams:
+            t.organization.name
+
+    provides:
+        WriterRequestsMentionCandidates(writer, repository, issue)
+        ViewerSearchesUsers(writer, scope, keyword, sort)
+        ClientSearchesTopics(writer, keyword)
+}
+
+surface Crawlers {
+    facing crawler: accounts/User
+
+    context dir: Directory
+
+    exposes:
+        dir.robots_policy
+        dir.sitemap_enabled
+
+    provides:
+        CrawlerFetchesSitemapIndex(crawler)
+        CrawlerFetchesSitemapPage(crawler, section, page)
+        GoToolRequestsImportMeta(crawler, owner_name, repo_name)
+
+    @guidance
+        -- GET /robots.txt: the operator's custom file if present, else a
+        --   default policy that disallows the API, avatars, user pages,
+        --   explore query strings, repository create/migrate/fork, and
+        --   per-repository source, blame, commit(s), raw, media, tags,
+        --   graph, branches, compare, activity, actions, projects, labels,
+        --   milestones, search, attachments, archives, .patch/.diff/.bundle,
+        --   feeds, and any URL with lang=, redirect_to=, tab=, q=, sort=.
+}
+
+surface MiscellaneousApi {
+    facing client: accounts/User
+
+    context dir: Directory
+
+    exposes:
+        dir.version
+        for t in all_templates():
+            t.kind
+            t.name
+
+    provides:
+        ClientRendersMarkup(client, mode, text, context_path, file_path, is_wiki, repository)
+        ClientReadsTemplate(client, kind, name)
+        ClientSearchesTopics(client, keyword)
+
+    @guarantee SanitisedOutput
+        -- Rendered HTML passes an allow-list sanitiser: no script, style
+        -- elements or event-handler attributes; javascript:, vbscript: and
+        -- data: links are removed (custom URL schemes may be allowed by the
+        -- operator); only a fixed set of classes, a few data-* attributes
+        -- and color/background-color styles survive; operator-defined
+        -- sanitiser rules may extend the allow-list. External renderers
+        -- may opt out per renderer (no_sanitizer) or be isolated in a
+        -- sandboxed frame (iframe).
+    @guidance
+        -- API: GET /api/v1/version (public), GET /api/v1/settings/ui|api|
+        --   attachment|repository (public summaries of instance settings,
+        --   owned by administration), the template listings and markup
+        --   endpoints listed on the rules.
+}
+
+surface ReindexControls {
+    facing admin: access/SiteAdmin
+
+    context repository: repositories/Repository
+
+    let entry = CodeIndexEntry{repository: repository}
+
+    exposes:
+        entry.commit_sha
+        entry.indexed_at
+
+    provides:
+        AdminRequestsReindex(admin, repository, kind)
+
+    @guidance
+        -- Shown in repository settings to site admins only: the commit the
+        -- code index and language statistics last reflected, and buttons to
+        -- re-index code (only with an indexer), stats and issues.
+}
+
+-- The code index backend reporting on itself (start-up completion and
+-- health), as seen by the rest of the system.
+surface CodeIndexBackend {
+    facing backend: CodeSearchService
+
+    exposes:
+        backend.kind
+        backend.status
+        backend.fuzzy_enabled
+
+    provides:
+        CodeIndexerStartupCompleted(backend, index_was_empty)
+        CodeIndexerHealthChanged(backend, reachable)
+
+    timeout:
+        CodeIndexerStartupTimesOut
+}
+
+surface IssueIndexBackend {
+    facing backend: IssueIndexService
+
+    exposes:
+        backend.kind
+        backend.status
+        backend.last_full_rebuild_at
+
+    provides:
+        IssueIndexerStartupCompleted(backend, index_was_empty)
+        IssueIndexerHealthChanged(backend, reachable)
+
+    timeout:
+        IssueIndexerStartupTimesOut
+        ScheduledIssueIndexRebuild
+}
+
+-- The background generator of contributor statistics.
+surface ContributorStatsWorker {
+    facing job: ContributorStats
+
+    exposes:
+        job.repository.name
+        job.revision
+        job.status
+
+    provides:
+        ContributorStatsGenerated(job, succeeded)
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred Markup.render       -- see: markup.allium (renderers, link/mention/issue-ref processing, sanitiser allow-list)
+deferred CodeIndexer.query   -- see: implementation note; per-backend tokenisation and scoring
+deferred IssueIndexer.query  -- see: implementation note; per-backend scoring for relevance sort

@@ -1,0 +1,2635 @@
+-- allium: 3
+-- notifications.allium — everything that tells people that something happened:
+-- the in-app inbox, outbound and inbound email, activity feeds, dashboards,
+-- syndication feeds and the contribution heatmap.
+--
+-- Scope: the reactive half of the system. Other modules emit domain triggers
+-- (an issue was opened, a pull request was merged, a push arrived); this module
+-- decides who is told, through which channel, and what they may later read.
+--
+-- Includes:
+--   - Notification: the per-user inbox thread about an issue, a pull request
+--     or a pending repository transfer; statuses unread / read / pinned;
+--     fan-out audience; mark read / unread / pin; mark-all-read; bulk marking
+--     through the API; automatic read-marking when the subject is viewed;
+--     unread count and its push over the live event stream.
+--   - MailMessage: every outbound email (issue/PR conversation mail, review
+--     requests, assignment, release published, repository transfer offer,
+--     collaborator added, team invitation, admin new-user notice, Actions job
+--     failure, and the account/security mails whose *triggers* belong to
+--     accounts/authentication but which are composed and sent here); how the
+--     per-user email preference (accounts/User.email_notifications) applies;
+--     the delivery queue; subject rules; mail categories (templates). The
+--     per-user preference itself is a field of accounts/User.
+--   - MailToken / reply-by-email: signed per-recipient reply and unsubscribe
+--     addresses, incoming mailbox processing, automatic-reply suppression.
+--   - Activity: the activity log (one Activity per event; feeds are computed
+--     from it when read — the actor's, the owning organization's, watchers'),
+--     its visibility rules (private repositories, keep-activity-private,
+--     user visibility), the user dashboard, organization/team dashboard,
+--     profile activity tab, repository/org/team/user activity APIs,
+--     RSS/Atom feeds (user, organization, repository, issue, release, tag,
+--     branch, file), the contribution heatmap, and the cleanup cron.
+--   - The notifier fan-out: the canonical list of notification-producing
+--     events and which modules react to each (see "Notifier fan-out" below).
+--
+-- Excludes:
+--   - Webhook deliveries (webhooks.allium reacts to the same triggers).
+--   - Actions workflow triggering from events (actions.allium).
+--   - Search-index updates on events (discovery.allium).
+--   - ActivityPub delivery of activities to remote followers and the
+--     "following" federated feed (federation.allium reacts to ActivityRecorded).
+--   - Repository activity/insights pages ("pulse": merged PRs, opened issues,
+--     contributors over a period) — discovery.allium owns repository insights.
+--   - Site-wide statistics (models/activities/statistic.go) — administration.
+--   - Issue subscription (IssueWatch) and repository Watch records themselves:
+--     owned by issues / repositories; this module only reads them. The
+--     "subscriptions" and "watching" tabs of the notifications page are
+--     listings of those records and are specified there.
+--   - star_repo / watch_repo activity kinds: declared in Forgejo but never
+--     produced by any code path — legacy, not rebuilt.
+--   - SMTP/sendmail transport mechanics (HELO, client certificates, CRLF
+--     conversion, envelope-from rewriting, header override) are kept only as
+--     config; their wire behaviour is implementation.
+--   - Gitea/GitHub/GitLab compatibility mail headers (X-Gitea-*, X-GitHub-*,
+--     X-GitLab-*): compatibility-only; a rebuild needs one set of list
+--     headers (List-ID, List-Unsubscribe, List-Post, reason, sender).
+--   - Queues, retries and batching of the fan-out (implementation detail;
+--     the spec states the eventual outcome).
+--   - The stopwatch payload and the "logout elsewhere" signal that share the
+--     live event stream: issues.allium / authentication.allium own them.
+--
+-- Emits (other modules react):
+--   ActivityRecorded(activity)                         -- federation publishes it to followers
+--   MailReplyReceived(author, issue, replied_to, replied_to_code, body, attachment_count)
+--                                                      -- issues/pulls create the comment
+--                                                      -- (a code-comment reply becomes a
+--                                                      -- reply in the same review thread)
+--   MailUnsubscribeReceived(user, issue)               -- issues records an explicit unsubscribe
+--   NotificationCountPushed(user, unread_count)        -- the web client refreshes its badge
+--   SignOutPushed(connection, session)                 -- the web client signs that tab out
+--
+--   OldActivityDeletionFinished()       -- administration: the delete_old_actions run is done
+-- Reacts to (names and parameters as the integration's canonical table gives them):
+--   issues/IssueOpened(issue, mentions)                 -- issues only (PRs: pulls/PullRequestOpened)
+--   issues/IssueClosed(issue, doer, comment)            -- issues (pulls never emits it for a PR)
+--   issues/IssueReopened(issue, doer, comment)          -- issues
+--   pulls/PullRequestClosed(pull_request, doer)         -- PRs (doer null: repository deleted, nobody told)
+--   pulls/PullRequestReopened(pull_request, doer)
+--   issues/IssueCommentCreated(issue, comment, doer, mentions)
+--   issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)
+--   issues/IssueDeleted(issue, doer)
+--   issues/UserViewsIssue(viewer, issue)                -- issues' external stimulus
+--   pulls/PullRequestOpened(pull_request)               -- poster is pull_request.issue.poster
+--   pulls/PullRequestReadyForReview(pull_request, doer)
+--   pulls/PullRequestMerged(pull_request, merger)       -- style is pull_request.merge_style
+--   pulls/PullRequestAutoMerged(pull_request, merger)
+--   pulls/PullRequestHeadUpdated(pull_request, pusher, old_commit_sha, new_commit_sha, is_force_push)
+--   pulls/ReviewSubmitted(review)                       -- the PR is review.pull_request
+--   pulls/PullRequestCodeCommented(pull_request, comment)
+--   pulls/ReviewDismissed(review, dismisser, message)
+--   pulls/ReviewRequested(pull_request, requester, reviewer)
+--   pulls/TeamReviewRequested(pull_request, requester, team) -- each member but the poster
+--   repositories/RepositoryCreated(repository, doer)
+--   repositories/RepositoryForked(source, fork, doer)
+--   repositories/RepositoryRenamed(repository, doer, old_name)
+--   repositories/RepositoryTransferred(repository, doer, old_owner_name)
+--   repositories/RepositoryTransferRequested(repository, doer, transfer)
+--   repositories/RepositoryDeleted(repository, doer)
+--   repositories/CollaboratorAddedDirectly(repository, user, doer)  -- a site admin's direct add
+--   repositories/RepositoryVisibilityChanged(repository, doer)
+--   repositories/RepositoryViewed(viewer, repository)
+--   repositories/MirrorSyncPushed(repository, ref_name, commits)
+--   repositories/MirrorRefCreated(repository, ref_name)
+--   repositories/MirrorRefDeleted(repository, ref_name)
+--   code/PushReceived(push)
+--   code/BranchCreated(branch, by)
+--   code/BranchDeleted(branch, by)
+--   releases/ReleasePublished(release)                  -- publisher is release.publisher
+--   releases/ReleaseUnpublished(release, doer)          -- doer null when the tag vanished in a sync
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+--   accounts/PrimaryEmailChanged(user, old_address, new_address)
+--   authentication/UserSignedUp(user)
+--   authentication/UserSignedOut(user, session)
+--   authentication/ActivationEmailRequested(user, code)
+--   authentication/EmailConfirmationRequested(user, email, code)
+--   authentication/PasswordResetRequested(user, code)
+--   authentication/PasswordChanged(user)
+--   authentication/TotpEnrolled(user)
+--   authentication/TotpDisabled(user)
+--   authentication/SecurityKeyRemoved(user, name)
+--   organizations/TeamInviteCreated(invite, inviter)
+--   actions/WorkflowJobCompleted(job, prior_status)
+--   administration/UserCreatedByAdmin(admin, user, send_notification)
+--   administration/TestMailRequested(admin, address)
+--   administration/MassMailRequested(subject, body, recipients)
+--   administration/OldActivityDeletionDue(older_than)
+--   migrations/RepositoryMigrated(repository)           -- feed: create_repo by the migration's doer
+--   pulls/AutoMergeFailed(pull_request, scheduler, reason)  -- inbox and mail to the scheduler
+--   moderation/AbuseReported(content, reporter, category)   -- inbox and mail to site admins
+--   moderation/ReportReviewed(report, reporter)         -- inbox and mail to the reporter
+--   (repositories/RepositoryTransferred also tells the receiving organisation's owners)
+--
+-- Read-only mode: a person's writes here (marking threads, replying or
+-- unsubscribing by mail) are refused while access/InstanceWriteGate.read_only
+-- (decided: administration 3). Reactions to other modules' events are not
+-- gated here: the module whose user action started them gates that action.
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./authentication.allium" as authentication
+use "./repositories.allium" as repositories
+use "./access.allium" as access
+use "./code.allium" as code
+use "./issues.allium" as issues
+use "./pulls.allium" as pulls
+use "./releases.allium" as releases
+use "./actions.allium" as actions
+use "./administration.allium" as administration
+use "./keys.allium" as keys
+use "./moderation.allium" as moderation
+use "./migrations.allium" as migrations
+
+------------------------------------------------------------
+-- Notifier fan-out
+------------------------------------------------------------
+--
+-- Forgejo routes every domain event through one "notifier" interface
+-- (services/notify/notifier.go) to a set of independent reactors. A rebuild
+-- should keep the shape: producers emit one domain trigger per event and never
+-- call a channel directly; each channel reacts on its own. The canonical event
+-- list and who reacts (I = inbox here, M = mail here, F = activity feed here,
+-- W = webhooks, A = actions, X = search index, R = federation, P = other):
+--
+--   repository created / adopted / migrated ......... F(created, migrated) W A X
+--   repository forked ............................... F W A X
+--   repository renamed / transferred ................ F W A X
+--   repository transfer offered (pending) ........... I M
+--   repository transferred into an organisation ..... I M (its owners)
+--   auto-merge failed ............................... I M (the scheduler)
+--   abuse reported / report reviewed ................ I M (site admins / the reporter)
+--   repository deleted .............................. W A X  (+ cleanup here)
+--   issue opened .................................... I M F W A X
+--   issue / PR closed or reopened ................... I M F W A X
+--   issue deleted ................................... W X (+ cleanup here)
+--   issue milestone / labels / title / body / ref ... W A X
+--     (title change that removes the WIP prefix of a PR = "ready for review": I M)
+--   issue assignee added ............................ I M W A
+--   review requested ................................ I M W A
+--   reaction added / removed ........................ (none in this module)
+--   pull request opened ............................. I M F W A X
+--   pull request merged / auto-merged ............... I M F W A  (+ P: automerge)
+--   pull request synchronized (new head) ............ W A  (+ P: automerge)
+--   pull request commits pushed (timeline entry) .... I M
+--   pull request target branch changed .............. W A
+--   review submitted ................................ I M F W A
+--   code comment created ............................ I(mentions) M(mentions)
+--   review dismissed ................................ I M F W A
+--   comment created ................................. I M F W A X
+--   comment edited / deleted ........................ W A X
+--   wiki page created / edited / deleted ............ W A
+--   user signed up .................................. M(admin notice)
+--   release published (prereleases too) ............. M F W A
+--   release updated / deleted ....................... W A
+--   push (commits / tag / branch delete) ............ F W A X  (+ P: push mirrors)
+--   ref created / deleted (non-push) ................ F W A
+--   mirror sync (push / create / delete) ............ F W A X
+--   package created / deleted ....................... W  (+ P: debian repo index)
+--   default branch changed .......................... A X
+--   workflow run / job attempt, status, completion .. M(run failure) W A
+--   scheduled workflow disabled for inactivity ...... M(repository admins)
+--
+-- Account and security mails (activation, email confirmation, password
+-- reset, registration notice, password changed, primary email changed, TOTP
+-- enrolled/disabled, security key removed), collaborator invitation / direct-add mail and team
+-- invitation mail are sent here in reaction to triggers owned by
+-- authentication / accounts / repositories / organizations.
+
+------------------------------------------------------------
+-- Black-box functions used below
+------------------------------------------------------------
+--
+--   can_read_issue(user, issue)      = access/can_read(user, issue.repository,
+--                                      pull_requests if issue.is_pull else issues)
+--   can_read_code(user, repo)        = access/can_read(user, repo, code)
+--   can_read_releases(user, repo)    = access/can_read(user, repo, releases)
+--   can_comment_on_issue(user, issue)= not issue.is_locked, or the user can write
+--                                      that unit, or the user is a site admin
+--   repository_watchers(repo, category) = users whose repositories/Watch on repo
+--                                      covers category (issues | pull_requests |
+--                                      releases; everything = any watch)
+--   issue_participants(issue)        = poster and every commenter
+--   issue_mentions(issue), review_mentions(review), code_comment_mentions(c)
+--                                    = users @-mentioned (directly or through a
+--                                      team) in that text, who can read the issue
+--   issue_notification_audience, mail_mention_recipients, mail_eligible,
+--   transfer_recipients, in_feed_of, activity_visible_to, repository_admins,
+--   organization_owners(org) (= users with organizations/is_org_owner(org, user)),
+--   repository_admins(repo) (= individual users with access/is_repo_admin(user, repo)),
+--   contribution_heatmap, feed_excerpt: described where they are used.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The mail infrastructure Forgejo talks to: the outgoing SMTP/sendmail
+-- transport and the incoming IMAP mailbox used for reply-by-email.
+-- from: services/mailer/mailer.go:392
+external entity MailServer {
+    direction: outgoing | incoming
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- (none: the contribution heatmap is a list of (15-minute bucket start,
+-- contribution count) cells; see the deferred contribution_heatmap.)
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- from: models/activities/notification.go:30
+enum NotificationStatus { unread | read | pinned }
+
+-- What a notification thread is about.
+-- decided (notifications 7): Forgejo's never-produced `commit` source is dropped.
+-- from: models/activities/notification.go:39
+-- repository: a pending transfer offer; repository_arrived: a repository
+-- transferred into an organisation the recipient owns; abuse_report: a new
+-- report for a site admin (decided: moderation 7); report_reviewed: the
+-- reporter's report was dealt with (decided: moderation 8).
+enum NotificationSource { issue | pull_request | repository | repository_arrived | abuse_report | report_reviewed }
+
+-- The per-user email preference is accounts/EmailNotificationPreference
+-- (enabled | on_mention | disabled | and_your_own) on accounts/User.email_notifications;
+-- accounts owns the field and the rule that changes it. "disabled" stops
+-- conversation mail only — account and security mail is always sent.
+
+-- The kinds of activity-log entries Forgejo produces.
+-- from: models/activities/action.go:36
+enum ActivityKind {
+    create_repo
+    | rename_repo
+    | transfer_repo
+    | commit_repo
+    | push_tag
+    | delete_tag
+    | delete_branch
+    | mirror_sync_push
+    | mirror_sync_create
+    | mirror_sync_delete
+    | create_issue
+    | comment_issue
+    | close_issue
+    | reopen_issue
+    | create_pull_request
+    | comment_pull
+    | merge_pull_request
+    | auto_merge_pull_request
+    | close_pull_request
+    | reopen_pull_request
+    | approve_pull_request
+    | reject_pull_request
+    | pull_review_dismissed
+    | publish_release
+    | unpublish_release     -- decided (releases 2)
+}
+
+-- Which part of a repository a watcher must be watching for an activity to
+-- reach their feed. `everything` means "any watch at all".
+-- from: models/activities/action.go:134
+enum WatchCategory { everything | issues | pull_requests | releases }
+
+-- Mail categories: each is one template family a rebuild must provide,
+-- localised to the recipient's language.
+-- from: services/mailer/mail.go:38
+enum MailCategory {
+    account_activation
+    | email_confirmation
+    | password_reset
+    | registration_notice
+    | password_changed
+    | primary_email_changed
+    | totp_enrolled
+    | totp_disabled
+    | security_key_removed
+    | collaborator_invited      -- decided (notifications 5)
+    | collaborator_added
+    | repo_transfer_offer
+    | team_invite
+    | admin_new_user
+    | release_published
+    | actions_run_failed        -- decided (notifications 4): one per failed run attempt
+    | actions_workflow_disabled -- a scheduled workflow was disabled for inactivity (actions 8)
+    | test_mail
+    | mass_mail
+    | issue_new
+    | issue_comment
+    | issue_close
+    | issue_reopen
+    | issue_assigned
+    | pull_new
+    | pull_comment
+    | pull_close
+    | pull_reopen
+    | pull_merge
+    | pull_ready_for_review
+    | pull_push
+    | pull_review_approve
+    | pull_review_reject
+    | pull_review_comment
+    | pull_code_comment
+    | pull_review_dismissed
+    | pull_review_requested
+    | pull_auto_merge_failed    -- the scheduler's auto-merge could not be carried out
+    | repository_arrived        -- a repository was transferred into an organisation
+    | abuse_reported            -- decided (moderation 7): a new report, to site admins
+    | report_reviewed           -- decided (moderation 8): to the reporter, no outcome named
+}
+
+-- from: services/mailer/token/token.go:22
+enum MailTokenPurpose { reply | unsubscribe }
+
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- An inbox thread: one per (recipient, issue) for issue/PR sources, one per
+-- (recipient, repository) offer for repository-transfer sources. New events on
+-- the same issue update the existing thread instead of creating another.
+-- from: models/activities/notification.go:45
+entity Notification {
+    recipient: accounts/User
+    repository: repositories/Repository? -- absent for report threads
+    source: NotificationSource
+    issue: issues/Issue?                 -- set for issue / pull_request sources
+    report: moderation/AbuseReport?      -- set for abuse_report / report_reviewed sources
+    comment: issues/Comment?             -- the comment that last made it unread
+    status: NotificationStatus
+    created_at: Timestamp
+    updated_at: Timestamp
+
+    transitions status {
+        unread -> read
+        unread -> pinned
+        read -> unread
+        read -> pinned
+        pinned -> read
+        pinned -> unread
+    }
+
+    is_unread: status = unread
+    is_about_issue: source in {issue, pull_request}
+    is_about_report: source in {abuse_report, report_reviewed}
+}
+
+-- One outbound email to one address. Every recipient gets an individually
+-- composed message so that no address leaks to other recipients.
+-- from: services/mailer/mailer.go:38
+entity MailMessage {
+    to_address: String
+    recipient: accounts/User?            -- absent for mail to a bare address (team invite, test mail)
+    category: MailCategory
+    subject: String
+    sender_display_name: String          -- the acting user, rendered by from_display_name_format
+    language: String                     -- recipient's UI language
+    issue: issues/Issue?                 -- conversation mail: the thread it belongs to
+    comment: issues/Comment?
+    code_comment: pulls/ReviewComment?   -- for code-comment mail
+    via_mention: Boolean                 -- sent because the recipient was @-mentioned
+    thread_key: String?                  -- groups mails of one issue/release into one mail thread
+    status: queued | sent | failed
+    queued_at: Timestamp
+    sent_at: Timestamp when status = sent
+    failure_reason: String when status = failed
+
+    transitions status {
+        queued -> sent
+        queued -> failed
+        terminal: sent, failed
+    }
+
+    tokens: MailToken with message = this
+}
+
+-- A signed, per-recipient address token embedded in conversation mail. A
+-- reply token lets the recipient answer by email; an unsubscribe token lets
+-- them stop following the issue by email. Tokens are bound to the recipient,
+-- expire, and are revoked when the holder's password changes.
+-- from: services/mailer/token/token.go:61
+entity MailToken {
+    message: MailMessage
+    purpose: MailTokenPurpose
+    holder: accounts/User
+    issue: issues/Issue
+    replied_to: issues/Comment?          -- reply tokens for a comment answer that comment
+    replied_to_code: pulls/ReviewComment? -- ... or continue that code-review thread
+    expires_at: Timestamp
+    revoked: Boolean                     -- decided (notifications 3): set on password change / reset
+
+    is_valid: expires_at > now
+}
+
+-- One activity-log entry: something an actor did to a repository.
+-- from: models/activities/action.go:203
+entity Activity {
+    kind: ActivityKind
+    actor: accounts/User?                -- absent for mirror syncs (attributed to the repository
+                                         -- owner) and for deploy-key pushes (deploy_key set)
+    deploy_key: keys/DeployKey?          -- decided (code 4): a deploy-key push is shown as by the key
+    repository: repositories/Repository
+    issue: issues/Issue?
+    comment: issues/Comment?
+    code_comment: pulls/ReviewComment?   -- for code-review comments
+    ref_name: String?                    -- branch / tag the activity concerns
+    content: String                      -- issue title, abbreviated comment, old name, release title,
+                                         -- or the (truncated) list of pushed commits
+    deploy_key: null, watch_category: WatchCategory
+    created_at: Timestamp
+}
+
+-- decided (notifications 6): there are no per-feed copies. Forgejo copied
+-- each activity into the feeds of the actor, the organization and every
+-- qualifying watcher at the time of the event (models/activities/action.go:701)
+-- and recorded whether the repository was private then; a rebuild computes
+-- every feed when it is read, from what the reader follows or watches now,
+-- filtered by current visibility (see in_feed_of and activity_visible_to).
+
+-- A browser holding the live event stream open.
+-- from: routers/web/events/events.go:22
+entity EventStreamConnection {
+    user: accounts/User
+    opened_at: Timestamp
+    last_count_check_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [mailer]
+    mailer_enabled: Boolean = false                         -- ENABLED; no mail at all when false
+    mailer_from: String = ""                                -- FROM (defaults to USER); "Name <addr>"
+    mailer_envelope_from: String = ""                       -- ENVELOPE_FROM; "<>" sends an empty envelope sender
+    mailer_subject_prefix: String = ""                      -- SUBJECT_PREFIX, prepended with a space
+    mailer_send_as_plain_text: Boolean = false              -- SEND_AS_PLAIN_TEXT; else HTML with text alternative
+    mailer_protocol: String = ""                            -- PROTOCOL: smtp | smtps | smtp+starttls | smtp+unix | sendmail | dummy; inferred from port when empty
+    mailer_smtp_addr: String = ""                           -- SMTP_ADDR
+    mailer_smtp_port: String = ""                           -- SMTP_PORT; 25 / 465 / 587 by protocol
+    mailer_enable_helo: Boolean = true                      -- ENABLE_HELO
+    mailer_helo_hostname: String = ""                       -- HELO_HOSTNAME
+    mailer_force_trust_server_cert: Boolean = false         -- FORCE_TRUST_SERVER_CERT
+    mailer_use_client_cert: Boolean = false                 -- USE_CLIENT_CERT
+    mailer_sendmail_path: String = "sendmail"               -- SENDMAIL_PATH
+    mailer_sendmail_timeout: Duration = 5.minutes           -- SENDMAIL_TIMEOUT
+    mailer_sendmail_convert_crlf: Boolean = true            -- SENDMAIL_CONVERT_CRLF
+    mailer_from_display_name_format: String = "{{ .DisplayName }}"  -- FROM_DISPLAY_NAME_FORMAT (DisplayName, AppName, Domain)
+    mail_subject_max_length: Integer = 256                  -- hard-coded: conversation mail subjects are truncated
+
+    -- [service]
+    enable_notify_mail: Boolean = false                     -- ENABLE_NOTIFY_MAIL: conversation/release/transfer mail
+    enable_user_heatmap: Boolean = true                     -- ENABLE_USER_HEATMAP
+
+    -- [admin] DEFAULT_EMAIL_NOTIFICATIONS is accounts/config.default_email_notifications;
+    -- SEND_NOTIFICATION_EMAIL_ON_NEW_USER is administration/config.notify_admins_on_new_user.
+
+    -- [email.incoming]
+    incoming_email_enabled: Boolean = false                 -- ENABLED
+    incoming_reply_to_address: String = ""                  -- REPLY_TO_ADDRESS, must contain %{token} once, in the local part
+    incoming_host: String = ""                              -- HOST
+    incoming_port: Integer = 143                            -- PORT (993 when USE_TLS)
+    incoming_use_tls: Boolean = false                       -- USE_TLS
+    incoming_skip_tls_verify: Boolean = false               -- SKIP_TLS_VERIFY
+    incoming_mailbox: String = "INBOX"                      -- MAILBOX
+    incoming_delete_handled_message: Boolean = true         -- DELETE_HANDLED_MESSAGE
+    incoming_maximum_message_size: Integer = 10_485_760     -- MAXIMUM_MESSAGE_SIZE (bytes); larger mail is never fetched
+    mail_token_lifetime: Duration = 365.days                -- hard-coded: reply/unsubscribe tokens live one year
+
+    -- [ui.notification]
+    notification_min_timeout: Duration = 10.seconds         -- MIN_TIMEOUT: client polling start interval
+    notification_timeout_step: Duration = 10.seconds        -- TIMEOUT_STEP
+    notification_max_timeout: Duration = 60.seconds         -- MAX_TIMEOUT
+    event_source_update_time: Duration = 10.seconds         -- EVENT_SOURCE_UPDATE_TIME; 0 disables the live stream
+    notification_page_size: Integer = 20                    -- inbox default page size
+
+    -- [ui] / [other]
+    feed_max_commit_num: Integer = 5                        -- FEED_MAX_COMMIT_NUM: commits kept per push activity
+    feed_paging_num: Integer = 20                           -- FEED_PAGING_NUM: dashboard page size, release-feed cap
+    feed_comment_excerpt_max: Integer = 200                 -- hard-coded: activity comment excerpt length
+    enable_feed: Boolean = true                             -- [other] ENABLE_FEED: RSS/Atom endpoints
+
+    -- [cron.delete_old_actions] ENABLED=false, SCHEDULE=@every 168h,
+    -- OLDER_THAN=8760h: owned by administration's cron registry.
+
+    -- heatmap shape (hard-coded)
+    heatmap_window: Duration = 371.days                     -- 53 full weeks
+    heatmap_bucket: Duration = 15.minutes
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+------------------------------------------------------------
+-- Inbox: fan-out of issue / pull request events
+------------------------------------------------------------
+
+-- Two internal triggers carry every inbox delivery:
+--   IssueThreadActivity(issue, comment, author, mentions) -> everyone in the audience
+--   IssueThreadActivityFor(issue, comment, author, receiver) -> one receiver
+-- decided (notifications 1): inbox and mail share ONE audience of an issue
+-- thread:
+--   (issue subscribers) + (repository watchers of the issue's kind — issues
+--   or pull_requests — except while a pull request title carries a
+--   work-in-progress prefix) + (participants: poster and commenters) +
+--   (assignees) + (the users this event @-mentions)
+--   minus the author, minus users who explicitly unsubscribed from the issue,
+--   minus users who have blocked the author.
+-- The inbox gets the whole audience; mail gets it filtered by each person's
+-- mail preference (see the conversation-mail section). An event-specific
+-- receiver (the new assignee, a requested reviewer) is told directly, still
+-- subject to the read-permission check.
+
+-- from: services/uinotification/notify.go:91
+rule InboxOnIssueOpened {
+    when: issues/IssueOpened(issue, mentions)
+    requires: not issue.is_pull
+    ensures: IssueThreadActivity(issue: issue, comment: null, author: issue.poster, mentions: mentions)
+}
+
+-- A new pull request goes to the thread audience as it stands at opening:
+-- pull-request watchers (even for a work-in-progress title — opening is the
+-- one event that reaches them while the prefix is there), participants and
+-- mentions, through the same filters as every other event. (Nobody else can
+-- have subscribed to a thread that did not exist; assignees chosen at opening
+-- are told by InboxOnAssigned.)
+-- decided (notifications 2): the unsubscribe and block filters apply to new
+-- pull requests too (Forgejo named every receiver explicitly and skipped them).
+-- from: services/uinotification/notify.go:131
+rule InboxOnPullRequestOpened {
+    when: pulls/PullRequestOpened(pull_request)
+    let issue = pull_request.issue
+    let author = issue.poster
+    let candidates = repository_watchers(issue.repository, pull_requests) + issue_participants(issue) + issue_mentions(issue)
+    ensures:
+        for r in candidates:
+            if r != author and (issues/IssueWatches where user = r and issue = issue and is_watching = false).count = 0 and (accounts/UserBlocks where blocker = r and blocked = author).count = 0:
+                IssueThreadActivityFor(issue: issue, comment: null, author: author, receiver: r)
+}
+
+-- from: services/uinotification/notify.go:64
+rule InboxOnComment {
+    when: issues/IssueCommentCreated(issue, comment, doer, mentions)
+    ensures: IssueThreadActivity(issue: issue, comment: comment, author: doer, mentions: mentions)
+}
+
+-- from: services/uinotification/notify.go:105
+rule InboxOnIssueClosed {
+    when: issues/IssueClosed(issue, doer, comment)
+    ensures: IssueThreadActivity(issue: issue, comment: comment, author: doer, mentions: {})
+}
+
+-- from: services/uinotification/notify.go:105
+rule InboxOnIssueReopened {
+    when: issues/IssueReopened(issue, doer, comment)
+    ensures: IssueThreadActivity(issue: issue, comment: comment, author: doer, mentions: {})
+}
+
+-- pulls never emits issues/IssueClosed / IssueReopened for a pull request; a
+-- PR's close / reopen arrives as pulls/PullRequestClosed / PullRequestReopened
+-- (doer null when a repository deletion closed it: nobody is told then).
+rule InboxOnPullRequestClosed {
+    when: pulls/PullRequestClosed(pull_request, doer)
+    requires: doer != null
+    ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: doer, mentions: {})
+}
+
+rule InboxOnPullRequestReopened {
+    when: pulls/PullRequestReopened(pull_request, doer)
+    ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: doer, mentions: {})
+}
+
+-- Removing the work-in-progress prefix from a pull request title tells the
+-- audience it is ready for review.
+-- from: services/uinotification/notify.go:113
+rule InboxOnReadyForReview {
+    when: pulls/PullRequestReadyForReview(pull_request, doer)
+    ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: doer, mentions: {})
+}
+
+-- from: services/uinotification/notify.go:124
+rule InboxOnPullRequestMerged {
+    when: pulls/PullRequestMerged(pull_request, merger)
+    -- an auto-merge is announced once, by the PullRequestAutoMerged rule
+    requires: not pull_request.merged_automatically
+    ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: merger, mentions: {})
+}
+
+-- from: services/uinotification/notify.go:128
+rule InboxOnPullRequestAutoMerged {
+    when: pulls/PullRequestAutoMerged(pull_request, merger)
+    ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: merger, mentions: {})
+}
+
+-- from: services/uinotification/notify.go:166
+rule InboxOnReviewSubmitted {
+    when: pulls/ReviewSubmitted(review)
+    let issue = review.pull_request.issue
+    let mentions = review_mentions(review)
+    ensures: IssueThreadActivity(issue: issue, comment: null, author: review.reviewer, mentions: mentions)
+}
+
+-- A stand-alone code comment notifies only the people it mentions, through
+-- the same filters as the rest of the audience (not the author, not
+-- unsubscribers, not users who blocked the author).
+-- decided (notifications 1)
+-- from: services/uinotification/notify.go:188
+rule InboxOnCodeComment {
+    when: pulls/PullRequestCodeCommented(pull_request, comment)
+    let issue = pull_request.issue
+    let author = comment.poster
+    let mentions = code_comment_mentions(comment)
+    ensures:
+        for m in mentions:
+            if m != author and (issues/IssueWatches where user = m and issue = issue and is_watching = false).count = 0 and (accounts/UserBlocks where blocker = m and blocked = author).count = 0:
+                IssueThreadActivityFor(issue: issue, comment: null, author: author, receiver: m)
+}
+
+-- from: services/uinotification/notify.go:199
+rule InboxOnPullRequestCommitsPushed {
+    when: pulls/PullRequestHeadUpdated(pull_request, pusher, old_commit_sha, new_commit_sha, is_force_push)
+    ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: pusher, mentions: {})
+}
+
+-- from: services/uinotification/notify.go:208
+rule InboxOnReviewDismissed {
+    when: pulls/ReviewDismissed(review, dismisser, message)
+    ensures: IssueThreadActivity(issue: review.pull_request.issue, comment: null, author: dismisser, mentions: {})
+}
+
+-- Being assigned by somebody else notifies the assignee. Unassignment and
+-- self-assignment notify nobody.
+-- from: services/uinotification/notify.go:217
+rule InboxOnAssigned {
+    when: issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)
+    requires: not removed
+    requires: doer != assignee
+    ensures: IssueThreadActivityFor(issue: issue, comment: comment, author: doer, receiver: assignee)
+}
+
+-- from: services/uinotification/notify.go:233
+rule InboxOnReviewRequested {
+    when: pulls/ReviewRequested(pull_request, requester, reviewer)
+    ensures: IssueThreadActivityFor(issue: pull_request.issue, comment: null, author: requester, receiver: reviewer)
+}
+
+-- A review requested from a team reaches each member of the team but the
+-- pull request's poster.
+rule InboxOnTeamReviewRequested {
+    when: pulls/TeamReviewRequested(pull_request, requester, team)
+    ensures:
+        for member in team.members:
+            if member != pull_request.issue.poster:
+                IssueThreadActivityFor(issue: pull_request.issue, comment: null, author: requester, receiver: member)
+}
+
+-- An auto-merge that could not be carried out tells the user who scheduled
+-- it, even when they are also the one whose action made it fail; the thread
+-- points at the pull request, whose timeline comment gives the reason.
+rule InboxOnAutoMergeFailed {
+    when: pulls/AutoMergeFailed(pull_request, scheduler, reason)
+    ensures: IssueThreadActivityFor(issue: pull_request.issue, comment: null, author: scheduler, receiver: scheduler)
+}
+
+-- Expand an audience-wide event into one delivery per audience member: the
+-- standing audience, then the event's mentions through the same filters.
+-- decided (notifications 1): one audience for inbox and mail; assignees are
+-- part of it, and mentions no longer bypass the unsubscribe / block filters.
+-- from: models/activities/notification_list.go:85
+rule ExpandIssueThreadAudience {
+    when: IssueThreadActivity(issue, comment, author, mentions)
+    let audience = issue_notification_audience(issue, author)
+    ensures:
+        for r in audience:
+            IssueThreadActivityFor(issue: issue, comment: comment, author: author, receiver: r)
+    ensures:
+        for m in mentions:
+            if m != author and (issues/IssueWatches where user = m and issue = issue and is_watching = false).count = 0 and (accounts/UserBlocks where blocker = m and blocked = author).count = 0:
+                IssueThreadActivityFor(issue: issue, comment: comment, author: author, receiver: m)
+    @guidance
+        -- issue_notification_audience(issue, author) is the standing audience
+        -- (everything but the event's mentions):
+        --   issues/subscribers(issue)
+        --   + (repository_watchers(repo, issues | pull_requests by kind)
+        --      unless the issue is a pull request whose title has a WIP prefix;
+        --      watchers hear of a WIP pull request when it is opened and when
+        --      it becomes ready for review)
+        --   + issue_participants(issue)
+        --   + issue.assignees
+        --   - {author}
+        --   - issues/explicitly_unsubscribed(issue)
+        --   - users who have blocked the author (accounts/UserBlock)
+}
+
+-- Deliver to one receiver: create the thread, or bring an existing one back.
+-- A read thread becomes unread and points at the new comment; an unread or
+-- pinned thread keeps its status and only moves to the top.
+-- from: models/activities/notification_list.go:155
+rule DeliverIssueNotification {
+    when: IssueThreadActivityFor(issue, comment, author, receiver)
+    requires: can_read_issue(receiver, issue)
+    let existing = Notification{recipient: receiver, issue: issue}
+    ensures:
+        if exists existing:
+            if existing.status = read:
+                existing.status = unread
+                existing.comment = comment
+            existing.updated_at = now
+        else:
+            Notification.created(
+                recipient: receiver,
+                repository: issue.repository,
+                source: if issue.is_pull: pull_request else: issue,
+                issue: issue,
+                comment: comment,
+                report: null,
+                status: unread,
+                created_at: now,
+                updated_at: now
+            )
+    @guidance
+        -- Deleted receivers are skipped silently. Delivery is asynchronous
+        -- (a queue) in Forgejo; only the eventual outcome is normative.
+}
+
+------------------------------------------------------------
+-- Inbox: repository transfer offers
+------------------------------------------------------------
+
+-- A pending transfer notifies the receiving user, or — for an organization —
+-- every member allowed to create repositories in it.
+-- from: models/activities/notification.go:69
+rule InboxOnRepoTransferOffered {
+    when: repositories/RepositoryTransferRequested(repository, doer, transfer)
+    let receivers = transfer_recipients(transfer)
+    ensures:
+        for r in receivers:
+            Notification.created(
+                recipient: r,
+                repository: transfer.repository,
+                source: repository,
+                issue: null,
+                comment: null,
+                report: null,
+                status: unread,
+                created_at: now,
+                updated_at: now
+            )
+    @guidance
+        -- transfer_recipients(transfer) = {transfer.recipient_user} when the
+        -- new owner is a user; otherwise every member of the new owner
+        -- organization who may create repositories in it (owners and members
+        -- of teams with repository-creation permission).
+}
+
+-- A repository transferred into an organisation tells the organisation's
+-- owners (other than the person who moved it) that it arrived and who moved
+-- it.
+rule InboxOnRepositoryArrived {
+    when: repositories/RepositoryTransferred(repository, doer, old_owner_name)
+    requires: repository.owner_org != null
+    let receivers = organization_owners(repository.owner_org) - {doer}
+    ensures:
+        for r in receivers:
+            Notification.created(
+                recipient: r,
+                repository: repository,
+                source: repository_arrived,
+                issue: null,
+                comment: null,
+                report: null,
+                status: unread,
+                created_at: now,
+                updated_at: now
+            )
+}
+
+------------------------------------------------------------
+-- Inbox: reading
+------------------------------------------------------------
+
+-- Opening an issue or pull request marks the viewer's unread thread read
+-- (pinned threads stay pinned).
+-- from: models/activities/notification.go:268
+rule ViewingIssueMarksItRead {
+    when: issues/UserViewsIssue(viewer, issue)
+    let thread = Notification{recipient: viewer, issue: issue}
+    requires: exists thread
+    requires: thread.status = unread
+    ensures: thread.status = read
+}
+
+-- Opening a repository's home page marks the viewer's unread transfer-offer
+-- and arrival threads for it read.
+-- from: models/activities/notification.go:296
+rule ViewingRepositoryMarksTransferOfferRead {
+    when: repositories/RepositoryViewed(viewer, repository)
+    ensures:
+        for n in Notifications where recipient = viewer and repository = repository and source in {repository, repository_arrived} and status = unread:
+            n.status = read
+}
+
+-- Explicitly set one thread to read, unread or pinned. Only the recipient
+-- may change a thread — not even a site administrator.
+-- Web: POST /notifications/status. API: PATCH /notifications/threads/{id}
+-- (to-status, default read).
+-- from: models/activities/notification.go:306
+rule UserMarksNotification {
+    when: UserMarksNotification(user, notification, target)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: notification.recipient = user
+    requires: notification.status != target
+    ensures: notification.status = target
+    ensures: notification.updated_at = now
+}
+
+-- "Mark all as read" in the web inbox: every unread thread of the user
+-- becomes read; pinned threads are untouched.
+-- Web: POST /notifications/purge.
+-- from: models/activities/notification.go:334
+rule UserMarksAllNotificationsRead {
+    when: UserMarksAllNotificationsRead(user)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    let unread = Notifications where status = unread and recipient = user
+    ensures:
+        for n in unread:
+            n.status = read
+            n.updated_at = now
+}
+
+-- API bulk marking: every thread of the user whose status is in
+-- `from_statuses` (default {unread}; all statuses when the caller asks for
+-- "all") and that was last updated at or before `updated_before` is moved to
+-- `to_status` (default read).
+-- API: PUT /notifications (last_read_at, all, status-types, to-status).
+-- from: routers/api/v1/notify/user.go:94
+rule UserMarksNotificationsInBulk {
+    when: UserMarksNotificationsInBulk(user, from_statuses, to_status, updated_before)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    ensures:
+        for n in Notifications where recipient = user and status in from_statuses and updated_at <= updated_before:
+            n.status = to_status
+            n.updated_at = now
+}
+
+-- The same, restricted to one repository.
+-- API: PUT /repos/{owner}/{repo}/notifications.
+-- from: routers/api/v1/notify/repo.go:134
+rule UserMarksRepoNotificationsInBulk {
+    when: UserMarksRepoNotificationsInBulk(user, repository, from_statuses, to_status, updated_before)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: can_read_code(user, repository)
+    ensures:
+        for n in Notifications where recipient = user and repository = repository and status in from_statuses and updated_at <= updated_before:
+            n.status = to_status
+            n.updated_at = now
+}
+
+------------------------------------------------------------
+-- Inbox: live unread count
+------------------------------------------------------------
+
+-- A signed-in browser opens the live event stream. Anonymous visitors are
+-- told the stream is closed ("unauthorized") and get nothing else.
+-- Web: GET /user/events (server-sent events, ping every 30s).
+-- from: routers/web/events/events.go:22
+rule UserOpensEventStream {
+    when: UserOpensEventStream(user)
+    requires: config.event_source_update_time > 0.seconds
+    ensures: EventStreamConnection.created(user: user, opened_at: now, last_count_check_at: now)
+}
+
+-- from: routers/web/events/events.go:88
+rule UserClosesEventStream {
+    when: UserClosesEventStream(connection)
+    ensures: not exists connection
+}
+
+-- Every update interval, each connected user whose threads changed since the
+-- last check is pushed their current unread count.
+-- from: modules/eventsource/manager_run.go:74
+rule PushUnreadCount {
+    when: connection: EventStreamConnection.last_count_check_at + config.event_source_update_time <= now
+    let changed = Notifications where recipient = connection.user and updated_at >= connection.last_count_check_at
+    let unread = Notifications where recipient = connection.user and status = unread
+    ensures: connection.last_count_check_at = now
+    ensures:
+        if changed.count > 0:
+            NotificationCountPushed(user: connection.user, unread_count: unread.count)
+    @guidance
+        -- When no stream is connected, clients fall back to polling
+        -- GET /notifications/new (web) or GET /api/v1/notifications/new with
+        -- a back-off from notification_min_timeout by notification_timeout_step
+        -- up to notification_max_timeout.
+}
+
+-- Signing out tells the user's other open tabs, which sign themselves out
+-- ("logout" event: "here" for the tab of that session, "elsewhere" otherwise).
+-- from: routers/web/events/events.go:88
+rule SignOutReachesOpenTabs {
+    when: authentication/UserSignedOut(user, session)
+    ensures:
+        for c in EventStreamConnections where user = user:
+            SignOutPushed(connection: c, session: session)
+}
+
+------------------------------------------------------------
+-- Inbox: cleanup
+------------------------------------------------------------
+
+-- from: services/issue/issue.go:275
+rule DeleteNotificationsOfDeletedIssue {
+    when: issues/IssueDeleted(issue, doer)
+    ensures:
+        for n in Notifications where issue = issue:
+            not exists n
+}
+
+-- from: services/repository/delete.go:190
+rule DeleteNotificationsOfDeletedRepository {
+    when: repositories/RepositoryDeleted(repository, doer)
+    ensures:
+        for n in Notifications where repository = repository:
+            not exists n
+}
+
+-- (Their feed needs no cleanup: it is computed on read — notifications 6.)
+-- from: services/user/delete.go:111
+rule DeleteInboxOfDeletedUser {
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+    ensures:
+        for n in Notifications where recipient = user:
+            not exists n
+}
+
+
+------------------------------------------------------------
+-- Email: conversation mail (issues and pull requests)
+------------------------------------------------------------
+
+-- Two internal triggers carry every conversation mail:
+--   IssueMailDue(issue, doer, category, comment, mentions, force_doer)
+--   IssueMailFor(issue, doer, category, comment, recipient, via_mention)
+-- decided (notifications 1): the mail audience is the inbox audience (see
+-- ExpandIssueThreadAudience) filtered by each person's mail preference:
+--   enabled / and_your_own  -> every conversation mail of the audience
+--   on_mention              -> only mail of an event that mentions them
+--   disabled                -> none
+-- The doer is never in the audience; they are mailed their own action only
+-- when they chose and_your_own (that is what the preference means), or when
+-- force_doer is set (the scheduler of an auto-merge). Each recipient must be
+-- an active, login-permitted individual user able to read the issue's unit.
+-- (Forgejo's mail audience differed: it added the poster and assignees and
+-- used the issues watch selection for pull requests too.)
+
+-- from: services/mailer/notify.go:48
+rule MailOnIssueOpened {
+    when: issues/IssueOpened(issue, mentions)
+    requires: not issue.is_pull
+    ensures: IssueMailDue(issue: issue, doer: issue.poster, category: issue_new, comment: null, code_comment: null, mentions: mentions, force_doer: false)
+}
+
+-- from: services/mailer/notify.go:89
+rule MailOnPullRequestOpened {
+    when: pulls/PullRequestOpened(pull_request)
+    let mentions = issue_mentions(pull_request.issue)
+    ensures: IssueMailDue(issue: pull_request.issue, doer: pull_request.issue.poster, category: pull_new, comment: null, code_comment: null, mentions: mentions, force_doer: false)
+}
+
+-- The mail category follows the comment kind: plain comment, close, reopen,
+-- code comment, or pull-request push.
+-- from: services/mailer/notify.go:25
+rule MailOnComment {
+    when: issues/IssueCommentCreated(issue, comment, doer, mentions)
+    let category = comment_mail_category(comment)
+    ensures: IssueMailDue(issue: issue, doer: doer, category: category, comment: comment, code_comment: null, mentions: mentions, force_doer: false)
+}
+
+-- When an issue is closed by a commit or a merged pull request, the mail says
+-- which commit closed it.
+-- from: services/mailer/notify.go:52
+rule MailOnIssueClosed {
+    when: issues/IssueClosed(issue, doer, comment)
+    let category = if issue.is_pull: pull_close else: issue_close
+    ensures: IssueMailDue(issue: issue, doer: doer, category: category, comment: null, code_comment: null, mentions: {}, force_doer: false)
+}
+
+-- from: services/mailer/notify.go:52
+rule MailOnIssueReopened {
+    when: issues/IssueReopened(issue, doer, comment)
+    let category = if issue.is_pull: pull_reopen else: issue_reopen
+    ensures: IssueMailDue(issue: issue, doer: doer, category: category, comment: null, code_comment: null, mentions: {}, force_doer: false)
+}
+
+-- pulls never emits issues/IssueClosed / IssueReopened for a pull request; a
+-- PR's close / reopen arrives as pulls/PullRequestClosed / PullRequestReopened
+-- (doer null when a repository deletion closed it: nobody is told then).
+rule MailOnPullRequestClosed {
+    when: pulls/PullRequestClosed(pull_request, doer)
+    requires: doer != null
+    ensures: IssueMailDue(issue: pull_request.issue, doer: doer, category: pull_close, comment: null, code_comment: null, mentions: {}, force_doer: false)
+}
+
+rule MailOnPullRequestReopened {
+    when: pulls/PullRequestReopened(pull_request, doer)
+    ensures: IssueMailDue(issue: pull_request.issue, doer: doer, category: pull_reopen, comment: null, code_comment: null, mentions: {}, force_doer: false)
+}
+
+-- from: services/mailer/notify.go:78
+rule MailOnReadyForReview {
+    when: pulls/PullRequestReadyForReview(pull_request, doer)
+    ensures: IssueMailDue(issue: pull_request.issue, doer: doer, category: pull_ready_for_review, comment: null, code_comment: null, mentions: {}, force_doer: false)
+}
+
+-- from: services/mailer/notify.go:132
+rule MailOnPullRequestMerged {
+    when: pulls/PullRequestMerged(pull_request, merger)
+    -- an auto-merge is announced once, by the PullRequestAutoMerged rule
+    requires: not pull_request.merged_automatically
+    ensures: IssueMailDue(issue: pull_request.issue, doer: merger, category: pull_merge, comment: null, code_comment: null, mentions: {}, force_doer: false)
+}
+
+-- An automatic merge also mails the person who scheduled it.
+-- from: services/mailer/notify.go:142
+rule MailOnPullRequestAutoMerged {
+    when: pulls/PullRequestAutoMerged(pull_request, merger)
+    ensures: IssueMailDue(issue: pull_request.issue, doer: merger, category: pull_merge, comment: null, code_comment: null, mentions: {}, force_doer: true)
+}
+
+-- from: services/mailer/notify.go:94
+rule MailOnReviewSubmitted {
+    when: pulls/ReviewSubmitted(review)
+    let category = review_mail_category(review)
+    let mentions = review_mentions(review)
+    ensures: IssueMailDue(issue: review.pull_request.issue, doer: review.reviewer, category: category, comment: null, code_comment: null, mentions: mentions, force_doer: false)
+    @guidance
+        -- review_mail_category: approve -> pull_review_approve,
+        -- request_changes -> pull_review_reject, comment -> pull_review_comment.
+        -- The mail body lists the review's code comments.
+}
+
+-- A stand-alone code comment mails only its mentions (never the poster).
+-- from: services/mailer/mail_comment.go:42
+rule MailOnCodeComment {
+    when: pulls/PullRequestCodeCommented(pull_request, comment)
+    let mentions = code_comment_mentions(comment)
+    let recipients = mail_mention_recipients(pull_request.issue, comment.poster, mentions, false)
+    ensures:
+        for r in recipients:
+            IssueMailFor(issue: pull_request.issue, doer: comment.poster, category: pull_code_comment, comment: null, code_comment: comment, recipient: r, via_mention: true)
+}
+
+-- from: services/mailer/notify.go:152
+rule MailOnPullRequestCommitsPushed {
+    when: pulls/PullRequestHeadUpdated(pull_request, pusher, old_commit_sha, new_commit_sha, is_force_push)
+    ensures: IssueMailDue(issue: pull_request.issue, doer: pusher, category: pull_push, comment: null, code_comment: null, mentions: {}, force_doer: false)
+}
+
+-- from: services/mailer/notify.go:176
+rule MailOnReviewDismissed {
+    when: pulls/ReviewDismissed(review, dismisser, message)
+    ensures: IssueMailDue(issue: review.pull_request.issue, doer: dismisser, category: pull_review_dismissed, comment: null, code_comment: null, mentions: {}, force_doer: false)
+}
+
+-- Assignment mail goes to the assignee only, when assigned by somebody else
+-- and the assignee has not disabled email.
+-- from: services/mailer/notify.go:115
+rule MailOnAssigned {
+    when: issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)
+    requires: not removed
+    requires: doer != assignee
+    requires: assignee.email_notifications != disabled
+    requires: assignee.is_active
+    ensures: IssueMailFor(issue: issue, doer: doer, category: issue_assigned, comment: comment, code_comment: null, recipient: assignee, via_mention: false)
+}
+
+-- from: services/mailer/notify.go:123
+rule MailOnReviewRequested {
+    when: pulls/ReviewRequested(pull_request, requester, reviewer)
+    requires: requester != reviewer
+    requires: reviewer.email_notifications != disabled
+    requires: reviewer.is_active
+    ensures: IssueMailFor(issue: pull_request.issue, doer: requester, category: pull_review_requested, comment: null, code_comment: null, recipient: reviewer, via_mention: false)
+}
+
+-- The scheduler of a failed auto-merge is mailed (their mail preference
+-- applies; and_your_own is not needed, the mail is about their own schedule).
+rule MailOnAutoMergeFailed {
+    when: pulls/AutoMergeFailed(pull_request, scheduler, reason)
+    requires: config.mailer_enabled
+    requires: config.enable_notify_mail
+    requires: mail_eligible(scheduler, false)
+    ensures: IssueMailFor(issue: pull_request.issue, doer: scheduler, category: pull_auto_merge_failed, comment: null, code_comment: null, recipient: scheduler, via_mention: false)
+    @guidance
+        -- The body quotes the reason (the pr_unscheduled_to_auto_merge
+        -- timeline comment) and says the pull request can be merged by hand
+        -- or scheduled again.
+}
+
+-- Resolve the audience of a conversation mail: the thread audience, filtered
+-- by mail preference.
+-- decided (notifications 1): one audience for inbox and mail.
+-- from: services/mailer/mail_issue.go:57
+rule ExpandIssueMailAudience {
+    when: IssueMailDue(issue, doer, category, comment, code_comment, mentions, force_doer)
+    requires: config.mailer_enabled
+    requires: config.enable_notify_mail
+    let by_mention = mail_mention_recipients(issue, doer, mentions, force_doer)
+    let others = issue_notification_audience(issue, doer) - by_mention
+    ensures:
+        for r in by_mention:
+            IssueMailFor(issue: issue, doer: doer, category: category, comment: comment, code_comment: code_comment, recipient: r, via_mention: true)
+    ensures:
+        for r in others:
+            if mail_eligible(r, false):
+                IssueMailFor(issue: issue, doer: doer, category: category, comment: comment, code_comment: code_comment, recipient: r, via_mention: false)
+    ensures:
+        if not (doer in by_mention) and (force_doer or doer.email_notifications = and_your_own) and mail_eligible(doer, false):
+            IssueMailFor(issue: issue, doer: doer, category: category, comment: comment, code_comment: code_comment, recipient: doer, via_mention: false)
+    @guidance
+        -- mail_mention_recipients(issue, doer, mentions, force_doer) = the
+        -- mentions the thread audience admits (not the doer unless force_doer
+        -- or and_your_own, not explicit unsubscribers, not users who blocked
+        -- the doer) for whom mail_eligible(m, true).
+        -- mail_eligible(user, via_mention) = an active, login-permitted
+        -- individual user who can receive mail, whose preference is enabled
+        -- or and_your_own, or on_mention when via_mention.
+}
+
+-- Compose one conversation mail for one recipient. With incoming email
+-- enabled it carries a personal reply address (when the subject supports
+-- replies: the issue itself, a comment, a review or a code comment — not a
+-- push notice) and a personal unsubscribe address.
+-- from: services/mailer/mail.go:223
+rule ComposeIssueMail {
+    when: IssueMailFor(issue, doer, category, comment, code_comment, recipient, via_mention)
+    requires: config.mailer_enabled
+    requires: can_read_issue(recipient, issue)
+    ensures:
+        let message = MailMessage.created(
+            to_address: recipient.primary_email,
+            recipient: recipient,
+            category: category,
+            subject: issue_mail_subject(issue, category, recipient.language),
+            sender_display_name: mail_sender_name(doer),
+            language: recipient.language,
+            issue: issue,
+            comment: comment,
+            code_comment: code_comment,
+            via_mention: via_mention,
+            thread_key: issue_thread_key(issue),
+            status: queued,
+            queued_at: now
+        )
+        if config.incoming_email_enabled:
+            MailToken.created(message: message, purpose: unsubscribe, holder: recipient, issue: issue, replied_to: null, replied_to_code: null, expires_at: now + config.mail_token_lifetime, revoked: false)
+            if category != pull_push:
+                MailToken.created(message: message, purpose: reply, holder: recipient, issue: issue, replied_to: comment, replied_to_code: code_comment, expires_at: now + config.mail_token_lifetime, revoked: false)
+    @guidance
+        -- Subject: rendered from the category's subject template; whitespace
+        -- collapsed, truncated to mail_subject_max_length characters, never
+        -- empty — falls back to "[owner/repo] title (Issue #n)" or
+        -- "(PR #n)", prefixed "Re: " for anything but a new issue/PR.
+        -- Threading: Message-ID is per comment / per state change; In-Reply-To
+        -- and References point at the issue so clients thread them.
+        -- Headers: List-ID (repository), List-Archive, List-Unsubscribe (issue
+        -- URL and, with incoming mail, the unsubscribe address), List-Post
+        -- (reply address), a reason header (issue | pull), sender, recipient.
+        -- Body: rendered markdown of the issue/comment (empty for close,
+        -- reopen and merge), link to the comment, review code comments, and
+        -- whether replying by mail is possible.
+}
+
+------------------------------------------------------------
+-- Email: other event mail
+------------------------------------------------------------
+
+-- Published releases, prereleases included, are mailed to release watchers
+-- who can read releases, except the publisher.
+-- decided (notifications 8): prereleases are mailed too (Forgejo mailed only
+-- full releases while the feed recorded both).
+-- from: services/mailer/mail_release.go:30
+rule MailOnReleasePublished {
+    when: releases/ReleasePublished(release)
+    requires: config.mailer_enabled
+    requires: config.enable_notify_mail
+    let publisher = release.publisher
+    let recipients = repository_watchers(release.repository, releases) - {publisher}
+    ensures:
+        for r in recipients:
+            if mail_eligible(r, false) and can_read_releases(r, release.repository):
+                MailMessage.created(
+                    to_address: r.primary_email,
+                    recipient: r,
+                    category: release_published,
+                    subject: release_mail_subject(release, r.language),
+                    sender_display_name: mail_sender_name(publisher),
+                    language: r.language,
+                    issue: null,
+                    comment: null,
+                    code_comment: null,
+                    via_mention: false,
+                    thread_key: release_thread_key(release),
+                    status: queued,
+                    queued_at: now
+                )
+}
+
+-- A pending repository transfer is mailed to the receiving user, or to every
+-- active member allowed to create repositories in the receiving organization.
+-- from: services/mailer/mail_repo.go:21
+rule MailOnRepoTransferOffered {
+    when: repositories/RepositoryTransferRequested(repository, doer, transfer)
+    requires: config.mailer_enabled
+    requires: config.enable_notify_mail
+    let recipients = transfer_recipients(transfer)
+    ensures:
+        for r in recipients:
+            if r.is_active:
+                MailMessage.created(
+                    to_address: r.primary_email,
+                    recipient: r,
+                    category: repo_transfer_offer,
+                    subject: transfer_mail_subject(transfer, r.language),
+                    sender_display_name: mail_sender_name(transfer.doer),
+                    language: r.language,
+                    issue: null,
+                    comment: null,
+                    code_comment: null,
+                    via_mention: false,
+                    thread_key: null,
+                    status: queued,
+                    queued_at: now
+                )
+}
+
+-- The same arrival is mailed to those owners, per their mail preference.
+rule MailOnRepositoryArrived {
+    when: repositories/RepositoryTransferred(repository, doer, old_owner_name)
+    requires: config.mailer_enabled
+    requires: config.enable_notify_mail
+    requires: repository.owner_org != null
+    let receivers = organization_owners(repository.owner_org) - {doer}
+    ensures:
+        for r in receivers:
+            if mail_eligible(r, false):
+                MailMessage.created(
+                    to_address: r.primary_email,
+                    recipient: r,
+                    category: repository_arrived,
+                    subject: repository_arrived_subject(repository, doer, old_owner_name, r.language),
+                    sender_display_name: mail_sender_name(doer),
+                    language: r.language,
+                    issue: null,
+                    comment: null,
+                    code_comment: null,
+                    via_mention: false,
+                    thread_key: null,
+                    status: queued,
+                    queued_at: now
+                )
+}
+
+-- An invitation to collaborate mails the invitee — who invited them, to which
+-- repository, with links to accept or decline — however it was made (web UI
+-- or API; both go through repositories' AdminInvitesCollaborator).
+-- decided (notifications 5): every path mails (Forgejo mailed only from the
+-- web UI).
+-- from: services/mailer/mail.go:193
+rule MailOnCollaboratorInvited {
+    when: repositories/CollaboratorInvited(repository, user, doer)
+    requires: config.mailer_enabled
+    requires: user.is_active
+    ensures: MailMessage.created(
+        to_address: user.primary_email,
+        recipient: user,
+        category: collaborator_invited,
+        subject: collaborator_mail_subject(repository, doer, user.language),
+        sender_display_name: mail_sender_name(doer),
+        language: user.language,
+        issue: null,
+        comment: null,
+        code_comment: null,
+        via_mention: false,
+        thread_key: null,
+        status: queued,
+        queued_at: now
+    )
+}
+
+-- A site administrator adds a collaborator directly (no invitation): the
+-- new collaborator is told. An accepted invitation also emits
+-- CollaboratorAdded, naming the (non-admin) inviter; the invitee already
+-- knows, so nothing is mailed then.
+-- decided (notifications 5; repositories 4)
+-- from: services/mailer/mail.go:193
+rule MailOnCollaboratorAdded {
+    when: repositories/CollaboratorAddedDirectly(repository, user, doer)
+    requires: config.mailer_enabled
+    requires: user.is_active
+    ensures: MailMessage.created(
+        to_address: user.primary_email,
+        recipient: user,
+        category: collaborator_added,
+        subject: collaborator_mail_subject(repository, doer, user.language),
+        sender_display_name: mail_sender_name(doer),
+        language: user.language,
+        issue: null,
+        comment: null,
+        code_comment: null,
+        via_mention: false,
+        thread_key: null,
+        status: queued,
+        queued_at: now
+    )
+}
+
+-- A team invitation goes to the invited address, whether or not an account
+-- exists for it. Refused when the address belongs to a login-prohibited user.
+-- The link points at sign-up, or at sign-in when the address already has an
+-- account or self-registration is closed.
+-- from: services/mailer/mail_team_invite.go:23
+rule MailOnTeamInvite {
+    when: organizations/TeamInviteCreated(invite, inviter)
+    requires: config.mailer_enabled
+    requires: not address_belongs_to_login_prohibited_user(invite.email)
+    ensures: MailMessage.created(
+        to_address: invite.email,
+        recipient: null,
+        category: team_invite,
+        subject: team_invite_subject(invite, inviter),
+        sender_display_name: mail_sender_name(inviter),
+        language: inviter.language,
+        issue: null,
+        comment: null,
+        code_comment: null,
+        via_mention: false,
+        thread_key: null,
+        status: queued,
+        queued_at: now
+    )
+}
+
+-- Optionally tell every site administrator about each new sign-up.
+-- from: services/mailer/mail_admin_new_user.go:23
+rule MailAdminsOnSignUp {
+    when: authentication/UserSignedUp(user)
+    requires: config.mailer_enabled
+    requires: administration/config.notify_admins_on_new_user
+    let admins = accounts/Users where is_admin = true
+    ensures:
+        for a in admins:
+            MailMessage.created(
+                to_address: a.primary_email,
+                recipient: a,
+                category: admin_new_user,
+                subject: admin_new_user_subject(user, a.language),
+                sender_display_name: "",
+                language: a.language,
+                issue: null,
+                comment: null,
+                code_comment: null,
+                via_mention: false,
+                thread_key: null,
+                status: queued,
+                queued_at: now
+            )
+}
+
+-- A failed workflow run mails the user who triggered it (or, for runs
+-- triggered by the system, the repository owner) when the run asked for
+-- email notification and the user has not disabled email. The mail lists
+-- the failed jobs.
+-- decided (notifications 4): exactly one mail per failed run attempt. The
+-- mail reacts only to the run reaching its final status, which happens once
+-- per attempt (a re-run starts a new attempt); job completions and
+-- intermediate status changes never mail (Forgejo mailed from three hooks
+-- and could repeat itself).
+-- from: services/mailer/mail_actions.go:20
+rule MailOnActionsRunFailed {
+    when: actions/WorkflowRunCompleted(run, prior_status)
+    requires: is_failure(run.status)
+    requires: not (prior_status in {success, failure, cancelled, skipped})
+    requires: config.mailer_enabled
+    requires: run.notify_email
+    requires: run.trigger_deploy_key = null
+    let target = run_failure_recipient(run)
+    requires: target != null
+    requires: target.email_notifications != disabled
+    ensures: MailMessage.created(
+        to_address: target.primary_email,
+        recipient: target,
+        category: actions_run_failed,
+        subject: run_failure_subject(run, target.language),
+        sender_display_name: "",
+        language: target.language,
+        issue: null,
+        comment: null,
+        code_comment: null,
+        via_mention: false,
+        thread_key: null,
+        status: queued,
+        queued_at: now
+    )
+    @guidance
+        -- run_failure_recipient(run) = run.trigger_user, or the repository
+        -- owner (a user; nobody for an organization) when the run was
+        -- triggered by the Actions bot (scheduled runs).
+}
+
+-- A failed run that a deploy-key push started has no user to tell: the
+-- repository's administrators are mailed instead, one mail each, under the
+-- same once-per-attempt rule.
+-- decided: requests 1 (failure mail for a deploy key's run goes to the admins)
+rule MailOnDeployKeyRunFailed {
+    when: actions/WorkflowRunCompleted(run, prior_status)
+    requires: is_failure(run.status)
+    requires: not (prior_status in {success, failure, cancelled, skipped})
+    requires: config.mailer_enabled
+    requires: run.notify_email
+    requires: run.trigger_deploy_key != null
+    ensures:
+        for a in repository_admins(run.repository):
+            if mail_eligible(a, false):
+                MailMessage.created(
+                    to_address: a.primary_email,
+                    recipient: a,
+                    category: actions_run_failed,
+                    subject: run_failure_subject(run, a.language),
+                    sender_display_name: "",
+                    language: a.language,
+                    issue: null,
+                    comment: null,
+                    code_comment: null,
+                    via_mention: false,
+                    thread_key: null,
+                    status: queued,
+                    queued_at: now
+                )
+}
+
+-- A scheduled workflow switched off for inactivity is mailed to the
+-- repository's administrators who have not disabled email, so they can
+-- re-enable it.
+-- decided (actions 8); Forgejo never disabled schedules.
+rule MailOnScheduledWorkflowDisabled {
+    when: actions/ScheduledWorkflowDisabledForInactivity(repository, workflow_file)
+    requires: config.mailer_enabled
+    let admins = repository_admins(repository)
+    ensures:
+        for a in admins:
+            if mail_eligible(a, false):
+                MailMessage.created(
+                    to_address: a.primary_email,
+                    recipient: a,
+                    category: actions_workflow_disabled,
+                    subject: workflow_disabled_subject(repository, workflow_file, a.language),
+                    sender_display_name: "",
+                    language: a.language,
+                    issue: null,
+                    comment: null,
+                    code_comment: null,
+                    via_mention: false,
+                    thread_key: null,
+                    status: queued,
+                    queued_at: now
+                )
+    @guidance
+        -- repository_admins(repository) = the individual users for whom
+        -- access/is_repo_admin(user, repository) holds: the owner (or the
+        -- owning organization's owners), admin collaborators and members of
+        -- teams with admin access to it.
+}
+
+------------------------------------------------------------
+-- Moderation: abuse reports
+------------------------------------------------------------
+
+-- A new abuse report tells every active site administrator (other than the
+-- reporter): an inbox thread linking the moderation queue.
+-- decided (moderation 7)
+rule InboxOnAbuseReported {
+    when: moderation/AbuseReported(content, reporter, category)
+    let report = moderation/AbuseReport{content: content, reporter: reporter, status: open}
+    let admins = accounts/Users where is_admin = true and is_active = true
+    ensures:
+        for a in admins:
+            if a != reporter:
+                Notification.created(
+                    recipient: a,
+                    repository: null,
+                    source: abuse_report,
+                    issue: null,
+                    comment: null,
+                    report: report,
+                    status: unread,
+                    created_at: now,
+                    updated_at: now
+                )
+}
+
+-- ... and mails them, per each admin's mail preference.
+-- decided (moderation 7)
+rule MailOnAbuseReported {
+    when: moderation/AbuseReported(content, reporter, category)
+    requires: config.mailer_enabled
+    let admins = accounts/Users where is_admin = true and is_active = true
+    ensures:
+        for a in admins:
+            if a != reporter and mail_eligible(a, false):
+                MailMessage.created(
+                    to_address: a.primary_email,
+                    recipient: a,
+                    category: abuse_reported,
+                    subject: abuse_report_subject(content, category, a.language),
+                    sender_display_name: "",
+                    language: a.language,
+                    issue: null,
+                    comment: null,
+                    code_comment: null,
+                    via_mention: false,
+                    thread_key: null,
+                    status: queued,
+                    queued_at: now
+                )
+    @guidance
+        -- The mail names the reported item (content.reference) and the
+        -- category, and links the moderation queue; never the remarks.
+}
+
+-- A closed report tells its reporter that it was reviewed, without naming
+-- the resolution or anything done to the content.
+-- decided (moderation 8)
+rule InboxOnReportReviewed {
+    when: moderation/ReportReviewed(report, reporter)
+    ensures: Notification.created(
+        recipient: reporter,
+        repository: null,
+        source: report_reviewed,
+        issue: null,
+        comment: null,
+        report: report,
+        status: unread,
+        created_at: now,
+        updated_at: now
+    )
+}
+
+-- decided (moderation 8)
+rule MailOnReportReviewed {
+    when: moderation/ReportReviewed(report, reporter)
+    requires: config.mailer_enabled
+    requires: mail_eligible(reporter, false)
+    ensures: MailMessage.created(
+        to_address: reporter.primary_email,
+        recipient: reporter,
+        category: report_reviewed,
+        subject: report_reviewed_subject(report, reporter.language),
+        sender_display_name: "",
+        language: reporter.language,
+        issue: null,
+        comment: null,
+        code_comment: null,
+        via_mention: false,
+        thread_key: null,
+        status: queued,
+        queued_at: now
+    )
+}
+
+------------------------------------------------------------
+-- Email: account and security mail (triggered elsewhere, sent here)
+------------------------------------------------------------
+
+-- from: services/mailer/mail.go:98
+rule MailAccountActivation {
+    when: authentication/ActivationEmailRequested(user, code)
+    requires: config.mailer_enabled
+    ensures: AccountMailQueued(user: user, address: user.primary_email, category: account_activation)
+}
+
+-- Sent to the address being confirmed, not the primary address. Authentication
+-- issues the code the mail links to (accounts/EmailActivationRequested is
+-- consumed by authentication only, to issue that code).
+-- from: services/mailer/mail.go:130
+rule MailEmailConfirmation {
+    when: authentication/EmailConfirmationRequested(user, email, code)
+    requires: config.mailer_enabled
+    ensures: AccountMailQueued(user: user, address: email, category: email_confirmation)
+}
+
+-- from: services/mailer/mail.go:114
+rule MailPasswordReset {
+    when: authentication/PasswordResetRequested(user, code)
+    requires: config.mailer_enabled
+    ensures: AccountMailQueued(user: user, address: user.primary_email, category: password_reset)
+}
+
+-- An administrator who creates an account may have the new user told about it.
+-- from: services/mailer/mail.go:165
+rule MailRegistrationNotice {
+    when: administration/UserCreatedByAdmin(admin, user, send_notification)
+    requires: config.mailer_enabled
+    requires: send_notification
+    requires: user.is_active
+    ensures: AccountMailQueued(user: user, address: user.primary_email, category: registration_notice)
+}
+
+-- from: services/mailer/mail.go:602
+rule MailPasswordChanged {
+    when: authentication/PasswordChanged(user)
+    requires: config.mailer_enabled
+    ensures: AccountMailQueued(user: user, address: user.primary_email, category: password_changed)
+}
+
+-- A password change — by the user, a forced change, or an account recovered
+-- through a password-reset link (authentication emits PasswordChanged for all
+-- three) — revokes every reply and unsubscribe address the user holds, so a
+-- leaked old mail cannot be used to post as them.
+-- decided (notifications 3): revoked explicitly (Forgejo's stateless tokens
+-- only died as a side effect of rotating the user's secret).
+rule RevokeMailTokensOnPasswordChange {
+    when: authentication/PasswordChanged(user)
+    ensures:
+        for t in MailTokens where holder = user:
+            t.revoked = true
+}
+
+-- An administrator or the operator resetting the password does the same.
+-- decided (notifications 3)
+rule RevokeMailTokensOnAdminPasswordReset {
+    when: administration/UserPasswordSetByAdmin(admin, user, password)
+    ensures:
+        for t in MailTokens where holder = user:
+            t.revoked = true
+}
+
+-- decided (notifications 3)
+rule RevokeMailTokensOnOperatorPasswordReset {
+    when: administration/UserPasswordSetByOperator(operator, user, password)
+    ensures:
+        for t in MailTokens where holder = user:
+            t.revoked = true
+}
+
+-- Sent to the old primary address, which will stop receiving notifications.
+-- from: services/mailer/mail.go:631
+rule MailPrimaryEmailChanged {
+    when: accounts/PrimaryEmailChanged(user, old_address, new_address)
+    requires: config.mailer_enabled
+    ensures: AccountMailQueued(user: user, address: old_address, category: primary_email_changed)
+}
+
+-- from: services/mailer/mail.go:726
+rule MailTotpEnrolled {
+    when: authentication/TotpEnrolled(user)
+    requires: config.mailer_enabled
+    ensures: AccountMailQueued(user: user, address: user.primary_email, category: totp_enrolled)
+}
+
+-- from: services/mailer/mail.go:659
+rule MailTotpDisabled {
+    when: authentication/TotpDisabled(user)
+    requires: config.mailer_enabled
+    ensures: AccountMailQueued(user: user, address: user.primary_email, category: totp_disabled)
+}
+
+-- from: services/mailer/mail.go:692
+rule MailSecurityKeyRemoved {
+    when: authentication/SecurityKeyRemoved(user, name)
+    requires: config.mailer_enabled
+    ensures: AccountMailQueued(user: user, address: user.primary_email, category: security_key_removed)
+}
+
+-- Account mail ignores the email preference: it is always sent.
+-- from: services/mailer/mail.go:73
+rule ComposeAccountMail {
+    when: AccountMailQueued(user, address, category)
+    ensures: MailMessage.created(
+        to_address: address,
+        recipient: user,
+        category: category,
+        subject: account_mail_subject(category, user.language),
+        sender_display_name: "",
+        language: user.language,
+        issue: null,
+        comment: null,
+        code_comment: null,
+        via_mention: false,
+        thread_key: null,
+        status: queued,
+        queued_at: now
+    )
+    @guidance
+        -- Activation / confirmation / reset bodies carry the code link and
+        -- state its lifetime (authentication's code lifetimes). TOTP and
+        -- security-key mails say whether another second factor remains.
+}
+
+-- The administrator's "send test mail" button, delivered immediately rather
+-- than queued.
+-- Web: POST /-/admin/config/test_mail.
+-- from: services/mailer/mail.go:64
+rule MailTestMessage {
+    when: administration/TestMailRequested(admin, address)
+    requires: config.mailer_enabled
+    ensures: MailMessage.created(
+        to_address: address,
+        recipient: null,
+        category: test_mail,
+        subject: "Forgejo Test Email!",
+        sender_display_name: "",
+        language: admin.language,
+        issue: null,
+        comment: null,
+        code_comment: null,
+        via_mention: false,
+        thread_key: null,
+        status: queued,
+        queued_at: now
+    )
+}
+
+-- `forgejo admin sendmail`: the operator mails every active account. With
+-- "force" unset the CLI asks for confirmation; that is administration's.
+-- from: services/mailer/mail.go:73
+rule MailEveryone {
+    when: administration/MassMailRequested(subject, body, recipients)
+    requires: config.mailer_enabled
+    ensures:
+        for r in recipients:
+            MailMessage.created(
+                to_address: r.primary_email,
+                recipient: r,
+                category: mass_mail,
+                subject: subject,
+                sender_display_name: "",
+                language: r.language,
+                issue: null,
+                comment: null,
+                code_comment: null,
+                via_mention: false,
+                thread_key: null,
+                status: queued,
+                queued_at: now
+            )
+}
+
+------------------------------------------------------------
+-- Email: delivery
+------------------------------------------------------------
+
+-- The transport accepted the message.
+-- from: services/mailer/mailer.go:417
+rule MailDelivered {
+    when: MailTransportAccepts(server, message)
+    requires: message.status = queued
+    ensures: message.status = sent
+    ensures: message.sent_at = now
+    @guidance
+        -- The configured subject prefix is prepended to the subject, and the
+        -- body is sent as plain text only when mailer_send_as_plain_text is
+        -- set (or HTML-to-text conversion fails); otherwise HTML with a text
+        -- alternative.
+}
+
+-- The transport refused it. The message is logged and dropped; there is no
+-- retry.
+-- decided (notifications 9): no retry, as in Forgejo.
+-- from: services/mailer/mailer.go:421
+rule MailDeliveryFailed {
+    when: MailTransportRejects(server, message, reason)
+    requires: message.status = queued
+    ensures: message.status = failed
+    ensures: message.failure_reason = reason
+}
+
+------------------------------------------------------------
+-- Email: incoming (reply by email)
+------------------------------------------------------------
+
+-- A reply to a conversation mail becomes a comment by the token holder: on the
+-- issue, or — for a reply to a code comment — in the same review thread.
+-- Mail flagged as automatic (Auto-Submitted other than "no", X-Autoreply: yes,
+-- Precedence: auto_reply, any X-Autorespond) is ignored, as is mail without a
+-- valid token, mail with neither text nor attachments, and mail from someone
+-- who may no longer read the issue or may not comment on a locked one.
+-- The quoted original and signature are stripped; attachments are uploaded
+-- when attachments are enabled and of an allowed type. The incoming mailbox
+-- is only polled when incoming_email_enabled, and tokens are only minted then.
+-- from: services/mailer/incoming/incoming_handler.go:36
+rule AcceptReplyByMail {
+    when: IncomingMailArrives(server, token, body, attachment_count, is_automatic_reply)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: not is_automatic_reply
+    requires: token.purpose = reply
+    requires: token.is_valid
+    requires: not token.revoked
+    let issue = token.issue
+    requires: can_read_issue(token.holder, issue)
+    requires: can_comment_on_issue(token.holder, issue)
+    requires: body != "" or attachment_count > 0
+    ensures: MailReplyReceived(author: token.holder, issue: issue, replied_to: token.replied_to, replied_to_code: token.replied_to_code, body: body, attachment_count: attachment_count)
+}
+
+-- Mailing the unsubscribe address stops the holder following the issue.
+-- from: services/mailer/incoming/incoming_handler.go:178
+rule AcceptUnsubscribeByMail {
+    when: IncomingMailArrives(server, token, body, attachment_count, is_automatic_reply)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: not is_automatic_reply
+    requires: token.purpose = unsubscribe
+    requires: token.is_valid
+    requires: not token.revoked
+    let issue = token.issue
+    requires: can_read_issue(token.holder, issue)
+    ensures: MailUnsubscribeReceived(user: token.holder, issue: issue)
+}
+
+------------------------------------------------------------
+-- Activity feed: recording
+------------------------------------------------------------
+
+-- from: services/feed/action.go:193
+rule RecordIssueOpened {
+    when: issues/IssueOpened(issue, mentions)
+    requires: not issue.is_pull
+    ensures: Activity.created(
+        kind: create_issue, actor: issue.poster, repository: issue.repository,
+        issue: issue, comment: null, code_comment: null, ref_name: null, content: issue.title,
+        deploy_key: null, watch_category: issues, created_at: now
+    )
+}
+
+-- from: services/feed/action.go:246
+rule RecordPullRequestOpened {
+    when: pulls/PullRequestOpened(pull_request)
+    ensures: Activity.created(
+        kind: create_pull_request, actor: pull_request.issue.poster, repository: pull_request.issue.repository,
+        issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: pull_request.issue.title,
+        deploy_key: null, watch_category: pull_requests, created_at: now
+    )
+}
+
+-- The content is an excerpt: the first line of the comment, cut at a word
+-- boundary to feed_comment_excerpt_max characters, or empty when the comment
+-- opens with a fenced code block.
+-- from: services/feed/action.go:226
+rule RecordComment {
+    when: issues/IssueCommentCreated(issue, comment, doer, mentions)
+    ensures: Activity.created(
+        kind: if issue.is_pull: comment_pull else: comment_issue,
+        actor: doer, repository: issue.repository,
+        issue: issue, comment: comment, code_comment: null, ref_name: null, content: feed_excerpt(comment.content),
+        deploy_key: null, watch_category: if issue.is_pull: pull_requests else: issues,
+        created_at: now
+    )
+}
+
+-- from: services/feed/action.go:213
+rule RecordIssueClosed {
+    when: issues/IssueClosed(issue, doer, comment)
+    ensures: Activity.created(
+        kind: if issue.is_pull: close_pull_request else: close_issue,
+        actor: doer, repository: issue.repository,
+        issue: issue, comment: comment, code_comment: null, ref_name: null, content: "",
+        deploy_key: null, watch_category: if issue.is_pull: pull_requests else: issues,
+        created_at: now
+    )
+}
+
+-- from: services/feed/action.go:213
+rule RecordIssueReopened {
+    when: issues/IssueReopened(issue, doer, comment)
+    ensures: Activity.created(
+        kind: if issue.is_pull: reopen_pull_request else: reopen_issue,
+        actor: doer, repository: issue.repository,
+        issue: issue, comment: comment, code_comment: null, ref_name: null, content: "",
+        deploy_key: null, watch_category: if issue.is_pull: pull_requests else: issues,
+        created_at: now
+    )
+}
+
+-- pulls never emits issues/IssueClosed / IssueReopened for a pull request; a
+-- PR's close / reopen arrives as pulls/PullRequestClosed / PullRequestReopened
+-- (doer null when a repository deletion closed it: nobody is told then).
+rule RecordPullRequestClosed {
+    when: pulls/PullRequestClosed(pull_request, doer)
+    requires: doer != null
+    ensures: Activity.created(
+        kind: close_pull_request, actor: doer, repository: pull_request.issue.repository,
+        issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: "",
+        deploy_key: null, watch_category: pull_requests, created_at: now
+    )
+}
+
+rule RecordPullRequestReopened {
+    when: pulls/PullRequestReopened(pull_request, doer)
+    ensures: Activity.created(
+        kind: reopen_pull_request, actor: doer, repository: pull_request.issue.repository,
+        issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: "",
+        deploy_key: null, watch_category: pull_requests, created_at: now
+    )
+}
+
+-- from: services/feed/action.go:378
+rule RecordPullRequestMerged {
+    when: pulls/PullRequestMerged(pull_request, merger)
+    -- an auto-merge is announced once, by the PullRequestAutoMerged rule
+    requires: not pull_request.merged_automatically
+    ensures: Activity.created(
+        kind: merge_pull_request, actor: merger, repository: pull_request.issue.repository,
+        issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: pull_request.issue.title,
+        deploy_key: null, watch_category: pull_requests, created_at: now
+    )
+}
+
+-- from: services/feed/action.go:388
+rule RecordPullRequestAutoMerged {
+    when: pulls/PullRequestAutoMerged(pull_request, merger)
+    ensures: Activity.created(
+        kind: auto_merge_pull_request, actor: merger, repository: pull_request.issue.repository,
+        issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: pull_request.issue.title,
+        deploy_key: null, watch_category: pull_requests, created_at: now
+    )
+}
+
+-- A submitted review records one comment_pull activity per code comment,
+-- plus one for the review itself (approve / reject / comment) unless it is a
+-- plain comment review with an empty body.
+-- from: services/feed/action.go:322
+rule RecordReviewSubmitted {
+    when: pulls/ReviewSubmitted(review)
+    let issue = review.pull_request.issue
+    requires: review.status = submitted
+    ensures:
+        for cc in review.comments:
+            Activity.created(
+                kind: comment_pull, actor: review.reviewer, repository: issue.repository,
+                issue: issue, comment: null, code_comment: cc, ref_name: null, content: feed_excerpt(cc.body),
+                deploy_key: null, watch_category: pull_requests, created_at: now
+            )
+    ensures:
+        if review.kind != comment or review.body != "":
+            Activity.created(
+                kind: review_activity_kind(review), actor: review.reviewer, repository: issue.repository,
+                issue: issue, comment: null, code_comment: null, ref_name: null, content: feed_excerpt(review.body),
+                deploy_key: null, watch_category: pull_requests, created_at: now
+            )
+    @guidance
+        -- review_activity_kind: approve -> approve_pull_request,
+        -- request_changes -> reject_pull_request, otherwise comment_pull.
+}
+
+-- from: services/feed/action.go:398
+rule RecordReviewDismissed {
+    when: pulls/ReviewDismissed(review, dismisser, message)
+    let issue = review.pull_request.issue
+    ensures: Activity.created(
+        kind: pull_review_dismissed, actor: dismisser, repository: issue.repository,
+        issue: issue, comment: null, code_comment: null, ref_name: null, content: feed_excerpt(message),
+        deploy_key: null, watch_category: pull_requests, created_at: now
+    )
+}
+
+-- from: services/feed/action.go:283
+rule RecordRepositoryCreated {
+    when: repositories/RepositoryCreated(repository, doer)
+    -- an import's reserved record is recorded once, by RecordRepositoryMigrated
+    requires: repository.status != being_migrated
+    ensures: Activity.created(
+        kind: create_repo, actor: doer, repository: repository,
+        issue: null, comment: null, code_comment: null, ref_name: null, content: "",
+        deploy_key: null, watch_category: everything, created_at: now
+    )
+}
+
+-- from: services/feed/action.go:292
+rule RecordRepositoryForked {
+    when: repositories/RepositoryForked(source, fork, doer)
+    ensures: Activity.created(
+        kind: create_repo, actor: doer, repository: fork,
+        issue: null, comment: null, code_comment: null, ref_name: null, content: "",
+        deploy_key: null, watch_category: everything, created_at: now
+    )
+}
+
+-- A migrated repository is recorded as created, by the user who ran the
+-- migration (migrations emits no RepositoryCreated for it).
+-- from: services/feed/action.go:283
+rule RecordRepositoryMigrated {
+    when: migrations/RepositoryMigrated(repository)
+    let migration = migrations/Migration{repository: repository}
+    ensures: Activity.created(
+        kind: create_repo, actor: migration.doer, repository: repository,
+        issue: null, comment: null, code_comment: null, ref_name: null, content: "",
+        deploy_key: null, watch_category: everything, created_at: now
+    )
+}
+
+-- from: services/feed/action.go:263
+rule RecordRepositoryRenamed {
+    when: repositories/RepositoryRenamed(repository, doer, old_name)
+    ensures: Activity.created(
+        kind: rename_repo, actor: doer, repository: repository,
+        issue: null, comment: null, code_comment: null, ref_name: null, content: old_name,
+        deploy_key: null, watch_category: everything, created_at: now
+    )
+}
+
+-- from: services/feed/action.go:273
+rule RecordRepositoryTransferred {
+    when: repositories/RepositoryTransferred(repository, doer, old_owner_name)
+    ensures: Activity.created(
+        kind: transfer_repo, actor: doer, repository: repository,
+        issue: null, comment: null, code_comment: null, ref_name: null, content: old_owner_name,
+        deploy_key: null, watch_category: everything, created_at: now
+    )
+}
+
+-- A push records commit_repo for branches, push_tag for tags, and
+-- delete_branch / delete_tag for deletions. A deploy-key push has no user
+-- pusher: the entry names the key (decided: code 4), never the owner. At most feed_max_commit_num
+-- commits are kept, each message cut to its excerpt; the total count and a
+-- compare link are kept too.
+-- from: services/feed/action.go:410
+rule RecordPush {
+    when: code/PushReceived(push)
+    ensures:
+        for u in push.ref_updates:
+            if u.ref_kind in {branch_ref, tag_ref}:
+                Activity.created(
+                    kind:
+                        if u.ref_kind = tag_ref and u.is_deletion: delete_tag
+                        else if u.ref_kind = tag_ref: push_tag
+                        else if u.is_deletion: delete_branch
+                        else: commit_repo,
+                    actor: push.pusher, repository: push.repository,
+                    issue: null, comment: null, code_comment: null, ref_name: u.ref_name,
+                    content: feed_commit_summary(u, config.feed_max_commit_num),
+                    deploy_key: push.deploy_key, watch_category: everything, created_at: now
+                )
+}
+
+-- A branch created outside a push (web UI / API) records an empty commit_repo.
+-- Tag creation is recorded by the push path only.
+-- from: services/feed/action.go:441
+rule RecordBranchCreated {
+    when: code/BranchCreated(branch, by)
+    -- by is null only for a deploy-key push, which RecordPush records with the key
+    requires: by != null
+    ensures: Activity.created(
+        kind: commit_repo, actor: by, repository: branch.repository,
+        issue: null, comment: null, code_comment: null, ref_name: branch.name, content: "",
+        deploy_key: null, watch_category: everything, created_at: now
+    )
+}
+
+-- from: services/feed/action.go:456
+rule RecordBranchDeleted {
+    when: code/BranchDeleted(branch, by)
+    -- by is null only for a deploy-key push, which RecordPush records with the key
+    requires: by != null
+    ensures: Activity.created(
+        kind: delete_branch, actor: by, repository: branch.repository,
+        issue: null, comment: null, code_comment: null, ref_name: branch.name, content: "",
+        deploy_key: null, watch_category: everything, created_at: now
+    )
+}
+
+-- Mirror syncs are attributed to the repository owner rather than a person.
+-- from: services/feed/action.go:471
+rule RecordMirrorSyncPush {
+    when: repositories/MirrorSyncPushed(repository, ref_name, commits)
+    ensures: Activity.created(
+        kind: mirror_sync_push, actor: null, repository: repository,
+        issue: null, comment: null, code_comment: null, ref_name: ref_name, content: feed_commit_list(commits, config.feed_max_commit_num),
+        deploy_key: null, watch_category: everything, created_at: now
+    )
+}
+
+-- from: services/feed/action.go:489
+rule RecordMirrorRefCreated {
+    when: repositories/MirrorRefCreated(repository, ref_name)
+    ensures: Activity.created(
+        kind: mirror_sync_create, actor: null, repository: repository,
+        issue: null, comment: null, code_comment: null, ref_name: ref_name, content: "",
+        deploy_key: null, watch_category: everything, created_at: now
+    )
+}
+
+-- from: services/feed/action.go:499
+rule RecordMirrorRefDeleted {
+    when: repositories/MirrorRefDeleted(repository, ref_name)
+    ensures: Activity.created(
+        kind: mirror_sync_delete, actor: null, repository: repository,
+        issue: null, comment: null, code_comment: null, ref_name: ref_name, content: "",
+        deploy_key: null, watch_category: everything, created_at: now
+    )
+}
+
+-- from: services/feed/action.go:509
+rule RecordReleasePublished {
+    when: releases/ReleasePublished(release)
+    ensures: Activity.created(
+        kind: publish_release, actor: release.publisher, repository: release.repository,
+        issue: null, comment: null, code_comment: null, ref_name: release.tag_name, content: release.title,
+        deploy_key: null, watch_category: releases, created_at: now
+    )
+}
+
+-- decided (releases 2): un-publishing is recorded in feeds; Forgejo had no entry.
+rule RecordReleaseUnpublished {
+    when: releases/ReleaseUnpublished(release, doer)
+    ensures: Activity.created(
+        kind: unpublish_release, actor: doer, repository: release.repository,
+        issue: null, comment: null, code_comment: null, ref_name: release.tag_name, content: release.title,
+        deploy_key: null, watch_category: releases, created_at: now
+    )
+}
+
+------------------------------------------------------------
+-- Activity feed: announcing, and who sees what
+------------------------------------------------------------
+
+-- Every recorded activity is announced once (federation publishes it to
+-- remote followers). Nothing is copied into feeds: a feed is the activities
+-- that are in_feed_of its reader and visible to them at the moment it is read.
+-- decided (notifications 6): feeds are computed on read.
+-- from: models/activities/action.go:701
+rule AnnounceActivity {
+    when: activity: Activity.created
+    ensures: ActivityRecorded(activity: activity)
+    @guidance
+        -- in_feed_of(reader, activity), evaluated when the feed is read:
+        --   the reader is the actor; or
+        --   the reader owns the repository and the activity has no actor
+        --   (mirror syncs, deploy-key pushes); or
+        --   the reader currently watches the repository with a watch that
+        --   covers activity.watch_category; or
+        --   the reader currently follows the actor (accounts/Follow);
+        -- and the reader has not blocked the actor, and can read the unit
+        -- the activity is about:
+        --   commit_repo, push_tag, delete_tag, delete_branch, publish_release,
+        --   unpublish_release                                                -> code
+        --   create/comment/close/reopen issue                                -> issues
+        --   create/comment/merge/auto-merge/close/reopen pull request        -> pull_requests
+        -- (rename/transfer/create repo, mirror syncs, reviews, dismissals:
+        --  repository read access only).
+        -- An organization's feed is the activities in repositories it owns
+        -- (narrowed to one team's repositories for a team dashboard).
+        -- Stopping a watch, unfollowing, losing access or a repository going
+        -- private takes past activity out of the feed at once; a repository
+        -- made public again shows it again.
+}
+
+------------------------------------------------------------
+-- Activity feed: cleanup
+------------------------------------------------------------
+
+-- from: services/issue/issue.go:307
+rule DeleteActivitiesOfDeletedIssue {
+    when: issues/IssueDeleted(issue, doer)
+    ensures:
+        for a in Activities where issue = issue:
+            not exists a
+}
+
+-- from: services/repository/delete.go:181
+rule DeleteActivitiesOfDeletedRepository {
+    when: repositories/RepositoryDeleted(repository, doer)
+    ensures:
+        for a in Activities where repository = repository:
+            not exists a
+}
+
+-- Cron "delete_old_actions" (scheduled by administration, disabled by
+-- default, weekly, OLDER_THAN 365 days): activity older than the given age is
+-- removed from every feed. An age of zero deletes nothing.
+-- from: models/activities/action.go:691
+rule DeleteOldActivity {
+    when: administration/OldActivityDeletionDue(older_than)
+    requires: older_than > 0.seconds
+    let expired = Activities where created_at < now - older_than
+    ensures:
+        for a in expired:
+            not exists a
+    ensures: OldActivityDeletionFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- When DeleteOldActivity cannot do its work the run is still reported done, so it never
+-- stays running (decided: requests 5).
+rule DeleteOldActivitySkipped {
+    when: administration/OldActivityDeletionDue(older_than)
+    requires: not (older_than > 0.seconds)
+    ensures: OldActivityDeletionFinished()
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- At most one inbox thread per person per issue.
+-- from: models/activities/notification.go:126
+invariant OneThreadPerRecipientAndIssue {
+    for a in Notifications:
+        for b in Notifications:
+            (a.recipient = b.recipient and a.issue != null and a.issue = b.issue) implies a = b
+}
+
+-- Issue/PR threads point at an issue; repository threads at a repository
+-- only; report threads at a report only.
+invariant ThreadSubjectMatchesSource {
+    for n in Notifications:
+        (n.is_about_issue implies n.issue != null and n.repository != null and n.report = null)
+        and (n.source in {repository, repository_arrived} implies n.issue = null and n.repository != null and n.report = null)
+        and (n.is_about_report implies n.report != null and n.issue = null and n.repository = null)
+}
+
+-- A thread always belongs to the repository of its issue.
+invariant ThreadRepositoryMatchesIssue {
+    for n in Notifications:
+        n.issue != null implies n.issue.repository = n.repository
+}
+
+-- Tokens are personal: a token is only ever minted for the recipient of the
+-- message that carries it.
+invariant TokenHolderIsMessageRecipient {
+    for t in MailTokens:
+        t.message.recipient = t.holder
+}
+
+-- Conversation mail subjects respect the length limit.
+invariant MailSubjectBounded {
+    for m in MailMessages:
+        m.issue != null implies length(m.subject) <= config.mail_subject_max_length
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- People are the shared actors access/SignedInUser (inbox, dashboard and
+-- preferences are personal) and access/SiteAdmin. The two mail endpoints
+-- below are this module's own.
+
+-- The outgoing mail transport (SMTP / sendmail).
+actor OutgoingMailTransport {
+    identified_by: MailServer where direction = outgoing
+}
+
+-- The incoming IMAP mailbox that collects replies.
+actor IncomingMailbox {
+    identified_by: MailServer where direction = incoming
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- One inbox thread, as its recipient sees it.
+surface NotificationThread {
+    facing user: access/SignedInUser
+    context notification: Notification where recipient = user
+
+    exposes:
+        notification.status
+        notification.source
+        notification.repository
+        notification.issue
+        notification.comment
+        notification.report
+        notification.updated_at
+
+    provides:
+        UserMarksNotification(user, notification, target)
+
+    @guarantee OnlyTheRecipientSeesOrChangesAThread
+        -- A thread is visible and changeable only by its recipient (an admin
+        -- may read another user's thread through the API, never change it).
+
+    @guidance
+        -- Web: GET /notifications (unread tab = unread + pinned, read tab =
+        -- read + pinned; newest update first; page size
+        -- notification_page_size), POST /notifications/status
+        -- (status=read|unread|pinned).
+        -- API: GET /notifications/threads/{id}, PATCH /notifications/threads/{id}
+        -- (to-status). Token scope: notification (read / write).
+        -- Threads whose repository, issue, comment or report no longer exists
+        -- are dropped from the listing. A report thread links the moderation
+        -- queue (site admins) or the reported item (the reporter) and never
+        -- names a resolution.
+}
+
+-- The inbox as a whole: the badge count and the bulk operations.
+surface NotificationInbox {
+    facing user: access/SignedInUser
+    let unread = Notifications where recipient = user and status = unread
+    let pinned = Notifications where recipient = user and status = pinned
+
+    exposes:
+        unread.count
+        pinned.count
+        for n in Notifications where recipient = user:
+            n.status
+            n.source
+            n.updated_at
+
+    provides:
+        UserMarksAllNotificationsRead(user)
+        UserMarksNotificationsInBulk(user, from_statuses, to_status, updated_before)
+        UserMarksRepoNotificationsInBulk(user, repository, from_statuses, to_status, updated_before)
+        UserOpensEventStream(user)
+            when config.event_source_update_time > 0.seconds
+
+    related:
+        NotificationThread(n)
+
+    @guidance
+        -- Web: GET /notifications, POST /notifications/purge (mark all read),
+        -- GET /notifications/new (unread count JSON), GET /user/events (SSE:
+        -- "notification-count" events).
+        -- API: GET /notifications (all, status-types default unread+pinned,
+        -- subject-type issue|pull|commit|repository, since, before, page,
+        -- limit), PUT /notifications (last_read_at, all, status-types default
+        -- unread, to-status default read), GET /notifications/new,
+        -- GET|PUT /repos/{owner}/{repo}/notifications (same filters, one repo).
+}
+
+-- The live stream a browser keeps open.
+surface NotificationEventStream {
+    facing user: access/SignedInUser
+    context connection: EventStreamConnection where user = user
+
+    exposes:
+        connection.opened_at
+
+    provides:
+        UserClosesEventStream(connection)
+
+    timeout:
+        PushUnreadCount
+}
+
+-- What a person receives in their own mailbox.
+surface PersonalMailbox {
+    facing user: access/SignedInUser
+    context message: MailMessage where recipient = user
+
+    exposes:
+        message.subject
+        message.category
+        message.sender_display_name
+        message.issue
+        message.comment
+        message.via_mention
+        for t in message.tokens:
+            t.purpose
+            t.expires_at
+
+    @guarantee EveryRecipientGetsTheirOwnMessage
+        -- No message lists more than one recipient address, and reply /
+        -- unsubscribe addresses are personal to the recipient.
+}
+
+-- A site administrator's view of mail and threads.
+surface AdminNotificationTools {
+    facing admin: access/SiteAdmin
+    context notification: Notification
+
+    exposes:
+        notification.status
+        notification.recipient
+        notification.updated_at
+
+    @guidance
+        -- API: GET /notifications/threads/{id} lets an admin read any thread;
+        -- PATCH is still refused for threads that are not their own.
+        -- The test-mail button lives on the admin configuration page
+        -- (administration.allium emits TestMailRequested).
+}
+
+-- The outgoing transport takes queued mail and reports the outcome.
+surface OutgoingMailQueue {
+    facing transport: OutgoingMailTransport
+    context message: MailMessage where status = queued
+
+    exposes:
+        message.to_address
+        message.subject
+        message.sender_display_name
+        message.thread_key
+        message.language
+        for t in message.tokens:
+            t.purpose
+
+    provides:
+        MailTransportAccepts(transport, message)
+        MailTransportRejects(transport, message, reason)
+
+    @guidance
+        -- From: "<sender display name> <mailer_from address>"; the subject
+        -- prefix is prepended at send time.
+}
+
+-- The incoming mailbox hands over messages that carry a token in To,
+-- Delivered-To, or a References entry of the form reply-<token>@<domain>.
+surface IncomingMailGateway {
+    facing mailbox: IncomingMailbox
+
+    provides:
+        IncomingMailArrives(mailbox, token, body, attachment_count, is_automatic_reply)
+
+    @guidance
+        -- The gateway runs only when incoming_email_enabled.
+        -- Only unseen messages no larger than incoming_maximum_message_size
+        -- are fetched; handled messages are deleted when
+        -- incoming_delete_handled_message is set. The mailbox is watched with
+        -- IMAP IDLE and re-checked on reconnect.
+}
+
+-- The signed-in user's dashboard: their feed (including private activity
+-- they can still see), filterable by day, with their heatmap.
+surface UserDashboard {
+    facing user: access/SignedInUser
+
+    exposes:
+        for a in Activities where in_feed_of(user, a) and activity_visible_to(a, user, true):
+            a.kind
+            a.actor
+            a.repository
+            a.issue
+            a.ref_name
+            a.content
+            a.created_at
+        contribution_heatmap(user, user)
+            when config.enable_user_heatmap
+
+    @guidance
+        -- Web: GET / (signed in), ?date=YYYY-MM-DD filters to one day,
+        -- page size feed_paging_num. Computed on read (notifications 6):
+        -- what the user follows or watches now, as they may see it now.
+}
+
+-- An organization's dashboard for one of its members, optionally narrowed to
+-- one team's repositories.
+surface OrganizationDashboard {
+    facing user: access/SignedInUser
+    context organization: organizations/Organization
+
+    exposes:
+        for a in Activities where a.repository.owner_org = organization and activity_visible_to(a, user, true):
+            a.kind
+            a.actor
+            a.repository
+            a.content
+            a.created_at
+        contribution_heatmap(organization, user)
+            when config.enable_user_heatmap
+
+    @guidance
+        -- Web: GET /org/{org}/dashboard and /org/{org}/dashboard/{team}.
+        -- API: GET /orgs/{org}/activities/feeds,
+        -- GET /teams/{id}/activities/feeds (team repositories only).
+}
+
+-- Somebody's public profile activity tab: what *they* did.
+surface ProfileActivity {
+    facing viewer: accounts/User
+    context subject: accounts/User
+
+    exposes:
+        for a in Activities where a.actor = subject and subject.activity_readable_by(viewer) and activity_visible_to(a, viewer, viewer = subject or viewer.is_admin):
+            a.kind
+            a.repository
+            a.issue
+            a.ref_name
+            a.content
+            a.created_at
+        contribution_heatmap(subject, viewer)
+            when config.enable_user_heatmap
+
+    @guarantee KeepActivityPrivateHidesEverything
+        -- When the subject keeps their activity private, neither their feed
+        -- nor their heatmap is shown to anyone but themselves and site
+        -- administrators.
+
+    @guarantee PrivateRepositoriesStayPrivate
+        -- Activity in repositories the viewer cannot read now is never shown;
+        -- activity in a repository that is private now is shown only to the
+        -- subject and admins.
+
+    @guidance
+        -- Viewer may be anonymous. Web: GET /{user}?tab=activity (?date=).
+        -- API: GET /users/{username}/activities/feeds (only-performed-by,
+        -- date, page, limit), GET /users/{username}/heatmap.
+        -- Anonymous viewers see only activity by public users who do not
+        -- keep activity private; signed-in viewers also see limited users;
+        -- admins see everything.
+}
+
+-- The activity of one repository.
+surface RepositoryActivityFeed {
+    facing viewer: accounts/User
+    context repository: repositories/Repository
+
+    exposes:
+        for a in Activities where repository = repository and can_read_code(viewer, repository):
+            a.kind when activity_visible_to(a, viewer, true)
+            a.actor when activity_visible_to(a, viewer, true)
+            a.issue when activity_visible_to(a, viewer, true)
+            a.ref_name when activity_visible_to(a, viewer, true)
+            a.content when activity_visible_to(a, viewer, true)
+            a.created_at when activity_visible_to(a, viewer, true)
+
+    @guidance
+        -- API: GET /repos/{owner}/{repo}/activities/feeds (date, page, limit).
+}
+
+-- RSS and Atom syndication. All endpoints answer "not found" when
+-- enable_feed is off.
+surface SyndicationFeeds {
+    facing reader: accounts/User
+    context repository: repositories/Repository
+
+    exposes:
+        for a in Activities where repository = repository and config.enable_feed and can_read_code(reader, repository):
+            a.kind
+            a.content
+            a.created_at
+
+    @guidance
+        -- Formats: RSS 2.0 and Atom.
+        -- Endpoints:
+        --   /{user}.rss|.atom            user or organization feed (as ProfileActivity /
+        --                                OrganizationDashboard visibility; private
+        --                                only for self/admin; ?date=)
+        --   /{owner}/{repo}.rss|.atom    repository activity
+        --   /{owner}/{repo}/issues/{n}.rss|.atom, /pulls/{n}.rss|.atom
+        --                                activity of one issue / pull request
+        --   /{owner}/{repo}/releases.rss|.atom   releases (limit <= feed_paging_num)
+        --   /{owner}/{repo}/tags.rss|.atom       releases and tags
+        --   /{owner}/{repo}/rss/branch/{b}, /atom/branch/{b}   commits on a branch
+        --   /{owner}/{repo}/rss/branch/{b}/{path}               commits touching a file
+        -- Branch/file feeds require code read access and a non-empty repository.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- issue_notification_audience: see ExpandIssueThreadAudience @guidance.
+-- mail_mention_recipients, mail_eligible: see ExpandIssueMailAudience @guidance.
+-- in_feed_of(reader, activity): see AnnounceActivity @guidance.
+-- activity_visible_to(activity, viewer, include_private): see ProfileActivity
+--   @guidance; evaluated against the current state (notifications 6):
+--   activity in a repository that is private now only when include_private; actor must be
+
+--   public (anonymous) / public-or-limited (signed in) and not keep activity
+--   private, unless the actor is the viewer, the feed's organization, or an
+--   organization the feed's user belongs to; repository readable by viewer;
+--   admins see everything.
+-- contribution_heatmap(subject, viewer): list of (15-minute bucket start,
+--   count) for activities performed by the subject (for an organization: in
+--   its feed) in the last heatmap_window, visible to the viewer; empty when the
+--   subject keeps activity private and the viewer is neither the subject nor
+--   an admin.
+-- feed_excerpt(text): first line, cut at a word boundary to
+--   feed_comment_excerpt_max, empty for a leading code fence.
+deferred MailTemplates.render    -- see: services/mailer/mail.go (templates/mail/**, per-category localised subject and body)
+deferred ActivityFeed.visibility -- see: models/activities/action.go (activityQueryCondition)
+deferred Heatmap.aggregate       -- see: models/activities/user_heatmap.go
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- (none: all nine were decided — see the `decided (notifications N)` comments.)
+
+------------------------------------------------------------
+-- Requests to other modules
+------------------------------------------------------------
+-- (Used as provided: accounts/User.email_notifications, keep_activity_private,
+--  language, can_receive_mail, activity_readable_by(viewer); accounts/config.
+--  default_email_notifications; administration/config.notify_admins_on_new_user;
+--  releases/Release.publisher; pulls/Review.{pull_request,
+--  reviewer, kind, body, comments, status}; code/Push.ref_updates and
+--  RefUpdate.{ref_kind, ref_name, is_deletion}; organizations/TeamInvite.
+--  {email, inviter}.)
+-- REQUEST notifications: no rule here consults accounts/has_blocked(blocker, blocked), so a blocked
+--   author still reaches the blocker's inbox, mail and feed; decide whether blocking filters them
+--   (the original request said it should) and, if so, guard the inbox, mail and feed rules with it.

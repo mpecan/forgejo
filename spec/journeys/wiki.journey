@@ -1,0 +1,513 @@
+-- Journeys through wiki.allium: starting a wiki, editing pages, history,
+-- permissions and administration.
+
+world {
+    cast:
+        ada:  accounts/User
+        bob:  accounts/User
+        repo: repositories/Repository
+        wiki: Wiki
+    given:
+        repo.is_archived = false
+        repo.is_mirror = false
+        repo.status = ready
+        repo.is_empty = false
+        repo.is_private = false
+        wiki.repository = repo
+        repo.wiki_branch = "main"
+        wiki.status = uninitialised
+        -- Ada and Bob are signed-in, active users; git reaches the wiki over
+        -- SSH, and neither must use two-factor authentication.
+        ada.is_active = true
+        ada.prohibit_login = false
+        bob.is_active = true
+        bob.prohibit_login = false
+        must_have_two_factor(ada) = false
+        must_have_two_factor(bob) = false
+        -- None of these stories is about CI: Actions is off on this instance,
+        -- so a wiki change starts no workflow.
+        actions/config.actions_enabled = false
+        -- Nor are they about commit signing: the instance has no signing key,
+        -- so every wiki commit is written unsigned.
+        keys/instance_signing_key_available(repo) = false
+        -- The wiki unit is on, Ada may write to it, and it is under quota, in
+        -- every story here unless one says otherwise.
+        wiki_unit_enabled(repo) = true
+        can_write_wiki(ada, repo) = true
+        wiki_quota_allows(repo) = true
+        -- (page edits count the page's size: every page written here fits)
+        wiki_quota_allows_content(repo, "Welcome") = true
+        wiki_quota_allows_content(repo, "Welcome to the project") = true
+        wiki_quota_allows_content(repo, "Run make install") = true
+        wiki_quota_allows_content(repo, "x") = true
+        wiki_quota_allows_content(repo, "dup") = true
+        wiki_quota_allows_content(repo, "vandalised") = true
+        wiki_quota_allows_content(repo, "Welcome!") = true
+        wiki_quota_allows_content(repo, "Welcome all") = true
+        wiki_quota_allows_content(repo, "Welcome everyone") = true
+        wiki_quota_allows_content(repo, "") = true
+        wiki_quota_allows_content(repo, "Run make") = true
+}
+
+-- The happy path: first page, then an edit, then history.
+journey AMaintainerStartsTheWiki {
+    goal: Ada's project has no wiki content yet. She writes the Home page,
+          which brings the wiki into being, then improves it. Bob, a reader,
+          reads it and its history.
+
+    1. she writes Home
+        stipulate page_name_for("Home") = "Home"
+        stipulate kind_of_page("Home") = regular
+        ada does UserCreatesWikiPage(ada, wiki, "Home", "Welcome", "") on WikiEditing
+            creating home: WikiPage
+        then UserCreatesWikiPage fires
+        then wiki.status = initialised
+        then home.name = "Home"
+        then home.content = "Welcome"
+        then home.revision = 1
+
+    2. she improves it with a commit message
+        ada does UserEditsWikiPage(ada, wiki, home, 1, "Home", "Welcome to the project", "Expand intro") on WikiEditing
+        then UserEditsWikiPage fires
+        then home.content = "Welcome to the project"
+        then home.last_author = ada
+        then home.revision = 2
+
+    3. bob reads it
+        stipulate can_read_wiki(bob, repo) = true
+        bob sees home.content on WikiReading in wiki
+        bob sees home.title on WikiReading in wiki
+
+    ends: The wiki is initialised with a Home page that has two revisions.
+}
+
+-- Renaming a page by giving it a new title.
+journey AnEditorRenamesAPage {
+    goal: Ada renames "Install" to "Getting Started" while editing it.
+
+    cast:
+        page: WikiPage
+    given:
+        wiki.status = initialised
+        page.wiki = wiki
+        page.name = "Install"
+        page.title = "Install"
+        page.kind = regular
+        page.content = "Run make"
+        page.revision = 3
+
+    1. she saves the page under a new title
+        stipulate page_name_for("Getting Started") = "Getting-Started"
+        stipulate kind_of_page("Getting-Started") = regular
+        ada does UserEditsWikiPage(ada, wiki, page, 3, "Getting Started", "Run make install", "") on WikiEditing
+        then page.name = "Getting-Started"
+        then page.title = "Getting Started"
+
+    ends: One page, now named Getting-Started, with the rename recorded as a revision.
+}
+
+-- Reserved names are refused.
+journey ReservedPageNamesAreRefused {
+    goal: The names _pages, _new, _edit and raw belong to the wiki's own
+          views. Ada cannot create a page called "raw".
+
+    1. she tries
+        stipulate page_name_for("raw") = "raw"
+        ada cannot do UserCreatesWikiPage(ada, wiki, "raw", "x", "") on WikiEditing
+
+    ends: No page was created.
+}
+
+-- A page name can only be used once.
+journey ADuplicatePageIsRefused {
+    goal: "FAQ" already exists. Creating another FAQ is refused rather than
+          overwriting it.
+
+    cast:
+        faq: WikiPage
+    given:
+        wiki.status = initialised
+        faq.wiki = wiki
+        faq.name = "FAQ"
+        faq.kind = regular
+
+    1. she tries to create FAQ again
+        stipulate page_name_for("FAQ") = "FAQ"
+        ada cannot do UserCreatesWikiPage(ada, wiki, "FAQ", "dup", "") on WikiEditing
+
+    ends: The original FAQ is untouched.
+}
+
+-- Readers cannot edit.
+journey AReaderCannotEditTheWiki {
+    goal: Bob can read the public wiki but has no write access to it.
+
+    cast:
+        home: WikiPage
+    given:
+        wiki.status = initialised
+        home.wiki = wiki
+        home.name = "Home"
+        home.content = "Welcome"
+        home.revision = 1
+
+    1. he reads the page
+        stipulate can_read_wiki(bob, repo) = true
+        bob sees home.content on WikiReading in wiki
+
+    2. he tries to edit it
+        stipulate can_write_wiki(bob, repo) = false
+        bob cannot do UserEditsWikiPage(bob, wiki, home, 1, "Home", "vandalised", "") on WikiEditing
+
+    3. and to delete it
+        bob cannot do UserDeletesWikiPage(bob, wiki, home) on WikiEditing
+
+    ends: The page is unchanged.
+}
+
+-- A globally writeable wiki lets any signed-in user edit (access decides).
+journey AGloballyWriteableWikiAcceptsOutsiders {
+    goal: The repository's wiki is marked "anyone may edit". Bob, who is not
+          a collaborator, fixes a typo.
+
+    cast:
+        home: WikiPage
+    given:
+        wiki.status = initialised
+        home.wiki = wiki
+        home.name = "Home"
+        home.title = "Home"
+        home.kind = regular
+        home.content = "Welcom"
+        home.revision = 1
+
+    1. he edits it
+        stipulate can_write_wiki(bob, repo) = true
+        stipulate page_name_for("Home") = "Home"
+        stipulate kind_of_page("Home") = regular
+        stipulate can_read_wiki(ada, repo) = true
+        ada sees home.content on WikiReading in wiki
+        bob does UserEditsWikiPage(bob, wiki, home, 1, "Home", "Welcome", "typo") on WikiEditing
+        then home.content = "Welcome"
+        then home.last_author = bob
+
+    ends: Bob's fix is a revision authored by him.
+}
+
+-- Archived repositories make the wiki read-only.
+journey AnArchivedWikiIsReadOnly {
+    goal: The repository is archived; Ada, a writer, cannot delete a page.
+
+    cast:
+        page: WikiPage
+    given:
+        repo.is_archived = true
+        wiki.status = initialised
+        page.wiki = wiki
+        page.name = "Old"
+
+    1. she tries to delete it
+        ada cannot do UserDeletesWikiPage(ada, wiki, page) on WikiEditing
+
+    ends: The page remains.
+}
+
+-- Deleting a page.
+journey AnEditorDeletesAPage {
+    goal: Ada removes an obsolete page; it disappears from the page list.
+
+    cast:
+        page: WikiPage
+    given:
+        wiki.status = initialised
+        page.wiki = wiki
+        page.name = "Obsolete"
+        page.title = "Obsolete"
+
+    1. she deletes it
+        ada does UserDeletesWikiPage(ada, wiki, page) on WikiEditing
+        then UserDeletesWikiPage fires
+        then page does not exist
+
+    ends: The page is gone; its history remains in the wiki's revisions.
+}
+
+-- Cloning over SSH initialises an empty wiki; pushing makes it real.
+journey ADeveloperWorksOnTheWikiWithGit {
+    goal: Ada prefers her editor. She clones the empty wiki over SSH, which
+          initialises it, then pushes pages.
+
+    1. she clones
+        stipulate can_read_wiki(ada, repo) = true
+        ada does GitClientFetchesWiki(ada, repo, ssh) on GitTransport
+        then GitFetchReachesWiki fires
+        then GitAccessInitialisesWiki fires
+        then wiki.status = initialised
+
+    2. she pushes a new Home page
+        stipulate push_leaves_empty_page(wiki) = false
+        stipulate pushed_added_pages(wiki) = {"Home"}
+        stipulate pushed_changed_pages(wiki) = {}
+        stipulate pushed_removed_pages(wiki) = {}
+        stipulate pushed_content(wiki, "Home") = "Hello from git"
+        stipulate pushed_message(wiki, "Home") = "Initial pages"
+        stipulate page_title_for("Home") = "Home"
+        stipulate kind_of_page("Home") = regular
+        ada does GitClientPushesToWiki(ada, repo, ssh) on GitTransport
+            creating home: WikiPage
+        then GitPushReachesWiki fires
+        then UserPushesToWiki fires
+        then PushAddsWikiPage fires
+        then home.name = "Home"
+        then home.content = "Hello from git"
+        then home.last_author = ada
+
+    3. bob, a reader, cannot push
+        -- the transport lets his authenticated push through to the wiki,
+        -- whose pre-receive refuses it for want of wiki write
+        stipulate can_write_wiki(bob, repo) = false
+        bob does GitClientPushesToWiki(bob, repo, ssh) on GitTransport
+        then GitPushReachesWiki fires
+        then UserPushesToWiki does not fire
+        then home.last_author = ada
+
+    ends: The wiki holds Ada's pushed Home page, announced as created by her; Bob could only clone.
+}
+
+-- A push that edits one page and removes another announces each, by the pusher.
+-- decided: git pushes emit an event per changed page.
+journey APushIsAnnouncedPageByPage {
+    goal: Ada pushes a commit that rewrites Home and removes Old. Each page
+          change is recorded and announced as hers, and a stale web edit
+          started before her push is refused afterwards.
+
+    cast:
+        home: WikiPage
+        old:  WikiPage
+    given:
+        wiki.status = initialised
+        home.wiki = wiki
+        home.name = "Home"
+        home.title = "Home"
+        home.kind = regular
+        home.content = "Welcome"
+        home.revision = 1
+        old.wiki = wiki
+        old.name = "Old"
+        old.kind = regular
+        old.revision = 1
+
+    1. she pushes
+        stipulate push_leaves_empty_page(wiki) = false
+        stipulate pushed_added_pages(wiki) = {}
+        stipulate pushed_changed_pages(wiki) = {home}
+        stipulate pushed_removed_pages(wiki) = {old}
+        stipulate pushed_content(wiki, "Home") = "Welcome pushed"
+        stipulate pushed_message(wiki, "Home") = "Tidy up"
+        stipulate pushed_message(wiki, "Old") = "Tidy up"
+        ada does GitClientPushesToWiki(ada, repo, ssh) on GitTransport
+        then PushEditsWikiPage fires
+        then PushDeletesWikiPage fires
+        then home.content = "Welcome pushed"
+        then home.last_author = ada
+        then home.revision = 2
+        then old does not exist
+
+    2. bob's edit, started from the page before the push, is refused
+        stipulate can_write_wiki(bob, repo) = true
+        stipulate page_name_for("Home") = "Home"
+        bob cannot do UserEditsWikiPage(bob, wiki, home, 1, "Home", "Welcome!", "") on WikiEditing
+
+    ends: Home holds Ada's pushed content, Old is gone, and both changes were announced as hers.
+}
+
+-- A push that would leave an empty page is refused, like an empty web save.
+journey APushWithAnEmptyPageIsRefused {
+    goal: Ada pushes a commit that empties Home. The push is refused.
+
+    given:
+        wiki.status = initialised
+
+    1. she pushes
+        stipulate push_leaves_empty_page(wiki) = true
+        ada does GitClientPushesToWiki(ada, repo, ssh) on GitTransport
+        then GitPushReachesWiki fires
+        then UserPushesToWiki does not fire
+        then wiki.status = initialised
+
+    ends: Nothing changed.
+}
+
+-- Two people edit the same page; the second save is stale.
+-- decided: stale edits are refused.
+journey AStaleEditIsRefused {
+    goal: Ada and Bob both open Home at revision 1. Ada saves first; Bob's
+          save, still based on revision 1, is refused rather than silently
+          overwriting hers. He reloads and saves again.
+
+    cast:
+        home: WikiPage
+    given:
+        wiki.status = initialised
+        home.wiki = wiki
+        home.name = "Home"
+        home.title = "Home"
+        home.kind = regular
+        home.content = "Welcome"
+        home.revision = 1
+
+    1. ada saves first
+        stipulate page_name_for("Home") = "Home"
+        stipulate kind_of_page("Home") = regular
+        ada does UserEditsWikiPage(ada, wiki, home, 1, "Home", "Welcome all", "") on WikiEditing
+        then home.revision = 2
+
+    2. bob's save from revision 1 is refused
+        stipulate can_write_wiki(bob, repo) = true
+        bob cannot do UserEditsWikiPage(bob, wiki, home, 1, "Home", "Welcome everyone", "") on WikiEditing
+        then home.content = "Welcome all"
+
+    3. he reloads and saves from revision 2
+        bob does UserEditsWikiPage(bob, wiki, home, 2, "Home", "Welcome everyone", "") on WikiEditing
+        then home.content = "Welcome everyone"
+        then home.last_author = bob
+
+    ends: Home has three revisions; no save was lost.
+}
+
+-- Empty content is refused when creating and when editing.
+-- decided: empty page content is refused on every path.
+journey EmptyPagesAreRefused {
+    goal: Ada cannot create an empty page, nor empty an existing one.
+
+    cast:
+        home: WikiPage
+    given:
+        wiki.status = initialised
+        home.wiki = wiki
+        home.name = "Home"
+        home.kind = regular
+        home.content = "Welcome"
+        home.revision = 1
+
+    1. she tries to create an empty page
+        stipulate page_name_for("Blank") = "Blank"
+        ada cannot do UserCreatesWikiPage(ada, wiki, "Blank", "", "") on WikiEditing
+
+    2. and to empty Home
+        stipulate page_name_for("Home") = "Home"
+        ada cannot do UserEditsWikiPage(ada, wiki, home, 1, "Home", "", "") on WikiEditing
+
+    ends: Home still says "Welcome" and there is no Blank page.
+}
+
+-- Renaming onto an existing page is refused.
+-- decided: renaming onto an existing page is refused.
+journey RenamingOntoAnExistingPageIsRefused {
+    goal: Ada tries to rename "Install" to "FAQ", which already exists.
+          The rename is refused and FAQ is untouched.
+
+    cast:
+        install: WikiPage
+        faq:     WikiPage
+    given:
+        wiki.status = initialised
+        install.wiki = wiki
+        install.name = "Install"
+        install.title = "Install"
+        install.content = "Run make"
+        install.revision = 1
+        faq.wiki = wiki
+        faq.name = "FAQ"
+        faq.content = "Questions"
+
+    1. she tries
+        stipulate page_name_for("FAQ") = "FAQ"
+        ada cannot do UserEditsWikiPage(ada, wiki, install, 1, "FAQ", "Run make", "") on WikiEditing
+        then faq.content = "Questions"
+
+    ends: Both pages remain as they were.
+}
+
+-- A "/" in a title puts the page in a directory.
+-- decided: nested pages are supported.
+journey AnEditorCreatesANestedPage {
+    goal: Ada creates "Guides/Install"; it lives in the Guides directory and
+          keeps the "/" in its name.
+
+    given:
+        wiki.status = initialised
+
+    1. she creates it
+        stipulate page_name_for("Guides/Install") = "Guides/Install"
+        stipulate kind_of_page("Guides/Install") = regular
+        ada does UserCreatesWikiPage(ada, wiki, "Guides/Install", "Run make", "") on WikiEditing
+            creating page: WikiPage
+        then page.name = "Guides/Install"
+        then page.title = "Guides/Install"
+
+    ends: The page is the file Guides/Install.md on the wiki branch.
+}
+
+-- Repository admins can wipe the wiki.
+-- decided: repository admins delete wiki data (was: owners only).
+journey AnAdminDeletesAllWikiData {
+    goal: Ada administers the repository and wants to start the wiki over.
+          Bob, a mere writer, may not.
+
+    cast:
+        page: WikiPage
+    given:
+        wiki.status = initialised
+        page.wiki = wiki
+        page.name = "Home"
+
+    1. bob cannot
+        stipulate can_admin_repository(bob, repo) = false
+        stipulate repository_full_name(repo) = "ada/project"
+        bob cannot do AdminDeletesWiki(bob, wiki, "ada/project") on WikiAdministration
+
+    2. ada confirms with the repository name
+        stipulate can_admin_repository(ada, repo) = true
+        ada does AdminDeletesWiki(ada, wiki, "ada/project") on WikiAdministration
+        then AdminDeletesWiki fires
+        then wiki.status = uninitialised
+        then page does not exist
+
+    3. she renames the wiki branch
+        stipulate repositories/config.default_branch = "main"
+        ada does AdminChangesWikiBranch(ada, wiki, "trunk") on WikiAdministration
+        then repo.wiki_branch = "trunk"
+
+    ends: The wiki is empty and uninitialised; the wiki unit is switched off by repositories.
+}
+
+-- Maintenance (read-only) mode refuses wiki writes, on the web and over git.
+-- decided: administration 3 (every write is refused while read-only)
+journey ReadOnlyModeFreezesTheWiki {
+    goal: While the instance is read-only, Ada cannot write the wiki's first
+          page nor push to the wiki; once the mode ends, her page is saved.
+
+    cast:
+        gate: access/InstanceWriteGate
+    given:
+        gate.read_only = true
+
+    1. she cannot write a page while the instance is read-only
+        stipulate page_name_for("Home") = "Home"
+        ada cannot do UserCreatesWikiPage(ada, wiki, "Home", "Welcome", "") on WikiEditing
+
+    2. nor push to the wiki
+        stipulate push_leaves_empty_page(wiki) = false
+        ada cannot do GitClientPushesToWiki(ada, repo, ssh) on GitTransport
+
+    3. once maintenance is over, the page is saved
+        stipulate gate.read_only = false
+        stipulate kind_of_page("Home") = regular
+        ada does UserCreatesWikiPage(ada, wiki, "Home", "Welcome", "") on WikiEditing
+            creating home: WikiPage
+        then home.content = "Welcome"
+        then wiki.status = initialised
+
+    ends: The wiki has its Home page, written after the read-only period.
+}

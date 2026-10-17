@@ -1,0 +1,678 @@
+-- Journeys through organizations.allium: founding an org, running its teams,
+-- inviting people, giving teams repositories, and the guard rails around the
+-- Owners team and deleting an organization.
+
+world {
+    cast:
+        alice:  accounts/User
+        bob:    accounts/User
+        carol:  accounts/User
+        org:    Organization
+        owners: Team
+        devs:   Team
+    given:
+        alice.kind = individual
+        alice.is_admin = false
+        alice.is_restricted = false
+        alice.prohibit_login = false
+        alice.is_active = true
+        bob.kind = individual
+        bob.is_admin = false
+        bob.is_restricted = false
+        bob.prohibit_login = false
+        bob.is_active = true
+        carol.kind = individual
+        carol.is_admin = false
+        carol.is_restricted = false
+        carol.prohibit_login = false
+        carol.is_active = true
+        carol.primary_email = "carol@example.org"
+        org.name = "acme"
+        org.visibility = public
+        org.repo_admin_change_team_access = false
+        org.has_custom_avatar = false
+        owners.organization = org
+        owners.name = "Owners"
+        owners.is_owners_team = true
+        owners.kind = owner
+        owners.includes_all_repositories = true
+        owners.can_create_org_repo = true
+        devs.organization = org
+        devs.name = "devs"
+        devs.is_owners_team = false
+        devs.kind = unit_grants
+        devs.includes_all_repositories = false
+        devs.can_create_org_repo = false
+        devs_code: TeamUnitAccess { team: devs, unit: code, access_mode: write }
+        -- Alice owns the organization in every story here.
+        is_org_owner(org, alice) = true
+}
+
+-- The happy path of founding an organization.
+journey AliceFoundsAnOrganization {
+    world: none
+
+    goal: Alice, an ordinary user allowed to create organizations, founds one
+          and finds herself its first owner.
+
+    cast:
+        alice: accounts/User
+
+    given:
+        alice.kind = individual
+        alice.is_admin = false
+        alice.allow_create_organization = true
+        alice.prohibit_login = false
+        alice.is_active = true
+
+    1. she picks a free name and creates the organization
+        stipulate is_usable_owner_name("acme") = true
+        stipulate owner_name_available("acme") = true
+        stipulate length("acme") = 4
+        alice does UserCreatesOrganization(alice, "acme", limited, true) on OrganizationCreation
+            creating org: Organization
+        then UserCreatesOrganization fires
+        then org.name = "acme"
+        then org.visibility = limited
+        then org.repo_admin_change_team_access = true
+
+    ends: The organization exists with an Owners team holding Alice, and she is
+          a (concealed, by default) member.
+}
+
+-- Creation is a privilege.
+journey CarolMayNotCreateOrganizations {
+    world: none
+
+    goal: Carol's account has had organization creation switched off by an
+          admin, so the instance refuses her.
+
+    cast:
+        carol: accounts/User
+
+    given:
+        carol.kind = individual
+        carol.is_admin = false
+        carol.allow_create_organization = false
+        carol.prohibit_login = false
+        carol.is_active = true
+
+    1. she tries anyway
+        stipulate is_usable_owner_name("carol-co") = true
+        stipulate owner_name_available("carol-co") = true
+        stipulate length("carol-co") = 8
+        carol cannot do UserCreatesOrganization(carol, "carol-co", public, false) on OrganizationCreation
+
+    ends: No organization was created.
+}
+
+-- Owners build a team and put a colleague on it.
+journey AliceBuildsATeam {
+    goal: Alice creates an admin "leads" team covering every repository and
+          puts Bob, who is not yet in the org, on it. Bob becomes an org member.
+
+    1. alice creates the team
+        stipulate is_alpha_dash_dot("leads") = true
+        stipulate length("leads") = 5
+        stipulate lower("leads") = "leads"
+        stipulate team_name_taken(org, "leads") = false
+        stipulate length("Tech leads") = 10
+        alice does OwnerCreatesTeam(alice, org, "leads", "Tech leads", admin, {}, true, false) on OrganizationSettings
+            creating docs: Team
+        then OwnerCreatesTeam fires
+        then docs.kind = admin
+        then docs.includes_all_repositories = true
+        then docs.is_owners_team = false
+
+    2. she adds bob, who joins the organization with it
+        stipulate is_org_member(org, bob) = false
+        stipulate is_team_member(docs, bob) = false
+        stipulate has_pending_team_invite(docs, bob) = false
+        alice does OwnerAddsTeamMember(alice, docs, bob) on TeamSettings
+            creating bob_on_docs: TeamMembership
+        then OwnerAddsTeamMember fires
+        then bob_on_docs.reason = added_by_user
+        then bob_on_docs.added_by = alice
+
+    ends: Bob is on the docs team and a member of acme.
+}
+
+-- Teams are an owners' affair.
+journey BobCannotManageTeams {
+    goal: Bob is a member of acme but not an owner. He can neither create a
+          team nor add Carol to his own team.
+
+    given:
+        bob_on_devs: TeamMembership { team: devs, organization: org, user: bob, reason: added_by_user }
+        bob_in_org:  OrgMembership { organization: org, user: bob, is_public: false }
+
+    1. bob tries to create a team
+        stipulate is_org_owner(org, bob) = false
+        stipulate is_alpha_dash_dot("rogue") = true
+        stipulate length("rogue") = 5
+        stipulate lower("rogue") = "rogue"
+        stipulate team_name_taken(org, "rogue") = false
+        bob cannot do OwnerCreatesTeam(bob, org, "rogue", "", admin, {}, false, false) on OrganizationSettings
+
+    2. bob tries to put carol on devs
+        stipulate is_team_member(devs, carol) = false
+        stipulate has_pending_team_invite(devs, carol) = false
+        bob cannot do OwnerAddsTeamMember(bob, devs, carol) on TeamSettings
+
+    ends: Nothing changed; only owners shape teams.
+}
+
+-- The Owners team is permanent and never empty.
+journey TheOwnersTeamHoldsTheLine {
+    goal: Alice is the only owner. She cannot delete the Owners team, cannot
+          leave it, and cannot leave the organization.
+
+    given:
+        alice_owner: TeamMembership { team: owners, organization: org, user: alice, reason: org_creator }
+        alice_in_org: OrgMembership { organization: org, user: alice, is_public: true }
+
+    1. she cannot delete the Owners team
+        alice cannot do OwnerDeletesTeam(alice, owners) on TeamSettings
+
+    2. she cannot step off the Owners team as its last member
+        stipulate owners.member_count = 1
+        alice cannot do MemberLeavesTeam(alice, owners) on TeamPage
+
+    3. nor leave the organization
+        stipulate owner_count(org) = 1
+        alice cannot do MemberLeavesOrganization(alice, org) on OrganizationProfile
+
+    4. but she can delete an ordinary team
+        alice does OwnerDeletesTeam(alice, devs) on TeamSettings
+        then OwnerDeletesTeam fires
+        then devs does not exist
+
+    ends: The organization still has its Owners team and its owner.
+}
+
+-- Leaving the last team means leaving the organization.
+journey BobLeavesHisOnlyTeam {
+    goal: Bob is on exactly one team. When he leaves it he is no longer a
+          member of acme at all.
+
+    given:
+        bob_on_devs: TeamMembership { team: devs, organization: org, user: bob, reason: added_by_user }
+        bob_in_org:  OrgMembership { organization: org, user: bob, is_public: false }
+
+    1. bob leaves devs, and with it the organization
+        stipulate can_view_team(devs, bob) = true
+        bob does MemberLeavesTeam(bob, devs) on TeamPage
+        then MemberLeavesTeam fires
+        then bob_on_devs does not exist
+        then DropOrgMembershipWithoutTeams fires
+        then bob_in_org does not exist
+
+    ends: Bob is no longer a member of acme.
+}
+
+-- Inviting by e-mail, then accepting.
+journey CarolIsInvitedByEmail {
+    goal: Alice invites carol@example.org to devs. Carol signs in, follows the
+          link, accepts while keeping her membership hidden, and is on the team.
+
+    1. alice sends the invitation
+        stipulate mail_service_enabled() = true
+        stipulate is_valid_email("carol@example.org") = true
+        stipulate has_pending_team_invite_for_email(devs, "carol@example.org") = false
+        stipulate has_member_with_email(devs, "carol@example.org") = false
+        alice does OwnerInvitesEmailToTeam(alice, devs, "carol@example.org") on TeamSettings
+            creating invite: TeamInvite
+        then OwnerInvitesEmailToTeam fires
+        then invite.status = pending
+        then invite.inviter = alice
+
+    2. carol sees who invited her to what
+        carol sees invite.team.name on TeamInvitation in invite
+        carol sees invite.inviter.name on TeamInvitation in invite
+
+    3. she accepts, keeping the membership concealed
+        stipulate is_team_member(devs, carol) = false
+        carol does InviteeAcceptsTeamInvite(carol, invite, true) on TeamInvitation
+            creating carol_on_devs: TeamMembership
+        then InviteeAcceptsTeamInvite fires
+        then carol_on_devs.added_by = alice
+        then invite does not exist
+
+    ends: Carol is a concealed member of acme, on devs.
+}
+
+-- An account invitation is personal.
+journey BobCannotTakeCarolsInvitation {
+    goal: An invitation addressed to Carol's account cannot be accepted by Bob,
+          even if he gets hold of the link.
+
+    given:
+        invite: TeamInvite { team: devs, organization: org, inviter: alice, email: "carol@example.org", invited_user: carol, status: pending }
+
+    1. bob tries to accept it
+        stipulate is_team_member(devs, bob) = false
+        bob cannot do InviteeAcceptsTeamInvite(bob, invite, false) on TeamInvitation
+
+    2. carol declines it instead
+        carol does InviteeDeclinesTeamInvite(carol, invite) on TeamInvitation
+        then invite does not exist
+
+    ends: Nobody joined devs.
+}
+
+-- Invitations go stale.
+journey AnInvitationExpires {
+    goal: Alice invites carol@example.org, who does nothing for a fortnight.
+          The invitation expires and can no longer be accepted; Alice clears
+          it away.
+
+    1. alice sends the invitation
+        stipulate mail_service_enabled() = true
+        stipulate is_valid_email("carol@example.org") = true
+        stipulate has_pending_team_invite_for_email(devs, "carol@example.org") = false
+        stipulate has_member_with_email(devs, "carol@example.org") = false
+        alice does OwnerInvitesEmailToTeam(alice, devs, "carol@example.org") on TeamSettings
+            creating invite: TeamInvite
+        then invite.status = pending
+
+    2. two weeks and a day pass
+        after 15.days
+        then TeamInviteExpires fires
+        then invite.status = expired
+
+    3. carol can no longer accept it
+        stipulate is_team_member(devs, carol) = false
+        carol cannot do InviteeAcceptsTeamInvite(carol, invite, false) on TeamInvitation
+
+    4. alice clears it away
+        alice does OwnerRevokesTeamInvite(alice, devs, invite) on TeamSettings
+        then invite does not exist
+
+    ends: The stale invitation is gone.
+}
+
+-- Giving a team a repository, and the includes-all special case.
+journey DevsGetTheirRepository {
+    goal: Alice gives devs the "api" repository, then takes it away again. The
+          Owners team, which includes all repositories, cannot have a single
+          repository taken from it.
+
+    cast:
+        api: repositories/Repository
+
+    given:
+        api.owner_org = org
+
+    1. alice adds api to devs
+        stipulate team_covers(devs, api) = false
+        alice does OwnerAddsRepositoryToTeam(alice, devs, api) on TeamSettings
+            creating link: TeamRepository
+        then link.team = devs
+        then link.repository = api
+
+    2. and removes it again
+        alice does OwnerRemovesRepositoryFromTeam(alice, devs, api) on TeamSettings
+        then link does not exist
+
+    3. the Owners team keeps every repository
+        stipulate team_covers(owners, api) = true
+        alice cannot do OwnerRemovesRepositoryFromTeam(alice, owners, api) on TeamSettings
+
+    ends: devs no longer covers api; Owners still does.
+}
+
+-- Repository admins and team access.
+journey RepoAdminAndTeamAccess {
+    goal: Bob administers the "api" repository but is not an org owner. While
+          acme forbids it he cannot add a team to his repository; once Alice
+          allows repository admins to manage team access, he can.
+
+    cast:
+        api: repositories/Repository
+
+    given:
+        api.owner_org = org
+
+    1. bob is refused while the org does not allow it
+        stipulate is_repo_admin(bob, api) = true
+        stipulate is_org_owner(org, bob) = false
+        stipulate team_covers(devs, api) = false
+        bob cannot do RepoAdminAddsTeamToRepository(bob, api, devs) on RepositoryTeamAccess
+
+    2. alice lets repository admins manage team access
+        alice does OwnerSetsRepoAdminTeamAccess(alice, org, true) on OrganizationSettings
+        then org.repo_admin_change_team_access = true
+
+    3. now bob can
+        bob does RepoAdminAddsTeamToRepository(bob, api, devs) on RepositoryTeamAccess
+            creating link: TeamRepository
+        then link.team = devs
+
+    ends: devs covers api, granted from the repository side.
+}
+
+-- Deleting an organization needs it to be empty.
+journey AcmeStillOwnsRepositories {
+    goal: Alice wants to delete acme, but it still owns two repositories, so
+          the deletion is refused until they are deleted or transferred.
+
+    1. refused while repositories remain
+        stipulate owned_repository_count(org) = 2
+        stipulate owned_package_count(org) = 0
+        alice cannot do OwnerDeletesOrganization(alice, org, "acme") on OrganizationSettings
+
+    ends: acme still exists.
+}
+
+journey DeletingAnEmptyAcme {
+    goal: acme owns nothing any more. Alice must type its name to delete it.
+
+    1. refused when the confirmation name is wrong
+        stipulate owned_repository_count(org) = 0
+        stipulate owned_package_count(org) = 0
+        alice cannot do OwnerDeletesOrganization(alice, org, "acne") on OrganizationSettings
+
+    2. accepted with the right name
+        alice does OwnerDeletesOrganization(alice, org, "acme") on OrganizationSettings
+        then OwnerDeletesOrganization fires
+        then org does not exist
+
+    ends: acme is gone and its name is free.
+}
+
+-- A site administrator may delete an organization that still owns packages
+-- by purging it, as for users (decision packages 8); its packages go too.
+journey AnAdminPurgesAcmeWithItsPackages {
+    goal: acme still owns packages, so Alice cannot delete it; a site admin
+          deletes it with purge and the packages are removed with it.
+
+    cast:
+        root: accounts/User
+    given:
+        root.kind = individual
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+        acme_reg: packages/OwnerRegistry { owner_user: null, owner_org: org }
+        tool:     packages/Package { registry: acme_reg, kind: generic, name: "tool", is_internal: false, repository: null, autolink_pending: false }
+        tool_v1:  packages/PackageVersion { package: tool, creator: alice, version: "1.0.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
+
+    1. the owner cannot delete it while it owns packages
+        stipulate owned_repository_count(org) = 0
+        stipulate owned_package_count(org) = 1
+        alice cannot do OwnerDeletesOrganization(alice, org, "acme") on OrganizationSettings
+
+    2. an ordinary user cannot purge it
+        alice cannot do AdminDeletesOrganizationWithPurge(alice, org, "acme") on OrganizationAdministration
+
+    3. the site admin purges it
+        root does AdminDeletesOrganizationWithPurge(root, org, "acme") on OrganizationAdministration
+        then AdminPurgesOrganization fires
+        then SystemPurgesOrganization fires
+        then PurgeOrganizationPackages fires
+        then tool_v1 does not exist
+        then org does not exist
+
+    ends: acme and its package versions are gone; the expired-data purge
+          removes the empty package and its blobs.
+}
+
+-- Who sees what.
+journey ConcealedMembersStayConcealed {
+    goal: Bob's membership of acme is concealed, Alice's is public. Carol, an
+          outsider, sees Alice listed but not Bob; Bob himself sees both.
+
+    given:
+        alice_owner:  TeamMembership { team: owners, organization: org, user: alice, reason: org_creator }
+        alice_in_org: OrgMembership { organization: org, user: alice, is_public: true }
+        bob_on_devs:  TeamMembership { team: devs, organization: org, user: bob, reason: added_by_user }
+        bob_in_org:   OrgMembership { organization: org, user: bob, is_public: false }
+
+    1. carol sees alice but not bob
+        stipulate sees_concealed_members(org, carol) = false
+        carol sees alice_in_org.user.name on OrganizationProfile in org
+        carol cannot see bob_in_org.user.name on OrganizationProfile in org
+
+    2. bob, a member, sees both
+        stipulate sees_concealed_members(org, bob) = true
+        bob sees bob_in_org.user.name on OrganizationProfile in org
+        bob sees alice_in_org.user.name on OrganizationProfile in org
+
+    3. bob makes his membership public
+        stipulate is_org_member(org, bob) = true
+        bob does MemberChangesMembershipVisibility(bob, org, bob_in_org, true) on OrganizationMembersArea
+        then bob_in_org.is_public = true
+
+    ends: Everyone can now see that Bob belongs to acme.
+}
+
+-- Private organizations do not exist for anonymous visitors.
+journey PrivateOrganizationIsInvisibleAnonymously {
+    goal: acme goes private. An anonymous visitor can no longer see its name.
+
+    cast:
+        stranger: access/RequestParty
+
+    given:
+        stranger.is_signed_in = false
+
+    1. while public, a visitor sees it
+        stranger sees org.name on AnonymousOrganizationProfile in org
+
+    2. alice makes it private
+        alice does OwnerChangesOrganizationVisibility(alice, org, private) on OrganizationSettings
+        then org.visibility = private
+
+    3. and the visitor no longer can
+        stranger cannot see org.name on AnonymousOrganizationProfile in org
+
+    ends: acme is hidden from everyone who is not a member.
+}
+
+-- Decided: the Owners team keeps its name on every path, and is never deleted.
+journey TheOwnersTeamCannotBeRenamed {
+    goal: Alice tries to rename the Owners team through the general team edit
+          (the API's PATCH /teams/{id}); it is refused. Only its description
+          can change.
+
+    1. renaming the Owners team is refused
+        stipulate is_alpha_dash_dot("bosses") = true
+        stipulate length("bosses") = 6
+        stipulate lower("bosses") = "bosses"
+        stipulate team_name_taken_by_other(owners, "bosses") = false
+        stipulate grants_some_unit({}) = false
+        alice cannot do OwnerEditsTeam(alice, owners, "bosses", "", admin, {}, true, true) on TeamSettings
+
+    2. its description can change
+        stipulate length("Those who decide") = 16
+        alice does OwnerEditsOwnersTeamDescription(alice, owners, "Those who decide") on TeamSettings
+        then owners.description = "Those who decide"
+        then owners.name = "Owners"
+
+    ends: The Owners team is still called Owners.
+}
+
+-- Decided: a team is owner, admin, or a set of unit grants; there is no summary mode.
+journey DevsBecomeAnAdminTeam {
+    goal: devs is defined by its unit grants. Alice turns it into an admin team;
+          she cannot turn it back into a team that grants no unit at all.
+
+    1. alice makes devs an admin team
+        stipulate is_alpha_dash_dot("devs") = true
+        stipulate length("devs") = 4
+        stipulate lower("devs") = "devs"
+        stipulate team_name_taken_by_other(devs, "devs") = false
+        stipulate length("Developers") = 10
+        alice does OwnerEditsTeam(alice, devs, "devs", "Developers", admin, {}, false, false) on TeamSettings
+        then OwnerEditsTeam fires
+        then devs.kind = admin
+        then devs_code does not exist
+
+    2. a write team with no unit grants is refused
+        stipulate grants_some_unit({}) = false
+        alice cannot do OwnerEditsTeam(alice, devs, "devs", "Developers", write, {}, false, false) on TeamSettings
+
+    ends: devs is an admin team.
+}
+
+-- Decided: only the member changes their own membership visibility.
+journey AliceCannotPublicizeBob {
+    goal: Bob's membership is concealed. Alice, an owner, cannot make it
+          public; only Bob can.
+
+    given:
+        alice_owner:  TeamMembership { team: owners, organization: org, user: alice, reason: org_creator }
+        alice_in_org: OrgMembership { organization: org, user: alice, is_public: true }
+        bob_on_devs:  TeamMembership { team: devs, organization: org, user: bob, reason: added_by_user }
+        bob_in_org:   OrgMembership { organization: org, user: bob, is_public: false }
+
+    1. alice is refused
+        stipulate is_org_member(org, alice) = true
+        alice cannot do MemberChangesMembershipVisibility(alice, org, bob_in_org, true) on OrganizationMembersArea
+
+    2. bob publicizes himself
+        stipulate is_org_member(org, bob) = true
+        bob does MemberChangesMembershipVisibility(bob, org, bob_in_org, true) on OrganizationMembersArea
+        then bob_in_org.is_public = true
+
+    ends: Bob's membership is public because Bob chose it.
+}
+
+-- Decided: the admin's right governs creating an organization for a user.
+journey AdminFoundsAnOrganizationForCarol {
+    world: none
+
+    goal: Carol may not create organizations herself, but a site admin
+          creates one for her and she becomes its owner.
+
+    cast:
+        root:  accounts/User
+        carol: accounts/User
+
+    given:
+        root.kind = individual
+        root.is_admin = true
+        root.prohibit_login = false
+        root.is_active = true
+        carol.kind = individual
+        carol.is_admin = false
+        carol.allow_create_organization = false
+        carol.prohibit_login = false
+        carol.is_active = true
+
+    1. the admin creates the organization on Carol's behalf
+        stipulate is_usable_owner_name("carol-co") = true
+        stipulate owner_name_available("carol-co") = true
+        stipulate length("carol-co") = 8
+        stipulate is_usable_username("carol-co") = true
+        stipulate username_taken("carol-co") = false
+        root does AdminCreatesOrganizationForUser(root, carol, "carol-co", public) on AdminUserAccount
+            creating org: Organization
+        then CreateOrganizationForUserByAdmin fires
+        then org.name = "carol-co"
+
+    ends: carol-co exists with Carol as its first owner.
+}
+
+-- Decided: an org block does not stop owners adding the blocked person to a team.
+journey BlockedBobCanStillBeAdded {
+    goal: acme has blocked Bob. Alice can still put him on devs, like Forgejo.
+
+    given:
+        block: accounts/UserBlock { blocker_organization: org, blocked: bob }
+
+    1. alice adds bob to devs
+        stipulate is_org_member(org, bob) = false
+        stipulate is_team_member(devs, bob) = false
+        stipulate has_pending_team_invite(devs, bob) = false
+        alice does OwnerAddsTeamMember(alice, devs, bob) on TeamSettings
+            creating bob_on_devs: TeamMembership
+        then bob_on_devs.team = devs
+
+    ends: Bob is on devs despite the block.
+}
+
+-- decided: administration 3 — while the instance is read-only, nothing about
+-- an organization changes, whoever asks; reading it keeps working.
+journey ReadOnlyModeFreezesTheOrganization {
+    goal: The site administrator has put the instance into read-only mode.
+          Alice, an owner, cannot create a team, rename acme or add Bob;
+          Bob cannot leave his team. Carol still sees the organization.
+
+    cast:
+        gate: access/InstanceWriteGate
+
+    given:
+        gate.read_only = true
+        bob_on_devs: TeamMembership { team: devs, organization: org, user: bob, reason: added_by_user }
+        bob_in_org:  OrgMembership { organization: org, user: bob, is_public: true }
+
+    1. alice cannot create a team
+        stipulate is_alpha_dash_dot("leads") = true
+        stipulate length("leads") = 5
+        stipulate lower("leads") = "leads"
+        stipulate team_name_taken(org, "leads") = false
+        alice cannot do OwnerCreatesTeam(alice, org, "leads", "", admin, {}, true, false) on OrganizationSettings
+
+    2. nor rename the organization
+        stipulate is_usable_owner_name("acme-corp") = true
+        stipulate length("acme-corp") = 9
+        stipulate owner_name_available("acme-corp") = true
+        stipulate owner_name_claimable("acme-corp", org) = true
+        alice cannot do OwnerRenamesOrganization(alice, org, "acme-corp") on OrganizationSettings
+
+    3. bob cannot leave devs
+        stipulate can_view_team(devs, bob) = true
+        bob cannot do MemberLeavesTeam(bob, devs) on TeamPage
+
+    4. carol still sees acme and its public members
+        stipulate sees_concealed_members(org, carol) = false
+        carol sees org.name on OrganizationProfile in org
+        carol sees bob_in_org.user.name on OrganizationProfile in org
+
+    ends: acme is exactly as it was; reads keep working.
+}
+
+-- A repository transferred into the organization joins the teams the doer
+-- named and every team that includes all repositories.
+journey ATransferredRepositoryJoinsItsTeams {
+    goal: Alice moves her own "tool" repository into acme and names devs.
+          Being an owner she may create repositories there, so it moves at
+          once: devs and the Owners team (which includes every repository)
+          now cover it.
+
+    cast:
+        tool: repositories/Repository
+
+    given:
+        tool.name = "tool"
+        tool.owner_user = alice
+        tool.owner_org = null
+        tool.status = ready
+        tool.is_private = false
+
+    1. alice transfers tool to acme with devs
+        stipulate is_repo_owner(alice, tool) = true
+        stipulate repository_name_free(org, "tool") = true
+        stipulate within_repo_quota(org) = true
+        stipulate within_creation_limit(org) = true
+        stipulate can_create_in_org(alice, org) = true
+        stipulate team_covers(devs, tool) = false
+        stipulate team_covers(owners, tool) = false
+        stipulate has_any_access(alice, tool) = true
+        -- alice is acme's only owner, so nobody else is told it arrived
+        stipulate notifications/organization_owners(org) = {alice}
+        alice does OwnerTransfersRepositoryToOrg(alice, tool, org, {devs}) on RepositoryDangerZone
+            creating devs_tool: TeamRepository
+            creating owners_tool: TeamRepository
+        then OwnershipMovesToOrg fires
+        then LinkTeamsNamedOnTransfer fires
+        then IncludeArrivedRepositoryInAllRepoTeams fires
+        then tool.owner_org = org
+        then devs_tool.team = devs
+        then devs_tool.repository = tool
+        then owners_tool.team = owners
+        then owners_tool.repository = tool
+
+    ends: tool belongs to acme, and devs and Owners cover it.
+}

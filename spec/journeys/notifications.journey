@@ -1,0 +1,644 @@
+-- Journeys through notifications.allium: the inbox, email (out and in), and
+-- the activity feed. Cast members of other modules' types (accounts/User,
+-- issues/Issue, ...) resolve once those modules exist.
+
+world {
+    cast:
+        ada:   accounts/User
+        bob:   accounts/User
+        repo:  repositories/Repository
+        issue: issues/Issue
+    given:
+        ada.is_active = true
+        bob.is_active = true
+        ada.prohibit_login = false
+        bob.prohibit_login = false
+        ada.is_admin = false
+        bob.is_admin = false
+        ada.email_notifications = enabled
+        bob.email_notifications = enabled
+        repo.owner_user = ada
+        repo.owner_org = null
+        issue.repository = repo
+        issue.is_pull = false
+        issue.is_locked = false
+}
+
+-- The happy path of the inbox: a thread arrives unread, is read, pinned,
+-- and then dropped back to read.
+journey AdaWorksThroughHerInbox {
+    goal: Ada has an unread thread about an issue she follows. She reads it,
+          pins it to keep it in view, and later unpins it by marking it read.
+
+    cast:
+        thread: Notification
+
+    given:
+        thread.recipient = ada
+        thread.repository = repo
+        thread.issue = issue
+        thread.source = issue
+        thread.status = unread
+
+    1. she sees it is unread
+        ada sees thread.status on NotificationThread in thread
+
+    2. she marks it read
+        ada does UserMarksNotification(ada, thread, read) on NotificationThread
+        then UserMarksNotification fires
+        then thread.status = read
+
+    3. she pins it so it stays at the top of both tabs
+        ada does UserMarksNotification(ada, thread, pinned) on NotificationThread
+        then thread.status = pinned
+
+    4. she is done with it
+        ada does UserMarksNotification(ada, thread, read) on NotificationThread
+        then thread.status = read
+
+    ends: The thread is read and stays in her inbox history.
+}
+
+-- Permission refusal and privacy: one person's inbox is not another's.
+journey BobCannotTouchAdasThread {
+    goal: Bob learns the address of Ada's notification thread and tries to read
+          and change it. He can do neither.
+
+    cast:
+        thread: Notification
+
+    given:
+        thread.recipient = ada
+        thread.repository = repo
+        thread.issue = issue
+        thread.source = issue
+        thread.status = unread
+
+    1. he cannot see it
+        bob cannot see thread.status on NotificationThread in thread
+
+    2. he cannot mark it read on her behalf
+        bob cannot do UserMarksNotification(bob, thread, read) on NotificationThread
+        then thread.status = unread
+
+    ends: Ada's thread is untouched and unseen by Bob.
+}
+
+-- Even a site administrator may read but not change somebody's thread.
+journey AnAdminReadsButDoesNotChangeAThread {
+    goal: Cora administers the site. She can look at Ada's thread through the
+          admin view, but cannot change its status.
+
+    cast:
+        cora:   accounts/User
+        thread: Notification
+
+    given:
+        cora.is_admin = true
+        cora.is_active = true
+        cora.prohibit_login = false
+        thread.recipient = ada
+        thread.repository = repo
+        thread.issue = issue
+        thread.source = issue
+        thread.status = unread
+
+    1. she can see it
+        cora sees thread.status on AdminNotificationTools in thread
+
+    2. she cannot change it
+        cora cannot do UserMarksNotification(cora, thread, read) on NotificationThread
+
+    ends: The thread is still unread for Ada.
+}
+
+-- Mark everything read: unread threads become read, pinned ones stay.
+journey AdaClearsHerInbox {
+    goal: Ada comes back from holiday to a pile of unread threads and one she
+          pinned before leaving. She marks everything read; the pinned one
+          keeps its place.
+
+    cast:
+        first:  Notification
+        second: Notification
+        keeper: Notification
+
+    given:
+        first.recipient = ada
+        first.status = unread
+        second.recipient = ada
+        second.status = unread
+        keeper.recipient = ada
+        keeper.status = pinned
+
+    1. she marks all as read
+        ada does UserMarksAllNotificationsRead(ada) on NotificationInbox
+        then UserMarksAllNotificationsRead fires
+        then first.status = read
+        then second.status = read
+        then keeper.status = pinned
+
+    ends: Nothing is unread; the pinned thread is still pinned.
+}
+
+-- Opening the issue clears its thread.
+journey ReadingTheIssueClearsTheThread {
+    goal: Ada clicks through to the issue itself instead of the inbox; the
+          thread is marked read for her.
+
+    cast:
+        thread: Notification
+
+    given:
+        thread.recipient = ada
+        thread.repository = repo
+        thread.issue = issue
+        thread.source = issue
+        thread.status = unread
+
+    1. she opens the issue
+        stipulate can_read_issue(ada, issue) = true
+        ada does UserViewsIssue(ada, issue) on IssueConversation
+        then ViewingIssueMarksItRead fires
+        then thread.status = read
+
+    ends: Visiting the subject is as good as marking it read.
+}
+
+-- Fan-out: an assignment reaches the assignee's inbox.
+journey BeingAssignedReachesTheInbox {
+    goal: Bob assigns Ada to an issue in a repository she can read. A thread
+          appears in her inbox.
+
+    given:
+        repo.is_archived = false
+
+    1. bob assigns ada
+        stipulate issue.assignees = {bob}
+        stipulate can_triage(bob, issue) = true
+        stipulate can_be_assigned(ada, repo) = true
+        stipulate can_read_issue(ada, issue) = true
+        bob does TriagerTogglesAssignee(bob, issue, ada) on IssueTriage
+            creating thread: Notification
+        then InboxOnAssigned fires
+        then DeliverIssueNotification fires
+        then thread.recipient = ada
+        then thread.status = unread
+
+    ends: Ada has an unread thread about the issue.
+}
+
+-- Outgoing mail is delivered, and only its recipient sees it.
+journey AConversationMailIsDelivered {
+    goal: A queued conversation mail for Ada is accepted by the SMTP server.
+          It is hers alone.
+
+    cast:
+        smtp:    MailServer
+        message: MailMessage
+
+    given:
+        smtp.direction = outgoing
+        message.recipient = ada
+        message.issue = issue
+        message.category = issue_comment
+        message.subject = "Re: [ada/repo] Crash on start (Issue #7)"
+        message.status = queued
+
+    1. the transport accepts it
+        smtp does MailTransportAccepts(smtp, message) on OutgoingMailQueue
+        then MailDelivered fires
+        then message.status = sent
+
+    2. ada sees it, bob does not
+        ada sees message.subject on PersonalMailbox in message
+        bob cannot see message.subject on PersonalMailbox in message
+
+    ends: Exactly one person received this copy.
+}
+
+-- Reply by email, happy path.
+journey AdaRepliesFromHerMailClient {
+    goal: Ada answers a conversation mail from her phone. Her reply becomes a
+          comment on the issue.
+
+    cast:
+        imap:    MailServer
+        message: MailMessage
+        token:   MailToken
+
+    given:
+        imap.direction = incoming
+        message.recipient = ada
+        token.message = message
+        token.purpose = reply
+        token.holder = ada
+        token.issue = issue
+        token.revoked = false
+        token.replied_to = null
+        token.replied_to_code = null
+
+    1. the mailbox hands over her reply
+        -- Token lifetimes are timestamps set when the mail is composed; a
+        -- journey cannot set a timestamp, so validity is said outright.
+        stipulate token.is_valid = true
+        stipulate can_read_issue(ada, issue) = true
+        stipulate can_comment_on_issue(ada, issue) = true
+        stipulate resolve_mentions(issue, ada, "Fixed in main. Thanks!") = {}
+        stipulate cross_references(repo, ada, null, "Fixed in main. Thanks!") = {}
+        stipulate issue_notification_audience(issue, ada) = {}
+        imap does IncomingMailArrives(imap, token, "Fixed in main. Thanks!", 0, false) on IncomingMailGateway
+        then AcceptReplyByMail fires
+        then CommentFromMailReply fires
+
+    ends: The issue has a new comment by Ada.
+}
+
+-- Automatic replies never become comments.
+journey AnOutOfOfficeReplyIsIgnored {
+    goal: Ada is on holiday and her mail server auto-answers a conversation
+          mail. Nothing is posted on the issue.
+
+    cast:
+        imap:  MailServer
+        token: MailToken
+
+    given:
+        imap.direction = incoming
+        token.purpose = reply
+        token.holder = ada
+        token.issue = issue
+        token.revoked = false
+
+    1. the auto-reply arrives and is refused
+        stipulate token.is_valid = true
+        stipulate can_read_issue(ada, issue) = true
+        imap cannot do IncomingMailArrives(imap, token, "I am out of office", 0, true) on IncomingMailGateway
+
+    ends: The issue is unchanged.
+}
+
+-- Reply addresses expire.
+journey AnExpiredReplyAddressNoLongerWorks {
+    goal: Ada digs out a conversation mail from more than a year ago and
+          replies to it. The reply address has expired and nothing is posted.
+
+    cast:
+        imap:  MailServer
+        token: MailToken
+
+    given:
+        imap.direction = incoming
+        token.purpose = reply
+        token.holder = ada
+        token.issue = issue
+        token.revoked = false
+
+    1. her reply is refused
+        -- expires_at is a year after composition; past it, is_valid is false.
+        stipulate token.is_valid = false
+        stipulate can_read_issue(ada, issue) = true
+        imap cannot do IncomingMailArrives(imap, token, "Is this still an issue?", 0, false) on IncomingMailGateway
+
+    ends: Expired reply addresses are ignored.
+}
+
+-- Unsubscribe by mail.
+journey AdaUnsubscribesByMail {
+    goal: Ada no longer cares about an issue and mails its unsubscribe address.
+          She stops following it.
+
+    cast:
+        imap:  MailServer
+        token: MailToken
+
+    given:
+        imap.direction = incoming
+        token.purpose = unsubscribe
+        token.holder = ada
+        token.issue = issue
+        token.revoked = false
+
+    1. the unsubscribe mail arrives
+        stipulate token.is_valid = true
+        stipulate can_read_issue(ada, issue) = true
+        imap does IncomingMailArrives(imap, token, "", 0, false) on IncomingMailGateway
+        then AcceptUnsubscribeByMail fires
+        then AcceptReplyByMail does not fire
+
+    ends: Ada is no longer subscribed to the issue.
+}
+
+-- Visibility: private activity on a profile. Feeds are computed when read
+-- (decided notifications 6), so the activity itself is what each feed shows.
+-- (Updated: this used to go through a per-feed copy, FeedEntry.)
+journey BobCannotSeeAdasPrivateActivity {
+    goal: Ada works in a private repository. Bob visits her profile and does
+          not see that activity; Ada, on her own dashboard, does.
+
+    cast:
+        act:   Activity
+
+    given:
+        repo.is_private = true
+        act.kind = create_issue
+        act.actor = ada
+        act.repository = repo
+
+    1. bob looks at her profile
+        stipulate activity_visible_to(act, bob, false) = false
+        bob cannot see act.content on ProfileActivity in ada
+
+    2. ada looks at her dashboard
+        stipulate in_feed_of(ada, act) = true
+        stipulate activity_visible_to(act, ada, true) = true
+        ada sees act.content on UserDashboard
+
+    ends: Private work stays private to people who can see the repository.
+}
+
+-- Computed on read: once Bob stops watching, the activity is gone from his
+-- dashboard, though it happened while he watched. (decided notifications 6)
+journey BobStopsWatchingAndTheFeedForgets {
+    goal: Ada opened an issue in her public repository while Bob watched it.
+          Bob stops watching; his dashboard no longer shows the activity.
+
+    cast:
+        act:   Activity
+
+    given:
+        repo.is_private = false
+        act.kind = create_issue
+        act.actor = ada
+        act.repository = repo
+
+    1. while he watches, he sees it
+        stipulate in_feed_of(bob, act) = true
+        stipulate activity_visible_to(act, bob, true) = true
+        bob sees act.content on UserDashboard
+
+    2. after he stops watching, it is gone
+        stipulate in_feed_of(bob, act) = false
+        bob cannot see act.content on UserDashboard
+
+    ends: Bob's feed follows what he watches now, not what he watched then.
+}
+
+-- Temporal: the live stream pushes the unread count on its own schedule.
+journey AdasBadgeUpdatesWithoutReloading {
+    goal: Ada keeps a tab open. A new thread lands in her inbox; within one
+          update interval the stream pushes her the new unread count, and she
+          never reloads the page.
+
+    cast:
+        thread: Notification
+
+    given:
+        thread.recipient = ada
+        thread.repository = repo
+        thread.issue = issue
+        thread.source = issue
+        thread.status = unread
+
+    1. she opens the stream
+        ada does UserOpensEventStream(ada) on NotificationInbox
+            creating connection: EventStreamConnection
+        then UserOpensEventStream fires
+
+    2. ten seconds pass
+        after 10.seconds
+        then PushUnreadCount fires
+
+    3. she closes the tab
+        ada does UserClosesEventStream(connection) on NotificationEventStream
+        then connection does not exist
+
+    ends: The badge followed her inbox without a single reload.
+}
+
+-- Configuration: an instance can switch the live stream off.
+journey TheLiveStreamCanBeSwitchedOff {
+    goal: The administrator set the event-source update time to zero. Ada's
+          inbox no longer offers a live stream; her badge updates only when
+          she reloads.
+
+    given:
+        config.event_source_update_time = 0.seconds
+
+    1. she cannot open the stream
+        ada cannot do UserOpensEventStream(ada) on NotificationInbox
+
+    ends: No stream connection exists for Ada.
+}
+
+-- Fan-out into the activity feed, driven by another module's act.
+journey AReleaseLandsInTheFeed {
+    goal: Ada publishes the first release of her repository. It is recorded
+          as activity and fanned out to the feeds; with mail switched off (the
+          default) nobody is mailed.
+
+    given:
+        repo.is_private = false
+        repo.is_archived = false
+        repo.is_mirror = false
+        repo.is_empty = false
+
+    1. she publishes it
+        stipulate can_write_releases(ada, repo) = true
+        stipulate is_valid_tag_name("v1.0") = true
+        stipulate may_control_tag(ada, repo, "v1.0") = true
+        stipulate target_resolves(repo, "main") = true
+        stipulate release_quota_allows(repo) = true
+        stipulate commit_of(repo, "main") = "c0ffee1"
+        ada does UserCreatesRelease(ada, repo, "v1.0", "main", "First release", "Notes", false, false, false) on ReleaseManagement
+            creating act: Activity
+        then RecordReleasePublished fires
+        then MailOnReleasePublished does not fire
+        then act.kind = publish_release
+        then act.watch_category = releases
+
+    ends: The release is on Ada's dashboard and in her watchers' feeds.
+}
+
+-- A password change revokes the reply and unsubscribe addresses of old mail.
+-- (decided notifications 3)
+journey AdasPasswordChangeRetiresOldReplyAddresses {
+    goal: Ada fears an old conversation mail leaked. She changes her
+          password; a reply sent to the address in that mail no longer posts
+          anything.
+
+    cast:
+        imap:  MailServer
+        token: MailToken
+        login: UserLogin
+
+    given:
+        imap.direction = incoming
+        token.purpose = reply
+        token.holder = ada
+        token.issue = issue
+        token.revoked = false
+        login.user = ada
+        login.source = null
+        login.has_password = true
+        login.must_change_password = false
+
+    1. she changes her password
+        stipulate password_matches(ada, "old secret") = true
+        stipulate password_acceptable("new secret") = true
+        ada does UserChangesPassword(ada, "old secret", "new secret") on SecuritySettings
+        then UserChangesPassword fires
+        then RevokeMailTokensOnPasswordChange fires
+        then token.revoked = true
+
+    2. a reply to the old address is refused
+        stipulate token.is_valid = true
+        stipulate can_read_issue(ada, issue) = true
+        stipulate can_comment_on_issue(ada, issue) = true
+        imap cannot do IncomingMailArrives(imap, token, "Posting as Ada", 0, false) on IncomingMailGateway
+
+    ends: Old reply addresses are dead; new mail carries new ones.
+}
+
+-- A collaborator invitation is mailed to the invitee, whichever way it is
+-- made. (decided notifications 5)
+journey BobIsMailedAnInvitationToCollaborate {
+    goal: Ada invites Bob to collaborate on her repository. With mail on, Bob
+          gets a mail saying who invited him and where; the access itself waits
+          for his answer.
+
+    given:
+        config.mailer_enabled = true
+        repo.is_archived = false
+
+    1. ada invites bob
+        stipulate repo.owner = ada
+        stipulate is_repo_admin(ada, repo) = true
+        stipulate is_blocked(ada, bob) = false
+        stipulate is_blocked(bob, ada) = false
+        ada does AdminInvitesCollaborator(ada, repo, bob) on RepositorySettings
+            creating message: MailMessage
+        then AdminInvitesCollaborator fires
+        then MailOnCollaboratorInvited fires
+        then MailOnCollaboratorAdded does not fire
+        then message.recipient = bob
+        then message.category = collaborator_invited
+        then message.status = queued
+
+    ends: Bob has an invitation mail with accept and decline links.
+}
+
+-- Mentions go through the audience filters: somebody who unsubscribed from
+-- an issue is not pulled back in by an @-mention. (decided notifications 1)
+journey AnUnsubscribedMentionStaysQuiet {
+    goal: Ada unsubscribed from an issue. Bob mentions her in a comment; she
+          gets no inbox thread for it.
+
+    cast:
+        optout: issues/IssueWatch
+
+    given:
+        issue.poster = bob
+        issue.status = open
+        repo.is_archived = false
+        optout.user = ada
+        optout.issue = issue
+        optout.is_watching = false
+
+    1. bob comments, mentioning ada
+        stipulate can_read_issue(bob, issue) = true
+        stipulate is_blocked(bob, bob) = false
+        stipulate is_blocked_by_owner(repo, bob) = false
+        stipulate issue_notification_audience(issue, bob) = {}
+        stipulate resolve_mentions(issue, bob, "@ada what do you think?") = {ada}
+        stipulate cross_references(repo, bob, null, "@ada what do you think?") = {}
+        bob does UserComments(bob, issue, "@ada what do you think?", {}) on IssueConversation
+        then InboxOnComment fires
+        then ExpandIssueThreadAudience fires
+        then DeliverIssueNotification does not fire
+
+    ends: Ada's opt-out holds even against a mention.
+}
+
+-- A new abuse report reaches the site administrators' inboxes; when it is
+-- closed the reporter hears that it was reviewed, and nothing more.
+-- decided: moderation 7, moderation 8
+journey AReportReachesTheAdminsAndTheReporterHearsBack {
+    goal: Bob reports a spam comment. Cora, a site admin, finds a thread about
+          the new report in her inbox. Once she closes it, Bob finds a thread
+          saying his report was reviewed.
+
+    cast:
+        cora:   accounts/User
+        author: accounts/User
+        remark: issues/Comment
+        item:   moderation/ReportableContent
+    given:
+        moderation/config.enabled = true
+        cora.is_admin = true
+        cora.is_active = true
+        cora.prohibit_login = false
+        remark.issue = issue
+        remark.ref_comment = null
+        item.kind = comment
+        item.reported_comment = remark
+        item.reported_user = null
+        item.reported_organization = null
+        item.reported_repository = null
+        item.reported_issue = null
+        item.is_deleted = false
+        item.has_user_content = true
+        item.poster = author
+
+    1. bob files the report and cora is told
+        stipulate can_read_conversation(bob, issue) = true
+        stipulate remarks_length("This comment links to a phishing site twice.") = 45
+        bob does UserReportsContent(bob, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
+            creating report: moderation/AbuseReport
+            creating alert: Notification
+        then InboxOnAbuseReported fires
+        then alert.recipient = cora
+        then alert.source = abuse_report
+        then alert.report = report
+        then alert.status = unread
+
+    2. cora closes it and bob hears back
+        cora does AdminResolvesReports(cora, item, handled) on ModerationQueue
+            creating reply: Notification
+        then InboxOnReportReviewed fires
+        then reply.recipient = bob
+        then reply.source = report_reviewed
+        then reply.report = report
+
+    ends: Cora saw the new report; Bob knows it was handled, not how.
+}
+
+-- While the instance is read-only the inbox can be read but not changed.
+-- decided: administration 3
+journey ReadOnlyModeKeepsTheInboxAsItIs {
+    goal: Ada has an unread thread. During maintenance she can see it but
+          cannot mark it read, alone or with everything else.
+
+    cast:
+        gate:   access/InstanceWriteGate
+        thread: Notification
+    given:
+        gate.read_only = true
+        thread.recipient = ada
+        thread.repository = repo
+        thread.issue = issue
+        thread.source = issue
+        thread.status = unread
+
+    1. she still sees it
+        ada sees thread.status on NotificationThread in thread
+
+    2. she cannot mark it read
+        ada cannot do UserMarksNotification(ada, thread, read) on NotificationThread
+
+    3. nor everything at once
+        ada cannot do UserMarksAllNotificationsRead(ada) on NotificationInbox
+        then thread.status = unread
+
+    ends: The thread stays unread until the instance is writable again.
+}

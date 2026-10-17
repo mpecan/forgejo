@@ -1,0 +1,3477 @@
+-- allium: 3
+-- repositories.allium — the lifecycle of a repository as a hosted thing: creating, forking,
+-- generating, renaming, transferring, archiving, deleting, its settings and units, the people
+-- attached to it (collaborators, stargazers, watchers) and its mirrors and download archives.
+--
+-- Scope: everything that exists *about* a repository rather than *inside* its git history.
+--
+-- Includes:
+--   - Repository (name rules, reserved names, object format, private-by-default policy,
+--     per-owner creation limits, push-to-create, empty/initialised content, status lifecycle)
+--   - Generation from a template repository (which items are copied)
+--   - Forks (to user or organisation, one fork per owner per fork network, privacy inheritance,
+--     fork-of-fork, detaching a fork, fast-forward sync of a fork branch from its base)
+--   - Rename and RepoRedirect; ownership transfer with pending acceptance/reject/cancel
+--   - Archive / unarchive, visibility change (with fork propagation), deletion and its cascade
+--   - RepoUnit (enable/disable units, per-unit settings: issue tracker, pull requests,
+--     external tracker URL formats, external wiki, per-unit default access for signed-in
+--     users and anonymous visitors)
+--   - Collaboration (invitation, acceptance / decline / revocation, site-admin direct add,
+--     change access mode, remove)
+--   - Star, Watch (explicit vs automatic watch, per-category watch selection)
+--   - Topic (count, length and format rules)
+--   - Repository avatar, language statistics, git + LFS size
+--   - Adoption / deletion of unadopted repositories found in storage
+--   - Mirror (pull mirror: interval, prune, credentials, LFS, sync now, scheduled sync, failure
+--     back-off, failing / paused state)
+--   - PushMirror (add/remove, interval, sync on commit, SSH key pair, branch filter)
+--   - RepoArchive (zip / tar.gz / bundle downloads, asynchronous generation, cleanup)
+--   - Repository flags (site-admin labels), trust model setting, health-check toggle
+--   - Background maintenance: scheduled mirror updates, git health check (fsck), git garbage
+--     collection, deletion / re-initialisation of repositories missing from storage, archive purge
+--
+-- Excludes:
+--   - Permission computation (who may read/write which unit) — owned by access.allium; this
+--     module only *asks* through the predicates listed under "Black-box predicates" below.
+--   - Branches, tags, commits, protected branches, git transport, server-side hooks, LFS objects,
+--     web file editing, the default-branch git operation itself — owned by code.allium.
+--   - Team ↔ repository assignment from the repository settings page — owned by
+--     organizations.allium (Team repositories); this module only names teams on a transfer.
+--   - Importing from another forge (the Migration task and what it imports) — owned by
+--     migrations.allium; this module only reserves the repository record and owns the Mirror.
+--   - Deploy keys (keys.allium), webhooks (webhooks.allium), actions secrets/variables/runners
+--     (actions.allium), wiki pages and wiki branch normalisation (wiki.allium).
+--   - Explore/search, code/issue/stats indexers and re-index requests (discovery.allium).
+--   - Federated "following repositories" list (federation.allium).
+--   - Counter repair cron `check_repo_stats` — counters here are derived values, so a rebuild
+--     has nothing to repair (implementation workaround for denormalised counters).
+--   - `delete_generated_repository_avatars` cron — repositories never get generated avatars
+--     in the rebuild; the fallback image is a rendering concern.
+--   - Daemon-export marker files, `update-server-info`, git config modernisation of old pull
+--     mirrors, legacy route `/repo/fork/{id}`, Gitea API compatibility aliases
+--     (`/org/{org}/repos` deprecated create) — legacy / storage implementation.
+--   - Charset detection, editor line-wrap, upload limits (rendering / code concerns).
+--
+-- Emits (other modules react; parameters named as emitted):
+--   RepositoryCreated(repository, doer)                     -- notifications feed, webhooks(create), actions, federation
+--   RepositoryForked(source, fork, doer)                    -- notifications feed, webhooks(fork) on source
+--   RepositoryGeneratedFromTemplate(template, repository, doer, git_content, topics,
+--       git_hooks, webhooks, avatar, labels, protected_branches)
+--                                                           -- code copies content/hooks/protection, webhooks copies hooks, issues copies labels
+--   LabelTemplateApplied(repository, template_name)         -- issues creates the labels of that template
+--   RepositoryRenamed(repository, doer, old_name)           -- notifications feed, webhooks, packages links
+--   RepositoryTransferRequested(repository, doer, transfer) -- notifications (inbox + mail to recipient / org members able to accept)
+--   RepositoryTransferRejected(repository, doer)            -- notifications
+--   RepositoryTransferred(repository, doer, old_owner_name) -- notifications feed, webhooks, access recalculation, issues (drop foreign org labels)
+--   RepositoryVisibilityChanged(repository, doer)           -- access (team access), notifications (feed entries become private), discovery (reindex), federation
+--   RepositoryArchived(repository, doer)                    -- actions (cancel scheduled workflows)
+--   RepositoryUnarchived(repository, doer)                  -- actions (re-detect schedules)
+--   RepositoryUnitsChanged(repository, doer)
+--   RepoUnitEnabled(repository, kind) / RepoUnitDisabled(repository, kind)
+--                                                           -- actions (schedules on/off when the actions unit toggles)
+--   RepositoryViewed(viewer, repository)                    -- notifications (transfer-offer threads marked read); provided as UserViewsRepository
+--   MirrorSyncPushed(repository, ref_name, commits)         -- notifications feed (mirror_sync_push)
+--   MirrorBranchUpdated(repository, branch_name, pusher, old_sha, new_sha, is_force)
+--                                                           -- for each branch a pull-mirror sync moved; code announces it as
+--                                                              CommitsPushed (issues, pulls, webhooks, actions see mirror updates like pushes)
+--   MirrorRefCreated(repository, ref_name) / MirrorRefDeleted(repository, ref_name)
+--                                                           -- notifications feed (mirror_sync_create / mirror_sync_delete)
+--   RepositoryDeletionAnnounced(repository, doer, owner_user, owner_org)
+--                                                           -- with RepositoryDeleted, carrying the owner the repository had (read
+--                                                              before the record went): webhooks (owner and system hooks)
+--   OrgRepositoryArrived(repository)                        -- organizations (includes-all teams): a transfer moved it into an organisation
+--   OrgRepositoryDeparted(repository, organization)         -- organizations (drop team links): it left `organization` by transfer or deletion
+--   RepositoryProfileChanging(repository, doer)             -- moderation (shadow copy of reported repositories): raised in the same atomic
+--                                                              step as a change of owner, name, description, website, topics or avatar
+--   RepositoryDeleted(repository, doer)                     -- every module holding repository-scoped data purges it: issues, pulls (close PRs from its branches first),
+--                                                              releases, projects, wiki, webhooks + deliveries, actions (runs/tasks/runners/secrets/variables/artifacts),
+--                                                              packages (unlink), code (branches, protected rules, LFS), keys (deploy keys), notifications, access tokens scoped to it,
+--                                                              moderation (shadow copy if reported)
+--   CollaboratorInvited(repository, user, doer)             -- notifications (mail to the invitee, MailOnCollaboratorInvited)
+--   CollaboratorInvitationDeclined(repository, user, doer)  -- notifications (optional: tell the inviter)
+--   CollaboratorAdded(repository, user, doer)               -- the access grant starts: an invitation was accepted
+--                                                              (doer = the inviter) or a site admin added directly; notifications, access
+--   CollaboratorAddedDirectly(repository, user, doer)       -- in addition, only for a site admin's direct add (no invitation):
+--                                                              notifications mails the new collaborator
+--   CollaboratorAccessChanged(repository, user, doer)       -- access
+--   CollaboratorRemoved(repository, user, doer)             -- access, issues (unassign the user from this repository's issues), notifications
+--   RepositoryStarred(user, repository)                     -- federation (Like activity); no activity-feed entry (Forgejo records none)
+--   RepositoryUnstarred(user, repository)
+--   WatchChanged(user, repository)                          -- notifications (who is subscribed)
+--   MirrorSyncDue(mirror)                                   -- the sync worker fetches from the remote
+--   PullMirrorSynced(mirror)                                -- releases (tags → releases), code (branch list sync)
+--   PullMirrorSyncFailed(mirror, reason)                    -- administration (SystemNotice)
+--   PushMirrorSyncDue(push_mirror)                          -- the sync worker pushes to the remote
+--   PushMirrorSyncFailed(push_mirror, reason)
+--   ArchiveGenerationRequested(archive)                     -- the archive worker builds the file
+--   RepositoryHealthCheckFailed(repository, reason)         -- administration (SystemNotice)
+--   RepositoryGarbageCollectionFailed(repository, reason)   -- administration (SystemNotice)
+--   RepositoryAdopted(repository, doer)
+--   MirrorConvertedToRepository(repository, doer)
+--   ForkDetached(repository, doer)
+--
+--   MirrorUpdateSweepFinished()         -- administration: the update_mirrors run is done
+--   ArchiveCleanupFinished()            -- administration: the archive_cleanup run is done
+--   AllArchivesDeletionFinished()       -- administration: the delete_repo_archives run is done
+--   HealthCheckSweepFinished()          -- administration: the repo_health_check run is done
+--   GarbageCollectionSweepFinished()    -- administration: the git_gc_repos run is done
+--   MissingRepositoryDeletionFinished() -- administration: the delete_missing_repos run is done
+--   MissingRepositoryReinitFinished()   -- administration: the reinit_missing_repos run is done
+--   RepositoryStatsCheckFinished()      -- administration: the check_repo_stats run is done
+--   GeneratedAvatarDeletionFinished()   -- administration: the delete_generated_repository_avatars run is done
+-- Reacts to:
+--   access/UserLostRepositoryAccess(user, repository)
+--                                    -- the user's watch on the repository is removed (UnwatchOnLostAccess)
+--                                       and their star with it (UnstarOnLostAccess)
+--   code/PushReceived(push)          -- push mirrors with sync-on-commit, auto-watch on changes, size refresh
+--   migrations/ImportCompleted(repository, remote_address, has_credentials, interval, lfs_enabled, lfs_endpoint)
+--                                    -- the import finished: ready, and a mirror import becomes a pull mirror
+--   Repository.created with status being_migrated -- migrations reserved the record (it creates it itself, with its
+--                                    Migration): provisioned like any new repository (ProvisionMigratedRepository)
+--   migrations/MigratedContentDiscarded(repository) -- a retry wipes what was imported; the record stays (ResetDiscardedImport)
+--   migrations/FailedImportDiscarded(repository, doer) -- a discarded failed import is deleted (DeleteDiscardedImport)
+--   migrations/TopicsImported(repository, topics)   -- imported topics replace the repository's topics
+--   code/PushToCreateRequested(pusher, owner_name, repository_name, is_private) -- push-to-create
+--   code/TagDeleted(repository, tag_name, by)       -- the release archive download counters of that tag go
+--   discovery/LanguageStatsComputed(repository, commit_sha, sizes) -- the stats indexer's result
+--   packages/CargoIndexInitialized(manager, registry) -- the owner's `_cargo-index` repository is created (or reused)
+--   accounts/UserBlocked(blocker, blocked), accounts/OrganizationBlockedUser(organization, blocked)
+--                                    -- the blocked user stops watching and collaborating on the blocker's repositories,
+--                                       and their pending transfers to the blocker are cancelled
+--   accounts/UserPurged(user)        -- every repository the user owns is deleted (idempotent: a resumed purge
+--                                       deletes what is left, so owns_repositories(user) becomes false)
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+--                                    -- the user's stars, watches, collaborations, invitations and transfers go
+--   organizations/OrganizationPurgeStarted(organization) -- every repository the organisation owns is deleted
+--   organizations/TeamMemberAdded(team, user), organizations/TeamRepositoryAdded(team, repository)
+--                                    -- auto-watch (config.auto_watch_new_repos); losing access through teams is
+--                                       handled by access/UserLostRepositoryAccess (UnwatchOnLostAccess)
+--   moderation/ModeratorDeletesRepository(admin, repository) -- deleted with the usual cascade
+--   wiki/WikiDeleted(wiki, deleter)  -- the wiki unit is switched off
+--   administration/RepositoryCreationRequestedByAdmin(admin, user, name)
+--                                    -- created as UserCreatesRepository creates, with the instance defaults; no creation limit
+--   administration/RepositoryDeletionRequestedByAdmin(admin, repository)
+--                                    -- deleted with the OwnerDeletesRepository cascade, ending in RepositoryDeleted(repository, doer: admin)
+--   administration/MirrorUpdateDue(pull_limit, push_limit), RepositoryHealthCheckDue(timeout, args),
+--     RepositoryStatsCheckDue() (no-op), RepositoryArchiveCleanupDue(older_than),
+--     AllRepositoryArchivesDeletionDue(), RepositoryGarbageCollectionDue(timeout, args),
+--     MissingRepositoryReinitDue(), MissingRepositoryDeletionDue(),
+--     GeneratedRepositoryAvatarDeletionDue() (no-op) -- the cron tasks, also run on demand
+--
+-- Black-box predicates. Qualified calls into sibling modules cannot yet be simulated, so the
+-- predicates this module needs are named locally, each delegating to its owner:
+--   can_see_repository(user, repository)  -- access: user can read at least one unit (anonymous rules included)
+--   can_read_code(user, repository)       -- access/can_read(user, repository, code)
+--   can_write_code(user, repository)      -- access/can_write(user, repository, code)
+--   is_repo_admin(user, repository)       -- access/is_repo_admin(user, repository)
+--   is_repo_owner(user, repository)       -- access: access mode `owner` (the owning user, an owner of the
+--                                            owning organisation, or a site admin)
+--   can_create_in_org(user, org)          -- organizations: org owner, or member of a team allowed to create repositories
+--   is_org_owner(org, user)               -- organizations: member of the owners team
+--   is_org_member(org, user)              -- organizations
+--   is_blocked(blocker, blocked)          -- accounts/UserBlock
+--   within_repo_quota(owner)              -- quota: not quota/config.enabled or quota/quota_allows(owner, size_repos_all, null)
+--                                            (gates create, generate, fork, push-to-create, transfer, accept, scheduled mirror sync)
+--   within_git_quota(owner)               -- quota: not quota/config.enabled or quota/quota_allows(owner, size_git_all, null)
+--                                            (manual pull-mirror sync, like a push; decided: quota 6, gate_mirror_manual)
+--   instance_read_only                    -- access: exists access/InstanceWriteGate{read_only: true}; written out in each
+--                                            user-initiated write below (decided: administration 3)
+--   within_creation_limit(owner)          -- accounts: owner's repository count below its effective limit
+--                                            (per-owner max_repo_creation when >= 0, else config.max_creation_limit; -1 = unlimited)
+--                                            and, while quota is enabled, quota/quota_allows(owner, count_repos, 1):
+--                                            the owner's count:repos quota rules allow one more repository.
+--                                            One check, so a site admin's exemption covers both, as it did MAX_CREATION_LIMIT.
+--                                            decided: follow-up 2 (quota count subjects; the per-owner limit and count:repos are related here)
+--   is_valid_repo_name(name)              -- name rules, see AllowedRepositoryNames
+--   is_allowed_remote(address, user)      -- migrations/is_allowed_remote (OutboundFetchPolicy allow/block lists; re-checked at every sync)
+--   is_valid_external_url(url)            -- absolute http(s) URL, not loopback/localhost, not this instance's API
+--   is_valid_tracker_url_format(format)   -- valid external URL whose {user} {repo} {index} placeholders are well formed
+--   is_valid_topic(topic)                 -- after trimming and lower-casing: 1..35 characters, starts with a
+--                                            letter or digit, then letters, digits, '-' or '.' (^[a-z0-9][-.a-z0-9]*$)
+--   all_valid_topics(names)               -- every name satisfies is_valid_topic
+--   label_template_exists(name)           -- a label template shipped with or installed on the instance
+--   initial_content_templates_exist(c)    -- null, or a README template, .gitignore templates and optional LICENSE
+--                                            template that all exist on the instance. README templates may use
+--                                            ${Name} ${Description} ${OwnerName} ${CloneURL.HTTPS} ${CloneURL.SSH};
+--                                            .gitignore templates are concatenated; LICENSE is filled with owner name,
+--                                            author e-mail, repository name and current year (services/repository/create.go:51)
+--   resolve_commit(repository, ref)       -- code: the commit a branch/tag/sha names, or null
+--   in_fork_network_of(owner, source)     -- owner owns `source` or any repository `source` was (transitively) forked from
+--   storage_missing(repository)           -- the git storage for the repository no longer exists
+--   is_branch_ref(ref_name), branch_of_ref(ref_name) -- code: refs/heads/<name> and its <name>
+--   mirror_pusher(repository)             -- the account mirror updates are attributed to: the owning
+--                                            user, or the owning organisation's account
+--   is_force_update(repository, old, new) -- code: old is not an ancestor of new (pruned history)
+--   is_valid_avatar_image(image)          -- decodable image within the avatar size limits
+--   mirror_retry_delay(failures, interval) -- wait before retrying a pull mirror after `failures` consecutive
+--                                            failed fetches: config.update_mirrors_schedule × 2^(failures − 1),
+--                                            never more than `interval` (decided: repositories decision 5)
+--
+-- Predicates this module answers for other modules (they name them locally as black boxes):
+--   owns_repositories(user)               -- exists Repository{owner_user: user} (accounts: deletion preconditions,
+--                                            and purge_steps_complete once UserPurged has deleted them)
+--   is_valid_repo_name(name)              -- the name rules above (migrations)
+--   repository_name_free(owner, name)     -- no repository and no unadopted storage of that name for the owner
+--                                            (a redirect does not block: taking the name removes it) (migrations)
+--   within_creation_limit(owner)          -- as defined above (migrations, organizations)
+--   merge_style_allowed(repository, style) -- the enabled pull_requests unit's pull_request_settings allow `style`
+--                                            (allow_merge, allow_rebase, allow_rebase_merge, allow_squash,
+--                                            allow_fast_forward_only, allow_manual_merge) (pulls)
+--   autodetects_manual_merge(repository)  -- that unit's pull_request_settings.autodetect_manual_merge (pulls)
+--   rebase_update_allowed(repository)     -- that unit's pull_request_settings.allow_rebase_update (pulls)
+--   The settings form's own check is merge_style_allowed(settings, style), the same test on the
+--   settings being saved.
+
+use "./accounts.allium" as accounts
+use "./organizations.allium" as organizations
+use "./access.allium" as access
+use "./code.allium" as code
+use "./pulls.allium" as pulls
+use "./releases.allium" as releases
+use "./keys.allium" as keys
+use "./administration.allium" as administration
+use "./migrations.allium" as migrations
+use "./discovery.allium" as discovery
+use "./moderation.allium" as moderation
+use "./wiki.allium" as wiki
+use "./packages.allium" as packages
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The instance's own queue workers. Git operations (fetching a pull mirror, pushing a push
+-- mirror, building a download archive, fsck, gc) run out of band; the worker reports back.
+-- from: services/mirror/queue.go:32
+external entity BackgroundWorker {
+    queue: String
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- Issue tracker settings (internal tracker).
+-- from: models/repo/repo_unit.go:118
+value IssuesSettings {
+    enable_time_tracker: Boolean
+    only_contributors_track_time: Boolean
+    enable_dependencies: Boolean
+}
+
+-- Pull request settings.
+-- from: models/repo/repo_unit.go:134
+value PullRequestSettings {
+    ignore_whitespace_conflicts: Boolean
+    allow_merge: Boolean
+    allow_rebase: Boolean
+    allow_rebase_merge: Boolean
+    allow_squash: Boolean
+    allow_fast_forward_only: Boolean
+    allow_manual_merge: Boolean
+    autodetect_manual_merge: Boolean
+    allow_rebase_update: Boolean
+    default_delete_branch_after_merge: Boolean
+    default_merge_style: pulls/MergeStyle
+    default_update_style: pulls/UpdateStyle
+    default_allow_maintainer_edit: Boolean
+}
+
+-- External issue tracker. `url_format` may contain {user}, {repo} and {index}
+-- (and {index} is replaced by the issue reference); `style` decides what counts as a reference.
+-- from: models/repo/repo_unit.go:101
+value ExternalTrackerSettings {
+    url: String
+    url_format: String?
+    style: ExternalTrackerStyle
+    regexp_pattern: String?
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Fixed shared vocabulary.
+-- from: models/unit/unit.go:20
+enum UnitKind {
+    code | issues | pull_requests | releases | wiki | external_wiki | external_tracker | projects | packages | actions
+}
+
+-- from: modules/git/object_format.go
+enum ObjectFormat { sha1 | sha256 }
+
+-- How commit signatures are trusted when shown (keys.allium evaluates; the choice is a repo setting).
+-- from: models/repo/repo.go:84
+
+-- from: services/repository/archiver/archiver.go:70
+enum ArchiveFormat { zip | tar_gz | bundle }
+
+-- from: modules/markup/html.go:37
+enum ExternalTrackerStyle { numeric | alphanumeric | regexp }
+
+-- Default state of the "private" checkbox on the create form.
+-- from: modules/setting/repository.go:17
+enum DefaultPrivacy { last | private | public }
+
+-- An explicit watch was chosen by the user; an automatic one was set by the system
+-- (new repository, push). An explicit choice is never overridden automatically.
+-- from: models/repo/watch.go:19
+enum WatchSource { explicit | automatic }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- from: models/repo/repo.go:133
+entity Repository {
+    -- Identity. Exactly one of owner_user / owner_org is set. The name is unique per owner,
+    -- case-insensitively, and may be renamed.
+    name: String
+    owner_user: accounts/User?
+    owner_org: organizations/Organization?
+    description: String                 -- at most 2048 characters
+    website: String                     -- at most 1024 characters, a valid URL or empty
+    original_url: String?               -- where it was imported from (migrations)
+
+    -- Flags
+    is_private: Boolean
+    is_archived: Boolean
+    archived_at: Timestamp?
+    is_mirror: Boolean
+    is_fork: Boolean
+    fork_of: Repository?
+    is_template: Boolean
+    generated_from: Repository?         -- the template it was generated from, if any
+    is_empty: Boolean                   -- no commits yet
+    is_fsck_enabled: Boolean            -- included in the scheduled git health check (site admin setting)
+    close_issues_via_commit_in_any_branch: Boolean
+
+    -- Git
+    default_branch: String
+    wiki_branch: String
+    object_format: ObjectFormat
+    trust_model: keys/TrustModel
+
+    -- Presentation
+    avatar: String?                     -- custom avatar image; null = instance fallback
+
+    -- Storage accounting
+    git_size: Integer                   -- bytes on disk of the git repository
+    lfs_size: Integer                   -- bytes of LFS objects referenced by this repository
+
+    status: ready | being_migrated | pending_transfer | broken
+
+    created_at: Timestamp
+    updated_at: Timestamp
+
+    -- Relationships
+    units: RepoUnit with repository = this
+    collaborations: Collaboration with repository = this
+    collaborator_invitations: CollaboratorInvitation with repository = this
+    stars: Star with repository = this
+    watches: Watch with repository = this
+    forks: Repository with fork_of = this
+    repo_topics: RepoTopic with repository = this
+    pending_transfer: RepoTransfer with repository = this
+    redirects: RepoRedirect with repository = this
+    mirror: Mirror with repository = this
+    push_mirrors: PushMirror with repository = this
+    archives: RepoArchive with repository = this
+    archive_download_counts: ArchiveDownloadCount with repository = this
+    flags: RepoFlag with repository = this
+    language_stats: LanguageStat with repository = this
+
+    -- Projections
+    enabled_units: units where enabled = true
+    active_watches: watches where is_watching = true
+    primary_language: language_stats where is_primary = true
+
+    -- Derived
+    -- The owning account, whichever kind it is (a user or an organisation).
+    owner: owner_user ?? owner_org
+    owner_name: owner.name
+    size: git_size + lfs_size
+    has_avatar: avatar != null
+    -- discovery's num_stars / num_forks / topics are star_count / fork_count / repo_topics.
+    star_count: stars.count
+    watcher_count: active_watches.count
+    fork_count: forks.count
+    owner_is_private: owner_user?.visibility = private or owner_org?.visibility = private
+    -- A fork is always at least as private as its base (base private, or base owner private).
+    effective_fork_privacy: is_private or owner_is_private
+    -- Pull requests can be enabled only on a repository that is neither a mirror nor empty.
+    can_enable_pulls: not is_mirror and not is_empty
+    -- Mirrors cannot get new branches or web edits.
+    can_create_branch: not is_mirror
+
+    transitions status {
+        being_migrated -> ready
+        ready -> pending_transfer
+        pending_transfer -> ready
+        ready -> broken
+        broken -> ready
+        terminal: broken
+    }
+
+    invariant OneOwner {
+        (owner_user != null and owner_org = null) or (owner_user = null and owner_org != null)
+    }
+
+    invariant ForkHasBase {
+        is_fork implies fork_of != null
+    }
+
+    invariant ArchivedHasTimestamp {
+        is_archived implies archived_at != null
+    }
+}
+
+-- A unit (feature area) of a repository. A unit that is globally disabled on the instance is
+-- treated as absent regardless of `enabled`. Each kind carries its own settings.
+-- from: models/repo/repo_unit.go:58
+entity RepoUnit {
+    repository: Repository
+    kind: UnitKind
+    enabled: Boolean
+
+    issues_settings: IssuesSettings?                  -- kind = issues
+    pull_request_settings: PullRequestSettings?       -- kind = pull_requests
+    external_tracker: ExternalTrackerSettings?        -- kind = external_tracker
+    external_wiki_url: String?                        -- kind = external_wiki
+    -- Per-unit defaults, set by a repository admin: the mode every non-restricted signed-in
+    -- user (none / read / write) and every anonymous visitor (none / read) gets on this unit
+    -- on top of what the repository's visibility already gives; they never lower it. On a
+    -- private repository they make individual units public (access derivation steps 1, 5, 6).
+    -- decided: access decisions 3 and 4 (public units of private repositories; per-unit
+    -- defaults generalised from the wiki-only "anyone may edit" to every unit)
+    everyone_access_mode: access/AccessMode
+    anonymous_access_mode: access/AccessMode
+    -- The former wiki-only "anyone may edit" option: every signed-in user may write.
+    everyone_can_write: everyone_access_mode = write
+
+    -- External units are read-only links; other units can be granted up to admin.
+    is_external: kind in { external_wiki, external_tracker }
+}
+
+-- A user given explicit access to a repository. Access mode is read, write or admin
+-- (owner is never granted this way). New collaborators start at write.
+-- from: models/repo/collaboration.go:20
+entity Collaboration {
+    repository: Repository
+    user: accounts/User
+    access_mode: access/AccessMode
+    created_at: Timestamp
+}
+
+-- An offer of explicit access awaiting the invitee's answer. The grant (a Collaboration)
+-- starts only when the invitee accepts; until then the invitee has no access through it.
+-- At most one per invitee per repository, and never for someone already a collaborator.
+-- decided: repositories decision 4 (invitation and acceptance; site admins may add directly).
+-- Modelled on the organisation team invite (models/organization/team_invite.go:22); Forgejo
+-- itself adds collaborators without consent.
+entity CollaboratorInvitation {
+    repository: Repository
+    invitee: accounts/User
+    inviter: accounts/User
+    access_mode: access/AccessMode        -- the mode the collaboration will start with (write)
+    created_at: Timestamp
+}
+
+-- from: models/repo/star.go:15
+entity Star {
+    user: accounts/User
+    repository: Repository
+    created_at: Timestamp
+}
+
+-- A user's subscription to a repository, per category.
+-- from: models/repo/watch.go:63
+entity Watch {
+    user: accounts/User
+    repository: Repository
+    source: WatchSource
+    watch_issues: Boolean
+    watch_pull_requests: Boolean
+    watch_releases: Boolean
+    created_at: Timestamp
+    updated_at: Timestamp
+
+    is_watching: watch_issues or watch_pull_requests or watch_releases
+    is_fully_watching: watch_issues and watch_pull_requests and watch_releases
+}
+
+-- A topic label shared across repositories.
+-- from: models/repo/topic.go:29
+entity Topic {
+    name: String
+    created_at: Timestamp
+    repo_topics: RepoTopic with topic = this
+    repo_count: repo_topics.count
+}
+
+-- from: models/repo/topic.go:38
+entity RepoTopic {
+    repository: Repository
+    topic: Topic
+}
+
+-- An ownership transfer awaiting the recipient's decision. At most one per repository; while it
+-- exists the repository is `pending_transfer`.
+-- from: models/repo_transfer.go:20
+entity RepoTransfer {
+    repository: Repository
+    doer: accounts/User
+    recipient_user: accounts/User?
+    recipient_org: organizations/Organization?
+    teams: Set<organizations/Team>       -- teams of recipient_org to receive the repository
+    created_at: Timestamp
+}
+
+-- An old (owner, name) that still resolves to a repository after a rename or transfer.
+-- Taking that name again (creating, renaming, transferring a repository to it) removes it.
+-- from: models/repo/redirect.go:37
+entity RepoRedirect {
+    owner_user: accounts/User?
+    owner_org: organizations/Organization?
+    name: String                          -- compared case-insensitively
+    repository: Repository
+}
+
+-- A pull mirror: the repository is periodically overwritten from a remote.
+-- Credentials are stored encrypted and are never shown back; the remote address shown is
+-- the sanitised (credential-free) form.
+-- from: models/repo/mirror.go:23
+entity Mirror {
+    repository: Repository
+    remote_address: String
+    has_credentials: Boolean
+    interval: Duration                    -- 0 = never synced automatically
+    enable_prune: Boolean                 -- remove local refs that disappeared remotely
+    lfs_enabled: Boolean
+    lfs_endpoint: String?
+    sync_state: idle | queued
+    last_synced_at: Timestamp?            -- last attempt (successful or not)
+    next_sync_at: Timestamp?              -- null when interval = 0 or while failing
+    -- Failure tracking. Consecutive failed fetches back off (mirror_retry_delay); after
+    -- config.mirror_failure_threshold of them the mirror is failing: shown to repository
+    -- admins with its last error and paused (no scheduled sync) until someone syncs it.
+    -- decided: repositories decision 5 (back-off and a failing state)
+    consecutive_failures: Integer         -- 0 after a successful fetch
+    last_error: String?                   -- reason of the last failed fetch; null after a success
+    health: healthy | failing
+
+    transitions sync_state {
+        idle -> queued
+        queued -> idle
+        terminal: idle
+    }
+
+    transitions health {
+        healthy -> failing
+        failing -> healthy
+        terminal: healthy
+    }
+}
+
+-- A push mirror: the repository (and its wiki) is pushed to a remote.
+-- from: models/repo/pushmirror.go:25
+entity PushMirror {
+    repository: Repository
+    remote_name: String                   -- generated, unique within the repository
+    remote_address: String                -- sanitised, credential-free
+    branch_filter: String?                -- comma-separated branch globs; empty = all branches and tags
+    uses_ssh: Boolean
+    public_key: String?                   -- shown to the admin to install on the remote when uses_ssh
+    sync_on_commit: Boolean
+    interval: Duration                    -- 0 = only on commit / on demand
+    sync_state: idle | queued
+    last_synced_at: Timestamp?
+    last_error: String?
+    next_sync_at: Timestamp?
+    created_at: Timestamp
+
+    transitions sync_state {
+        idle -> queued
+        queued -> idle
+        terminal: idle
+    }
+}
+
+-- A generated download archive of one commit in one format.
+-- from: models/repo/archiver.go:27
+entity RepoArchive {
+    repository: Repository
+    format: ArchiveFormat
+    commit_sha: String
+    state: generating | ready
+    created_at: Timestamp
+
+    transitions state {
+        generating -> ready
+        terminal: ready
+    }
+}
+
+-- How often the source archive of a release's tag was downloaded, per format.
+-- from: models/repo/archive_download_count.go:15
+entity ArchiveDownloadCount {
+    repository: Repository
+    release: releases/Release
+    format: ArchiveFormat
+    count: Integer
+}
+
+-- A site-admin label on a repository (only when flags are enabled on the instance).
+-- from: models/repo/repo_flags.go:15
+entity RepoFlag {
+    repository: Repository
+    name: String
+}
+
+-- Bytes of each detected language on the default branch. Languages under 0.1% of the total
+-- are folded into "other"; the largest non-"other" language is primary.
+-- from: models/repo/language_stats.go:20
+entity LanguageStat {
+    repository: Repository
+    language: String
+    size: Integer
+    is_primary: Boolean
+    commit_sha: String
+}
+
+-- A git repository found in storage under an owner's directory with no repository record.
+-- from: services/repository/adopt.go:245
+entity UnadoptedRepository {
+    owner_name: String
+    name: String
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [repository]
+    force_private: Boolean = false                       -- FORCE_PRIVATE: every new repository is private; only site admins may make one public
+    default_private: DefaultPrivacy = last               -- DEFAULT_PRIVATE: initial state of the private checkbox (last = owner's last choice)
+    default_push_create_private: Boolean = true          -- DEFAULT_PUSH_CREATE_PRIVATE
+    max_creation_limit: Integer = -1                     -- MAX_CREATION_LIMIT: default per-owner repository limit, -1 unlimited
+    enable_push_create_user: Boolean = false             -- ENABLE_PUSH_CREATE_USER
+    enable_push_create_org: Boolean = false              -- ENABLE_PUSH_CREATE_ORG
+    disabled_repo_units: Set<UnitKind> = {}              -- DISABLED_REPO_UNITS (+ packages/actions when those features are off)
+    default_repo_units: Set<UnitKind> = { code, issues, pull_requests, releases, wiki, projects, packages, actions }
+    default_fork_repo_units: Set<UnitKind> = { code, pull_requests }
+    default_mirror_repo_units: Set<UnitKind> = { code, issues, releases, wiki, projects, packages }
+    default_branch: String = "main"                      -- DEFAULT_BRANCH
+    default_object_format: ObjectFormat = sha1
+    disable_stars: Boolean = false                       -- DISABLE_STARS
+    disable_forks: Boolean = false                       -- DISABLE_FORKS
+    disable_migrations: Boolean = false                  -- DISABLE_MIGRATIONS (enforced by migrations)
+    allow_fork_without_maximum_limit: Boolean = true     -- ALLOW_FORK_WITHOUT_MAXIMUM_LIMIT: forks ignore the creation limit
+    allow_adoption_of_unadopted: Boolean = false         -- ALLOW_ADOPTION_OF_UNADOPTED_REPOSITORIES
+    allow_delete_of_unadopted: Boolean = false           -- ALLOW_DELETE_OF_UNADOPTED_REPOSITORIES
+    disable_download_source_archives: Boolean = false    -- DISABLE_DOWNLOAD_SOURCE_ARCHIVES
+    prefix_archive_files: Boolean = true                 -- PREFIX_ARCHIVE_FILES: archive entries live under "<repo>/"
+    default_close_issues_via_commits_in_any_branch: Boolean = false
+    enable_flags: Boolean = false                        -- ENABLE_FLAGS
+    settable_flags: Set<String> = {}                     -- SETTABLE_FLAGS
+    preferred_licenses: Set<String> = { "Apache-2.0", "MIT" }   -- listed first on the create form
+    default_trust_model: keys/TrustModel = collaborator       -- [repository.signing] DEFAULT_TRUST_MODEL
+    initial_commit_signing: Set<String> = { "always" }   -- [repository.signing] INITIAL_COMMIT (evaluated by keys)
+    -- [repository.pull-request]
+    default_merge_style: pulls/MergeStyle = merge        -- DEFAULT_MERGE_STYLE
+    default_update_style: pulls/UpdateStyle = merge      -- DEFAULT_UPDATE_STYLE
+    -- [service]
+    default_enable_timetracking: Boolean = true
+    default_allow_only_contributors_to_track_time: Boolean = true
+    default_enable_dependencies: Boolean = true
+    auto_watch_new_repos: Boolean = true                 -- AUTO_WATCH_NEW_REPOS
+    auto_watch_on_changes: Boolean = false               -- AUTO_WATCH_ON_CHANGES
+    -- [mirror]
+    mirror_enabled: Boolean = true                       -- ENABLED (false also disables new pull and push mirrors)
+    disable_new_pull_mirrors: Boolean = false            -- DISABLE_NEW_PULL
+    disable_new_push_mirrors: Boolean = false            -- DISABLE_NEW_PUSH
+    mirror_default_interval: Duration = 8.hours          -- DEFAULT_INTERVAL
+    mirror_min_interval: Duration = 10.minutes           -- MIN_INTERVAL (never below 1 minute)
+    -- Consecutive failed fetches after which a pull mirror is marked failing and paused.
+    -- Not in Forgejo (which retries every update run forever). decided: repositories decision 5
+    mirror_failure_threshold: Integer = 5                -- FAILURE_THRESHOLD
+    -- [lfs]
+    lfs_server_enabled: Boolean = false                  -- LFS_START_SERVER: mirrors may fetch LFS only when on
+    -- [git.timeout]
+    git_timeout_mirror: Duration = 300.seconds
+    git_timeout_gc: Duration = 60.seconds
+    git_timeout_default: Duration = 360.seconds
+    -- [picture] (repository avatars share the avatar limits)
+    avatar_max_file_size: Integer = 1048576
+    avatar_max_width: Integer = 4096
+    avatar_max_height: Integer = 4096
+    -- Limits users hit
+    max_repo_name_length: Integer = 100
+    max_description_length: Integer = 2048
+    max_website_length: Integer = 1024
+    max_topics: Integer = 25
+    max_topic_length: Integer = 35
+    -- [cron.*]
+    update_mirrors_schedule: Duration = 10.minutes       -- cron.update_mirrors SCHEDULE @every 10m (enabled)
+    update_mirrors_pull_limit: Integer = 50              -- PULL_LIMIT per run
+    update_mirrors_push_limit: Integer = 50              -- PUSH_LIMIT per run
+    repo_health_check_schedule: Duration = 24.hours      -- cron.repo_health_check @midnight (enabled)
+    archive_cleanup_older_than: Duration = 24.hours      -- cron.archive_cleanup OLDER_THAN (enabled, @midnight)
+    git_gc_schedule: Duration = 72.hours                 -- cron.git_gc_repos @every 72h
+    -- Whether each maintenance task is enabled (cron.<task> ENABLED).
+    update_mirrors_enabled: Boolean = true
+    archive_cleanup_enabled: Boolean = true
+}
+
+------------------------------------------------------------
+-- Rules: creation
+------------------------------------------------------------
+
+-- Creating a repository owned by the signed-in user (web /repo/create, API POST /user/repos).
+-- from: services/repository/create.go:200
+rule UserCreatesRepository {
+    when: UserCreatesRepository(user, name, description, is_private, is_template, auto_init, object_format, initial_content?, label_template?)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: user.is_active
+    requires: is_valid_repo_name(name)
+    requires: not exists Repository{owner_user: user, name: name}
+    requires: not exists UnadoptedRepository{owner_name: user.name, name: name}
+    requires: user.is_admin or within_creation_limit(user)
+    requires: within_repo_quota(user)
+    requires: label_template = null or label_template_exists(label_template)
+    requires: initial_content = null or initial_content_templates_exist(initial_content)
+    ensures: UserRepositoryCreationAccepted(doer: user, owner: user, name: name, description: description,
+        is_private: is_private, is_template: is_template, auto_init: auto_init, object_format: object_format,
+        initial_content: initial_content, label_template: label_template)
+    @guidance
+        -- With auto_init, the first commit (README.md from initial_content.readme_template,
+        -- .gitignore concatenated from the chosen templates each prefixed "# ---> <name>",
+        -- LICENSE filled with owner, e-mail, repository and year) is authored by the owner and
+        -- signed by the instance key when config.initial_commit_signing allows (keys.allium);
+        -- it lands on the requested default branch. Without auto_init the repository is empty.
+        -- API: when auto_init is set without a README template, the "Default" template is used;
+        -- an unknown README template is rejected.
+        -- Endpoints: GET/POST /repo/create; POST /api/v1/user/repos.
+}
+
+-- What creating a user-owned repository does, whoever asked: the signed-in owner (above) or
+-- a site admin creating it for them (below). `doer` is who asked; it is the doer who is
+-- auto-watched and reported as having created it.
+-- from: services/repository/create.go:200
+rule CreateUserOwnedRepository {
+    when: UserRepositoryCreationAccepted(doer, owner, name, description, is_private, is_template, auto_init, object_format, initial_content?, label_template?)
+    ensures:
+        let repo = Repository.created(
+            name: name,
+            owner_user: owner,
+            owner_org: null,
+            description: description,
+            website: "",
+            is_private: is_private or config.force_private,
+            is_archived: false,
+            is_mirror: false,
+            is_fork: false,
+            fork_of: null,
+            is_template: is_template,
+            generated_from: null,
+            is_empty: not auto_init,
+            is_fsck_enabled: true,
+            close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
+            default_branch: config.default_branch,
+            wiki_branch: config.default_branch,
+            object_format: object_format,
+            trust_model: instance_default,
+            avatar: null,
+            git_size: 0,
+            lfs_size: 0,
+            status: ready,
+            created_at: now,
+            updated_at: now
+        )
+        not exists RepoRedirect{owner_user: owner, name: name}
+        RepositoryProvisioned(repository: repo, doer: doer, unit_kinds: config.default_repo_units)
+        if label_template != null:
+            LabelTemplateApplied(repository: repo, template_name: label_template)
+}
+
+-- A site admin creates a repository for a user (API POST /admin/users/{username}/repos), with
+-- the instance defaults for everything but the name: no description, public (unless the
+-- instance forces private), not a template, not initialised, the default object format.
+-- A site admin is not held to the owner's creation limit.
+-- from: routers/api/v1/admin/repo.go:14
+rule SiteAdminCreatesRepositoryForUser {
+    when: administration/RepositoryCreationRequestedByAdmin(admin, user, name)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: admin.is_admin
+    requires: is_valid_repo_name(name)
+    requires: not exists Repository{owner_user: user, name: name}
+    requires: not exists UnadoptedRepository{owner_name: user.name, name: name}
+    requires: within_repo_quota(user)
+    ensures: UserRepositoryCreationAccepted(doer: admin, owner: user, name: name, description: "",
+        is_private: false, is_template: false, auto_init: false, object_format: config.default_object_format,
+        initial_content: null, label_template: null)
+}
+
+-- Creating a repository owned by an organisation (web /repo/create with an org owner,
+-- API POST /orgs/{org}/repos).
+-- from: routers/api/v1/repo/repo.go:509
+rule UserCreatesOrgRepository {
+    when: UserCreatesOrgRepository(user, org, name, description, is_private, is_template, auto_init, object_format, initial_content?, label_template?)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: user.is_active
+    requires: user.is_admin or can_create_in_org(user, org)
+    requires: is_valid_repo_name(name)
+    requires: not exists Repository{owner_org: org, name: name}
+    requires: not exists UnadoptedRepository{owner_name: org.name, name: name}
+    requires: user.is_admin or within_creation_limit(org)
+    requires: within_repo_quota(org)
+    requires: label_template = null or label_template_exists(label_template)
+    requires: initial_content = null or initial_content_templates_exist(initial_content)
+    ensures: OrgRepositoryCreationAccepted(doer: user, org: org, name: name, description: description,
+        is_private: is_private, is_template: is_template, auto_init: auto_init, object_format: object_format,
+        initial_content: initial_content, label_template: label_template)
+    @guidance
+        -- Teams of the organisation that include all repositories get the new repository
+        -- (organizations / access react to RepositoryCreated).
+}
+
+-- What creating an organisation-owned repository does, whoever asked: a member through the
+-- form or API (above) or packages' Cargo index (below). `doer` is the creator.
+-- from: routers/api/v1/repo/repo.go:509
+rule CreateOrgOwnedRepository {
+    when: OrgRepositoryCreationAccepted(doer, org, name, description, is_private, is_template, auto_init, object_format, initial_content?, label_template?)
+    ensures:
+        let repo = Repository.created(
+            name: name,
+            owner_user: null,
+            owner_org: org,
+            description: description,
+            website: "",
+            is_private: is_private or config.force_private,
+            is_archived: false,
+            is_mirror: false,
+            is_fork: false,
+            fork_of: null,
+            is_template: is_template,
+            generated_from: null,
+            is_empty: not auto_init,
+            is_fsck_enabled: true,
+            close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
+            default_branch: config.default_branch,
+            wiki_branch: config.default_branch,
+            object_format: object_format,
+            trust_model: instance_default,
+            avatar: null,
+            git_size: 0,
+            lfs_size: 0,
+            status: ready,
+            created_at: now,
+            updated_at: now
+        )
+        not exists RepoRedirect{owner_org: org, name: name}
+        RepositoryProvisioned(repository: repo, doer: doer, unit_kinds: config.default_repo_units)
+        OrgRepositoryCreatorGranted(repository: repo, doer: doer)
+        if label_template != null:
+            LabelTemplateApplied(repository: repo, template_name: label_template)
+}
+
+-- A Cargo registry's index lives in the owner's `_cargo-index` repository. Initialising
+-- the index creates it as an ordinary new repository (public unless the instance forces
+-- private, empty, the default units, created by the manager), or reuses one already there.
+rule CargoIndexGetsItsRepository {
+    when: packages/CargoIndexInitialized(manager, registry)
+    ensures:
+        if registry.owner_user != null and not exists Repository{owner_user: registry.owner_user, name: "_cargo-index"}:
+            UserRepositoryCreationAccepted(doer: manager, owner: registry.owner_user, name: "_cargo-index",
+                description: "", is_private: false, is_template: false, auto_init: false,
+                object_format: config.default_object_format, initial_content: null, label_template: null)
+    ensures:
+        if registry.owner_org != null and not exists Repository{owner_org: registry.owner_org, name: "_cargo-index"}:
+            OrgRepositoryCreationAccepted(doer: manager, org: registry.owner_org, name: "_cargo-index",
+                description: "", is_private: false, is_template: false, auto_init: false,
+                object_format: config.default_object_format, initial_content: null, label_template: null)
+}
+
+-- The creator of an organisation repository who is not already a repository admin through a
+-- team becomes an admin collaborator, so they can manage what they just made.
+-- from: modules/repository/create.go:140
+rule OrgRepositoryCreatorBecomesAdmin {
+    when: OrgRepositoryCreatorGranted(repository, doer)
+    requires: not is_repo_admin(doer, repository)
+    ensures: Collaboration.created(repository: repository, user: doer, access_mode: admin, created_at: now)
+}
+
+-- Shared provisioning of every new repository record: default units with their default
+-- settings (globally disabled kinds skipped; external units never defaulted), the creator
+-- remembered as last visibility choice (accounts), auto-watch, default webhooks (webhooks).
+-- from: modules/repository/create.go:71
+rule ProvisionRepository {
+    when: RepositoryProvisioned(repository, doer, unit_kinds)
+    ensures:
+        for kind in unit_kinds:
+            if kind not in config.disabled_repo_units and kind not in { external_wiki, external_tracker }:
+                RepoUnit.created(
+                    repository: repository,
+                    kind: kind,
+                    enabled: true,
+                    issues_settings: null,
+                    pull_request_settings: null,
+                    external_tracker: null,
+                    external_wiki_url: null,
+                    everyone_access_mode: none, anonymous_access_mode: none
+                )
+        if config.auto_watch_new_repos:
+            AutoWatchRequested(user: doer, repository: repository)
+        RepositoryCreated(repository: repository, doer: doer)
+    @guidance
+        -- Default issue settings: time tracker = config.default_enable_timetracking,
+        -- only contributors track time = config.default_allow_only_contributors_to_track_time,
+        -- dependencies = config.default_enable_dependencies.
+        -- Default pull request settings: every merge style allowed except manual merge,
+        -- default merge/update style from config, rebase update allowed, maintainers may edit.
+        -- The owner's "last repository visibility" (used when default_private = last) is
+        -- updated to this repository's privacy (accounts/User.last_repo_visibility).
+}
+
+-- Creating a repository by pushing to a name that does not exist yet (git over HTTP/SSH).
+-- code checks the transport, the namespace's push-to-create switch and that the pusher may
+-- create there (PushToCreateRequested); this module owns the record, its name rules, the
+-- creation limit and quota.
+-- from: services/repository/repository.go:70
+rule PushToCreateCreatesUserRepository {
+    when: code/PushToCreateRequested(pusher, owner_name, repository_name, is_private)
+    let owner = accounts/User{name: owner_name}
+    requires: exists owner
+    requires: config.enable_push_create_user
+    requires: pusher.is_admin or pusher = owner
+    requires: not (exists access/InstanceWriteGate{read_only: true})
+    requires: is_valid_repo_name(repository_name)
+    requires: not exists Repository{owner_user: owner, name: repository_name}
+    requires: not exists UnadoptedRepository{owner_name: owner_name, name: repository_name}
+    requires: pusher.is_admin or within_creation_limit(owner)
+    requires: within_repo_quota(owner)
+    ensures:
+        let repo = Repository.created(
+            name: repository_name, owner_user: owner, owner_org: null, description: "", website: "",
+            is_private: is_private or config.force_private,
+            is_archived: false, is_mirror: false, is_fork: false, fork_of: null,
+            is_template: false, generated_from: null, is_empty: true, is_fsck_enabled: true,
+            close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
+            default_branch: config.default_branch, wiki_branch: config.default_branch,
+            object_format: config.default_object_format, trust_model: instance_default, avatar: null,
+            git_size: 0, lfs_size: 0, status: ready, created_at: now, updated_at: now
+        )
+        not exists RepoRedirect{owner_user: owner, name: repository_name}
+        RepositoryProvisioned(repository: repo, doer: pusher, unit_kinds: config.default_repo_units)
+    @guidance
+        -- Deploy keys never push-create (code refuses). The push then proceeds against the
+        -- new empty repository.
+}
+
+-- from: routers/private/serv.go:375
+rule PushToCreateCreatesOrgRepository {
+    when: code/PushToCreateRequested(pusher, owner_name, repository_name, is_private)
+    let org = organizations/Organization{name: owner_name}
+    requires: exists org
+    requires: config.enable_push_create_org
+    requires: pusher.is_admin or can_create_in_org(pusher, org)
+    requires: not (exists access/InstanceWriteGate{read_only: true})
+    requires: is_valid_repo_name(repository_name)
+    requires: not exists Repository{owner_org: org, name: repository_name}
+    requires: not exists UnadoptedRepository{owner_name: owner_name, name: repository_name}
+    requires: pusher.is_admin or within_creation_limit(org)
+    requires: within_repo_quota(org)
+    ensures:
+        let repo = Repository.created(
+            name: repository_name, owner_user: null, owner_org: org, description: "", website: "",
+            is_private: is_private or config.force_private,
+            is_archived: false, is_mirror: false, is_fork: false, fork_of: null,
+            is_template: false, generated_from: null, is_empty: true, is_fsck_enabled: true,
+            close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
+            default_branch: config.default_branch, wiki_branch: config.default_branch,
+            object_format: config.default_object_format, trust_model: instance_default, avatar: null,
+            git_size: 0, lfs_size: 0, status: ready, created_at: now, updated_at: now
+        )
+        not exists RepoRedirect{owner_org: org, name: repository_name}
+        RepositoryProvisioned(repository: repo, doer: pusher, unit_kinds: config.default_repo_units)
+        OrgRepositoryCreatorGranted(repository: repo, doer: pusher)
+}
+
+------------------------------------------------------------
+-- Rules: generation from a template
+------------------------------------------------------------
+
+-- Generating a new repository from a template (web create form with a template selected,
+-- API POST /repos/{owner}/{repo}/generate). At least one item must be chosen.
+-- from: services/repository/template.go:65
+rule UserGeneratesRepositoryFromTemplate {
+    when: UserGeneratesRepository(user, template, name, description, is_private, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: template.is_template
+    requires: can_read_code(user, template)
+    requires: git_content or topics or git_hooks or webhooks or avatar or labels or protected_branches
+    requires: is_valid_repo_name(name)
+    requires: not exists Repository{owner_user: user, name: name}
+    requires: not exists UnadoptedRepository{owner_name: user.name, name: name}
+    requires: user.is_admin or within_creation_limit(user)
+    requires: within_repo_quota(user)
+    ensures:
+        let repo = Repository.created(
+            name: name, owner_user: user, owner_org: null, description: description, website: "",
+            is_private: is_private or config.force_private,
+            is_archived: false, is_mirror: false, is_fork: false, fork_of: null,
+            is_template: false, generated_from: template,
+            is_empty: not git_content or template.is_empty,
+            is_fsck_enabled: template.is_fsck_enabled,
+            close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
+            default_branch: template.default_branch, wiki_branch: config.default_branch,
+            object_format: template.object_format, trust_model: template.trust_model,
+            avatar: if avatar: template.avatar else: null,
+            git_size: 0, lfs_size: 0, status: ready, created_at: now, updated_at: now
+        )
+        RepositoryProvisioned(repository: repo, doer: user, unit_kinds: config.default_repo_units)
+        TemplateItemsCopied(template: template, repository: repo, doer: user, git_content: git_content, topics: topics, git_hooks: git_hooks, webhooks: webhooks, avatar: avatar, labels: labels, protected_branches: protected_branches)
+    @guidance
+        -- Git content: the template's default branch tree becomes one fresh commit (history is
+        -- not copied). A `.forgejo/template` (or `.gitea/template`) file lists globs of paths in
+        -- which variables are expanded in file contents and file names, then is removed:
+        -- $REPO_NAME $REPO_OWNER $REPO_DESCRIPTION $REPO_LINK $REPO_HTTPS_URL $REPO_SSH_URL,
+        -- the TEMPLATE_* equivalents, $YEAR $MONTH $MONTH_ENGLISH $DAY, each name with
+        -- _SNAKE _KEBAB _CAMEL _PASCAL _LOWER _UPPER _TITLE variants where meaningful.
+        -- Git hooks are copied only for doers allowed to edit git hooks (code.allium).
+}
+
+-- from: routers/api/v1/repo/repo.go:344
+rule UserGeneratesOrgRepositoryFromTemplate {
+    when: UserGeneratesOrgRepository(user, org, template, name, description, is_private, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: template.is_template
+    requires: can_read_code(user, template)
+    requires: git_content or topics or git_hooks or webhooks or avatar or labels or protected_branches
+    requires: user.is_admin or can_create_in_org(user, org)
+    requires: is_valid_repo_name(name)
+    requires: not exists Repository{owner_org: org, name: name}
+    requires: not exists UnadoptedRepository{owner_name: org.name, name: name}
+    requires: user.is_admin or within_creation_limit(org)
+    requires: within_repo_quota(org)
+    ensures:
+        let repo = Repository.created(
+            name: name, owner_user: null, owner_org: org, description: description, website: "",
+            is_private: is_private or config.force_private,
+            is_archived: false, is_mirror: false, is_fork: false, fork_of: null,
+            is_template: false, generated_from: template,
+            is_empty: not git_content or template.is_empty,
+            is_fsck_enabled: template.is_fsck_enabled,
+            close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
+            default_branch: template.default_branch, wiki_branch: config.default_branch,
+            object_format: template.object_format, trust_model: template.trust_model,
+            avatar: if avatar: template.avatar else: null,
+            git_size: 0, lfs_size: 0, status: ready, created_at: now, updated_at: now
+        )
+        RepositoryProvisioned(repository: repo, doer: user, unit_kinds: config.default_repo_units)
+        OrgRepositoryCreatorGranted(repository: repo, doer: user)
+        TemplateItemsCopied(template: template, repository: repo, doer: user, git_content: git_content, topics: topics, git_hooks: git_hooks, webhooks: webhooks, avatar: avatar, labels: labels, protected_branches: protected_branches)
+}
+
+-- The items this module owns (topics) are copied here; the rest are announced.
+-- from: models/repo/topic.go:324
+rule CopyTemplateItems {
+    when: TemplateItemsCopied(template, repository, doer, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches)
+    ensures:
+        if topics:
+            for rt in template.repo_topics:
+                RepoTopic.created(repository: repository, topic: rt.topic)
+        RepositoryGeneratedFromTemplate(template: template, repository: repository, doer: doer, git_content: git_content, topics: topics, git_hooks: git_hooks, webhooks: webhooks, avatar: avatar, labels: labels, protected_branches: protected_branches)
+}
+
+------------------------------------------------------------
+-- Rules: forks
+------------------------------------------------------------
+
+-- Forking into the user's own namespace (web /{owner}/{repo}/fork, API POST .../forks).
+-- An owner can hold one fork per fork network: forking is refused when the target owner
+-- owns the source or any repository it descends from, or already has a fork of the source.
+-- A fork stays its owner's when the owner later loses access to the base: it is kept, stays
+-- as private as it was and stays linked to the base (nothing here reacts to lost access).
+-- decided: repositories decision 9 (forks are kept, like Forgejo)
+-- from: services/repository/fork.go:55
+rule UserForksRepository {
+    when: UserForksRepository(user, source, name, description, single_branch?)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: not config.disable_forks
+    requires: can_read_code(user, source)
+    requires: not source.is_empty
+    requires: source.status = ready
+    requires: source.owner_user != user
+    requires: not exists Repository{fork_of: source, owner_user: user}
+    requires: not in_fork_network_of(user, source)
+    requires: is_valid_repo_name(name)
+    requires: not exists Repository{owner_user: user, name: name}
+    requires: user.is_admin or config.allow_fork_without_maximum_limit or within_creation_limit(user)
+    requires: within_repo_quota(user)
+    ensures:
+        let fork = Repository.created(
+            name: name, owner_user: user, owner_org: null, description: description, website: "",
+            is_private: source.effective_fork_privacy,
+            is_archived: false, is_mirror: false, is_fork: true, fork_of: source,
+            is_template: false, generated_from: null, is_empty: source.is_empty, is_fsck_enabled: true,
+            close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
+            default_branch: single_branch ?? source.default_branch, wiki_branch: config.default_branch,
+            object_format: source.object_format, trust_model: instance_default, avatar: null,
+            git_size: source.git_size, lfs_size: source.lfs_size, status: ready, created_at: now, updated_at: now
+        )
+        RepositoryProvisioned(repository: fork, doer: user, unit_kinds: config.default_fork_repo_units)
+        ForkContentCopied(source: source, fork: fork, doer: user)
+    @guidance
+        -- The fork gets the source's git content (all branches, or only `single_branch`), its
+        -- LFS objects, language statistics and releases synced from tags (code/releases react).
+        -- The web UI pre-selects the user if allowed, otherwise the first eligible organisation;
+        -- when there is an existing fork of the network, the UI redirects to it instead.
+}
+
+-- from: routers/web/repo/pull.go:240
+rule UserForksRepositoryIntoOrg {
+    when: UserForksRepositoryIntoOrg(user, source, org, name, description, single_branch?)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: not config.disable_forks
+    requires: can_read_code(user, source)
+    requires: not source.is_empty
+    requires: source.status = ready
+    requires: user.is_admin or can_create_in_org(user, org)
+    requires: source.owner_org != org
+    requires: not exists Repository{fork_of: source, owner_org: org}
+    requires: not in_fork_network_of(org, source)
+    requires: is_valid_repo_name(name)
+    requires: not exists Repository{owner_org: org, name: name}
+    requires: user.is_admin or config.allow_fork_without_maximum_limit or within_creation_limit(org)
+    requires: within_repo_quota(org)
+    ensures:
+        let fork = Repository.created(
+            name: name, owner_user: null, owner_org: org, description: description, website: "",
+            is_private: source.effective_fork_privacy,
+            is_archived: false, is_mirror: false, is_fork: true, fork_of: source,
+            is_template: false, generated_from: null, is_empty: source.is_empty, is_fsck_enabled: true,
+            close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
+            default_branch: single_branch ?? source.default_branch, wiki_branch: config.default_branch,
+            object_format: source.object_format, trust_model: instance_default, avatar: null,
+            git_size: source.git_size, lfs_size: source.lfs_size, status: ready, created_at: now, updated_at: now
+        )
+        RepositoryProvisioned(repository: fork, doer: user, unit_kinds: config.default_fork_repo_units)
+        OrgRepositoryCreatorGranted(repository: fork, doer: user)
+        ForkContentCopied(source: source, fork: fork, doer: user)
+}
+
+-- Language statistics are copied from the source so the fork shows them immediately.
+-- from: services/repository/fork.go:186
+rule ForkInheritsLanguageStats {
+    when: ForkContentCopied(source, fork, doer)
+    ensures:
+        for stat in source.language_stats:
+            LanguageStat.created(repository: fork, language: stat.language, size: stat.size, is_primary: stat.is_primary, commit_sha: stat.commit_sha)
+        RepositoryForked(source: source, fork: fork, doer: doer)
+}
+
+-- Turning a fork into an independent repository (owner only; counts against the creation limit).
+-- from: services/repository/fork.go:216
+rule OwnerDetachesFork {
+    when: OwnerDetachesFork(user, repository)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_owner(user, repository)
+    requires: repository.is_fork
+    requires: user.is_admin or within_creation_limit(repository.owner)
+    ensures: repository.is_fork = false
+    ensures: repository.fork_of = null
+    ensures: ForkDetached(repository: repository, doer: user)
+}
+
+-- Fast-forwarding a fork's branch to the same branch of its base ("sync fork").
+-- Only possible when the fork branch is an ancestor of the base branch.
+-- from: services/repository/sync_fork.go:20
+rule WriterSyncsForkBranch {
+    when: WriterSyncsForkBranch(user, repository, branch)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: repository.is_fork
+    requires: not repository.is_archived
+    requires: not repository.is_empty
+    requires: can_write_code(user, repository)
+    requires: fork_branch_can_fast_forward(repository, branch)
+    ensures: ForkBranchFastForwarded(repository: repository, base: repository.fork_of, branch: branch, doer: user)
+    @guidance
+        -- code.allium performs the push from the base branch into the fork branch; it is
+        -- reported as an ordinary push by `user` (code/PushReceived).
+}
+
+------------------------------------------------------------
+-- Rules: viewing
+------------------------------------------------------------
+
+-- Opening a repository's home page (other modules react: unread transfer-offer notifications
+-- for it are marked read).
+-- from: routers/web/repo/view_home.go
+rule UserViewsRepository {
+    when: UserViewsRepository(viewer, repository)
+    requires: can_see_repository(viewer, repository)
+    ensures: RepositoryViewed(viewer: viewer, repository: repository)
+}
+
+------------------------------------------------------------
+-- Rules: basic settings, rename, visibility
+------------------------------------------------------------
+
+-- Description, website and template flag (web settings "update", API PATCH /repos/{o}/{r}).
+-- from: routers/web/repo/setting/setting.go:325
+rule AdminUpdatesRepositoryProfile {
+    when: AdminUpdatesRepositoryProfile(user, repository, description, website, is_template)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: length(description) <= config.max_description_length
+    requires: length(website) <= config.max_website_length
+    ensures: repository.description = description
+    ensures: repository.website = website
+    ensures: repository.is_template = is_template
+    ensures: repository.updated_at = now
+    ensures: RepositoryProfileChanging(repository: repository, doer: user)
+}
+
+-- Renaming keeps the old name working through a redirect.
+-- from: services/repository/transfer.go:288
+rule AdminRenamesRepository {
+    when: AdminRenamesRepository(user, repository, new_name)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: new_name != repository.name
+    requires: is_valid_repo_name(new_name)
+    requires: repository_name_free(repository.owner, new_name)
+    let old_name = repository.name
+    ensures: repository.name = new_name
+    ensures: not exists RepoRedirect{owner_user: repository.owner_user, owner_org: repository.owner_org, name: new_name}
+    ensures: RepoRedirect.created(owner_user: repository.owner_user, owner_org: repository.owner_org, name: old_name, repository: repository)
+    ensures: RepositoryRenamed(repository: repository, doer: user, old_name: old_name)
+    ensures: RepositoryProfileChanging(repository: repository, doer: user)
+    @guidance
+        -- A change of letter case only is not a rename (no redirect). The wiki moves with the
+        -- repository. `repository_name_free` = no repository and no unadopted storage of that
+        -- name for the owner.
+}
+
+-- Changing visibility. A fork may always be made private; making a fork public is refused
+-- (with the reason shown) while its base is private or owned by a private account.
+-- With force_private, only site admins may make a repository public.
+-- decided: repositories decision 2 (refuse with a reason rather than silently forcing the
+-- fork back to its base's visibility, as Forgejo does); decision 3 (stars are no longer
+-- deleted here: only those of people who lose read access go, see UnstarOnLostAccess)
+-- from: routers/web/repo/setting/setting.go:376
+rule AdminChangesVisibility {
+    when: AdminChangesVisibility(user, repository, make_private)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: make_private != repository.is_private
+    requires: make_private or not repository.is_fork or not repository.fork_of.effective_fork_privacy
+    requires: make_private or not config.force_private or user.is_admin
+    ensures: repository.is_private = make_private
+    ensures:
+        if make_private:
+            for f in repository.forks:
+                BaseVisibilityChanged(fork: f, base_private: true, doer: user)
+    ensures: RepositoryVisibilityChanged(repository: repository, doer: user)
+    @guidance
+        -- Making a repository private marks its activity feed entries private (notifications
+        -- reacts) and recalculates access (access reacts); everyone who no longer has read
+        -- access loses their watch and star (UnwatchOnLostAccess, UnstarOnLostAccess).
+        -- The refusal for a fork names the private base it must stay as private as.
+}
+
+-- A fork becomes private when its base does, transitively. Making a base public leaves its
+-- forks as they are: a fork's owner may have made it private on purpose, and may now make
+-- it public. Each fork's visibility change is announced like its base's, so access, feeds and
+-- indexes follow it too.
+-- decided: repositories decision 2 (forks are at least as private as their base, but their
+-- owners choose otherwise) and 3 (stars kept for people who keep read access)
+-- from: modules/repository/create.go:292
+rule ForkFollowsBaseVisibility {
+    when: BaseVisibilityChanged(fork, base_private, doer)
+    requires: base_private
+    requires: not fork.is_private
+    ensures: fork.is_private = true
+    ensures:
+        for f in fork.forks:
+            BaseVisibilityChanged(fork: f, base_private: true, doer: doer)
+    ensures: RepositoryVisibilityChanged(repository: fork, doer: doer)
+}
+
+-- Trust model for showing commit signatures.
+-- from: routers/web/repo/setting/setting.go:752
+rule AdminSetsTrustModel {
+    when: AdminSetsTrustModel(user, repository, trust_model)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    ensures: repository.trust_model = trust_model
+}
+
+-- "Close issues via commit in any branch" toggle (units page).
+-- from: routers/web/repo/setting/setting.go:125
+rule AdminSetsCloseIssuesViaAnyBranch {
+    when: AdminSetsCloseIssuesViaAnyBranch(user, repository, enabled)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    ensures: repository.close_issues_via_commit_in_any_branch = enabled
+}
+
+-- Choosing the default branch is code's: code/AdminChangesDefaultBranch, which emits
+-- code/DefaultBranchChanged(repository, old_name, new_name, by).
+
+-- Site-admin only: include or exclude the repository from the scheduled git health check.
+-- from: routers/web/repo/setting/setting.go:771
+rule SiteAdminSetsHealthCheck {
+    when: SiteAdminSetsHealthCheck(admin, repository, enabled)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: admin.is_admin
+    ensures: repository.is_fsck_enabled = enabled
+}
+
+-- Site-admin flags (only when enabled, only from the settable list).
+-- from: routers/web/repo/flags/manage.go:41
+rule SiteAdminReplacesFlags {
+    when: SiteAdminReplacesFlags(admin, repository, names)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: admin.is_admin
+    requires: config.enable_flags
+    ensures:
+        for f in repository.flags:
+            not exists f
+        for n in names:
+            RepoFlag.created(repository: repository, name: n)
+    @guidance
+        -- API also offers add/remove/check of a single flag and delete-all
+        -- (/repos/{o}/{r}/flags[/{flag}], site admin with admin scope).
+}
+
+------------------------------------------------------------
+-- Rules: units and per-unit settings
+------------------------------------------------------------
+
+-- Enabling a simple unit (code, releases, projects, packages, actions) or turning a disabled
+-- unit back on. Globally disabled kinds cannot be enabled.
+-- from: services/repository/setting.go:18
+rule AdminEnablesUnit {
+    when: AdminEnablesUnit(user, repository, kind)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: kind not in config.disabled_repo_units
+    requires: kind in { code, releases, projects, packages, actions, pull_requests, issues, wiki }
+    requires: kind != pull_requests or repository.can_enable_pulls
+    let existing = RepoUnit{repository: repository, kind: kind}
+    ensures:
+        if exists existing:
+            existing.enabled = true
+        else:
+            RepoUnit.created(
+                repository: repository, kind: kind, enabled: true,
+                issues_settings: null, pull_request_settings: null, external_tracker: null,
+                external_wiki_url: null, everyone_access_mode: none, anonymous_access_mode: none
+            )
+        if kind = issues:
+            for u in repository.units:
+                if u.kind = external_tracker:
+                    u.enabled = false
+        if kind = wiki:
+            for u in repository.units:
+                if u.kind = external_wiki:
+                    u.enabled = false
+        RepoUnitEnabled(repository: repository, kind: kind)
+        RepositoryUnitsChanged(repository: repository, doer: user)
+    @guidance
+        -- Issues and external tracker are mutually exclusive, as are wiki and external wiki:
+        -- enabling one disables the other.
+}
+
+-- Disabling a unit. At least one unit must stay enabled.
+-- from: routers/web/repo/setting/setting.go:279
+rule AdminDisablesUnit {
+    when: AdminDisablesUnit(user, repository, unit)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: unit.repository = repository
+    requires: unit.enabled
+    requires: repository.enabled_units.count > 1
+    ensures: unit.enabled = false
+    ensures: RepoUnitDisabled(repository: repository, kind: unit.kind)
+    ensures: RepositoryUnitsChanged(repository: repository, doer: user)
+}
+
+-- Internal issue tracker settings.
+-- from: routers/web/repo/setting/setting.go:188
+rule AdminConfiguresIssueTracker {
+    when: AdminConfiguresIssueTracker(user, repository, unit, settings)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: unit.repository = repository
+    requires: is_repo_admin(user, unit.repository)
+    requires: unit.kind = issues
+    ensures: unit.issues_settings = settings
+}
+
+-- Pull request settings. The default merge style must be one of the allowed styles.
+-- from: routers/web/repo/setting/setting.go:252
+rule AdminConfiguresPullRequests {
+    when: AdminConfiguresPullRequests(user, repository, unit, settings)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: unit.repository = repository
+    requires: is_repo_admin(user, unit.repository)
+    requires: unit.kind = pull_requests
+    requires: merge_style_allowed(settings, settings.default_merge_style)
+    ensures: unit.pull_request_settings = settings
+}
+
+-- Switching to an external issue tracker (replaces the internal tracker).
+-- from: routers/web/repo/setting/setting.go:175
+rule AdminSetsExternalTracker {
+    when: AdminSetsExternalTracker(user, repository, settings)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: external_tracker not in config.disabled_repo_units
+    requires: is_valid_external_url(settings.url)
+    requires: settings.url_format = null or is_valid_tracker_url_format(settings.url_format)
+    requires: settings.style != regexp or settings.regexp_pattern != null
+    ensures:
+        for u in repository.units:
+            if u.kind = issues:
+                u.enabled = false
+        RepoUnit.created(
+            repository: repository, kind: external_tracker, enabled: true,
+            issues_settings: null, pull_request_settings: null, external_tracker: settings,
+            external_wiki_url: null, everyone_access_mode: none, anonymous_access_mode: none
+        )
+        RepositoryUnitsChanged(repository: repository, doer: user)
+}
+
+-- Switching to an external wiki (replaces the built-in wiki).
+-- from: routers/web/repo/setting/setting.go:141
+rule AdminSetsExternalWiki {
+    when: AdminSetsExternalWiki(user, repository, url)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: external_wiki not in config.disabled_repo_units
+    requires: is_valid_external_url(url)
+    ensures:
+        for u in repository.units:
+            if u.kind = wiki:
+                u.enabled = false
+        RepoUnit.created(
+            repository: repository, kind: external_wiki, enabled: true,
+            issues_settings: null, pull_request_settings: null, external_tracker: null,
+            external_wiki_url: url, everyone_access_mode: none, anonymous_access_mode: none
+        )
+        RepositoryUnitsChanged(repository: repository, doer: user)
+}
+
+-- Set a unit's default access for signed-in users and anonymous visitors. External units
+-- never exceed read. The wiki's "anyone may edit" option is everyone_mode = write.
+-- decided: access decisions 3 and 4: any unit, also on a private repository
+-- from: routers/web/repo/setting/setting.go:152
+rule AdminSetsUnitDefaultAccess {
+    when: AdminSetsUnitDefaultAccess(user, repository, unit, everyone_mode, anonymous_mode)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: unit.repository = repository
+    requires: is_repo_admin(user, unit.repository)
+    requires: everyone_mode in { none, read, write }
+    requires: anonymous_mode in { none, read }
+    requires: not unit.is_external or everyone_mode != write
+    ensures: unit.everyone_access_mode = everyone_mode
+    ensures: unit.anonymous_access_mode = anonymous_mode
+    ensures: RepositoryUnitsChanged(repository: repository, doer: user)
+}
+
+------------------------------------------------------------
+-- Rules: archive, delete
+------------------------------------------------------------
+
+-- Archiving makes the repository read-only. Mirrors cannot be archived. Any repository admin
+-- may archive, on every path (Forgejo's web settings ask for owner access, its API PATCH
+-- archived only for repository admin).
+-- decided: repositories decision 1 (any repository admin may archive or unarchive)
+-- from: routers/api/v1/repo/repo.go:1118
+rule AdminArchivesRepository {
+    when: AdminArchivesRepository(user, repository)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: not repository.is_mirror
+    requires: not repository.is_archived
+    ensures: repository.is_archived = true
+    ensures: repository.archived_at = now
+    ensures: RepositoryArchived(repository: repository, doer: user)
+    @guidance
+        -- While archived: no pushes, no new issues/PRs/comments/releases, no setting changes that
+        -- touch content (topics, protected branches, push-mirror settings), scheduled workflows
+        -- stop. Push mirrors still sync (AdminRequestsPushMirrorSync, ScheduledPushMirrorSync).
+        -- Each module enforces `not repository.is_archived` on its own writes.
+}
+
+-- decided: repositories decision 1 (any repository admin may archive or unarchive)
+-- from: routers/api/v1/repo/repo.go:1118
+rule AdminUnarchivesRepository {
+    when: AdminUnarchivesRepository(user, repository)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: not repository.is_mirror
+    requires: repository.is_archived
+    ensures: repository.is_archived = false
+    ensures: repository.archived_at = null
+    ensures: RepositoryUnarchived(repository: repository, doer: user)
+}
+
+-- Deleting a repository. Allowed for site admins, the owning user, and owners of the owning
+-- organisation. Everything scoped to the repository goes with it; forks become independent.
+-- from: services/repository/delete.go:52
+rule OwnerDeletesRepository {
+    when: OwnerDeletesRepository(user, repository)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: user.is_admin or repository.owner_user = user or (repository.owner_org != null and is_org_owner(repository.owner_org, user))
+    ensures: RepositoryDeletionAccepted(repository: repository, doer: user)
+    @guidance
+        -- Web requires typing the full name to confirm. Pull requests opened *from* this
+        -- repository's branches into other repositories are closed first (pulls reacts).
+        -- API: DELETE /repos/{o}/{r}; web: settings action "delete".
+}
+
+-- A site admin deletes a repository from the admin list (web /admin/repos, API as owner).
+-- from: routers/web/admin/repos.go:42
+rule SiteAdminDeletesRepository {
+    when: administration/RepositoryDeletionRequestedByAdmin(admin, repository)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: admin.is_admin
+    ensures: RepositoryDeletionAccepted(repository: repository, doer: admin)
+}
+
+-- A repository admin discarded a failed import: the half-made repository is deleted like
+-- any other (decided: requests 2).
+rule DeleteDiscardedImport {
+    when: migrations/FailedImportDiscarded(repository, doer)
+    requires: repository.status = being_migrated
+    ensures: RepositoryDeletionAccepted(repository: repository, doer: doer)
+}
+
+-- A site admin deletes a reported repository from the moderation queue.
+-- from: routers/web/admin/reports.go:349
+rule ModeratorDeletesRepository {
+    when: moderation/ModeratorDeletesRepository(admin, repository)
+    requires: admin.is_admin
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    ensures: RepositoryDeletionAccepted(repository: repository, doer: admin)
+}
+
+-- What deleting a repository does, whoever asked (`doer` is null when the system did): every
+-- record about it goes, forks become standalone, and every module holding repository-scoped
+-- data purges it on RepositoryDeleted.
+-- from: services/repository/delete.go:46
+rule DeleteRepositoryAndItsRecords {
+    when: RepositoryDeletionAccepted(repository, doer)
+    -- read before the record goes: listeners get the owner in the event
+    let owner_user = repository.owner_user
+    let owner_org = repository.owner_org
+    ensures:
+        for f in repository.forks:
+            f.is_fork = false
+            f.fork_of = null
+        for c in repository.collaborations:
+            not exists c
+        for ci in repository.collaborator_invitations:
+            not exists ci
+        for s in repository.stars:
+            not exists s
+        for w in repository.watches:
+            not exists w
+        for u in repository.units:
+            not exists u
+        for rt in repository.repo_topics:
+            not exists rt
+        for r in repository.redirects:
+            not exists r
+        for t in repository.pending_transfer:
+            not exists t
+        for m in repository.mirror:
+            not exists m
+        for pm in repository.push_mirrors:
+            not exists pm
+        for a in repository.archives:
+            not exists a
+        for dc in repository.archive_download_counts:
+            not exists dc
+        for f in repository.flags:
+            not exists f
+        for l in repository.language_stats:
+            not exists l
+        not exists repository
+        if owner_org != null:
+            OrgRepositoryDeparted(repository: repository, organization: owner_org)
+        RepositoryDeletionAnnounced(repository: repository, doer: doer, owner_user: owner_user, owner_org: owner_org)
+        RepositoryDeleted(repository: repository, doer: doer)
+    @guidance
+        -- The git data and the wiki's go with the record. Modules holding repository-scoped
+        -- records (including migrations' Migration, ExternalAuthorship and ExternalAssignee,
+        -- and moderation's reports) react to RepositoryDeleted by identity.
+}
+
+------------------------------------------------------------
+-- Rules: ownership transfer
+------------------------------------------------------------
+
+-- Transfer to a user. Completes immediately when a site admin does it or the doer is the
+-- recipient; otherwise the recipient must accept. A recipient without access is given read
+-- access meanwhile so they can look at what they are offered. The recipient's repository
+-- count limit is checked, as on creation, unless a site admin does it.
+-- decided: repositories decision 8 (transfers check the repository limit; site admins exempt)
+-- from: services/repository/transfer.go:364
+rule OwnerTransfersRepositoryToUser {
+    when: OwnerTransfersRepositoryToUser(user, repository, recipient)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_owner(user, repository)
+    requires: repository.status = ready
+    requires: recipient != repository.owner_user
+    requires: not is_blocked(recipient, user)
+    requires: repository_name_free(recipient, repository.name)
+    requires: within_repo_quota(recipient)
+    requires: user.is_admin or within_creation_limit(recipient)
+    let immediate = user.is_admin or user = recipient
+    ensures:
+        if immediate:
+            OwnershipMovesToUser(repository: repository, doer: user, recipient: recipient)
+        else:
+            repository.status = pending_transfer
+            let transfer = RepoTransfer.created(repository: repository, doer: user, recipient_user: recipient, recipient_org: null, teams: {}, created_at: now)
+            if not can_see_repository(recipient, repository):
+                Collaboration.created(repository: repository, user: recipient, access_mode: read, created_at: now)
+            RepositoryTransferRequested(repository: repository, doer: user, transfer: transfer)
+}
+
+-- Transfer to an organisation, optionally naming teams that receive the repository.
+-- Completes immediately when the doer is a site admin or may create repositories there; the
+-- organisation's owners are told of the arrival (notifications reacts to RepositoryTransferred,
+-- MailOnRepositoryArrived). A private organisation the doer is not a member of is treated as non-existent.
+-- decided: repositories decision 10 (immediate when the doer may create repositories there,
+-- like Forgejo; the org owners are notified); decision 8 (the organisation's repository limit
+-- is checked; site admins exempt)
+-- from: routers/api/v1/repo/transfer.go:60
+rule OwnerTransfersRepositoryToOrg {
+    when: OwnerTransfersRepositoryToOrg(user, repository, org, teams)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_owner(user, repository)
+    requires: repository.status = ready
+    requires: org != repository.owner_org
+    requires: user.is_admin or org.visibility != private or is_org_member(org, user)
+    requires: teams.all(t => t.organization = org)
+    requires: repository_name_free(org, repository.name)
+    requires: within_repo_quota(org)
+    requires: user.is_admin or within_creation_limit(org)
+    let immediate = user.is_admin or can_create_in_org(user, org)
+    ensures:
+        if immediate:
+            OwnershipMovesToOrg(repository: repository, doer: user, org: org, teams: teams)
+        else:
+            repository.status = pending_transfer
+            let transfer = RepoTransfer.created(repository: repository, doer: user, recipient_user: null, recipient_org: org, teams: teams, created_at: now)
+            RepositoryTransferRequested(repository: repository, doer: user, transfer: transfer)
+}
+
+-- The recipient accepts. Refused when the repository would take them past their repository
+-- limit (site admins are exempt).
+-- decided: repositories decision 8 (accepting checks the repository limit)
+-- from: routers/web/repo/repo.go:409
+rule RecipientAcceptsTransfer {
+    when: RecipientAcceptsTransfer(user, transfer)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: transfer.recipient_user = user
+    requires: within_repo_quota(user)
+    requires: user.is_admin or within_creation_limit(user)
+    ensures: OwnershipMovesToUser(repository: transfer.repository, doer: transfer.doer, recipient: user)
+}
+
+-- For an organisation, anyone allowed to create repositories in it accepts on its behalf,
+-- within the organisation's repository limit (site admins are exempt).
+-- decided: repositories decision 8 (accepting checks the repository limit)
+-- from: models/repo_transfer.go:73
+rule OrgMemberAcceptsTransfer {
+    when: OrgMemberAcceptsTransfer(user, transfer)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: transfer.recipient_org != null
+    requires: can_create_in_org(user, transfer.recipient_org)
+    requires: within_repo_quota(transfer.recipient_org)
+    requires: user.is_admin or within_creation_limit(transfer.recipient_org)
+    ensures: OwnershipMovesToOrg(repository: transfer.repository, doer: transfer.doer, org: transfer.recipient_org, teams: transfer.teams)
+}
+
+-- The recipient declines.
+-- from: routers/web/repo/repo.go:436
+rule RecipientRejectsTransfer {
+    when: RecipientRejectsTransfer(user, transfer)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: transfer.recipient_user = user
+    let repository = transfer.repository
+    requires: repository.status = pending_transfer
+    ensures: repository.status = ready
+    ensures: not exists transfer
+    ensures: RepositoryTransferRejected(repository: repository, doer: user)
+}
+
+-- An organisation member able to create repositories declines on its behalf.
+-- from: routers/api/v1/repo/transfer.go:188
+rule OrgMemberRejectsTransfer {
+    when: OrgMemberRejectsTransfer(user, transfer)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: transfer.recipient_org != null
+    requires: can_create_in_org(user, transfer.recipient_org)
+    let repository = transfer.repository
+    requires: repository.status = pending_transfer
+    ensures: repository.status = ready
+    ensures: not exists transfer
+    ensures: RepositoryTransferRejected(repository: repository, doer: user)
+}
+
+-- The current owner withdraws the offer.
+-- from: services/repository/transfer.go:417
+rule OwnerCancelsTransfer {
+    when: OwnerCancelsTransfer(user, repository, transfer)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: transfer.repository = repository
+    requires: is_repo_owner(user, repository)
+    requires: repository.status = pending_transfer
+    ensures: repository.status = ready
+    ensures: not exists transfer
+}
+
+-- Completing a transfer to a user.
+-- from: services/repository/transfer.go:68
+rule OwnershipMovesToUser {
+    when: OwnershipMovesToUser(repository, doer, recipient)
+    requires: repository.status in { ready, pending_transfer }
+    let old_user = repository.owner_user
+    let old_org = repository.owner_org
+    let old_owner_name = repository.owner_name
+    ensures: repository.owner_user = recipient
+    ensures: repository.owner_org = null
+    ensures: repository.status = ready
+    ensures: not exists RepoTransfer{repository: repository}
+    ensures:
+        for c in repository.collaborations:
+            if c.user = recipient:
+                not exists c
+    ensures:
+        for ci in repository.collaborator_invitations:
+            if ci.invitee = recipient:
+                not exists ci
+    ensures: not exists RepoRedirect{owner_user: recipient, name: repository.name}
+    ensures: RepoRedirect.created(owner_user: old_user, owner_org: old_org, name: repository.name, repository: repository)
+    ensures: WatchSelectionChosen(user: doer, repository: repository, issues: true, pull_requests: true, releases: true)
+    ensures:
+        if old_org != null:
+            OrgRepositoryDeparted(repository: repository, organization: old_org)
+    ensures: RepositoryProfileChanging(repository: repository, doer: doer)
+    ensures: RepositoryTransferred(repository: repository, doer: doer, old_owner_name: old_owner_name)
+    @guidance
+        -- The git data (and the wiki's) moves to the new owner's namespace with the record.
+}
+
+-- Completing a transfer to an organisation. Collaborators who are members of the
+-- organisation are dropped (their access now comes from teams); named teams get the repository.
+-- from: services/repository/transfer.go:32
+rule OwnershipMovesToOrg {
+    when: OwnershipMovesToOrg(repository, doer, org, teams)
+    requires: repository.status in { ready, pending_transfer }
+    let old_user = repository.owner_user
+    let old_org = repository.owner_org
+    let old_owner_name = repository.owner_name
+    ensures: repository.owner_user = null
+    ensures: repository.owner_org = org
+    ensures: repository.status = ready
+    ensures: not exists RepoTransfer{repository: repository}
+    ensures:
+        for c in repository.collaborations:
+            if is_org_member(org, c.user):
+                not exists c
+    ensures:
+        for ci in repository.collaborator_invitations:
+            if is_org_member(org, ci.invitee):
+                not exists ci
+    ensures: not exists RepoRedirect{owner_org: org, name: repository.name}
+    ensures: RepoRedirect.created(owner_user: old_user, owner_org: old_org, name: repository.name, repository: repository)
+    ensures: WatchSelectionChosen(user: doer, repository: repository, issues: true, pull_requests: true, releases: true)
+    ensures: TeamsReceiveTransferredRepository(repository: repository, teams: teams)
+    ensures:
+        if old_org != null:
+            OrgRepositoryDeparted(repository: repository, organization: old_org)
+    ensures: OrgRepositoryArrived(repository: repository)
+    ensures: RepositoryProfileChanging(repository: repository, doer: doer)
+    ensures: RepositoryTransferred(repository: repository, doer: doer, old_owner_name: old_owner_name)
+    @guidance
+        -- The git data (and the wiki's) moves to the new owner's namespace with the record.
+        -- organizations reacts to TeamsReceiveTransferredRepository (named teams) and to
+        -- RepositoryTransferred (teams including all repositories). When the old owner was an
+        -- organisation, issue labels and label events that referred to that organisation's
+        -- labels are removed (issues reacts).
+}
+
+------------------------------------------------------------
+-- Rules: collaborators
+------------------------------------------------------------
+
+-- Adding a collaborator (individual, active user) sends an invitation; access starts only
+-- when the invitee accepts, with write access. A site admin adds directly, without an
+-- invitation. Refused when either side blocks the other, (organisation repositories) when the
+-- user already owns the organisation, or when the user is already a collaborator or invited.
+-- decided: repositories decision 4 (invitation and acceptance; site admins add directly)
+-- from: routers/web/repo/setting/collaboration.go:52
+rule AdminInvitesCollaborator {
+    when: AdminInvitesCollaborator(user, repository, collaborator)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: collaborator.is_active
+    requires: collaborator != repository.owner_user
+    requires: not exists Collaboration{repository: repository, user: collaborator}
+    requires: not exists CollaboratorInvitation{repository: repository, invitee: collaborator}
+    requires: not is_blocked(repository.owner, collaborator)
+    requires: not is_blocked(collaborator, repository.owner)
+    requires: repository.owner_org = null or not is_org_owner(repository.owner_org, collaborator)
+    ensures:
+        if user.is_admin:
+            Collaboration.created(repository: repository, user: collaborator, access_mode: write, created_at: now)
+            CollaboratorAdded(repository: repository, user: collaborator, doer: user)
+            CollaboratorAddedDirectly(repository: repository, user: collaborator, doer: user)
+        else:
+            CollaboratorInvitation.created(repository: repository, invitee: collaborator, inviter: user, access_mode: write, created_at: now)
+            CollaboratorInvited(repository: repository, user: collaborator, doer: user)
+    @guidance
+        -- The invitee is mailed with links to accept or decline (notifications, MailOnCollaboratorInvited).
+        -- API PUT .../collaborators/{user} invites the same way; a permission passed there is
+        -- applied after acceptance (AdminChangesCollaboratorAccess).
+}
+
+-- The invitee accepts: the collaboration starts now. Blocks and the organisation-owner rule
+-- are checked again, since either may have changed while the invitation waited.
+-- decided: repositories decision 4 (access starts on acceptance; CollaboratorAdded is emitted
+-- here, naming the inviter as doer)
+rule InviteeAcceptsCollaboration {
+    when: InviteeAcceptsCollaboration(user, invitation)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: invitation.invitee = user
+    requires: user.is_active
+    let repository = invitation.repository
+    let access_mode = invitation.access_mode
+    let inviter = invitation.inviter
+    requires: not is_blocked(repository.owner, user)
+    requires: not is_blocked(user, repository.owner)
+    requires: repository.owner_org = null or not is_org_owner(repository.owner_org, user)
+    ensures: not exists invitation
+    ensures: Collaboration.created(repository: repository, user: user, access_mode: access_mode, created_at: now)
+    ensures: CollaboratorAdded(repository: repository, user: user, doer: inviter)
+}
+
+-- The invitee declines; nothing is granted.
+-- decided: repositories decision 4
+rule InviteeDeclinesCollaboration {
+    when: InviteeDeclinesCollaboration(user, invitation)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: invitation.invitee = user
+    let repository = invitation.repository
+    let inviter = invitation.inviter
+    ensures: not exists invitation
+    ensures: CollaboratorInvitationDeclined(repository: repository, user: user, doer: inviter)
+}
+
+-- A repository admin withdraws a pending invitation.
+-- decided: repositories decision 4
+rule AdminRevokesCollaboratorInvitation {
+    when: AdminRevokesCollaboratorInvitation(user, repository, invitation)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: invitation.repository = repository
+    requires: is_repo_admin(user, repository)
+    ensures: not exists invitation
+}
+
+-- from: modules/repository/collaborator.go:49
+rule AdminChangesCollaboratorAccess {
+    when: AdminChangesCollaboratorAccess(user, repository, collaboration, access_mode)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: collaboration.repository = repository
+    requires: is_repo_admin(user, collaboration.repository)
+    requires: access_mode in { read, write, admin }
+    requires: access_mode != collaboration.access_mode
+    ensures: collaboration.access_mode = access_mode
+    ensures: CollaboratorAccessChanged(repository: collaboration.repository, user: collaboration.user, doer: user)
+}
+
+-- Removing a collaborator also unsubscribes them from the repository.
+-- from: modules/repository/collaborator.go:89
+rule AdminRemovesCollaborator {
+    when: AdminRemovesCollaborator(user, repository, collaboration)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: collaboration.repository = repository
+    requires: is_repo_admin(user, collaboration.repository)
+    let removed = collaboration.user
+    ensures: not exists collaboration
+    ensures: WatchSelectionChosen(user: removed, repository: repository, issues: false, pull_requests: false, releases: false)
+    ensures: CollaboratorRemoved(repository: repository, user: removed, doer: user)
+}
+
+------------------------------------------------------------
+-- Rules: stars and watches
+------------------------------------------------------------
+
+-- from: models/repo/star.go:27
+rule UserStarsRepository {
+    when: UserStarsRepository(user, repository)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: not config.disable_stars
+    requires: can_see_repository(user, repository)
+    requires: not exists Star{user: user, repository: repository}
+    ensures: Star.created(user: user, repository: repository, created_at: now)
+    ensures: RepositoryStarred(user: user, repository: repository)
+}
+
+-- from: models/repo/star.go:49
+rule UserUnstarsRepository {
+    when: UserUnstarsRepository(user, star)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: star.user = user
+    let repository = star.repository
+    ensures: not exists star
+    ensures: RepositoryUnstarred(user: user, repository: repository)
+}
+
+-- Explicit watch with a per-category selection ("watch" = all three categories).
+-- from: routers/web/repo/repo.go:320
+rule UserWatchesRepository {
+    when: UserWatchesRepository(user, repository, issues, pull_requests, releases)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: can_see_repository(user, repository)
+    ensures: WatchSelectionChosen(user: user, repository: repository, issues: issues, pull_requests: pull_requests, releases: releases)
+}
+
+-- from: routers/web/web.go:1378
+rule UserUnwatchesRepository {
+    when: UserUnwatchesRepository(user, repository)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    ensures: WatchSelectionChosen(user: user, repository: repository, issues: false, pull_requests: false, releases: false)
+}
+
+-- Recording an explicit choice (also used by the system on transfer and collaborator removal).
+-- An explicit choice is remembered even when it is "nothing", so auto-watch never overrides it.
+-- from: models/repo/watch.go:173
+rule SetWatchSelection {
+    when: WatchSelectionChosen(user, repository, issues, pull_requests, releases)
+    let existing = Watch{user: user, repository: repository}
+    ensures:
+        if exists existing:
+            existing.source = explicit
+            existing.watch_issues = issues
+            existing.watch_pull_requests = pull_requests
+            existing.watch_releases = releases
+            existing.updated_at = now
+        else:
+            Watch.created(user: user, repository: repository, source: explicit, watch_issues: issues, watch_pull_requests: pull_requests, watch_releases: releases, created_at: now, updated_at: now)
+        WatchChanged(user: user, repository: repository)
+}
+
+-- A user who loses read access to the repository, for any reason, stops watching it: the
+-- watch becomes an explicit "nothing" choice, so a later push cannot auto-watch it back.
+-- decided: access decision 7: watches are cleared immediately on losing read access
+-- from: models/org_team.go:556
+rule UnwatchOnLostAccess {
+    when: access/UserLostRepositoryAccess(user, repository)
+    let existing = Watch{user: user, repository: repository}
+    requires: exists existing
+    requires: existing.is_watching
+    ensures: WatchSelectionChosen(user: user, repository: repository, issues: false, pull_requests: false, releases: false)
+}
+
+-- A user who loses read access to the repository, for any reason (including the repository
+-- going private), loses their star on it; stars of people who keep read access stay.
+-- decided: repositories decision 3 (stars of people who keep read access stay; consistent
+-- with clearing watches on lost access). Forgejo deletes every star on going private.
+-- from: modules/repository/create.go:262
+rule UnstarOnLostAccess {
+    when: access/UserLostRepositoryAccess(user, repository)
+    let star = Star{user: user, repository: repository}
+    requires: exists star
+    ensures: not exists star
+    ensures: RepositoryUnstarred(user: user, repository: repository)
+}
+
+-- Automatic watching: the creator of a new repository (auto_watch_new_repos) and a pusher
+-- (auto_watch_on_changes) start watching everything unless they made an explicit choice.
+-- from: models/repo/watch.go:260
+rule AutoWatch {
+    when: AutoWatchRequested(user, repository)
+    let existing = Watch{user: user, repository: repository}
+    requires: not exists existing or existing.source = automatic
+    ensures:
+        if exists existing:
+            existing.watch_issues = true
+            existing.watch_pull_requests = true
+            existing.watch_releases = true
+            existing.updated_at = now
+        else:
+            Watch.created(user: user, repository: repository, source: automatic, watch_issues: true, watch_pull_requests: true, watch_releases: true, created_at: now, updated_at: now)
+}
+
+-- A push may make the pusher an automatic watcher, refreshes the size and triggers
+-- push mirrors configured to sync on commit. A deploy-key push has no user pusher
+-- (push.pusher null, decided code 4), so nobody starts watching.
+-- from: services/repository/push.go:276
+rule PushTouchesRepository {
+    when: code/PushReceived(push)
+    let repository = push.repository
+    ensures:
+        if config.auto_watch_on_changes and push.pusher != null:
+            AutoWatchRequested(user: push.pusher, repository: repository)
+    ensures: repository.git_size = measured_git_size(repository)
+    ensures: repository.updated_at = now
+    ensures:
+        for pm in repository.push_mirrors:
+            if pm.sync_on_commit and pm.sync_state = idle:
+                pm.sync_state = queued
+                PushMirrorSyncDue(push_mirror: pm)
+}
+
+------------------------------------------------------------
+-- Rules: what other modules' events do to repositories
+------------------------------------------------------------
+
+-- A user blocks someone: on the repositories the blocker owns personally, the blocked user
+-- stops watching (an explicit "nothing", so no push watches it back), stops being a
+-- collaborator (and loses a pending invitation); and the transfers the blocked user offered
+-- the blocker, of any repository, are cancelled. Adding them as a collaborator or transferring to the blocker is refused
+-- from now on (AdminInvitesCollaborator, OwnerTransfersRepositoryToUser).
+-- from: services/user/block.go:21
+rule BlockedUserLeavesBlockersRepositories {
+    when: accounts/UserBlocked(blocker, blocked)
+    ensures:
+        for r in Repositories where owner_user = blocker:
+            for w in r.watches where user = blocked and is_watching:
+                WatchSelectionChosen(user: blocked, repository: r, issues: false, pull_requests: false, releases: false)
+            for c in r.collaborations where user = blocked:
+                not exists c
+                CollaboratorRemoved(repository: r, user: blocked, doer: blocker)
+            for ci in r.collaborator_invitations where invitee = blocked:
+                not exists ci
+    ensures:
+        for t in RepoTransfers where doer = blocked and recipient_user = blocker:
+            TransferWithdrawn(transfer: t)
+}
+
+-- The same when an organisation blocks someone, for the organisation's repositories.
+-- from: routers/web/org/setting/blocked_users.go:62 (BlockUser with the organisation as blocker)
+rule BlockedUserLeavesOrganizationRepositories {
+    when: accounts/OrganizationBlockedUser(organization, blocked)
+    ensures:
+        for r in Repositories where owner_org = organization:
+            for w in r.watches where user = blocked and is_watching:
+                WatchSelectionChosen(user: blocked, repository: r, issues: false, pull_requests: false, releases: false)
+            for c in r.collaborations where user = blocked:
+                not exists c
+                CollaboratorRemoved(repository: r, user: blocked, doer: null)
+            for ci in r.collaborator_invitations where invitee = blocked:
+                not exists ci
+    ensures:
+        for t in RepoTransfers where doer = blocked and recipient_org = organization:
+            TransferWithdrawn(transfer: t)
+}
+
+-- Purging an account deletes every repository it owns, with the usual cascade. A resumed
+-- purge emits UserPurged again and deletes only what is left, so the step is idempotent and
+-- owns_repositories(user) is false once it has run.
+-- from: services/user/user.go:244 (DeleteOwnerRepositoriesDirectly)
+rule DeleteRepositoriesOfPurgedUser {
+    when: accounts/UserPurged(user)
+    ensures:
+        for repository in Repositories where owner_user = user:
+            RepositoryDeletionAccepted(repository: repository, doer: null)
+}
+
+-- Purging an organisation deletes every repository it owns, before the organisation goes.
+-- from: services/org/org.go:43
+rule DeleteRepositoriesOfPurgedOrganization {
+    when: organizations/OrganizationPurgeStarted(organization)
+    ensures:
+        for repository in Repositories where owner_org = organization:
+            RepositoryDeletionAccepted(repository: repository, doer: null)
+}
+
+-- A deleted account leaves no stars, watches, collaborations, invitations (sent or
+-- received) or transfer offers behind. It owns no repository by now (accounts refuses the
+-- deletion otherwise, and a purge deleted them).
+-- from: services/user/delete.go:36
+rule ForgetDeletedUser {
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+    ensures:
+        for s in Stars where user = user:
+            not exists s
+        for w in Watches where user = user:
+            not exists w
+        for c in Collaborations where user = user:
+            not exists c
+        for ci in CollaboratorInvitations where invitee = user or inviter = user:
+            not exists ci
+        for t in RepoTransfers where doer = user or recipient_user = user:
+            TransferWithdrawn(transfer: t)
+}
+
+-- A pending transfer that can no longer stand (a block, a deleted account) is withdrawn:
+-- the repository is ready again.
+-- from: services/user/block.go:73
+rule WithdrawTransfer {
+    when: TransferWithdrawn(transfer)
+    let repository = transfer.repository
+    requires: repository.status = pending_transfer
+    ensures: repository.status = ready
+    ensures: not exists transfer
+}
+
+-- A repository joining a team is watched by the team's members, and a new team member
+-- watches the team's repositories, when new repositories are auto-watched; explicit choices
+-- are kept (AutoWatch). Losing read access through a team is handled by UnwatchOnLostAccess.
+-- from: models/org_team.go:54
+rule TeamMembersWatchAddedRepository {
+    when: organizations/TeamRepositoryAdded(team, repository)
+    requires: config.auto_watch_new_repos
+    ensures:
+        for m in team.memberships:
+            AutoWatchRequested(user: m.user, repository: repository)
+}
+
+-- from: models/org_team.go:443
+rule NewTeamMemberWatchesTeamRepositories {
+    when: organizations/TeamMemberAdded(team, user)
+    requires: config.auto_watch_new_repos
+    ensures:
+        for tr in team.repository_links:
+            AutoWatchRequested(user: user, repository: tr.repository)
+}
+
+-- Deleting the wiki's data switches the wiki unit off.
+-- from: services/wiki/wiki.go:381
+-- (The trigger's `wiki` parameter shadows the unit kind of the same name, so the wiki unit is
+-- picked out as the kind that is none of the others.)
+rule WikiUnitOffWhenWikiDeleted {
+    when: wiki/WikiDeleted(wiki, deleter)
+    let repository = wiki.repository
+    ensures:
+        for u in repository.units where enabled = true:
+            if u.kind not in { code, issues, pull_requests, releases, external_wiki, external_tracker, projects, packages, actions }:
+                u.enabled = false
+                RepoUnitDisabled(repository: repository, kind: u.kind)
+                RepositoryUnitsChanged(repository: repository, doer: deleter)
+}
+
+-- Deleting a tag drops the archive download counters of its release.
+-- from: models/repo/release.go:506
+rule DropArchiveCountsOfDeletedTag {
+    when: code/TagDeleted(repository, tag_name, by)
+    ensures:
+        for dc in repository.archive_download_counts where release.tag_name = tag_name:
+            not exists dc
+}
+
+------------------------------------------------------------
+-- Rules: topics
+------------------------------------------------------------
+
+-- Replacing the whole topic list. Topics are trimmed, lower-cased and de-duplicated; each
+-- must match the topic format and the list may hold at most 25.
+-- from: routers/web/repo/topic.go:18
+rule AdminReplacesTopics {
+    when: AdminReplacesTopics(user, repository, names)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: not repository.is_archived
+    requires: names.count <= config.max_topics
+    requires: all_valid_topics(names)
+    ensures:
+        for rt in repository.repo_topics:
+            not exists rt
+        for n in names:
+            let topic = Topic{name: n}
+            if exists topic:
+                RepoTopic.created(repository: repository, topic: topic)
+            else:
+                RepoTopic.created(repository: repository, topic: Topic.created(name: n, created_at: now))
+    ensures: RepositoryProfileChanging(repository: repository, doer: user)
+}
+
+-- Topics an import brought replace the repository's topics. migrations already dropped the
+-- invalid ones and kept at most config.max_topics.
+-- from: services/migrations/gitea_uploader.go:192
+rule ImportReplacesTopics {
+    when: migrations/TopicsImported(repository, topics)
+    requires: repository.status = being_migrated
+    ensures:
+        for rt in repository.repo_topics:
+            not exists rt
+        for n in topics:
+            let topic = Topic{name: n}
+            if exists topic:
+                RepoTopic.created(repository: repository, topic: topic)
+            else:
+                RepoTopic.created(repository: repository, topic: Topic.created(name: n, created_at: now))
+}
+
+-- Adding a single topic (API PUT /repos/{o}/{r}/topics/{topic}).
+-- from: routers/api/v1/repo/topic.go:134
+rule AdminAddsTopic {
+    when: AdminAddsTopic(user, repository, name)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: is_valid_topic(name)
+    requires: repository.repo_topics.count < config.max_topics
+    requires: not repository.repo_topics.any(rt => rt.topic.name = name)
+    let topic = Topic{name: name}
+    ensures:
+        if exists topic:
+            RepoTopic.created(repository: repository, topic: topic)
+        else:
+            RepoTopic.created(repository: repository, topic: Topic.created(name: name, created_at: now))
+    ensures: RepositoryProfileChanging(repository: repository, doer: user)
+}
+
+-- from: routers/api/v1/repo/topic.go:201
+rule AdminRemovesTopic {
+    when: AdminRemovesTopic(user, repository, repo_topic)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: repo_topic.repository = repository
+    requires: is_repo_admin(user, repo_topic.repository)
+    ensures: not exists repo_topic
+    ensures: RepositoryProfileChanging(repository: repository, doer: user)
+}
+
+------------------------------------------------------------
+-- Rules: avatar, size, language statistics
+------------------------------------------------------------
+
+-- from: services/repository/avatar.go:22
+rule AdminUploadsAvatar {
+    when: AdminUploadsAvatar(user, repository, image)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: is_valid_avatar_image(image)
+    ensures: repository.avatar = image
+    ensures: RepositoryProfileChanging(repository: repository, doer: user)
+}
+
+-- from: services/repository/avatar.go:62
+rule AdminRemovesAvatar {
+    when: AdminRemovesAvatar(user, repository)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: repository.avatar != null
+    ensures: repository.avatar = null
+    ensures: RepositoryProfileChanging(repository: repository, doer: user)
+}
+
+-- The stats indexer reports language sizes of the default branch head.
+-- from: models/repo/language_stats.go:152
+rule RecordLanguageStats {
+    when: discovery/LanguageStatsComputed(repository, commit_sha, sizes)
+    ensures:
+        for l in repository.language_stats:
+            not exists l
+        for entry in sizes:
+            LanguageStat.created(repository: repository, language: entry.language, size: entry.size, is_primary: entry.language = largest_language(sizes), commit_sha: commit_sha)
+    @guidance
+        -- Percentages shown are size / total; languages at or below 0.1% are grouped as "other",
+        -- and the top-N view groups the remainder as "other" too. Detection follows
+        -- linguist-style attributes (vendored, generated, documentation excluded).
+}
+
+------------------------------------------------------------
+-- Rules: unadopted repositories
+------------------------------------------------------------
+
+-- Adopting git storage that has no repository record. Site admins always; owners for their own
+-- namespace (or an organisation they can create in) when adoption is allowed by config.
+-- This module owns adopt and delete for users and admins alike; administration only lists
+-- the unadopted directories instance-wide (administration/UnadoptedRepositories).
+-- decided: administration 7 (repositories owns adopt and delete)
+-- from: services/repository/adopt.go:32
+rule UserAdoptsRepository {
+    when: UserAdoptsRepository(user, unadopted, owner)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    -- read before the unadopted record goes (postconditions see the resulting state)
+    let adopted_name = unadopted.name
+    requires: owner.name = unadopted.owner_name
+    requires: user.is_admin or (config.allow_adoption_of_unadopted and user = owner)
+    requires: user.is_admin or within_creation_limit(owner)
+    ensures:
+        let repo = Repository.created(
+            name: adopted_name, owner_user: owner, owner_org: null, description: "", website: "",
+            is_private: config.force_private or default_private_for(owner),
+            is_archived: false, is_mirror: false, is_fork: false, fork_of: null,
+            is_template: false, generated_from: null, is_empty: storage_is_empty(unadopted), is_fsck_enabled: true,
+            close_issues_via_commit_in_any_branch: config.default_close_issues_via_commits_in_any_branch,
+            default_branch: storage_head_branch(unadopted) ?? config.default_branch, wiki_branch: config.default_branch,
+            object_format: storage_object_format(unadopted), trust_model: instance_default, avatar: null,
+            git_size: 0, lfs_size: 0, status: ready, created_at: now, updated_at: now
+        )
+        not exists unadopted
+        RepositoryProvisioned(repository: repo, doer: user, unit_kinds: config.default_repo_units)
+        RepositoryAdopted(repository: repo, doer: user)
+    @guidance
+        -- Organisation namespaces work the same with can_create_in_org in place of user = owner.
+        -- Branches and releases are synchronised from the adopted git data (code/releases).
+        -- Endpoints: /user/settings/repos (own), /admin/repos/unadopted, API /admin/unadopted.
+}
+
+-- decided: administration 7 (repositories owns delete of unadopted storage, for owners and admins)
+-- from: services/repository/adopt.go:201
+rule UserDeletesUnadoptedRepository {
+    when: UserDeletesUnadoptedRepository(user, unadopted)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: user.is_admin or (config.allow_delete_of_unadopted and user.name = unadopted.owner_name)
+    ensures: not exists unadopted
+}
+
+------------------------------------------------------------
+-- Rules: import reservation (driven by migrations)
+------------------------------------------------------------
+
+-- migrations creates the being_migrated record itself, together with the Migration that
+-- imports into it (every route: web and API import, organisation import, archive restore),
+-- having checked the name, the creation limit and quota with this module's predicates. The
+-- record is provisioned here like any new repository: units (mirror imports get the mirror
+-- defaults), auto-watch and RepositoryCreated, and, in an organisation, an admin
+-- collaboration for the importer when no team gives them admin.
+-- from: modules/repository/create.go:75
+rule ProvisionMigratedRepository {
+    when: repo: Repository.created
+    requires: repo.status = being_migrated
+    let migration = migrations/Migration{repository: repo}
+    requires: exists migration
+    ensures: RepositoryProvisioned(repository: repo, doer: migration.doer, unit_kinds: if repo.is_mirror: config.default_mirror_repo_units else: config.default_repo_units)
+    ensures:
+        if repo.owner_org != null:
+            OrgRepositoryCreatorGranted(repository: repo, doer: migration.doer)
+}
+
+-- A retry first discards what the failed import brought. The record, its name, units,
+-- collaborators and watchers stay, and it stays being_migrated; what this module derived
+-- from the imported git data is reset. code, wiki, issues, pulls and releases wipe their own
+-- imported records, reacting to the same trigger.
+-- from: services/task/task.go:138
+rule ResetDiscardedImport {
+    when: migrations/MigratedContentDiscarded(repository)
+    requires: repository.status = being_migrated
+    ensures: repository.is_empty = true
+    ensures: repository.git_size = 0
+    ensures: repository.lfs_size = 0
+    ensures:
+        for l in repository.language_stats:
+            not exists l
+        for rt in repository.repo_topics:
+            not exists rt
+        for a in repository.archives:
+            not exists a
+}
+
+-- A failed import leaves the repository being_migrated (nothing here reacts to the failure),
+-- so the progress page, retry and discard keep working; discarding a failed import deletes
+-- the repository with the usual cascade.
+
+-- The import finished; a mirror import becomes a pull mirror on its schedule.
+-- from: services/repository/migrate.go
+rule ImportCompletes {
+    when: migrations/ImportCompleted(repository, remote_address, has_credentials, interval, lfs_enabled, lfs_endpoint)
+    requires: repository.status = being_migrated
+    requires: interval = 0.seconds or interval >= config.mirror_min_interval
+    ensures: repository.status = ready
+    ensures: repository.is_empty = false
+    ensures:
+        if repository.is_mirror:
+            Mirror.created(
+                repository: repository, remote_address: remote_address, has_credentials: has_credentials,
+                interval: interval, enable_prune: true, lfs_enabled: lfs_enabled and config.lfs_server_enabled,
+                lfs_endpoint: lfs_endpoint, sync_state: idle, last_synced_at: now,
+                next_sync_at: if interval = 0.seconds: null else: now + interval,
+                consecutive_failures: 0, last_error: null, health: healthy
+            )
+}
+
+-- Storage that cannot be opened marks the repository broken; it recovers when storage is back.
+-- from: models/repo/repo.go:290
+rule RepositoryStorageBreaks {
+    when: RepositoryStorageUnreadable(repository)
+    requires: repository.status = ready
+    ensures: repository.status = broken
+    ensures: repository.is_empty = true
+}
+
+-- from: services/repository/check.go:176
+rule RepositoryStorageRestored {
+    when: RepositoryStorageRestored(repository)
+    requires: repository.status = broken
+    ensures: repository.status = ready
+}
+
+------------------------------------------------------------
+-- Rules: pull mirrors
+------------------------------------------------------------
+
+-- Mirror settings: interval (0 or at least the minimum), prune, remote address and
+-- credentials (the address must pass the migration allow/block lists), LFS.
+-- from: routers/web/repo/setting/setting.go:431
+rule AdminConfiguresPullMirror {
+    when: AdminConfiguresPullMirror(user, repository, mirror, remote_address, has_credentials, interval, enable_prune, lfs_enabled, lfs_endpoint?)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: mirror.repository = repository
+    requires: is_repo_admin(user, repository)
+    requires: config.mirror_enabled
+    requires: repository.is_mirror
+    requires: not repository.is_archived
+    requires: interval = 0.seconds or interval >= config.mirror_min_interval
+    requires: is_allowed_remote(remote_address, user)
+    requires: lfs_endpoint = null or is_allowed_remote(lfs_endpoint, user)
+    ensures: mirror.interval = interval
+    ensures: mirror.enable_prune = enable_prune
+    ensures: mirror.remote_address = remote_address
+    ensures: mirror.has_credentials = has_credentials
+    ensures: mirror.lfs_enabled = lfs_enabled and config.lfs_server_enabled
+    ensures: mirror.lfs_endpoint = lfs_endpoint
+    ensures: mirror.next_sync_at = if interval = 0.seconds: null else: now + interval
+    @guidance
+        -- Leaving the password blank while keeping the same username keeps the stored password.
+        -- Supported remote schemes: http, https, git, ssh (credentials only over http/https);
+        -- local paths only for users allowed to import local paths.
+}
+
+-- "Synchronise now" (web settings, API POST /repos/{o}/{r}/mirror-sync). Code write access
+-- suffices on every path (Forgejo's web settings ask for repository admin). Syncing a failing
+-- mirror resumes it: it is healthy again until the failure threshold is reached once more
+-- (the failure count is kept until a fetch succeeds).
+-- decided: repositories decision 6 (code write, on every path); decision 5 (a failing mirror
+-- stays paused until someone syncs it)
+-- from: routers/api/v1/repo/mirror.go:30
+rule WriterRequestsMirrorSync {
+    when: WriterRequestsMirrorSync(user, mirror)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    let repository = mirror.repository
+    requires: can_write_code(user, repository)
+    requires: config.mirror_enabled
+    requires: repository.is_mirror
+    requires: not repository.is_archived
+    -- decided: quota 6 (a manual sync is gated like a push, on size:git:all)
+    requires: within_git_quota(repository.owner)
+    requires: mirror.sync_state = idle
+    ensures: mirror.sync_state = queued
+    ensures: mirror.health = healthy
+    ensures: MirrorSyncDue(mirror: mirror)
+}
+
+-- Scheduled sync (the update_mirrors task, every 10 minutes, at most 50 pull mirrors per run,
+-- least recently synced first). Skipped while the owner is over quota, and while the mirror
+-- is failing (decided: repositories decision 5).
+-- from: services/mirror/mirror.go:37
+rule ScheduledPullMirrorSync {
+    when: mirror: Mirror.next_sync_at <= now
+    requires: config.mirror_enabled
+    requires: config.update_mirrors_enabled
+    requires: mirror.sync_state = idle
+    requires: mirror.health = healthy
+    requires: mirror.interval > 0.seconds
+    requires: within_repo_quota(mirror.repository.owner)
+    ensures: mirror.sync_state = queued
+    ensures: MirrorSyncDue(mirror: mirror)
+}
+
+-- The worker fetched successfully: refs (and, if enabled, LFS objects and the wiki) now match
+-- the remote; tags became releases; the repository is no longer empty if anything arrived.
+-- from: services/mirror/mirror_pull.go:534
+rule PullMirrorSyncSucceeds {
+    when: PullMirrorFetchSucceeded(worker, mirror, received_any)
+    requires: mirror.sync_state = queued
+    ensures: mirror.sync_state = idle
+    ensures: mirror.last_synced_at = now
+    ensures: mirror.next_sync_at = if mirror.interval = 0.seconds: null else: now + mirror.interval
+    ensures: mirror.consecutive_failures = 0
+    ensures: mirror.last_error = null
+    ensures: mirror.health = healthy
+    ensures:
+        if received_any:
+            mirror.repository.is_empty = false
+    ensures: mirror.repository.updated_at = now
+    ensures: PullMirrorSynced(mirror: mirror)
+    @guidance
+        -- Each changed ref is reported to code.allium as a sync push / ref creation / ref
+        -- deletion by the repository owner (so feeds, webhooks and actions see mirror updates).
+        -- Broken references are pruned and the fetch retried once before giving up.
+        -- The remote address is re-checked against the allow/block lists before every fetch.
+        -- A fetch is bounded by config.git_timeout_mirror.
+}
+
+-- While fetching, the worker reports each ref that changed. Updated branches are announced
+-- like pushes by the repository owner (MirrorBranchUpdated, which code announces as
+-- CommitsPushed, so issues, pulls, webhooks and actions see them) and wake push mirrors that sync on commit.
+-- from: services/mirror/mirror_pull.go:595
+rule PullMirrorRefUpdated {
+    when: PullMirrorRefUpdated(worker, mirror, ref_name, old_sha, new_sha, commits)
+    requires: mirror.sync_state = queued
+    ensures: MirrorSyncPushed(repository: mirror.repository, ref_name: ref_name, commits: commits)
+    ensures:
+        if is_branch_ref(ref_name):
+            MirrorBranchUpdated(repository: mirror.repository, branch_name: branch_of_ref(ref_name),
+                pusher: mirror_pusher(mirror.repository), old_sha: old_sha, new_sha: new_sha,
+                is_force: is_force_update(mirror.repository, old_sha, new_sha))
+    ensures:
+        for pm in mirror.repository.push_mirrors:
+            if pm.sync_on_commit and pm.sync_state = idle:
+                pm.sync_state = queued
+                PushMirrorSyncDue(push_mirror: pm)
+}
+
+-- from: services/mirror/mirror_pull.go:605
+rule PullMirrorRefCreated {
+    when: PullMirrorRefCreated(worker, mirror, ref_name)
+    requires: mirror.sync_state = queued
+    ensures: MirrorRefCreated(repository: mirror.repository, ref_name: ref_name)
+}
+
+-- from: services/mirror/mirror_pull.go:611
+rule PullMirrorRefDeleted {
+    when: PullMirrorRefDeleted(worker, mirror, ref_name)
+    requires: mirror.sync_state = queued
+    ensures: MirrorRefDeleted(repository: mirror.repository, ref_name: ref_name)
+}
+
+-- A failed fetch is recorded and retried with exponential back-off: after the first failure
+-- at the next update run, then twice as long each time, never longer than the mirror's
+-- interval. After config.mirror_failure_threshold consecutive failures the mirror is failing:
+-- no further scheduled syncs until someone syncs it (WriterRequestsMirrorSync); repository
+-- admins see the state and the last error in the settings.
+-- decided: repositories decision 5 (back-off and a failing state). Forgejo retries every
+-- update run indefinitely.
+-- from: services/mirror/mirror_pull.go:562
+rule PullMirrorSyncFails {
+    when: PullMirrorFetchFailed(worker, mirror, reason)
+    requires: mirror.sync_state = queued
+    let failures = mirror.consecutive_failures + 1
+    ensures: mirror.sync_state = idle
+    ensures: mirror.last_synced_at = now
+    ensures: mirror.consecutive_failures = failures
+    ensures: mirror.last_error = reason
+    ensures:
+        if failures >= config.mirror_failure_threshold:
+            mirror.health = failing
+            mirror.next_sync_at = null
+        else:
+            mirror.next_sync_at = if mirror.interval = 0.seconds: null else: now + mirror_retry_delay(failures, mirror.interval)
+    ensures: PullMirrorSyncFailed(mirror: mirror, reason: reason)
+}
+
+-- Converting a pull mirror into an ordinary repository (owner only).
+-- from: services/repository/repository.go:123
+rule OwnerConvertsMirror {
+    when: OwnerConvertsMirror(user, repository, mirror)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: mirror.repository = repository
+    requires: is_repo_owner(user, repository)
+    requires: repository.is_mirror
+    ensures: repository.is_mirror = false
+    ensures: repository.original_url = null
+    ensures: not exists mirror
+    ensures: MirrorConvertedToRepository(repository: repository, doer: user)
+}
+
+------------------------------------------------------------
+-- Rules: push mirrors
+------------------------------------------------------------
+
+-- Adding a push mirror. SSH authentication (a key pair generated by the instance, whose public
+-- key is shown to install on the remote) excludes username/password.
+-- from: routers/web/repo/setting/setting.go:661
+rule AdminAddsPushMirror {
+    when: AdminAddsPushMirror(user, repository, remote_address, has_credentials, uses_ssh, interval, sync_on_commit, branch_filter?)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: is_repo_admin(user, repository)
+    requires: config.mirror_enabled
+    requires: not config.disable_new_push_mirrors
+    requires: not repository.is_archived
+    requires: interval = 0.seconds or interval >= config.mirror_min_interval
+    requires: not (uses_ssh and has_credentials)
+    requires: is_allowed_remote(remote_address, user)
+    ensures: PushMirror.created(
+        repository: repository,
+        remote_name: new_remote_name(repository),
+        remote_address: remote_address,
+        branch_filter: branch_filter,
+        uses_ssh: uses_ssh,
+        public_key: if uses_ssh: generated_public_key(repository) else: null,
+        sync_on_commit: sync_on_commit,
+        interval: interval,
+        sync_state: idle,
+        last_synced_at: null,
+        last_error: null,
+        next_sync_at: if interval = 0.seconds: null else: now,
+        created_at: now
+    )
+    @guidance
+        -- The private key is stored encrypted and never shown. The first scheduled push is due
+        -- immediately. API: POST /repos/{o}/{r}/push_mirrors.
+}
+
+-- from: routers/web/repo/setting/setting.go:580
+rule AdminUpdatesPushMirror {
+    when: AdminUpdatesPushMirror(user, repository, push_mirror, interval, branch_filter?)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: push_mirror.repository = repository
+    requires: is_repo_admin(user, repository)
+    requires: config.mirror_enabled
+    requires: not repository.is_archived
+    requires: interval = 0.seconds or interval >= config.mirror_min_interval
+    ensures: push_mirror.interval = interval
+    ensures: push_mirror.branch_filter = branch_filter
+    ensures: push_mirror.next_sync_at = if interval = 0.seconds: null else: now
+}
+
+-- from: routers/web/repo/setting/setting.go:632
+rule AdminRemovesPushMirror {
+    when: AdminRemovesPushMirror(user, repository, push_mirror)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: push_mirror.repository = repository
+    requires: is_repo_admin(user, push_mirror.repository)
+    requires: config.mirror_enabled
+    requires: not push_mirror.repository.is_archived
+    ensures: not exists push_mirror
+}
+
+-- "Synchronise now" for a push mirror. Allowed on an archived repository, on every path:
+-- pushing its unchanged content keeps backups current (Forgejo's API refuses it there, the
+-- web settings allow it).
+-- decided: repositories decision 7 (push-mirror sync allowed on archived repositories)
+-- from: routers/web/repo/setting/setting.go:563
+rule AdminRequestsPushMirrorSync {
+    when: AdminRequestsPushMirrorSync(user, repository, push_mirror)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode)
+    requires: push_mirror.repository = repository
+    requires: is_repo_admin(user, push_mirror.repository)
+    requires: config.mirror_enabled
+    requires: push_mirror.sync_state = idle
+    ensures: push_mirror.sync_state = queued
+    ensures: PushMirrorSyncDue(push_mirror: push_mirror)
+}
+
+-- Scheduled push (update_mirrors task), archived repositories included.
+-- decided: repositories decision 7 (push mirrors of archived repositories keep syncing;
+-- Forgejo skips them)
+-- from: models/repo/pushmirror.go:162
+rule ScheduledPushMirrorSync {
+    when: push_mirror: PushMirror.next_sync_at <= now
+    requires: config.mirror_enabled
+    requires: config.update_mirrors_enabled
+    requires: push_mirror.sync_state = idle
+    requires: push_mirror.interval > 0.seconds
+    ensures: push_mirror.sync_state = queued
+    ensures: PushMirrorSyncDue(push_mirror: push_mirror)
+}
+
+-- The update_mirrors task started by administration (cron or "run now"): queue every due
+-- pull mirror and push mirror exactly as the two scheduled rules above do.
+-- from: services/mirror/mirror.go:37
+rule AdministrationUpdatesMirrors {
+    when: administration/MirrorUpdateDue(pull_limit, push_limit)
+    requires: config.mirror_enabled
+    ensures:
+        for mirror in Mirrors where sync_state = idle and health = healthy and interval > 0.seconds and next_sync_at <= now:
+            if within_repo_quota(mirror.repository.owner):
+                mirror.sync_state = queued
+                MirrorSyncDue(mirror: mirror)
+    ensures:
+        for pm in PushMirrors where sync_state = idle and interval > 0.seconds and next_sync_at <= now:
+            pm.sync_state = queued
+            PushMirrorSyncDue(push_mirror: pm)
+    ensures: MirrorUpdateSweepFinished()   -- decided: requests 5 (the owner reports the run done)
+    @guidance
+        -- At most pull_limit pull mirrors and push_limit push mirrors are queued per run
+        -- (least recently synced first); the rest wait for the next run. A negative limit
+        -- means no limit.
+}
+
+-- When AdministrationUpdatesMirrors cannot do its work the run is still reported done, so it never
+-- stays running (decided: requests 5).
+rule AdministrationUpdatesMirrorsSkipped {
+    when: administration/MirrorUpdateDue(pull_limit, push_limit)
+    requires: not (config.mirror_enabled)
+    ensures: MirrorUpdateSweepFinished()
+}
+
+-- The worker pushed (branches/tags matching the filter, or everything with prune semantics,
+-- LFS objects when enabled, and the wiki if it exists).
+-- from: services/mirror/mirror_push.go:138
+rule PushMirrorSyncSucceeds {
+    when: PushMirrorPushSucceeded(worker, push_mirror)
+    requires: push_mirror.sync_state = queued
+    ensures: push_mirror.sync_state = idle
+    ensures: push_mirror.last_synced_at = now
+    ensures: push_mirror.last_error = null
+    ensures: push_mirror.next_sync_at = if push_mirror.interval = 0.seconds: null else: now + push_mirror.interval
+}
+
+-- from: services/mirror/mirror_push.go:165
+rule PushMirrorSyncFails {
+    when: PushMirrorPushFailed(worker, push_mirror, reason)
+    requires: push_mirror.sync_state = queued
+    ensures: push_mirror.sync_state = idle
+    ensures: push_mirror.last_synced_at = now
+    ensures: push_mirror.last_error = reason
+    ensures: push_mirror.next_sync_at = if push_mirror.interval = 0.seconds: null else: now + push_mirror.interval
+    ensures: PushMirrorSyncFailed(push_mirror: push_mirror, reason: reason)
+}
+
+------------------------------------------------------------
+-- Rules: download archives
+------------------------------------------------------------
+
+-- Requesting a source archive of a ref. An existing ready archive of the same commit and format
+-- is reused; otherwise one is generated in the background (the web UI polls; a direct download
+-- waits for it).
+-- from: routers/web/repo/repo.go:579
+rule ReaderRequestsArchive {
+    when: ReaderRequestsArchive(user, repository, ref, format)
+    requires: not config.disable_download_source_archives
+    requires: can_read_code(user, repository)
+    requires: not repository.is_empty
+    requires: resolve_commit(repository, ref) != null
+    let commit_sha = resolve_commit(repository, ref)
+    let existing = RepoArchive{repository: repository, format: format, commit_sha: commit_sha}
+    ensures:
+        if not exists existing:
+            let archive = RepoArchive.created(repository: repository, format: format, commit_sha: commit_sha, state: generating, created_at: now)
+            ArchiveGenerationRequested(archive: archive)
+    @guidance
+        -- File name: "<repo>-<ref with / replaced by ->.<zip|tar.gz|bundle>"; entries are
+        -- prefixed with "<repo>/" when config.prefix_archive_files. Downloads of a release tag's
+        -- archive are counted per release and format (ArchiveDownloadCount).
+        -- Endpoints: GET/POST /{o}/{r}/archive/{ref}.{ext}; API GET /repos/{o}/{r}/archive/{ref}.{ext}.
+}
+
+-- from: services/repository/archiver/archiver.go:182
+rule ArchiveGenerated {
+    when: ArchiveBuilt(worker, repo_archive)
+    requires: repo_archive.state = generating
+    ensures: repo_archive.state = ready
+}
+
+-- Downloading a ready archive. When the ref was a release's tag, the download is counted
+-- for that release and format.
+-- from: routers/web/repo/repo.go:527
+rule ReaderDownloadsArchive {
+    when: ReaderDownloadsArchive(user, repo_archive)
+    requires: repo_archive.state = ready
+    requires: can_read_code(user, repo_archive.repository)
+    ensures: ArchiveDownloaded(repository: repo_archive.repository, repo_archive: repo_archive)
+    @guidance
+        -- When storage can serve signed URLs directly, the reader is redirected to it.
+        -- A `Link: <...archive/<sha>.tar.gz?rev=<sha>>; rel="immutable"` header lets tarball
+        -- fetchers lock to the commit.
+}
+
+-- Downloading the source archive of a tag counts the download for that tag's release, found
+-- as releases/Release{repository, tag_name}.
+-- from: models/repo/archive_download_count.go:28
+rule ReaderDownloadsReleaseArchive {
+    when: ReaderDownloadsReleaseArchive(user, repo_archive, tag_name)
+    let repository = repo_archive.repository
+    let release = releases/Release{repository: repository, tag_name: tag_name}
+    requires: repo_archive.state = ready
+    requires: can_read_code(user, repository)
+    requires: exists release
+    let counter = ArchiveDownloadCount{repository: repository, release: release, format: repo_archive.format}
+    ensures:
+        if exists counter:
+            counter.count = counter.count + 1
+        else:
+            ArchiveDownloadCount.created(repository: repository, release: release, format: repo_archive.format, count: 1)
+    ensures: ArchiveDownloaded(repository: repository, repo_archive: repo_archive)
+}
+
+-- Generated archives are temporary: removed once older than the retention (archive_cleanup).
+-- from: services/repository/archiver/archiver.go:339
+rule ExpiredArchiveRemoved {
+    when: archive: RepoArchive.created_at + config.archive_cleanup_older_than <= now
+    requires: archive.state = ready
+    requires: config.archive_cleanup_enabled
+    ensures: not exists archive
+}
+
+-- The archive_cleanup task started by administration (cron or "run now"): the same removal
+-- as ExpiredArchiveRemoved, with the task's own threshold.
+-- from: services/repository/archiver/archiver.go:339
+rule AdministrationCleansUpArchives {
+    when: administration/RepositoryArchiveCleanupDue(older_than)
+    ensures:
+        for a in RepoArchives where state = ready and created_at + older_than <= now:
+            not exists a
+    ensures: ArchiveCleanupFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- Admin-triggered purge of all generated archives (delete_repo_archives, disabled by default).
+-- from: services/repository/archiver/archiver.go:370
+rule PurgeAllArchives {
+    when: administration/AllRepositoryArchivesDeletionDue()
+    ensures:
+        for a in RepoArchives:
+            not exists a
+    ensures: AllArchivesDeletionFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+------------------------------------------------------------
+-- Rules: maintenance tasks
+------------------------------------------------------------
+
+-- git fsck on every repository with health checks enabled (repo_health_check, daily).
+-- from: services/repository/check.go:24
+rule ScheduledHealthCheck {
+    when: administration/RepositoryHealthCheckDue(timeout, args)
+    ensures:
+        for repository in Repositories where is_fsck_enabled = true:
+            if not passes_fsck(repository):
+                RepositoryHealthCheckFailed(repository: repository, reason: fsck_report(repository))
+    ensures: HealthCheckSweepFinished()   -- decided: requests 5 (the owner reports the run done)
+    @guidance
+        -- `git fsck` runs with the task's args and is bounded by its timeout. One
+        -- RepositoryHealthCheckFailed per failing repository (administration records a notice).
+}
+
+-- git gc on every repository, then refresh its size (git_gc_repos, every 72h, off by default).
+-- from: services/repository/check.go:61
+rule ScheduledGarbageCollection {
+    when: administration/RepositoryGarbageCollectionDue(timeout, args)
+    ensures:
+        for repository in Repositories:
+            if gc_succeeds(repository):
+                repository.git_size = measured_git_size(repository)
+            else:
+                RepositoryGarbageCollectionFailed(repository: repository, reason: gc_report(repository))
+    ensures: GarbageCollectionSweepFinished()   -- decided: requests 5 (the owner reports the run done)
+    @guidance
+        -- `git gc` runs with the task's args and is bounded by its timeout. One
+        -- RepositoryGarbageCollectionFailed per failing repository (administration records a notice).
+}
+
+-- Records whose storage vanished are deleted (delete_missing_repos, off by default).
+-- from: services/repository/check.go:148
+rule DeleteRepositoriesMissingFromStorage {
+    when: administration/MissingRepositoryDeletionDue()
+    ensures:
+        for repository in Repositories where storage_missing(repository):
+            RepositoryDeletionRequested(repository: repository)
+    ensures: MissingRepositoryDeletionFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- The deletion cascade for a system-initiated delete (no doer).
+-- from: services/repository/check.go:160
+rule SystemDeletesRepository {
+    when: RepositoryDeletionRequested(repository)
+    ensures: RepositoryDeletionAccepted(repository: repository, doer: null)
+}
+
+-- Records whose storage vanished get a fresh empty git repository (reinit_missing_repos, off by default).
+-- from: services/repository/check.go:176
+rule ReinitialiseRepositoriesMissingFromStorage {
+    when: administration/MissingRepositoryReinitDue()
+    ensures:
+        for repository in Repositories where storage_missing(repository):
+            RepositoryStorageRecreated(repository: repository)
+    ensures: MissingRepositoryReinitFinished()   -- decided: requests 5 (the owner reports the run done)
+}
+
+-- check_repo_stats: repository counters (stars, watches, forks, issues, ...) are derived
+-- values here, so the repair task has nothing to correct.
+-- from: services/cron/tasks_basic.go:98
+rule AdministrationChecksRepositoryStats {
+    when: administration/RepositoryStatsCheckDue()
+    ensures: RepositoryStatsChecked()
+    ensures: RepositoryStatsCheckFinished()   -- decided: requests 5 (the owner reports the run done)
+    @guidance
+        -- Implementation workaround for denormalised counters; a rebuild that derives
+        -- counts has no work to do.
+}
+
+-- delete_generated_repository_avatars: repositories never get generated avatars here (the
+-- fallback image is a rendering concern), so there is nothing to delete.
+-- from: services/cron/tasks_extended.go:107
+rule AdministrationDeletesGeneratedAvatars {
+    when: administration/GeneratedRepositoryAvatarDeletionDue()
+    ensures: GeneratedAvatarDeletionFinished()   -- decided: requests 5 (the owner reports the run done)
+    ensures: GeneratedRepositoryAvatarsChecked()
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Repository names are unique per owner (case-insensitively; see guidance on rules).
+-- from: models/repo/repo.go:135
+invariant UniqueRepositoryNamePerOwner {
+    for a in Repositories:
+        for b in Repositories:
+            (a != b and a.owner_user = b.owner_user and a.owner_org = b.owner_org) implies a.name != b.name
+}
+
+-- One fork per owner of the same base.
+-- from: services/repository/fork.go:64
+invariant OneForkPerOwner {
+    for a in Repositories:
+        for b in Repositories:
+            (a != b and a.is_fork and b.is_fork and a.fork_of = b.fork_of) implies (a.owner_user != b.owner_user or a.owner_org != b.owner_org)
+}
+
+-- A fork is never more visible than its base.
+-- from: services/repository/fork.go:96
+invariant ForkNoMorePublicThanBase {
+    for r in Repositories:
+        (r.is_fork and r.fork_of.is_private) implies r.is_private
+}
+
+-- At most one pending transfer per repository, and only while the repository is pending.
+-- from: models/repo_transfer.go:133
+invariant PendingTransferMatchesStatus {
+    for t in RepoTransfers:
+        t.repository.status = pending_transfer
+}
+
+invariant OneStarPerUser {
+    for a in Stars:
+        for b in Stars:
+            (a != b and a.repository = b.repository) implies a.user != b.user
+}
+
+invariant OneWatchPerUser {
+    for a in Watches:
+        for b in Watches:
+            (a != b and a.repository = b.repository) implies a.user != b.user
+}
+
+-- One pending invitation per invitee per repository, and none for an existing collaborator.
+invariant OneInvitationPerUser {
+    for a in CollaboratorInvitations:
+        for b in CollaboratorInvitations:
+            (a != b and a.repository = b.repository) implies a.invitee != b.invitee
+}
+
+invariant InvitationOnlyForNonCollaborators {
+    for ci in CollaboratorInvitations:
+        not exists Collaboration{repository: ci.repository, user: ci.invitee}
+}
+
+invariant OneCollaborationPerUser {
+    for a in Collaborations:
+        for b in Collaborations:
+            (a != b and a.repository = b.repository) implies a.user != b.user
+}
+
+-- Collaborators are never granted owner access.
+invariant CollaboratorAccessBelowOwner {
+    for c in Collaborations:
+        c.access_mode in { read, write, admin }
+}
+
+-- Topic limits per repository.
+-- from: models/repo/topic.go:24
+invariant TopicCountLimit {
+    for r in Repositories:
+        r.repo_topics.count <= 25
+}
+
+-- One unit record per kind per repository; issues/external tracker and wiki/external wiki are
+-- never both enabled.
+-- from: models/unit/unit.go:178
+invariant ExclusiveUnits {
+    for r in Repositories:
+        not (r.enabled_units.any(u => u.kind = issues) and r.enabled_units.any(u => u.kind = external_tracker))
+        and not (r.enabled_units.any(u => u.kind = wiki) and r.enabled_units.any(u => u.kind = external_wiki))
+}
+
+-- A mirror belongs to a mirror repository; mirrors are never archived.
+invariant MirrorOnlyOnMirrorRepositories {
+    for m in Mirrors:
+        m.repository.is_mirror and not m.repository.is_archived
+}
+
+-- Mirror intervals respect the minimum.
+-- from: modules/setting/mirror.go:44
+invariant MirrorIntervalAboveMinimum {
+    for m in Mirrors:
+        m.interval = 0.seconds or m.interval >= 10.minutes
+}
+
+-- A failing pull mirror is paused: nothing schedules it until someone syncs it.
+-- decided: repositories decision 5
+invariant FailingMirrorIsPaused {
+    for m in Mirrors:
+        m.health = failing implies m.next_sync_at = null
+}
+
+invariant PushMirrorSshExcludesCredentials {
+    for pm in PushMirrors:
+        pm.uses_ssh implies pm.public_key != null
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Shared actors: access/SignedInUser (anyone signed in and allowed to log in; anonymous
+-- visitors are access/Visitor, and every read surface below is also offered to them when
+-- access allows reading), access/RepoAdmin (admin access to the repository: collaborator
+-- with admin, admin team, org owner, owning user, site admin), access/SiteAdmin, and
+-- code/GitClient (an authenticated git client pushing over HTTP or SSH).
+
+-- Someone with owner-level access to this repository (owning user, owner of the owning
+-- organisation, site admin) — needed for the danger zone.
+actor RepoOwner {
+    within: Repository
+    identified_by: accounts/User where is_repo_owner(this, within)
+}
+
+-- The instance's own background workers.
+actor Worker {
+    identified_by: BackgroundWorker where queue != ""
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- Creating repositories: blank, from a template, into the user's namespace or an organisation.
+-- Web: GET/POST /repo/create. API: POST /user/repos, POST /orgs/{org}/repos,
+-- POST /repos/{template_owner}/{template}/generate.
+surface RepositoryCreation {
+    facing creator: access/SignedInUser
+
+    let templates = Repositories where is_template = true
+
+    exposes:
+        for t in templates:
+            t.name
+            t.description
+
+    provides:
+        UserCreatesRepository(creator, name, description, is_private, is_template, auto_init, object_format, initial_content, label_template)
+        UserCreatesOrgRepository(creator, org, name, description, is_private, is_template, auto_init, object_format, initial_content, label_template)
+        UserGeneratesRepository(creator, template, name, description, is_private, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches)
+        UserGeneratesOrgRepository(creator, org, template, name, description, is_private, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches)
+
+    @guarantee CreationLimitShown
+        -- The form shows the creator's effective repository limit and refuses with the limit
+        -- in the message when reached; organisations listed are only those the creator may
+        -- create repositories in (and that are below their own limit).
+
+    @guidance
+        -- The private checkbox starts per config.default_private and is forced on (and
+        -- disabled) with config.force_private. Object format offers sha1 and sha256.
+        -- Label, .gitignore, license and README template lists come from the instance's
+        -- template sets; config.preferred_licenses are listed first.
+}
+
+-- The repository as any reader sees it (home page header, API GET /repos/{o}/{r},
+-- /repos/{o}/{r}/languages, /stargazers, /subscribers, /forks, /topics).
+surface RepositoryOverview {
+    facing viewer: access/SignedInUser
+    context repository: Repository
+
+    exposes:
+        repository.name
+        repository.description
+        repository.website
+        repository.is_private
+        repository.is_archived
+        repository.archived_at
+        repository.is_mirror
+        repository.is_fork
+        repository.fork_of.name
+        repository.is_template
+        repository.generated_from.name
+        repository.is_empty
+        repository.default_branch
+        repository.object_format
+        repository.avatar
+        repository.size
+        repository.git_size
+        repository.lfs_size
+        repository.star_count
+        repository.watcher_count
+        repository.fork_count
+        repository.status
+        repository.created_at
+        repository.updated_at
+        for rt in repository.repo_topics:
+            rt.topic.name
+        for stat in repository.language_stats:
+            stat.language
+            stat.size
+            stat.is_primary
+        for s in repository.stars:
+            s.user.name
+        for w in repository.active_watches:
+            w.user.name
+        for f in repository.forks:
+            f.name
+        for u in repository.enabled_units:
+            u.kind
+            u.external_wiki_url
+            u.external_tracker
+
+    provides:
+        UserViewsRepository(viewer, repository)
+        UserStarsRepository(viewer, repository)
+            when not config.disable_stars
+        UserWatchesRepository(viewer, repository, issues, pull_requests, releases)
+        UserUnwatchesRepository(viewer, repository)
+        UserForksRepository(viewer, repository, name, description, single_branch)
+            when not config.disable_forks and not repository.is_empty
+        UserForksRepositoryIntoOrg(viewer, repository, org, name, description, single_branch)
+            when not config.disable_forks and not repository.is_empty
+        ReaderRequestsArchive(viewer, repository, ref, format)
+            when not config.disable_download_source_archives and not repository.is_empty
+        ReaderDownloadsArchive(viewer, repo_archive)
+            when not config.disable_download_source_archives
+        ReaderDownloadsReleaseArchive(viewer, repo_archive, tag_name)
+            when not config.disable_download_source_archives
+        WriterSyncsForkBranch(viewer, repository, branch)
+            when repository.is_fork and not repository.is_archived
+        WriterRequestsMirrorSync(viewer, mirror)
+            when repository.is_mirror and not repository.is_archived
+
+    @guarantee OnlyReadersSeeIt
+        -- The surface exists for a viewer only when access allows reading the repository;
+        -- otherwise the repository is reported as not found (never as forbidden).
+
+    @guarantee MirrorAndForkProvenance
+        -- A mirror shows its sanitised remote address and last sync time; a fork links its base;
+        -- a generated repository links its template.
+
+    @guidance
+        -- A README / CITATION.cff / LICENSE in the default branch is rendered on the home page
+        -- (code.allium). Size shows git and LFS parts separately.
+}
+
+-- A user's own stars and watches (API /user/starred, /user/subscriptions, /users/{u}/starred).
+surface MyStarsAndWatches {
+    facing viewer: access/SignedInUser
+    context star: Star where user = viewer
+
+    exposes:
+        star.repository.name
+        star.created_at
+
+    provides:
+        UserUnstarsRepository(viewer, star)
+}
+
+-- Repository settings for repository administrators. Web /{o}/{r}/settings (options, units,
+-- collaboration, avatar, mirror sections), API PATCH /repos/{o}/{r}, /collaborators,
+-- /topics, /avatar, /push_mirrors, /push_mirrors-sync.
+surface RepositorySettings {
+    facing admin: access/RepoAdmin
+    context repository: Repository
+
+    exposes:
+        repository.name
+        repository.description
+        repository.website
+        repository.is_private
+        repository.is_template
+        repository.trust_model
+        repository.default_branch
+        repository.close_issues_via_commit_in_any_branch
+        repository.is_fsck_enabled
+        for u in repository.units:
+            u.kind
+            u.enabled
+            u.issues_settings
+            u.pull_request_settings
+            u.external_tracker
+            u.external_wiki_url
+            u.everyone_access_mode
+            u.anonymous_access_mode
+        repository.is_archived
+        for c in repository.collaborations:
+            c.user.name
+            c.access_mode
+        for ci in repository.collaborator_invitations:
+            ci.invitee.name
+            ci.inviter.name
+            ci.access_mode
+            ci.created_at
+        for m in repository.mirror:
+            m.remote_address
+            m.interval
+            m.enable_prune
+            m.lfs_enabled
+            m.lfs_endpoint
+            m.last_synced_at
+            m.next_sync_at
+            m.health
+            m.consecutive_failures
+            m.last_error
+        for pm in repository.push_mirrors:
+            pm.remote_address
+            pm.branch_filter
+            pm.uses_ssh
+            pm.public_key
+            pm.sync_on_commit
+            pm.interval
+            pm.last_synced_at
+            pm.last_error
+        for rt in repository.repo_topics:
+            rt.topic.name
+
+    provides:
+        AdminUpdatesRepositoryProfile(admin, repository, description, website, is_template)
+        AdminRenamesRepository(admin, repository, new_name)
+        AdminChangesVisibility(admin, repository, make_private)
+        AdminArchivesRepository(admin, repository)
+            when not repository.is_archived and not repository.is_mirror
+        AdminUnarchivesRepository(admin, repository)
+            when repository.is_archived
+        AdminSetsTrustModel(admin, repository, trust_model)
+        AdminSetsCloseIssuesViaAnyBranch(admin, repository, enabled)
+        AdminEnablesUnit(admin, repository, kind)
+        AdminDisablesUnit(admin, repository, unit)
+        AdminConfiguresIssueTracker(admin, repository, unit, settings)
+        AdminConfiguresPullRequests(admin, repository, unit, settings)
+        AdminSetsExternalTracker(admin, repository, settings)
+        AdminSetsExternalWiki(admin, repository, url)
+        AdminSetsUnitDefaultAccess(admin, repository, unit, everyone_mode, anonymous_mode)
+        AdminInvitesCollaborator(admin, repository, collaborator)
+        AdminRevokesCollaboratorInvitation(admin, repository, invitation)
+        AdminChangesCollaboratorAccess(admin, repository, collaboration, access_mode)
+        AdminRemovesCollaborator(admin, repository, collaboration)
+        AdminReplacesTopics(admin, repository, names)
+            when not repository.is_archived
+        AdminAddsTopic(admin, repository, name)
+        AdminRemovesTopic(admin, repository, repo_topic)
+        AdminUploadsAvatar(admin, repository, image)
+        AdminRemovesAvatar(admin, repository)
+        AdminConfiguresPullMirror(admin, repository, mirror, remote_address, has_credentials, interval, enable_prune, lfs_enabled, lfs_endpoint)
+            when repository.is_mirror and not repository.is_archived
+        AdminAddsPushMirror(admin, repository, remote_address, has_credentials, uses_ssh, interval, sync_on_commit, branch_filter)
+            when not repository.is_archived
+        AdminUpdatesPushMirror(admin, repository, push_mirror, interval, branch_filter)
+            when not repository.is_archived
+        AdminRemovesPushMirror(admin, repository, push_mirror)
+            when not repository.is_archived
+        AdminRequestsPushMirrorSync(admin, repository, push_mirror)
+
+    @guarantee FailingMirrorShown
+        -- A failing pull mirror is flagged to repository admins with its last error and the
+        -- number of consecutive failures, next to "Synchronise now" (decided: decision 5).
+
+    @guarantee CredentialsNeverShown
+        -- Mirror passwords and push-mirror private keys are write-only; addresses are shown
+        -- without credentials.
+
+    @guarantee NoUnitsLeftImpossible
+        -- Saving a units configuration with no unit enabled is refused.
+
+    @guidance
+        -- Team access (add/remove teams) on this page belongs to organizations.allium and is
+        -- only offered to repository admins when the organisation allows it, otherwise to owners.
+        -- Deploy keys, webhooks, git hooks, protected branches/tags, LFS, actions settings are
+        -- separate surfaces of their owning modules.
+}
+
+-- The danger zone: owner-level operations. Web /{o}/{r}/settings actions convert,
+-- convert_fork, transfer, cancel_transfer, delete, archive, unarchive; API POST
+-- /repos/{o}/{r}/transfer, /convert, DELETE /repos/{o}/{r}, PATCH archived.
+surface RepositoryDangerZone {
+    facing owner: RepoOwner
+    context repository: Repository
+
+    exposes:
+        repository.status
+        repository.is_archived
+        repository.is_mirror
+        repository.is_fork
+        for t in repository.pending_transfer:
+            t.recipient_user.name
+            t.recipient_org.name
+            t.created_at
+
+    provides:
+        OwnerTransfersRepositoryToUser(owner, repository, recipient)
+            when repository.status = ready
+        OwnerTransfersRepositoryToOrg(owner, repository, org, teams)
+            when repository.status = ready
+        OwnerCancelsTransfer(owner, repository, transfer)
+            when repository.status = pending_transfer
+        OwnerConvertsMirror(owner, repository, mirror)
+            when repository.is_mirror
+        OwnerDetachesFork(owner, repository)
+            when repository.is_fork
+        OwnerDeletesRepository(owner, repository)
+
+    @guarantee ConfirmByFullName
+        -- Transfer, convert, detach and delete require typing "<owner>/<name>".
+}
+
+-- Offers of repositories transferred to the viewer personally.
+-- Web: /{o}/{r}/action/accept_transfer, reject_transfer; API POST .../transfer/accept, /reject.
+surface IncomingTransfer {
+    facing recipient: access/SignedInUser
+    context transfer: RepoTransfer where recipient_user = recipient
+
+    exposes:
+        transfer.repository.name
+        transfer.doer.name
+        transfer.created_at
+
+    provides:
+        RecipientAcceptsTransfer(recipient, transfer)
+        RecipientRejectsTransfer(recipient, transfer)
+}
+
+-- Offers of repositories transferred to an organisation the viewer may create repositories in.
+surface IncomingOrgTransfer {
+    facing member: access/SignedInUser
+    context transfer: RepoTransfer where recipient_org != null and can_create_in_org(member, recipient_org)
+
+    exposes:
+        transfer.repository.name
+        transfer.recipient_org.name
+        transfer.doer.name
+        for team in transfer.teams:
+            team.name
+
+    provides:
+        OrgMemberAcceptsTransfer(member, transfer)
+        OrgMemberRejectsTransfer(member, transfer)
+}
+
+-- Invitations to collaborate addressed to the viewer, with accept / decline (no Forgejo
+-- counterpart; the mail sent on invitation links here).
+-- decided: repositories decision 4
+surface IncomingCollaboratorInvitation {
+    facing person: access/SignedInUser
+    context invitation: CollaboratorInvitation where invitee = person
+
+    exposes:
+        invitation.repository.name
+        invitation.repository.owner_name
+        invitation.inviter.name
+        invitation.access_mode
+        invitation.created_at
+
+    provides:
+        InviteeAcceptsCollaboration(person, invitation)
+        InviteeDeclinesCollaboration(person, invitation)
+
+    @guarantee InvitationRevealsOnlyTheName
+        -- Until accepted, the invitation shows the repository's name and owner, not its
+        -- content: a private repository stays unreadable to the invitee.
+}
+
+-- Who has explicit access (API GET /repos/{o}/{r}/collaborators[/{user}], readers).
+surface CollaboratorList {
+    facing reader: access/SignedInUser
+    context collaboration: Collaboration where can_see_repository(reader, repository)
+
+    exposes:
+        collaboration.user.name
+        collaboration.access_mode
+}
+
+-- Site administration of repositories: /admin/repos, /admin/repos/unadopted,
+-- /{o}/{r}/flags, API /admin/unadopted, /repos/{o}/{r}/flags.
+surface RepositoryAdministration {
+    facing admin: access/SiteAdmin
+
+    let unadopted = UnadoptedRepositories
+
+    exposes:
+        for u in unadopted:
+            u.owner_name
+            u.name
+
+    provides:
+        UserAdoptsRepository(admin, unadopted_repository, owner)
+        UserDeletesUnadoptedRepository(admin, unadopted_repository)
+        SiteAdminSetsHealthCheck(admin, repository, enabled)
+        SiteAdminReplacesFlags(admin, repository, names)
+            when config.enable_flags
+        OwnerDeletesRepository(admin, repository)
+}
+
+-- A user's own unadopted repositories (web /user/settings/repos).
+surface MyUnadoptedRepositories {
+    facing viewer: access/SignedInUser
+    context unadopted: UnadoptedRepository where owner_name = viewer.name
+
+    exposes:
+        unadopted.name
+
+    provides:
+        UserAdoptsRepository(viewer, unadopted, viewer)
+            when config.allow_adoption_of_unadopted
+        UserDeletesUnadoptedRepository(viewer, unadopted)
+            when config.allow_delete_of_unadopted
+}
+
+-- What the background workers report back.
+surface RepositoryWorkers {
+    facing worker: Worker
+
+    provides:
+        PullMirrorFetchSucceeded(worker, mirror, received_any)
+        PullMirrorRefUpdated(worker, mirror, ref_name, old_sha, new_sha, commits)
+        PullMirrorRefCreated(worker, mirror, ref_name)
+        PullMirrorRefDeleted(worker, mirror, ref_name)
+        PullMirrorFetchFailed(worker, mirror, reason)
+        PushMirrorPushSucceeded(worker, push_mirror)
+        PushMirrorPushFailed(worker, push_mirror, reason)
+        ArchiveBuilt(worker, repo_archive)
+
+    timeout:
+        ScheduledPullMirrorSync
+        ScheduledPushMirrorSync
+        ExpiredArchiveRemoved
+}
+
+-- The cron scheduler (administration.allium owns schedules and enablement) runs this module's
+-- maintenance tasks. Defaults: update_mirrors @every 10m (on, 50 pull + 50 push per run),
+-- repo_health_check @midnight (on), archive_cleanup @midnight (on, older than 24h),
+-- git_gc_repos @every 72h (off), delete_missing_repos / reinit_missing_repos @every 72h (off),
+-- delete_repo_archives @annually (off). Site admins may also run any task on demand.
+surface MaintenanceScheduler {
+    facing worker: Worker
+
+    exposes:
+        worker.queue
+
+    @guidance
+        -- The tasks themselves arrive as administration/*Due triggers (MirrorUpdateDue,
+        -- RepositoryHealthCheckDue, RepositoryStatsCheckDue, RepositoryArchiveCleanupDue,
+        -- AllRepositoryArchivesDeletionDue, RepositoryGarbageCollectionDue,
+        -- MissingRepositoryReinitDue, MissingRepositoryDeletionDue,
+        -- GeneratedRepositoryAvatarDeletionDue); administration owns schedules,
+        -- enablement and "run now".
+}
+
+-- Other modules' pipelines reporting into this one: the git storage layer (code). The importer
+-- (migrations) and the language statistics indexer (discovery) reach this module through
+-- their own triggers.
+surface RepositoryIntegrations {
+    facing worker: Worker
+
+    exposes:
+        worker.queue
+
+    provides:
+        RepositoryDeletionRequested(repository)
+        RepositoryStorageUnreadable(repository)
+        RepositoryStorageRestored(repository)
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred TemplateExpansion.expand           -- see: services/repository/generate.go (variables, transformers, .forgejo/template globs)
+deferred InitialContent.render              -- see: services/repository/create.go:51 (README/.gitignore/LICENSE templates)
+deferred LanguageDetection.classify         -- see: modules/analyze (linguist-style detection)

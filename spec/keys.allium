@@ -1,0 +1,1980 @@
+-- allium: 3
+-- keys.allium — SSH keys, deploy keys, SSH principals, GPG keys, signature verification and instance signing.
+--
+-- Scope: the asymmetric keys people register with the forge and what the
+-- forge concludes from them: which SSH key (or certificate principal) a git
+-- client authenticated with, whether a commit or tag signature is verified and
+-- trusted, and whether the forge itself signs the commits it makes on
+-- somebody's behalf.
+--
+-- Includes:
+--   - SshKey: personal SSH public keys (kind personal), the shared key material of
+--     deploy keys (kind deploy) and SSH certificate principals (kind principal)
+--   - DeployKey: a key attached to one repository with read-only or read-write
+--     access; the same key material may be attached to several repositories
+--   - Fingerprint uniqueness, allowed algorithms and minimum key sizes
+--   - Proving possession of an SSH or GPG key by signing a short-lived token
+--     (VerificationChallenge)
+--   - SSH keys supplied by an external authentication source (LDAP attribute,
+--     OAuth2 provider) and their synchronisation; such keys are read-only to
+--     their owner
+--   - GpgKey (primary keys and subkeys), GpgKeyImport (the armored original,
+--     used for export), the email rule for adding unverified GPG keys
+--   - CommitVerification: verifying OpenPGP and SSH signatures on commits and
+--     tags, and the per-repository trust model (collaborator / committer /
+--     collaborator+committer) that turns a valid signature into
+--     trusted / untrusted / unmatched
+--   - SigningPolicy and SigningDecision: whether commits the forge creates
+--     (initial commit, web edits, merges, wiki edits) are signed with the
+--     instance key
+--   - What a user exposes publicly: `/{user}.keys`, `/{user}.gpg`, the public
+--     key list APIs, and the instance signing keys
+--   - Key lookup for SSH authentication (public key or certificate ->
+--     registered key) and last-use tracking
+--
+-- Excludes:
+--   - Whether an authenticated SSH key may read or write a given repository,
+--     2FA enforcement on SSH, restricted users, archived/mirror push refusal:
+--     owned by code (git transport) and access. This module only resolves the
+--     presented key to a registered SshKey / DeployKey (SshKeyAuthenticated).
+--   - "Require signed commits" on protected branches and the pre-receive check
+--     that enforces it: owned by code; it asks this module for a
+--     CommitVerification.
+--   - The repository's trust_model setting itself (a repository setting):
+--     owned by repositories; this module defines TrustModel and its meaning.
+--   - authorized_keys / authorized_principals file maintenance (append, full
+--     rewrite, backups, AuthorizedKeysCommand template, the
+--     resync_all_sshkeys / resync_all_sshprincipals cron tasks, the doctor
+--     check): implementation of "a registered key is accepted by the SSH
+--     daemon", not behaviour. The built-in SSH server, host keys, ciphers,
+--     KEX/MAC lists, listen ports, per-write timeouts and the ssh-keygen vs
+--     native parser choice (SSH_KEYGEN_PATH, SSH_KEY_TEST_PATH) are transport
+--     implementation.
+--   - Accepting a GPG verification signature over "token\n", "token\n\n" or
+--     "token\r\n", and the SSH CR LF retry: workarounds for client tooling,
+--     folded into "a signature over the token".
+--   - Padding of short GPG key ids to 16 characters and stripping leading
+--     zeroes in the verify API: presentation / Gitea API compatibility.
+--   - SSH2 ("---- BEGIN SSH2 PUBLIC KEY ----") and PEM/PKIX input formats are
+--     accepted and normalised to one OpenSSH line; the conversion itself is an
+--     implementation detail of ssh_normalised().
+--   - The `X-…` Gitea API shapes (key_type "unknown", read_only flag on user
+--     keys): API compatibility only.
+--
+-- Provides to other modules:
+--   SshKey.grants_read_on(repository) / grants_write_on(repository)  -- code: deploy key access
+--   CommitVerification (answer to SignatureVerificationRequested)    -- code (require signed
+--     commits: every new commit's result = verified), releases (tag badges), pulls
+--   SigningDecision (answer to the *SigningRequested triggers)       -- code (web edits,
+--     can_sign_as), pulls (merge_signing_satisfied), wiki, repositories (initial commit)
+--   The CommitSigning contract (code): new_commits_verified, can_sign_as.
+--   Black boxes other modules call by these names, each standing for the keys
+--   value on the right:
+--     new_commits_verified(repository, old_sha, new_sha)  -- code: every commit reachable from
+--         new_sha and not from old_sha has a CommitVerification (SignatureVerificationRequested
+--         for that commit in repository) with result = verified
+--     can_sign_as(user, repository, branch)  -- code: the SigningDecision answering
+--         WebEditSigningRequested(actor: user, repository, parent_verified: <the branch head's
+--         CommitVerification result = verified>) has will_sign = true
+--     merge_signing_satisfied(pr, user, style)  -- pulls: style = fast_forward_only (no commit is
+--         created), or the SigningDecision answering MergeSigningRequested(actor: user, pull: pr, ...)
+--         has will_sign = true
+--     keys_of_repository(keys, repository)  -- code: the members of keys (a set of DeployKey) whose
+--         repository = repository
+--
+-- Emits:
+--   SshKeyAdded(key, actor)                         -- a user / admin / external source registered a personal key or principal
+--   SshKeyDeleted(owner, fingerprint, actor)        -- a personal key or principal was removed
+--   DeployKeyAdded(deploy_key, actor)               -- a key was attached to a repository
+--   DeployKeyDeleted(deploy_key, repository, name, actor) -- a key was detached from a repository;
+--                                                   -- deploy_key is the identity of the gone grant
+--                                                   -- (code drops it from branch / tag allowlists)
+--   GpgKeyAdded(key, actor)                         -- a primary GPG key (with its subkeys) was registered
+--   GpgKeyDeleted(owner, key_id, actor)             -- a primary GPG key (with its subkeys) was removed
+--   SshKeyAuthenticated(connection, key)            -- code: the git client on `connection` holds `key`
+--   SignatureVerified(verification)                 -- internal chain: a signature verified, trust to be assessed
+--   ExternalSshKeyRefused(user, source, fingerprint) -- administration: a directory / OAuth2 key failed the
+--                                                   -- key policy and was skipped (record a system notice)
+--   KeyFilesRewritten(kind)                         -- administration: a resync_all_sshkeys /
+--                                                   -- resync_all_sshprincipals run (or the operator's
+--                                                   -- regenerate command) is done; finish the cron run
+--   (CommitVerification and SigningDecision entities are created for the
+--    requesting module to read; they are answers, not events.)
+--
+-- Reacts to:
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)  -- remove the user's keys
+--   repositories/RepositoryDeleted(repository, doer)                 -- detach deploy keys
+--   authentication/ExternalSshKeysAsserted(user, source, keys)       -- source-managed keys (LDAP login /
+--                                                                    -- LDAP sync / OAuth2 login)
+--   administration/SshKeyAddedForUserByAdmin(admin, user, key_content, title)   -- admin API adds a key
+--   administration/SshKeyRemovedForUserByAdmin(admin, user, key)                -- admin API removes a key
+--   administration/AuthorizedKeysRewriteDue(), AuthorizedPrincipalsRewriteDue():
+--   documented no-op reactions (AuthorizedKeysRewrite / AuthorizedPrincipalsRewrite)
+--   — rebuilding the SSH daemon's key files is implementation (see Excludes).
+--   wiki/WikiCommitSigningRequested(actor, repository, wiki_head_verified) -- wiki_edit signing decision
+--   administration/AuthorizedKeysRegenerationRequested(operator): likewise (AuthorizedKeysRegeneration).
+--   Requests from other modules, modelled as external stimuli on the
+--   ForgeSubsystem surfaces below:
+--     SshClientPresentsPublicKey, SshClientPresentsCertificate, SshKeyUsedForRepository  (code: SSH transport)
+--     SignatureVerificationRequested  (code, pulls, releases, webhooks payloads, API)
+--     InitialCommitSigningRequested, WebEditSigningRequested,
+--     MergeSigningRequested           (repositories, code, wiki, pulls)
+
+use "./accounts.allium" as accounts
+use "./authentication.allium" as authentication
+use "./repositories.allium" as repositories
+use "./pulls.allium" as pulls
+use "./administration.allium" as administration
+use "./access.allium" as access
+use "./wiki.allium" as wiki
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- Another part of the forge acting on its own behalf (the SSH transport, the
+-- LDAP synchroniser, the merge service, the web editor). Used to give the
+-- integration surfaces below a party to face.
+external entity ForgeSubsystem {
+    name: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- What code asks of keys when it writes commits: whether a push's new commits
+-- are all verified, and whether a web edit would be signed. Both are keys'
+-- answers (CommitVerification, SigningDecision); code never raises keys'
+-- triggers to get them.
+contract CommitSigning {
+    -- every commit reachable from new_sha and not from old_sha has a
+    -- CommitVerification with result = verified (require signed commits)
+    new_commits_verified: (repository: repositories/Repository, old_sha: String?, new_sha: String) -> Boolean
+    -- the SigningDecision for a web edit by user on branch has will_sign = true
+    -- (the parent counts as verified when the branch head's CommitVerification is)
+    can_sign_as: (user: accounts/User, repository: repositories/Repository, branch: String) -> Boolean
+
+    @invariant AnswersMatchTheDecisions
+        -- Each answer is the one the matching SignatureVerificationRequested /
+        -- WebEditSigningRequested decision would give at that moment.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- What a submitted SSH public key turned out to be.
+enum SshKeyParseOutcome { valid | private_key | malformed | multiple_keys | unknown_algorithm }
+
+-- Algorithms a key can use. Certificates are classified by their underlying key.
+enum SshKeyAlgorithm { ed25519 | ed25519_sk | ecdsa | ecdsa_sk | rsa | dsa }
+
+enum DeployKeyAccess { read_only | read_write }
+
+enum SignatureFormat { openpgp | ssh }
+
+enum SignedObjectKind { commit | tag }
+
+-- How a repository decides whether a valid signature is trusted.
+-- `instance_default` (Forgejo: "default") means "use config.default_trust_model".
+enum TrustModel { instance_default | collaborator | committer | collaborator_committer }
+
+enum TrustStatus { trusted | untrusted | unmatched }
+
+enum VerificationResult { verified | unverified | warning }
+
+enum VerificationReason {
+    not_signed                -- the object carries no signature
+    | unreadable_signature    -- the signature block could not be parsed
+    | signed_by_user_key      -- a registered user key produced the signature
+    | signed_by_instance_key  -- the forge's own signing key produced the signature
+    | probable_bad_signature  -- the signature names a key we know, but that key did not produce it
+    | no_matching_key         -- no registered or instance key produced the signature
+    | key_expired             -- a registered key produced it, but the signature is dated after the key expired
+    | key_revoked             -- a registered key produced it, but that key has been revoked
+}
+
+-- The commits the forge creates itself and may sign.
+enum SignedOperation { initial_commit | web_edit | merge | wiki_edit }
+
+enum SigningMode { never | always | conditional }
+
+-- One entry of a [repository.signing] list (INITIAL_COMMIT, CRUD_ACTIONS,
+-- MERGES, WIKI), as written in app.ini.
+enum SigningListEntry {
+    never | always | pubkey | twofa | parentsigned
+    | basesigned | headsigned | commitssigned | approved
+}
+
+-- Why the forge declined to sign (the first failing condition).
+enum SigningRefusal {
+    no_instance_key        -- no signing key configured / available ("nokey")
+    | policy_never         -- policy is "never"
+    | no_registered_key    -- "pubkey": the actor has no GPG key or personal SSH key
+    | no_two_factor        -- "twofa": the actor has no second factor enrolled
+    | parent_unsigned      -- "parentsigned": the parent commit is not verified
+    | base_unsigned        -- "basesigned": the merge base head is not verified
+    | head_unsigned        -- "headsigned": the PR head commit is not verified
+    | commits_unsigned     -- "commitssigned": some PR commit is not verified
+    | not_approved         -- "approved": no protected-branch approval on the PR
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A registered SSH public key, or an SSH certificate principal.
+--   kind personal  : a personal key of `owner`; authenticates as that user.
+--   kind deploy    : key material attached to one or more repositories through
+--                    DeployKey; it has no owner and authenticates only for
+--                    the repositories it is attached to.
+--   kind principal : not a key at all but a principal name; a client presenting
+--                    a certificate from a trusted CA naming this principal
+--                    authenticates as `owner`.
+-- from: models/asymkey/ssh_key.go:38
+entity SshKey {
+    kind: personal | deploy | principal
+    owner: accounts/User?                 -- set for user and principal keys, absent for deploy keys
+    name: String                          -- title; for a principal it equals the principal
+    content: String                       -- one normalised OpenSSH line ("type base64 comment"), or the principal
+    fingerprint: String?                  -- SHA256 fingerprint; absent for principals
+    algorithm: SshKeyAlgorithm?           -- absent for principals
+    bits: Integer?                        -- absent for principals
+    auth_source: authentication/AuthSource?   -- set when the key was supplied by an external source
+    is_verified: Boolean                  -- possession proven by signing a token (personal keys only)
+    created_at: Timestamp
+    last_used_at: Timestamp?              -- last successful SSH use
+
+    -- Relationships
+    attachments: DeployKey with key = this
+
+    -- What a deploy key may do in a repository (code asks these when a git
+    -- client authenticated with this key).
+    grants_read_on(repository): kind = deploy and attachments.any(d => d.repository = repository)
+    grants_write_on(repository): kind = deploy and attachments.any(d => d.repository = repository and d.access = read_write)
+
+    -- Derived
+    has_been_used: last_used_at != null
+    has_recent_activity: last_used_at != null and last_used_at + config.recent_activity_window > now
+    -- A key supplied by a source that (still) provides SSH keys is managed there,
+    -- not by its owner. If the source has been deleted the key becomes ordinary.
+    -- from: models/asymkey/ssh_key.go:267
+    is_externally_managed: auth_source != null and auth_source.provides_ssh_keys
+    -- The key line without its trailing comment (which often holds an email).
+    -- from: models/asymkey/ssh_key.go:66
+    public_line: without_comment(content)
+}
+
+-- One repository's grant to an SSH key.
+-- from: models/asymkey/ssh_key_deploy.go:28
+entity DeployKey {
+    repository: repositories/Repository
+    key: SshKey
+    name: String                          -- unique within the repository
+    access: DeployKeyAccess
+    created_at: Timestamp
+    last_used_at: Timestamp?
+
+    is_read_only: access = read_only
+    has_recent_activity: last_used_at != null and last_used_at + config.recent_activity_window > now
+}
+
+-- A GPG public key. Primary keys have no `primary`; subkeys point at their
+-- primary key and share its owner.
+-- from: models/asymkey/gpg_key.go:23
+entity GpgKey {
+    owner: accounts/User
+    key_id: String                        -- 16-hex-digit long key id, unique across the instance
+    primary: GpgKey?                      -- set for subkeys
+    public_key: String                    -- the (sub)key's public key packet
+    identity_emails: Set<String>          -- emails of the primary key's non-revoked user ids (empty for subkeys)
+    key_created_at: Timestamp             -- creation time recorded in the key
+    expires_at: Timestamp?                -- absent when the key never expires
+    is_revoked: Boolean                   -- the uploaded key carries a revocation signature
+    added_at: Timestamp
+    is_verified: Boolean                  -- possession proven by signing a token
+    can_sign: Boolean
+    can_encrypt_comms: Boolean
+    can_encrypt_storage: Boolean
+    can_certify: Boolean
+
+    -- Relationships
+    subkeys: GpgKey with primary = this
+    original_import: GpgKeyImport with key = this
+
+    -- Derived
+    is_primary: primary = null
+    is_expired: expires_at != null and expires_at <= now
+    -- Identity emails that are activated addresses of the owner (case-insensitive).
+    -- from: models/asymkey/gpg_key.go:169
+    matched_emails: activated_identity_emails(owner, identity_emails)
+    -- A key may vouch for signatures when its holder proved possession or one of
+    -- its identities is an activated address of the owner.
+    -- from: models/asymkey/gpg_key.go:252
+    is_usable_for_signatures: is_verified or has_activated_identity(owner, identity_emails)
+}
+
+-- The armored block a primary GPG key was uploaded in, kept verbatim so the
+-- user's keys can be exported again with their signatures and identities.
+-- from: models/asymkey/gpg_key_import.go:24
+entity GpgKeyImport {
+    key: GpgKey
+    armored: String
+}
+
+-- A short-lived token a user signs with a key to prove they hold it.
+-- from: models/asymkey/gpg_key_verify.go:111
+entity VerificationChallenge {
+    owner: accounts/User
+    token: String
+    issued_at: Timestamp
+    expires_at: Timestamp
+    status: open | expired
+
+    transitions status {
+        open -> expired
+        terminal: expired
+    }
+}
+
+-- The answer to "is this commit / tag signature verified, and is it trusted
+-- in this repository?". Created on request; never edited by users.
+-- from: models/asymkey/gpg_key_object_verification.go:27
+entity CommitVerification {
+    repository: repositories/Repository
+    object_kind: SignedObjectKind
+    object_id: String                     -- commit or tag object id
+    committer_email: String               -- committer (or tagger) email recorded in the object
+    committer: accounts/User?             -- account owning that email (activated, or the user's no-reply address)
+    format: SignatureFormat?              -- absent when unsigned
+    result: VerificationResult
+    reason: VerificationReason
+    signer: accounts/User?                -- user whose key produced the signature
+    signed_by_instance: Boolean           -- the forge's own key produced the signature
+    signing_email: String?                -- email the signer is credited with
+    signing_gpg_key: GpgKey?
+    signing_ssh_key: SshKey?
+    trust: TrustStatus?                   -- set when result = verified
+
+    -- What a reader is shown: green, yellow, orange, red or grey.
+    -- from: templates/repo/commit_page.tmpl (badge classes)
+    is_trusted: result = verified and trust = trusted
+}
+
+-- How one kind of forge-made commit is signed. One instance per operation,
+-- materialised from the [repository.signing] lists in config at start-up
+-- (INITIAL_COMMIT, CRUD_ACTIONS, MERGES, WIKI). A list containing "never"
+-- gives mode never, whatever else it lists and in whatever order; otherwise
+-- one containing "always" gives mode always; an empty or
+-- unrecognised list gives mode never; otherwise mode conditional with one
+-- flag per listed condition. Conditions that do not apply to an operation are
+-- ignored (see invariant SigningConditionsApply).
+-- decided: "never" wins over "always" regardless of list order (Forgejo
+-- takes whichever comes first).
+-- from: services/asymkey/sign.go:39
+entity SigningPolicy {
+    operation: SignedOperation
+    mode: SigningMode
+    requires_registered_key: Boolean      -- "pubkey"
+    requires_two_factor: Boolean          -- "twofa"
+    requires_parent_signed: Boolean       -- "parentsigned" (web_edit, wiki_edit)
+    requires_base_signed: Boolean         -- "basesigned"   (merge)
+    requires_head_signed: Boolean         -- "headsigned"   (merge)
+    requires_commits_signed: Boolean      -- "commitssigned" (merge)
+    requires_approval: Boolean            -- "approved"     (merge)
+}
+
+-- The forge's decision on whether to sign one commit it is about to create.
+-- from: services/asymkey/sign.go:139
+entity SigningDecision {
+    operation: SignedOperation
+    actor: accounts/User
+    repository: repositories/Repository
+    will_sign: Boolean
+    refusal: SigningRefusal?              -- set when will_sign = false
+    signer_name: String?                  -- identity the commit is signed as, when will_sign
+    signer_email: String?
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [server]
+    ssh_disabled: Boolean = false                       -- DISABLE_SSH
+    minimum_key_size_check: Boolean = true              -- MINIMUM_KEY_SIZE_CHECK
+
+    -- [ssh.minimum_key_sizes]: minimum bits per algorithm; -1 forbids the
+    -- algorithm entirely. An algorithm without an entry is forbidden (DSA).
+    min_bits_ed25519: Integer = 256                     -- ED25519
+    min_bits_ed25519_sk: Integer = 256                  -- ED25519-SK
+    min_bits_ecdsa: Integer = 256                       -- ECDSA
+    min_bits_ecdsa_sk: Integer = 256                    -- ECDSA-SK
+    min_bits_rsa: Integer = 3071                        -- RSA
+    min_bits_dsa: Integer = -1                          -- DSA (no entry by default: forbidden)
+
+    -- [server] SSH certificates. SSH_TRUSTED_USER_CA_KEYS lists the CAs whose
+    -- user certificates are accepted. SSH_AUTHORIZED_PRINCIPALS_ALLOW decides
+    -- which principals a user may register: "off", or any of "username",
+    -- "email", "anything". Its default is "username,email" when trusted CA keys
+    -- are configured and "off" otherwise.
+    trusted_user_ca_keys_configured: Boolean = false    -- SSH_TRUSTED_USER_CA_KEYS non-empty
+    principals_allow_username: Boolean = false          -- SSH_AUTHORIZED_PRINCIPALS_ALLOW contains username
+    principals_allow_email: Boolean = false             -- SSH_AUTHORIZED_PRINCIPALS_ALLOW contains email
+    principals_allow_anything: Boolean = false          -- SSH_AUTHORIZED_PRINCIPALS_ALLOW contains anything
+
+    -- [repository.signing]
+    signing_key: String = "default"                     -- SIGNING_KEY: "none", "default" (the server's git/gpg config), a GPG key id, or (ssh format) a public key file
+    signing_name: String = ""                           -- SIGNING_NAME
+    signing_email: String = ""                          -- SIGNING_EMAIL
+    signing_format: SignatureFormat = openpgp           -- FORMAT
+    initial_commit_signing: Set<SigningListEntry> = {always}           -- INITIAL_COMMIT (materialised as SigningPolicy initial_commit)
+    crud_actions_signing: Set<SigningListEntry> = {pubkey, twofa, parentsigned}   -- CRUD_ACTIONS (SigningPolicy web_edit)
+    merges_signing: Set<SigningListEntry> = {pubkey, twofa, basesigned, commitssigned}  -- MERGES (SigningPolicy merge)
+    wiki_signing: Set<SigningListEntry> = {never}                      -- WIKI (SigningPolicy wiki_edit)
+    default_trust_model: TrustModel = collaborator      -- DEFAULT_TRUST_MODEL ("default" also means collaborator; instance_default is not a valid value here)
+
+    -- Hard-coded in Forgejo
+    recent_activity_window: Duration = 7.days           -- "used recently" marker on key lists
+    verification_token_lifetime: Duration = 2.minutes   -- a token stays signable for the rest of its minute and the next
+    title_max_length: Integer = 50                      -- key / deploy key title limit (web form)
+}
+
+------------------------------------------------------------
+-- Rules: personal SSH keys
+------------------------------------------------------------
+
+-- A user registers one of their SSH public keys.
+-- The key must parse as a single public key, use an allowed algorithm with
+-- enough bits, and have a fingerprint no other key (personal, deploy or
+-- otherwise) already uses. Titles are unique per owner.
+-- decided: personal SSH keys may still be added while SSH is disabled, since
+-- they also verify SSH commit signatures (deploy keys and principals may not).
+-- from: routers/web/user/setting/keys.go:163
+rule UserAddsSshKey {
+    when: UserAddsSshKey(owner, title, content)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    let fingerprint = ssh_fingerprint(content)
+    let algorithm = ssh_key_algorithm(content)
+    let bits = ssh_key_bits(content)
+
+    requires: manages_own_ssh_keys(owner)
+    requires: title != "" and length(title) <= config.title_max_length
+    requires: ssh_parse_outcome(content) = valid
+    requires: not config.minimum_key_size_check
+        or (algorithm = ed25519 and config.min_bits_ed25519 >= 0 and bits >= config.min_bits_ed25519)
+        or (algorithm = ed25519_sk and config.min_bits_ed25519_sk >= 0 and bits >= config.min_bits_ed25519_sk)
+        or (algorithm = ecdsa and config.min_bits_ecdsa >= 0 and bits >= config.min_bits_ecdsa)
+        or (algorithm = ecdsa_sk and config.min_bits_ecdsa_sk >= 0 and bits >= config.min_bits_ecdsa_sk)
+        or (algorithm = rsa and config.min_bits_rsa >= 0 and bits >= config.min_bits_rsa)
+        or (algorithm = dsa and config.min_bits_dsa >= 0 and bits >= config.min_bits_dsa)
+    requires: not exists SshKey{fingerprint: fingerprint}
+    requires: not exists SshKey{owner: owner, name: title}
+
+    ensures:
+        let key = SshKey.created(
+            kind: personal,
+            owner: owner,
+            name: title,
+            content: ssh_normalised(content),
+            fingerprint: fingerprint,
+            algorithm: algorithm,
+            bits: bits,
+            auth_source: null,
+            is_verified: false,
+            created_at: now,
+            last_used_at: null
+        )
+        SshKeyAdded(key: key, actor: owner)
+
+    @guidance
+        -- Web: POST /user/settings/keys (type=ssh). API: POST /api/v1/user/keys.
+        -- Input may be OpenSSH, SSH2 or PEM/PKIX; it is normalised to one
+        -- OpenSSH line. A private key is refused with a dedicated message
+        -- (ssh_parse_outcome = private_key) so the user knows they pasted the
+        -- wrong half.
+}
+
+-- An administrator registers an SSH key on behalf of a user (API only). The
+-- admin surface and permission check live in administration; this rule is
+-- the key-side effect with the same validation as a user's own addition.
+-- from: routers/api/v1/admin/user.go:329
+rule AddSshKeyForUserByAdmin {
+    when: administration/SshKeyAddedForUserByAdmin(admin, user, key_content, title)
+
+    let fingerprint = ssh_fingerprint(key_content)
+    let algorithm = ssh_key_algorithm(key_content)
+    let bits = ssh_key_bits(key_content)
+
+    requires: admin.is_admin
+    requires: manages_own_ssh_keys(admin)
+    requires: title != ""
+    requires: ssh_parse_outcome(key_content) = valid
+    requires: not config.minimum_key_size_check
+        or (algorithm = ed25519 and config.min_bits_ed25519 >= 0 and bits >= config.min_bits_ed25519)
+        or (algorithm = ed25519_sk and config.min_bits_ed25519_sk >= 0 and bits >= config.min_bits_ed25519_sk)
+        or (algorithm = ecdsa and config.min_bits_ecdsa >= 0 and bits >= config.min_bits_ecdsa)
+        or (algorithm = ecdsa_sk and config.min_bits_ecdsa_sk >= 0 and bits >= config.min_bits_ecdsa_sk)
+        or (algorithm = rsa and config.min_bits_rsa >= 0 and bits >= config.min_bits_rsa)
+        or (algorithm = dsa and config.min_bits_dsa >= 0 and bits >= config.min_bits_dsa)
+    requires: not exists SshKey{fingerprint: fingerprint}
+    requires: not exists SshKey{owner: user, name: title}
+
+    ensures:
+        let key = SshKey.created(
+            kind: personal,
+            owner: user,
+            name: title,
+            content: ssh_normalised(key_content),
+            fingerprint: fingerprint,
+            algorithm: algorithm,
+            bits: bits,
+            auth_source: null,
+            is_verified: false,
+            created_at: now,
+            last_used_at: null
+        )
+        SshKeyAdded(key: key, actor: admin)
+
+    @guidance
+        -- API: POST /api/v1/admin/users/{username}/keys.
+}
+
+-- A user asks for a token to sign. The same token serves SSH and GPG proofs.
+-- from: routers/api/v1/user/gpg_key.go:191
+rule UserRequestsVerificationToken {
+    when: UserRequestsVerificationToken(owner)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    ensures: VerificationChallenge.created(
+        owner: owner,
+        token: new_verification_token(owner),
+        issued_at: now,
+        expires_at: now + config.verification_token_lifetime,
+        status: open
+    )
+
+    @guidance
+        -- Web: shown on /user/settings/keys whenever a verify form is open.
+        -- API: GET /api/v1/user/gpg_key_token.
+        -- Forgejo derives the token deterministically from the current minute
+        -- and the user's identity, so no state is kept; a rebuild may store it.
+}
+
+-- from: models/asymkey/gpg_key_verify.go:111
+rule VerificationChallengeExpires {
+    when: challenge: VerificationChallenge.expires_at <= now
+    requires: challenge.status = open
+    ensures: challenge.status = expired
+}
+
+-- A user proves they hold the private half of one of their SSH keys by
+-- signing the token (`ssh-keygen -Y sign -n <instance domain>`).
+-- from: models/asymkey/ssh_key_verify.go:17
+rule UserVerifiesSshKey {
+    when: UserVerifiesSshKey(owner, key, challenge, signature)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    requires: manages_own_ssh_keys(owner)
+    requires: key.kind = personal
+    requires: key.owner = owner
+    requires: challenge.owner = owner
+    requires: challenge.status = open
+    requires: ssh_signs_token(key, signature, challenge.token)
+
+    ensures: key.is_verified = true
+
+    @guidance
+        -- Web: POST /user/settings/keys (type=verify_ssh, fingerprint, signature).
+        -- The SSH signature namespace is the instance's domain, so a
+        -- signature made for another forge does not verify here.
+}
+
+-- A user removes one of their keys; an administrator may remove anyone's.
+-- Keys managed by an external source cannot be removed this way.
+-- from: services/asymkey/ssh_key.go:17
+rule UserDeletesSshKey {
+    when: UserDeletesSshKey(actor, key)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    -- read before the record goes: an emission sees the resulting state
+    let key_owner = key.owner
+    let key_fingerprint = key.fingerprint
+
+    requires: manages_own_ssh_keys(actor)
+    requires: key.kind = personal
+    requires: key.owner = actor or actor.is_admin
+    requires: not key.is_externally_managed
+
+    ensures: not exists key
+    ensures: SshKeyDeleted(owner: key_owner, fingerprint: key_fingerprint, actor: actor)
+
+    @guidance
+        -- Web: POST /user/settings/keys/delete (type=ssh). API: DELETE /api/v1/user/keys/{id}.
+}
+
+-- An administrator removes a key from a given user's account (API). The
+-- admin surface lives in administration.
+-- from: routers/api/v1/admin/user.go:361
+rule RemoveSshKeyOfUserByAdmin {
+    when: administration/SshKeyRemovedForUserByAdmin(admin, user, key)
+    -- read before the record goes: an emission sees the resulting state
+    let key_fingerprint = key.fingerprint
+
+    requires: admin.is_admin
+    requires: key.kind in {personal, principal}
+    requires: key.owner = user
+
+    ensures: not exists key
+    ensures: SshKeyDeleted(owner: user, fingerprint: key_fingerprint, actor: admin)
+
+    @guidance
+        -- API: DELETE /api/v1/admin/users/{username}/keys/{id}. Unlike the
+        -- user's own deletion this also removes externally managed keys.
+}
+
+------------------------------------------------------------
+-- Rules: SSH certificate principals
+------------------------------------------------------------
+
+-- A user registers a principal so certificates naming it log them in.
+-- decided: principals only serve SSH access, so they are refused while SSH
+-- is disabled (as Forgejo already does).
+-- from: models/asymkey/ssh_key_principals.go:58
+rule UserAddsPrincipal {
+    when: UserAddsPrincipal(owner, principal)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    let value = trimmed(principal)
+
+    requires: not config.ssh_disabled
+    requires: config.principals_allow_anything or config.principals_allow_username or config.principals_allow_email
+    requires: is_single_line(value)
+    requires: config.principals_allow_anything
+        or (config.principals_allow_username and value = owner.name)
+        or (config.principals_allow_email and owner.activated_emails.any(e => e.address = value))
+    requires: not exists SshKey{kind: principal, content: value}
+    requires: not exists SshKey{owner: owner, name: value}
+
+    ensures:
+        let key = SshKey.created(
+            kind: principal,
+            owner: owner,
+            name: value,
+            content: value,
+            fingerprint: null,
+            algorithm: null,
+            bits: null,
+            auth_source: null,
+            is_verified: false,
+            created_at: now,
+            last_used_at: null
+        )
+        SshKeyAdded(key: key, actor: owner)
+
+    @guidance
+        -- Web only: POST /user/settings/keys (type=principal). The form is
+        -- hidden unless principals are enabled.
+}
+
+-- from: routers/web/user/setting/keys.go:277
+rule UserDeletesPrincipal {
+    when: UserDeletesPrincipal(actor, key)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    -- read before the record goes: an emission sees the resulting state
+    let key_owner = key.owner
+
+    requires: key.kind = principal
+    requires: key.owner = actor or actor.is_admin
+
+    ensures: not exists key
+    ensures: SshKeyDeleted(owner: key_owner, fingerprint: null, actor: actor)
+}
+
+------------------------------------------------------------
+-- Rules: SSH keys from external authentication sources
+------------------------------------------------------------
+
+-- An external source (LDAP attribute on login or sync, OAuth2 provider on
+-- login) reports the SSH keys a user should have. Keys new to the user are
+-- added, named "<source name>-<fingerprint>" and tied to the source. Keys
+-- whose fingerprint is already registered anywhere, or which do not parse,
+-- are skipped silently. A key that parses but does not meet the algorithm and
+-- minimum-size policy is skipped and reported (ExternalSshKeyRefused), so an
+-- operator sees it as a system notice.
+-- decided: the key policy applies to externally supplied keys too; a
+-- non-compliant key is skipped and recorded as a system notice.
+-- from: models/asymkey/ssh_key.go:321
+rule AddExternallySuppliedSshKeys {
+    when: authentication/ExternalSshKeysAsserted(user, source, keys)
+
+    requires: source.provides_ssh_keys
+
+    ensures:
+        for content in keys:
+            if ssh_parse_outcome(content) = valid and not exists SshKey{fingerprint: ssh_fingerprint(content)}:
+                let algorithm = ssh_key_algorithm(content)
+                let bits = ssh_key_bits(content)
+                if not config.minimum_key_size_check
+                    or (algorithm = ed25519 and config.min_bits_ed25519 >= 0 and bits >= config.min_bits_ed25519)
+                    or (algorithm = ed25519_sk and config.min_bits_ed25519_sk >= 0 and bits >= config.min_bits_ed25519_sk)
+                    or (algorithm = ecdsa and config.min_bits_ecdsa >= 0 and bits >= config.min_bits_ecdsa)
+                    or (algorithm = ecdsa_sk and config.min_bits_ecdsa_sk >= 0 and bits >= config.min_bits_ecdsa_sk)
+                    or (algorithm = rsa and config.min_bits_rsa >= 0 and bits >= config.min_bits_rsa)
+                    or (algorithm = dsa and config.min_bits_dsa >= 0 and bits >= config.min_bits_dsa):
+                    let key = SshKey.created(
+                        kind: personal,
+                        owner: user,
+                        name: source.name + "-" + ssh_fingerprint(content),
+                        content: ssh_normalised(content),
+                        fingerprint: ssh_fingerprint(content),
+                        algorithm: algorithm,
+                        bits: bits,
+                        auth_source: source,
+                        is_verified: false,
+                        created_at: now,
+                        last_used_at: null
+                    )
+                    SshKeyAdded(key: key, actor: user)
+                else:
+                    ExternalSshKeyRefused(user: user, source: source, fingerprint: ssh_fingerprint(content))
+
+    @guidance
+        -- Forgejo applies no algorithm or size policy here; the rebuild does
+        -- (decided). Keys already registered (by fingerprint, to anyone) and
+        -- unparseable entries are skipped without a notice.
+}
+
+-- Keys previously supplied by this source that it no longer reports are removed.
+-- from: models/asymkey/ssh_key.go:359
+rule RemoveWithdrawnExternalSshKeys {
+    when: authentication/ExternalSshKeysAsserted(user, source, keys)
+
+    let still_published = presented_public_lines(keys)
+
+    requires: source.provides_ssh_keys
+
+    ensures:
+        for key in SshKeys where owner = user and auth_source = source and public_line not in still_published:
+            ExternalSshKeyWithdrawn(key: key, user: user)
+}
+
+-- One withdrawn key goes. Its fingerprint is read before it does: the
+-- deletion event is about a key that no longer exists.
+-- from: services/asymkey/ssh_key_authorized_keys.go:142
+rule RemoveWithdrawnExternalSshKey {
+    when: ExternalSshKeyWithdrawn(key, user)
+    let withdrawn_fingerprint = key.fingerprint
+    ensures: not exists key
+    ensures: SshKeyDeleted(owner: user, fingerprint: withdrawn_fingerprint, actor: user)
+}
+
+------------------------------------------------------------
+-- Rules: deploy keys
+------------------------------------------------------------
+
+-- A repository administrator grants an SSH key read-only or read-write git
+-- access to the repository. The key material may already be a deploy key of
+-- other repositories (it is then shared), but never a personal key or
+-- principal.
+-- decided: deploy keys only serve SSH access, so they are refused while SSH
+-- is disabled.
+-- decided: deploy keys are refused on archived repositories; a mirror only
+-- takes read-only deploy keys (nothing may push to it).
+-- from: models/asymkey/ssh_key_deploy.go:109
+rule RepoAdminAddsDeployKey {
+    when: RepoAdminAddsDeployKey(admin, repository, title, content, access)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    let fingerprint = ssh_fingerprint(content)
+    let algorithm = ssh_key_algorithm(content)
+    let bits = ssh_key_bits(content)
+    let existing = SshKey{fingerprint: fingerprint}
+
+    requires: is_repo_admin(admin, repository)
+    requires: not config.ssh_disabled
+    requires: not repository.is_archived
+    requires: not repository.is_mirror or access = read_only
+    requires: title != "" and length(title) <= config.title_max_length
+    requires: ssh_parse_outcome(content) = valid
+    requires: not config.minimum_key_size_check
+        or (algorithm = ed25519 and config.min_bits_ed25519 >= 0 and bits >= config.min_bits_ed25519)
+        or (algorithm = ed25519_sk and config.min_bits_ed25519_sk >= 0 and bits >= config.min_bits_ed25519_sk)
+        or (algorithm = ecdsa and config.min_bits_ecdsa >= 0 and bits >= config.min_bits_ecdsa)
+        or (algorithm = ecdsa_sk and config.min_bits_ecdsa_sk >= 0 and bits >= config.min_bits_ecdsa_sk)
+        or (algorithm = rsa and config.min_bits_rsa >= 0 and bits >= config.min_bits_rsa)
+        or (algorithm = dsa and config.min_bits_dsa >= 0 and bits >= config.min_bits_dsa)
+    requires: not exists existing or existing.kind = deploy
+    requires: not exists existing or not exists DeployKey{repository: repository, key: existing}
+    requires: not exists DeployKey{repository: repository, name: title}
+
+    ensures:
+        if exists existing:
+            let attached = DeployKey.created(
+                repository: repository,
+                key: existing,
+                name: title,
+                access: access,
+                created_at: now,
+                last_used_at: null
+            )
+            DeployKeyAdded(deploy_key: attached, actor: admin)
+        else:
+            let material = SshKey.created(
+                kind: deploy,
+                owner: null,
+                name: title,
+                content: ssh_normalised(content),
+                fingerprint: fingerprint,
+                algorithm: algorithm,
+                bits: bits,
+                auth_source: null,
+                is_verified: false,
+                created_at: now,
+                last_used_at: null
+            )
+            let fresh = DeployKey.created(
+                repository: repository,
+                key: material,
+                name: title,
+                access: access,
+                created_at: now,
+                last_used_at: null
+            )
+            DeployKeyAdded(deploy_key: fresh, actor: admin)
+
+    @guidance
+        -- Web: POST /{owner}/{repo}/settings/keys (is_writable checkbox).
+        -- API: POST /api/v1/repos/{owner}/{repo}/keys (read_only flag).
+        -- Both require repository admin access (API: a token with repository scope).
+}
+
+-- A repository administrator detaches a deploy key. When no repository uses
+-- the key material any more, the material is forgotten too.
+-- from: models/repo.go:278
+rule RepoAdminDeletesDeployKey {
+    when: RepoAdminDeletesDeployKey(admin, deploy_key)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    -- read before the record goes: an emission sees the resulting state
+    let key_repository = deploy_key.repository
+    let key_name = deploy_key.name
+
+    let material = deploy_key.key
+    let shared = material.attachments.count > 1
+
+    requires: is_repo_admin(admin, deploy_key.repository)
+
+    ensures: not exists deploy_key
+    ensures:
+        if not shared:
+            not exists material
+    ensures: DeployKeyDeleted(deploy_key: deploy_key, repository: key_repository, name: key_name, actor: admin)
+
+    @guidance
+        -- Web: POST /{owner}/{repo}/settings/keys/delete.
+        -- API: DELETE /api/v1/repos/{owner}/{repo}/keys/{id}; a key id that
+        -- belongs to another repository is refused.
+}
+
+-- Deleting a repository detaches all its deploy keys (and forgets material
+-- no other repository uses).
+-- from: services/repository/delete.go:106
+rule DetachDeployKeysOfDeletedRepository {
+    when: repositories/RepositoryDeleted(repository, doer)
+
+    for deploy_key in DeployKeys where repository = repository:
+        let material = deploy_key.key
+        let shared = material.attachments.count > 1
+        ensures: not exists deploy_key
+        ensures:
+            if not shared:
+                not exists material
+}
+
+------------------------------------------------------------
+-- Rules: scheduled key-file rewrites
+------------------------------------------------------------
+
+-- administration's resync_all_sshkeys cron task. Rewriting the SSH daemon's
+-- authorized_keys file from SshKeys is an implementation detail (see
+-- Excludes): the keys themselves do not change, so this reaction only
+-- reports that the rewrite is done (administration finishes the cron run).
+-- from: services/cron/tasks_extended.go (resync_all_sshkeys)
+rule AuthorizedKeysRewrite {
+    when: administration/AuthorizedKeysRewriteDue()
+    ensures: KeyFilesRewritten(kind: authorized_keys)
+}
+
+-- administration's resync_all_sshprincipals cron task; as above, for the
+-- authorized_principals file.
+-- from: services/cron/tasks_extended.go (resync_all_sshprincipals)
+rule AuthorizedPrincipalsRewrite {
+    when: administration/AuthorizedPrincipalsRewriteDue()
+    ensures: KeyFilesRewritten(kind: authorized_principals)
+}
+
+-- `forgejo admin regenerate keys`: the operator rebuilds authorized_keys by
+-- hand. As above, the key set is unchanged; the rewrite is reported done.
+-- from: cmd/admin_regenerate.go:20
+rule AuthorizedKeysRegeneration {
+    when: administration/AuthorizedKeysRegenerationRequested(operator)
+    ensures: KeyFilesRewritten(kind: authorized_keys)
+}
+
+------------------------------------------------------------
+-- Rules: account deletion
+------------------------------------------------------------
+
+-- Deleting an account removes its SSH keys, principals, GPG keys and imports.
+-- from: services/user/delete.go:213
+rule RemoveKeysOfDeletedAccount {
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+
+    ensures:
+        for key in SshKeys where owner = user:
+            not exists key
+    ensures:
+        for gpg in GpgKeys where owner = user:
+            not exists gpg
+    ensures:
+        for imported in GpgKeyImports where key.owner = user:
+            not exists imported
+}
+
+------------------------------------------------------------
+-- Rules: GPG keys
+------------------------------------------------------------
+
+-- A user adds a GPG key without proving possession. It is accepted only if one
+-- of its (non-revoked) identities is an activated email address of the user.
+-- The key is stored unverified.
+-- from: models/asymkey/gpg_key_add.go:349
+rule UserAddsGpgKeyMatchedByEmail {
+    when: UserAddsGpgKey(owner, armored)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    let key_id = gpg_primary_key_id(armored)
+    let identities = gpg_identity_emails(armored)
+
+    requires: manages_own_gpg_keys(owner)
+    requires: gpg_armored_key_parses(armored)
+    requires: not exists GpgKey{key_id: key_id}
+    requires: has_activated_identity(owner, identities)
+
+    ensures:
+        let key = GpgKey.created(
+            owner: owner,
+            key_id: key_id,
+            primary: null,
+            public_key: gpg_primary_public_key(armored),
+            identity_emails: identities,
+            key_created_at: gpg_key_created_at(armored, key_id),
+            expires_at: gpg_key_expires_at(armored, key_id),
+            is_revoked: gpg_key_is_revoked(armored, key_id),
+            added_at: now,
+            is_verified: false,
+            can_sign: gpg_key_can_sign(armored, key_id),
+            can_encrypt_comms: gpg_key_can_encrypt(armored, key_id),
+            can_encrypt_storage: gpg_key_can_encrypt(armored, key_id),
+            can_certify: gpg_key_can_certify(armored, key_id)
+        )
+        GpgKeyImport.created(key: key, armored: armored)
+        for sub_id in gpg_subkey_ids(armored):
+            GpgKey.created(
+                owner: owner,
+                key_id: sub_id,
+                primary: key,
+                public_key: gpg_subkey_public_key(armored, sub_id),
+                identity_emails: {},
+                key_created_at: gpg_key_created_at(armored, sub_id),
+                expires_at: gpg_key_expires_at(armored, sub_id),
+                is_revoked: gpg_key_is_revoked(armored, sub_id),
+                added_at: now,
+                is_verified: false,
+                can_sign: gpg_key_can_sign(armored, sub_id),
+                can_encrypt_comms: gpg_key_can_encrypt(armored, sub_id),
+                can_encrypt_storage: gpg_key_can_encrypt(armored, sub_id),
+                can_certify: gpg_key_can_certify(armored, sub_id)
+            )
+        GpgKeyAdded(key: key, actor: owner)
+
+    @guidance
+        -- Web: POST /user/settings/keys (type=gpg). API: POST /api/v1/user/gpg_keys.
+        -- An armored block holding several primary keys adds each of them
+        -- (blocks repeating a primary key id are merged first: subkeys and
+        -- identities are unioned); the whole upload fails if any primary key
+        -- id is already registered. A subkey without its own lifetime inherits
+        -- the primary key's expiry. The refusal when no identity matches tells
+        -- the user the token to sign, since a signature lifts the email rule.
+}
+
+-- A user adds a GPG key together with a signature of their current token
+-- made by that key (the same form / endpoint with the signature field set). The email rule is lifted and the key is stored verified.
+-- Only the primary key that produced the signature is added.
+-- from: models/asymkey/gpg_key_add.go:364
+rule UserAddsGpgKeyProvenBySignature {
+    when: UserAddsSignedGpgKey(owner, armored, challenge, signature)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    let key_id = gpg_token_signer_key_id(armored, signature)
+    let identities = gpg_identity_emails(armored)
+
+    requires: manages_own_gpg_keys(owner)
+    requires: gpg_armored_key_parses(armored)
+    requires: challenge.owner = owner
+    requires: challenge.status = open
+    requires: gpg_signs_token(armored, signature, challenge.token)
+    requires: not exists GpgKey{key_id: key_id}
+
+    ensures:
+        let key = GpgKey.created(
+            owner: owner,
+            key_id: key_id,
+            primary: null,
+            public_key: gpg_primary_public_key(armored),
+            identity_emails: identities,
+            key_created_at: gpg_key_created_at(armored, key_id),
+            expires_at: gpg_key_expires_at(armored, key_id),
+            is_revoked: gpg_key_is_revoked(armored, key_id),
+            added_at: now,
+            is_verified: true,
+            can_sign: gpg_key_can_sign(armored, key_id),
+            can_encrypt_comms: gpg_key_can_encrypt(armored, key_id),
+            can_encrypt_storage: gpg_key_can_encrypt(armored, key_id),
+            can_certify: gpg_key_can_certify(armored, key_id)
+        )
+        GpgKeyImport.created(key: key, armored: armored)
+        for sub_id in gpg_subkey_ids(armored):
+            GpgKey.created(
+                owner: owner,
+                key_id: sub_id,
+                primary: key,
+                public_key: gpg_subkey_public_key(armored, sub_id),
+                identity_emails: {},
+                key_created_at: gpg_key_created_at(armored, sub_id),
+                expires_at: gpg_key_expires_at(armored, sub_id),
+                is_revoked: gpg_key_is_revoked(armored, sub_id),
+                added_at: now,
+                is_verified: true,
+                can_sign: gpg_key_can_sign(armored, sub_id),
+                can_encrypt_comms: gpg_key_can_encrypt(armored, sub_id),
+                can_encrypt_storage: gpg_key_can_encrypt(armored, sub_id),
+                can_certify: gpg_key_can_certify(armored, sub_id)
+            )
+        GpgKeyAdded(key: key, actor: owner)
+}
+
+-- A user proves possession of an already registered primary key (or any of
+-- its subkeys) by signing the token.
+-- decided: verification stays available when the user may not manage their
+-- GPG keys (manage_gpg_keys disabled); it does not change the key set.
+-- from: models/asymkey/gpg_key_verify.go:33
+rule UserVerifiesGpgKey {
+    when: UserVerifiesGpgKey(owner, key, challenge, signature)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
+    requires: key.owner = owner
+    requires: key.is_primary
+    requires: challenge.owner = owner
+    requires: challenge.status = open
+    requires: gpg_key_signs_token(key, signature, challenge.token)
+
+    ensures: key.is_verified = true
+
+    @guidance
+        -- Web: POST /user/settings/keys (type=verify_gpg, key_id, signature).
+        -- API: POST /api/v1/user/gpg_key_verify. Neither checks the
+        -- manage_gpg_keys feature flag.
+}
+
+-- A user removes one of their primary GPG keys; its subkeys and the original
+-- import go with it. Only the owner can remove a GPG key.
+-- from: models/asymkey/gpg_key.go:230
+rule UserDeletesGpgKey {
+    when: UserDeletesGpgKey(owner, key)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    -- read before the record goes: an emission sees the resulting state
+    let deleted_key_id = key.key_id
+
+    requires: manages_own_gpg_keys(owner)
+    requires: key.owner = owner
+    requires: key.is_primary
+
+    ensures:
+        for sub in key.subkeys:
+            not exists sub
+    ensures:
+        for imported in key.original_import:
+            not exists imported
+    ensures: not exists key
+    ensures: GpgKeyDeleted(owner: owner, key_id: deleted_key_id, actor: owner)
+
+    @guidance
+        -- Web: POST /user/settings/keys/delete (type=gpg).
+        -- API: DELETE /api/v1/user/gpg_keys/{id}.
+}
+
+------------------------------------------------------------
+-- Rules: signature verification
+------------------------------------------------------------
+
+-- An object without a signature is simply unverified.
+-- from: models/asymkey/gpg_key_object_verification.go:105
+rule VerifyUnsignedObject {
+    when: SignatureVerificationRequested(repository, object_kind, object_id, committer_email, format?, signature?)
+
+    requires: signature = null
+
+    ensures: CommitVerification.created(
+        repository: repository,
+        object_kind: object_kind,
+        object_id: object_id,
+        committer_email: committer_email,
+        committer: committer_account(committer_email),
+        format: null,
+        result: unverified,
+        reason: not_signed,
+        signer: null,
+        signed_by_instance: false,
+        signing_email: null,
+        signing_gpg_key: null,
+        signing_ssh_key: null,
+        trust: null
+    )
+}
+
+-- OpenPGP signatures. In order:
+--   1. a registered key (primary or subkey) that may vouch for signatures
+--      produced it: verified, credited to the key's owner -- unless that key
+--      is revoked (unverified, key_revoked) or the signature is dated after
+--      the key expired (unverified, key_expired);
+--   2. the instance signing key (or the repository's default key) produced it:
+--      verified, credited to the instance identity;
+--   3. the signature names a key id we know (registered, or the instance
+--      key) but that key did not produce it: warning (probable forgery);
+--   4. otherwise: unverified, no matching key.
+-- Committer and signer may differ; the trust model decides what that means.
+-- decided: verification is expiry-aware: a signature made while the key was
+-- valid stays verified after the key expires; one dated after expiry, or by a
+-- revoked key, is unverified with that reason.
+-- from: models/asymkey/gpg_key_object_verification.go:80
+rule VerifyOpenPgpSignature {
+    when: SignatureVerificationRequested(repository, object_kind, object_id, committer_email, format?, signature?)
+
+    let committer = committer_account(committer_email)
+    let issuer_id = gpg_signature_issuer(signature)
+    let signing_key = registered_gpg_key_that_signed(signature)
+
+    requires: signature != null
+    requires: format = openpgp
+
+    ensures:
+        if not gpg_signature_readable(signature):
+            CommitVerification.created(
+                repository: repository, object_kind: object_kind, object_id: object_id,
+                committer_email: committer_email, committer: committer, format: openpgp,
+                result: unverified, reason: unreadable_signature,
+                signer: null, signed_by_instance: false, signing_email: null,
+                signing_gpg_key: null, signing_ssh_key: null, trust: null
+            )
+        else if signing_key != null and signing_key.is_usable_for_signatures and signing_key.is_revoked:
+            CommitVerification.created(
+                repository: repository, object_kind: object_kind, object_id: object_id,
+                committer_email: committer_email, committer: committer, format: openpgp,
+                result: unverified, reason: key_revoked,
+                signer: null, signed_by_instance: false, signing_email: null,
+                signing_gpg_key: signing_key, signing_ssh_key: null, trust: null
+            )
+        else if signing_key != null and signing_key.is_usable_for_signatures
+            and signing_key.expires_at != null and gpg_signature_created_at(signature) > signing_key.expires_at:
+            CommitVerification.created(
+                repository: repository, object_kind: object_kind, object_id: object_id,
+                committer_email: committer_email, committer: committer, format: openpgp,
+                result: unverified, reason: key_expired,
+                signer: null, signed_by_instance: false, signing_email: null,
+                signing_gpg_key: signing_key, signing_ssh_key: null, trust: null
+            )
+        else if signing_key != null and signing_key.is_usable_for_signatures:
+            let verification = CommitVerification.created(
+                repository: repository, object_kind: object_kind, object_id: object_id,
+                committer_email: committer_email, committer: committer, format: openpgp,
+                result: verified, reason: signed_by_user_key,
+                signer: signing_key.owner, signed_by_instance: false,
+                signing_email: credited_email(signing_key, committer_email),
+                signing_gpg_key: signing_key, signing_ssh_key: null, trust: null
+            )
+            SignatureVerified(verification: verification)
+        else if instance_gpg_key_signed(repository, signature):
+            let by_instance = CommitVerification.created(
+                repository: repository, object_kind: object_kind, object_id: object_id,
+                committer_email: committer_email, committer: committer, format: openpgp,
+                result: verified, reason: signed_by_instance_key,
+                signer: null, signed_by_instance: true,
+                signing_email: instance_signing_email(repository),
+                signing_gpg_key: null, signing_ssh_key: null, trust: null
+            )
+            SignatureVerified(verification: by_instance)
+        else if exists GpgKey{key_id: issuer_id} or issuer_id = instance_gpg_key_id(repository):
+            CommitVerification.created(
+                repository: repository, object_kind: object_kind, object_id: object_id,
+                committer_email: committer_email, committer: committer, format: openpgp,
+                result: warning, reason: probable_bad_signature,
+                signer: null, signed_by_instance: false, signing_email: null,
+                signing_gpg_key: null, signing_ssh_key: null, trust: null
+            )
+        else:
+            CommitVerification.created(
+                repository: repository, object_kind: object_kind, object_id: object_id,
+                committer_email: committer_email, committer: committer, format: openpgp,
+                result: unverified, reason: no_matching_key,
+                signer: null, signed_by_instance: false, signing_email: null,
+                signing_gpg_key: null, signing_ssh_key: null, trust: null
+            )
+
+    @guidance
+        -- registered_gpg_key_that_signed returns the primary key (resolving a
+        -- subkey to its primary) whose signing-capable key validates the
+        -- signature over the object's payload, looking first at the key id
+        -- the signature names and then at the committer's own keys.
+        -- The instance key is config.signing_key when signing_format is
+        -- openpgp and it is an explicit key id; otherwise the key the server's
+        -- git configuration signs with in this repository (SIGNING_KEY=default).
+        -- Expiry and revocation are those of the returned primary key; a
+        -- rebuild also honours the expiry or revocation of the subkey that
+        -- produced the signature. gpg_signature_created_at is the creation
+        -- time recorded in the signature packet. Forgejo only displays expiry.
+}
+
+-- SSH signatures. Only verified personal keys of the committer count, and only
+-- when the committer email is one of the committer's activated addresses (or
+-- their no-reply address). Otherwise the instance SSH key is tried.
+-- from: models/asymkey/ssh_key_object_verification.go:22
+rule VerifySshSignature {
+    when: SignatureVerificationRequested(repository, object_kind, object_id, committer_email, format?, signature?)
+
+    let committer = committer_account(committer_email)
+    let signing_key = registered_ssh_key_that_signed(signature)
+
+    requires: signature != null
+    requires: format = ssh
+
+    ensures:
+        if committer != null and signing_key != null
+            and signing_key.kind = personal and signing_key.owner = committer and signing_key.is_verified:
+            let verification = CommitVerification.created(
+                repository: repository, object_kind: object_kind, object_id: object_id,
+                committer_email: committer_email, committer: committer, format: ssh,
+                result: verified, reason: signed_by_user_key,
+                signer: committer, signed_by_instance: false, signing_email: committer_email,
+                signing_gpg_key: null, signing_ssh_key: signing_key, trust: null
+            )
+            SignatureVerified(verification: verification)
+        else if instance_ssh_key_signed(signature):
+            let by_instance = CommitVerification.created(
+                repository: repository, object_kind: object_kind, object_id: object_id,
+                committer_email: committer_email, committer: committer, format: ssh,
+                result: verified, reason: signed_by_instance_key,
+                signer: null, signed_by_instance: true, signing_email: config.signing_email,
+                signing_gpg_key: null, signing_ssh_key: null, trust: null
+            )
+            SignatureVerified(verification: by_instance)
+        else:
+            CommitVerification.created(
+                repository: repository, object_kind: object_kind, object_id: object_id,
+                committer_email: committer_email, committer: committer, format: ssh,
+                result: unverified, reason: no_matching_key,
+                signer: null, signed_by_instance: false, signing_email: null,
+                signing_gpg_key: null, signing_ssh_key: null, trust: null
+            )
+
+    @guidance
+        -- The SSH signature namespace for git objects is "git".
+}
+
+-- A verified signature is then judged by the repository's trust model.
+--   committer model: trusted only when the signer is the committer (or, for
+--     the instance key, when neither has an account and the emails agree);
+--     otherwise unmatched.
+--   collaborator model: the instance key is trusted; a user signer who is the
+--     repository owner, a member of a team with code access to it, or a
+--     collaborator is trusted; any other user signer is untrusted when they
+--     are the committer and unmatched when they are not.
+--   collaborator_committer model: as collaborator, but a trusted signer who is
+--     not the committer becomes unmatched, and the instance key is untrusted
+--     unless the committer has no account and the emails agree.
+-- decided: SSH and GPG signatures are judged by the same trust model,
+-- collaborator check included (Forgejo skips it for SSH signing keys).
+-- from: models/asymkey/gpg_key_object_verification.go:458
+rule AssessSignatureTrust {
+    when: SignatureVerified(verification)
+
+    let repo_model = repository_trust_model(verification.repository)
+    let model = if repo_model = instance_default: config.default_trust_model else: repo_model
+    let signing_user = verification.signer
+    let committing_user = verification.committer
+    let same_person = signing_user != null and committing_user != null and signing_user = committing_user
+    let instance_matches_committer = verification.signed_by_instance and committing_user = null
+        and verification.signing_email = verification.committer_email
+    let signer_is_member = signing_user != null and is_owner_member_or_collaborator(signing_user, verification.repository)
+
+    requires: verification.result = verified
+
+    ensures:
+        if model = committer:
+            if same_person or instance_matches_committer:
+                verification.trust = trusted
+            else:
+                verification.trust = unmatched
+        else if verification.signed_by_instance:
+            if model = collaborator_committer and not instance_matches_committer:
+                verification.trust = untrusted
+            else:
+                verification.trust = trusted
+        else if not signer_is_member:
+            if same_person:
+                verification.trust = untrusted
+            else:
+                verification.trust = unmatched
+        else if model = collaborator_committer and not same_person:
+            verification.trust = unmatched
+        else:
+            verification.trust = trusted
+}
+
+------------------------------------------------------------
+-- Rules: instance signing of forge-made commits
+------------------------------------------------------------
+
+-- The initial commit of a repository created with auto-init (README, license,
+-- .gitignore) or from a template.
+-- from: services/asymkey/sign.go:139
+rule DecideInitialCommitSigning {
+    when: InitialCommitSigningRequested(actor, repository)
+
+    let policy = SigningPolicy{operation: initial_commit}
+
+    ensures:
+        if not instance_signing_key_available(repository):
+            SigningDecision.created(operation: initial_commit, actor: actor, repository: repository,
+                will_sign: false, refusal: no_instance_key, signer_name: null, signer_email: null)
+        else if policy.mode = never:
+            SigningDecision.created(operation: initial_commit, actor: actor, repository: repository,
+                will_sign: false, refusal: policy_never, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_registered_key and not has_registered_key(actor):
+            SigningDecision.created(operation: initial_commit, actor: actor, repository: repository,
+                will_sign: false, refusal: no_registered_key, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_two_factor and not has_two_factor(actor):
+            SigningDecision.created(operation: initial_commit, actor: actor, repository: repository,
+                will_sign: false, refusal: no_two_factor, signer_name: null, signer_email: null)
+        else:
+            SigningDecision.created(operation: initial_commit, actor: actor, repository: repository,
+                will_sign: true, refusal: null,
+                signer_name: instance_signing_name(repository), signer_email: instance_signing_email(repository))
+}
+
+-- Commits made through the web editor and file APIs (create / update / delete
+-- files, apply patch, cherry-pick, revert).
+-- from: services/asymkey/sign.go:229
+rule DecideWebEditSigning {
+    when: WebEditSigningRequested(actor, repository, parent_verified)
+
+    let policy = SigningPolicy{operation: web_edit}
+
+    ensures:
+        if not instance_signing_key_available(repository):
+            SigningDecision.created(operation: web_edit, actor: actor, repository: repository,
+                will_sign: false, refusal: no_instance_key, signer_name: null, signer_email: null)
+        else if policy.mode = never:
+            SigningDecision.created(operation: web_edit, actor: actor, repository: repository,
+                will_sign: false, refusal: policy_never, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_registered_key and not has_registered_key(actor):
+            SigningDecision.created(operation: web_edit, actor: actor, repository: repository,
+                will_sign: false, refusal: no_registered_key, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_two_factor and not has_two_factor(actor):
+            SigningDecision.created(operation: web_edit, actor: actor, repository: repository,
+                will_sign: false, refusal: no_two_factor, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_parent_signed and not parent_verified:
+            SigningDecision.created(operation: web_edit, actor: actor, repository: repository,
+                will_sign: false, refusal: parent_unsigned, signer_name: null, signer_email: null)
+        else:
+            SigningDecision.created(operation: web_edit, actor: actor, repository: repository,
+                will_sign: true, refusal: null,
+                signer_name: instance_signing_name(repository), signer_email: instance_signing_email(repository))
+
+    @guidance
+        -- `parent_verified` is the CommitVerification result of the commit
+        -- the edit is made on top of (verified = true).
+}
+
+-- Commits to a repository's wiki.
+-- from: services/asymkey/sign.go:175
+rule DecideWikiSigning {
+    when: wiki/WikiCommitSigningRequested(actor, repository, wiki_head_verified)
+
+    let policy = SigningPolicy{operation: wiki_edit}
+
+    ensures:
+        if not instance_signing_key_available(repository):
+            SigningDecision.created(operation: wiki_edit, actor: actor, repository: repository,
+                will_sign: false, refusal: no_instance_key, signer_name: null, signer_email: null)
+        else if policy.mode = never:
+            SigningDecision.created(operation: wiki_edit, actor: actor, repository: repository,
+                will_sign: false, refusal: policy_never, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_registered_key and not has_registered_key(actor):
+            SigningDecision.created(operation: wiki_edit, actor: actor, repository: repository,
+                will_sign: false, refusal: no_registered_key, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_two_factor and not has_two_factor(actor):
+            SigningDecision.created(operation: wiki_edit, actor: actor, repository: repository,
+                will_sign: false, refusal: no_two_factor, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_parent_signed and not wiki_head_verified:
+            SigningDecision.created(operation: wiki_edit, actor: actor, repository: repository,
+                will_sign: false, refusal: parent_unsigned, signer_name: null, signer_email: null)
+        else:
+            SigningDecision.created(operation: wiki_edit, actor: actor, repository: repository,
+                will_sign: true, refusal: null,
+                signer_name: instance_signing_name(repository), signer_email: instance_signing_email(repository))
+}
+
+-- The merge commit (or rebased / squashed commits) created when a pull
+-- request is merged through the forge.
+-- from: services/asymkey/sign.go:282
+rule DecideMergeSigning {
+    when: MergeSigningRequested(actor, pull, base_verified, head_verified, all_commits_verified, has_approval)
+
+    let repository = pull.base_repository
+    let policy = SigningPolicy{operation: merge}
+
+    ensures:
+        if not instance_signing_key_available(repository):
+            SigningDecision.created(operation: merge, actor: actor, repository: repository,
+                will_sign: false, refusal: no_instance_key, signer_name: null, signer_email: null)
+        else if policy.mode = never:
+            SigningDecision.created(operation: merge, actor: actor, repository: repository,
+                will_sign: false, refusal: policy_never, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_registered_key and not has_registered_key(actor):
+            SigningDecision.created(operation: merge, actor: actor, repository: repository,
+                will_sign: false, refusal: no_registered_key, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_two_factor and not has_two_factor(actor):
+            SigningDecision.created(operation: merge, actor: actor, repository: repository,
+                will_sign: false, refusal: no_two_factor, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_approval and not has_approval:
+            SigningDecision.created(operation: merge, actor: actor, repository: repository,
+                will_sign: false, refusal: not_approved, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_base_signed and not base_verified:
+            SigningDecision.created(operation: merge, actor: actor, repository: repository,
+                will_sign: false, refusal: base_unsigned, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_head_signed and not head_verified:
+            SigningDecision.created(operation: merge, actor: actor, repository: repository,
+                will_sign: false, refusal: head_unsigned, signer_name: null, signer_email: null)
+        else if policy.mode = conditional and policy.requires_commits_signed and not all_commits_verified:
+            SigningDecision.created(operation: merge, actor: actor, repository: repository,
+                will_sign: false, refusal: commits_unsigned, signer_name: null, signer_email: null)
+        else:
+            SigningDecision.created(operation: merge, actor: actor, repository: repository,
+                will_sign: true, refusal: null,
+                signer_name: instance_signing_name(repository), signer_email: instance_signing_email(repository))
+
+    @guidance
+        -- `has_approval`: the base branch has a protection rule and the pull
+        -- request has at least one approval that counts under it.
+        -- `all_commits_verified`: the head commit and every commit between the
+        -- merge base and the head are verified.
+}
+
+------------------------------------------------------------
+-- Rules: SSH authentication key lookup
+------------------------------------------------------------
+
+-- A git client offers a plain public key. It is accepted when it is a
+-- registered personal or deploy key; what it may do is decided by code/access.
+-- from: modules/ssh/ssh.go:266
+rule AuthenticateSshPublicKey {
+    when: SshClientPresentsPublicKey(connection, presented_key)
+
+    let key = SshKey{fingerprint: ssh_fingerprint(presented_key)}
+
+    requires: not config.ssh_disabled
+    requires: exists key
+    requires: key.kind in {personal, deploy}
+
+    ensures: SshKeyAuthenticated(connection: connection, key: key)
+
+    @guidance
+        -- Built-in server: the public-key callback. External OpenSSH: the
+        -- AuthorizedKeysCommand / authorized_keys line, which carries the key
+        -- id ("serv key-<id>"); routers/private/key.go answers fingerprint
+        -- lookups for AuthorizedKeysCommand.
+}
+
+-- A git client offers a user certificate. It is accepted when it was signed
+-- by a trusted CA and one of the principals it lists is registered to an
+-- active user and passes the certificate checks; the client then
+-- authenticates as that principal's owner. Every listed principal is tried.
+-- decided: try every principal; a principal whose check fails no longer
+-- stops the attempt.
+-- from: modules/ssh/ssh.go:186
+rule AuthenticateSshCertificate {
+    when: SshClientPresentsCertificate(connection, certificate)
+
+    let key = acceptable_principal_for(certificate)
+
+    requires: not config.ssh_disabled
+    requires: config.trusted_user_ca_keys_configured
+    requires: is_user_certificate(certificate)
+    requires: certificate_signed_by_trusted_ca(certificate)
+    requires: key != null
+    requires: key.kind = principal
+    requires: key.owner.is_active and not key.owner.prohibit_login
+    requires: certificate_valid_for(certificate, key.content)
+
+    ensures: SshKeyAuthenticated(connection: connection, key: key)
+
+    @guidance
+        -- acceptable_principal_for(certificate) is the first principal, in
+        -- the order the certificate lists them, that is registered
+        -- (SshKey kind principal with that content), whose owner is active
+        -- and not prohibited from logging in, and for which
+        -- certificate_valid_for holds (validity window, principal listed,
+        -- critical options). Principals failing any of these are skipped and
+        -- the next is tried; Forgejo instead stops at the first registered
+        -- principal whose check fails.
+}
+
+-- After a successful git operation over SSH, the key (and, for a deploy key,
+-- its grant on that repository) is marked as used.
+-- from: routers/private/key.go:17
+rule RecordSshKeyUse {
+    when: SshKeyUsedForRepository(key, repository)
+
+    let grant = DeployKey{repository: repository, key: key}
+
+    ensures: key.last_used_at = now
+    ensures:
+        if exists grant:
+            grant.last_used_at = now
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- No two registered SSH keys (of any kind) share a fingerprint.
+invariant UniqueSshFingerprint {
+    for a in SshKeys:
+        for b in SshKeys:
+            a != b and a.fingerprint != null implies a.fingerprint != b.fingerprint
+}
+
+-- Titles are unique per owner (principals use the principal as title).
+invariant UniqueKeyTitlePerOwner {
+    for a in SshKeys:
+        for b in SshKeys:
+            a != b and a.owner != null and a.owner = b.owner implies a.name != b.name
+}
+
+-- A principal belongs to at most one user.
+invariant UniquePrincipal {
+    for a in SshKeys:
+        for b in SshKeys:
+            a != b and a.kind = principal and b.kind = principal implies a.content != b.content
+}
+
+-- Deploy key material has no owner; personal keys and principals always do.
+invariant DeployKeysAreOwnerless {
+    for k in SshKeys:
+        (k.kind = deploy implies k.owner = null) and (k.kind != deploy implies k.owner != null)
+}
+
+-- Only principals lack a fingerprint.
+invariant PrincipalsHaveNoFingerprint {
+    for k in SshKeys:
+        (k.kind = principal) = (k.fingerprint = null)
+}
+
+-- Repository grants only ever point at deploy key material.
+invariant GrantsUseDeployMaterial {
+    for d in DeployKeys:
+        d.key.kind = deploy
+}
+
+-- One grant per (repository, key) and per (repository, title).
+invariant UniqueDeployKeyPerRepository {
+    for a in DeployKeys:
+        for b in DeployKeys:
+            a != b and a.repository = b.repository implies (a.key != b.key and a.name != b.name)
+}
+
+-- Deploy key material exists only while some repository uses it.
+invariant DeployMaterialIsAttached {
+    for k in SshKeys:
+        k.kind = deploy implies k.attachments.count > 0
+}
+
+-- GPG key ids are unique across the instance (primary keys and subkeys).
+invariant UniqueGpgKeyId {
+    for a in GpgKeys:
+        for b in GpgKeys:
+            a != b implies a.key_id != b.key_id
+}
+
+-- Subkeys hang directly off a primary key of the same owner.
+invariant SubkeysBelongToPrimaryOwner {
+    for k in GpgKeys:
+        k.primary != null implies (k.primary.owner = k.owner and k.primary.primary = null)
+}
+
+-- Only primary keys carry identities and an original import.
+invariant ImportsAreForPrimaryKeys {
+    for i in GpgKeyImports:
+        i.key.primary = null
+}
+
+-- A verified result names who (or what) signed; others name nobody.
+invariant VerifiedResultsNameASigner {
+    for v in CommitVerifications:
+        (v.result = verified implies (v.signer != null or v.signed_by_instance))
+        and (v.result != verified implies (v.signer = null and not v.signed_by_instance and v.trust = null))
+}
+
+-- Exactly one signing policy per operation.
+invariant OneSigningPolicyPerOperation {
+    for a in SigningPolicys:
+        for b in SigningPolicys:
+            a != b implies a.operation != b.operation
+}
+
+-- Conditions only exist where they make sense.
+invariant SigningConditionsApply {
+    for p in SigningPolicys:
+        (p.operation = initial_commit implies not p.requires_parent_signed)
+        and (p.operation != merge implies
+            not (p.requires_base_signed or p.requires_head_signed or p.requires_commits_signed or p.requires_approval))
+        and (p.operation = merge implies not p.requires_parent_signed)
+}
+
+-- A refusal is recorded exactly when the forge declines to sign.
+invariant RefusalExplainsDecision {
+    for d in SigningDecisions:
+        (d.will_sign = false) = (d.refusal != null)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- An administrator of one repository (owner, org owner, team or collaborator
+-- with admin access, or site admin) is access/RepoAdmin.
+
+-- An administrator of the repository a deploy key is attached to.
+actor DeployKeyAdministrator {
+    within: DeployKey
+    identified_by: accounts/User where is_repo_admin(this, within.repository)
+}
+
+-- The forge's own subsystems calling into this module.
+actor InternalCaller {
+    identified_by: ForgeSubsystem where name != ""
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The signed-in user's key settings page: adding keys and asking for a token.
+surface KeySettings {
+    facing owner: access/SignedInUser
+
+    exposes:
+        config.ssh_disabled
+        config.principals_allow_anything
+        config.principals_allow_username
+        config.principals_allow_email
+        manages_own_ssh_keys(owner)
+        manages_own_gpg_keys(owner)
+
+    provides:
+        UserAddsSshKey(owner, title, content)
+            when manages_own_ssh_keys(owner)
+        UserAddsGpgKey(owner, armored)
+            when manages_own_gpg_keys(owner)
+        UserAddsSignedGpgKey(owner, armored, challenge, signature)
+            when manages_own_gpg_keys(owner)
+        UserAddsPrincipal(owner, principal)
+            when not config.ssh_disabled
+        UserRequestsVerificationToken(owner)
+
+    @guidance
+        -- Web: GET/POST /user/settings/keys (form field `type` = ssh | gpg |
+        -- principal | verify_ssh | verify_gpg), POST /user/settings/keys/delete.
+        -- API: GET/POST /api/v1/user/keys, GET/DELETE /api/v1/user/keys/{id},
+        -- GET/POST /api/v1/user/gpg_keys, GET/DELETE /api/v1/user/gpg_keys/{id},
+        -- GET /api/v1/user/gpg_key_token, POST /api/v1/user/gpg_key_verify.
+        -- API access needs a token with the user scope.
+}
+
+-- The token a user is asked to sign.
+surface VerificationTokenView {
+    facing owner: access/SignedInUser
+    context challenge: VerificationChallenge where owner = owner and status = open
+
+    exposes:
+        challenge.token
+        challenge.expires_at
+
+    timeout:
+        VerificationChallengeExpires
+}
+
+-- One of the user's own personal SSH keys. Listing and getting keys by id
+-- (API GET /api/v1/user/keys, /api/v1/user/keys/{id}) return only these.
+-- decided: by-id and list lookups are limited to the caller's own keys.
+surface OwnSshKey {
+    facing owner: access/SignedInUser
+    context key: SshKey where owner = owner and kind = personal
+
+    exposes:
+        key.name
+        key.content
+        key.fingerprint
+        key.algorithm
+        key.bits
+        key.is_verified
+        key.created_at
+        key.last_used_at
+        key.has_recent_activity
+        key.is_externally_managed
+
+    provides:
+        UserVerifiesSshKey(owner, key, challenge, signature)
+            when not key.is_verified and manages_own_ssh_keys(owner)
+        UserDeletesSshKey(owner, key)
+            when not key.is_externally_managed and manages_own_ssh_keys(owner)
+
+    @guarantee ExternallyManagedKeysAreReadOnly
+        -- A key supplied by an LDAP or OAuth2 source is shown, marked as
+        -- managed elsewhere, and cannot be removed by its owner.
+}
+
+-- One of the user's own SSH certificate principals.
+surface OwnPrincipal {
+    facing owner: access/SignedInUser
+    context key: SshKey where owner = owner and kind = principal
+
+    exposes:
+        key.content
+        key.created_at
+        key.last_used_at
+
+    provides:
+        UserDeletesPrincipal(owner, key)
+}
+
+-- One of the user's own primary GPG keys.
+surface OwnGpgKey {
+    facing owner: access/SignedInUser
+    context key: GpgKey where owner = owner and primary = null
+
+    exposes:
+        key.key_id
+        key.identity_emails
+        key.matched_emails
+        key.is_verified
+        key.can_sign
+        key.can_encrypt_comms
+        key.can_encrypt_storage
+        key.can_certify
+        key.key_created_at
+        key.expires_at
+        key.added_at
+        for sub in key.subkeys:
+            sub.key_id
+            sub.can_sign
+            sub.expires_at
+
+    provides:
+        UserVerifiesGpgKey(owner, key, challenge, signature)
+            when not key.is_verified
+        UserDeletesGpgKey(owner, key)
+            when manages_own_gpg_keys(owner)
+}
+
+-- The deploy keys page of a repository.
+surface RepositoryDeployKeys {
+    facing admin: access/RepoAdmin
+    context repository: repositories/Repository
+
+    exposes:
+        config.ssh_disabled
+
+    provides:
+        RepoAdminAddsDeployKey(admin, repository, title, content, access)
+            when not config.ssh_disabled and not repository.is_archived
+
+    @guidance
+        -- Web: GET/POST /{owner}/{repo}/settings/keys,
+        -- POST /{owner}/{repo}/settings/keys/delete.
+        -- API: GET/POST /api/v1/repos/{owner}/{repo}/keys (filters: key_id,
+        -- fingerprint), GET/DELETE /api/v1/repos/{owner}/{repo}/keys/{id}.
+}
+
+-- One deploy key of a repository, as its administrators see it.
+surface RepositoryDeployKey {
+    facing admin: DeployKeyAdministrator
+    context deploy_key: DeployKey
+
+    exposes:
+        deploy_key.name
+        deploy_key.access
+        deploy_key.created_at
+        deploy_key.last_used_at
+        deploy_key.has_recent_activity
+        deploy_key.key.fingerprint
+        deploy_key.key.content
+
+    provides:
+        RepoAdminDeletesDeployKey(admin, deploy_key)
+}
+
+-- A user's public SSH keys, as anyone who may see the user's profile sees
+-- them. Principals and deploy keys are never listed.
+surface PublicSshKeys {
+    facing viewer: accounts/User
+    context key: SshKey where kind = personal and owner.visible_to(viewer)
+
+    exposes:
+        key.public_line
+        key.name
+        key.fingerprint
+        key.is_verified
+        key.created_at
+        key.last_used_at
+
+    @guidance
+        -- Web: GET /{username}.keys (one public_line per key, comments
+        -- stripped, a "# Note" line when there are none).
+        -- API: GET /api/v1/users/{username}/keys; the owner and site admins
+        -- also see key_type, read_only and the owner object.
+        -- Anonymous visitors see what a public profile shows.
+}
+
+-- Looking up who owns an SSH key by its fingerprint (API:
+-- GET /api/v1/user/keys?fingerprint=...). The owning user is named only when
+-- the caller may see their profile; deploy keys and principals never match.
+-- Site administrators see every key, deploy keys included.
+-- decided: own keys plus a visibility-respecting fingerprint lookup; listing
+-- and getting by id return only the caller's own keys (OwnSshKey).
+-- from: routers/api/v1/user/key.go:59
+surface SshKeyFingerprintLookup {
+    facing viewer: accounts/User
+    context key: SshKey where (kind = personal and owner.visible_to(viewer)) or viewer.is_admin
+
+    exposes:
+        key.fingerprint
+        key.public_line
+        key.name
+        key.owner
+
+    @guidance
+        -- Forgejo searches every user's keys, deploy keys included, and
+        -- returns any user's key by id; the rebuild limits GET
+        -- /api/v1/user/keys and /api/v1/user/keys/{id} to the caller's own
+        -- keys (site administrators: any key).
+}
+
+-- A user's public GPG keys.
+surface PublicGpgKeys {
+    facing viewer: accounts/User
+    context key: GpgKey where primary = null and owner.visible_to(viewer)
+
+    exposes:
+        key.key_id
+        key.public_key
+        key.identity_emails
+        key.is_verified
+        key.expires_at
+        for imported in key.original_import:
+            imported.armored
+
+    @guidance
+        -- Web: GET /{username}.gpg returns one armored block re-exporting
+        -- every primary key from its original import; keys with no import
+        -- are listed in a "Note" header asking for a re-upload.
+        -- API: GET /api/v1/users/{username}/gpg_keys.
+}
+
+-- The forge's own public signing keys.
+surface InstanceSigningKeys {
+    facing viewer: accounts/User
+    context repository: repositories/Repository
+
+    exposes:
+        instance_gpg_public_key(repository)
+        instance_ssh_public_key()
+
+    @guidance
+        -- API: GET /api/v1/signing-key.gpg, GET /api/v1/signing-key.ssh,
+        -- GET /api/v1/repos/{owner}/{repo}/signing-key.gpg (the key used in
+        -- that repository, which may differ under SIGNING_KEY=default).
+        -- Empty / not found when no key is configured.
+}
+
+-- The verification badge on a commit or tag.
+surface SignatureBadge {
+    facing viewer: accounts/User
+    context verification: CommitVerification where can_read_code(viewer, repository)
+
+    exposes:
+        verification.result
+        verification.reason
+        verification.trust
+        verification.signer
+        verification.signed_by_instance
+        verification.signing_email
+        verification.signing_gpg_key
+        verification.signing_ssh_key
+
+    @guidance
+        -- Shown on commit lists, the commit page, tags/releases, pull request
+        -- commit lists and the commit graph; included as `verification` in the
+        -- API commit object and in push webhook payloads.
+        -- Colour: verified+trusted green, verified+untrusted yellow,
+        -- verified+unmatched orange, warning red, unverified grey.
+}
+
+-- The SSH transport asking which key a client holds.
+surface SshKeyResolution {
+    facing _: InternalCaller
+
+    provides:
+        SshClientPresentsPublicKey(connection, presented_key)
+        SshClientPresentsCertificate(connection, certificate)
+        SshKeyUsedForRepository(key, repository)
+
+    @guidance
+        -- Internal routes: GET /api/internal/serv/none/{keyid},
+        -- GET /api/internal/serv/command/{keyid}/{owner}/{repo},
+        -- POST /api/internal/ssh/{id}/update/{repoid},
+        -- POST /api/internal/ssh/authorized_keys (fingerprint lookup).
+}
+
+-- Other modules asking for verification and signing decisions.
+surface SigningService {
+    facing _: InternalCaller
+
+    provides:
+        SignatureVerificationRequested(repository, object_kind, object_id, committer_email, format?, signature?)
+        InitialCommitSigningRequested(actor, repository)
+        WebEditSigningRequested(actor, repository, parent_verified)
+        MergeSigningRequested(actor, pull, base_verified, head_verified, all_commits_verified, has_approval)
+
+    contracts:
+        fulfils CommitSigning
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- (all keys open questions decided; see spec/DECISIONS.md "## keys")

@@ -1,0 +1,2818 @@
+-- allium: 3
+-- administration.allium — site administration and the lifecycle of one Forgejo instance.
+--
+-- Scope: everything a site administrator (web UI + /api/v1/admin) or a server
+--   operator (the `forgejo` CLI on the host) does to run the instance as a whole,
+--   plus the instance's own lifecycle: first-run installation, health, scheduled
+--   maintenance (cron), operational notices, runtime-changeable settings and the
+--   site-wide announcement.
+-- Includes:
+--   - Installation: the first-run install wizard, the install lock, creation of
+--     the first administrator.
+--   - Instance: version, start time, release/update check, health endpoint,
+--     instance statistics (dashboard).
+--   - Runtime settings (the system-settings store): disable gravatar, federated
+--     avatars, "open with" editor apps — editable by admins without restart.
+--   - SystemNotice: operational failure log; created by failing background work,
+--     listed, deleted, emptied, aged out.
+--   - CronTask: EVERY scheduled task registered by services/cron, its schedule,
+--     enablement, run-at-start, run-now, last/next run, exec count, last outcome,
+--     and which module owns the work each task performs.
+--   - Dashboard one-off operations (resync all branches / all tags).
+--   - Announcement (service message): a site-wide modal or non-blocking banner,
+--     each optionally limited to a start/end window, and per-user
+--     acknowledgement of it.
+--   - Read-only (maintenance) mode: admins switch the instance read-only for
+--     upgrades and backups; writes are refused everywhere, a banner says why.
+--   - Admin management of users: create (optionally forcing a password change),
+--     edit any account field (admin, restricted, prohibit-login, active,
+--     max repo creation, visibility, permissions, login source, password, email),
+--     rename (bypassing non-local and cooldown restrictions), delete / purge,
+--     reset 2FA, avatar, list/search, email directory (activate / delete).
+--   - Admin management of orgs and repositories: list, delete repository,
+--     unadopted repository directories (adopt / delete), create org or repo on a
+--     user's behalf.
+--   - Read-only configuration view with secrets masked; test mail; cache test.
+--   - Monitoring as a capability only: processes, queues, stack traces.
+--   - CLI surface: `forgejo admin user …`, `admin regenerate keys`,
+--     `admin auth …` (reference), `admin sendmail`, `admin repo-sync-releases`,
+--     `doctor check` (with the full list of checks), `dump`, `restore`,
+--     `manager …`; the report-only doctor checks also from the web admin.
+-- Excludes:
+--   - Auth source CRUD behaviour (LDAP/SMTP/PAM/OAuth2/SSPI) — owned by
+--     authentication; only referenced from the admin surfaces here.
+--   - System and default webhooks — owned by webhooks; referenced.
+--   - Instance-wide OAuth2 applications — owned by authentication; referenced.
+--   - Admin runner / variable management — owned by actions; referenced.
+--   - Quota rules and groups — owned by quota; referenced.
+--   - Abuse report moderation — owned by moderation; referenced.
+--   - API impersonation (`sudo`) — owned by access (SiteAdminActsAs); referenced.
+--   - Federation host / federated user listing — owned by federation; referenced.
+--   - Admin package listing / deletion / cleanup — owned by packages; referenced.
+--   - The *work* performed by each cron task (mirror sync, GC, cleanup, ...) —
+--     owned by the module named on the task; this module only schedules it and
+--     records its outcome.
+--   - models/admin/task.go (`Task`) — it is the repository migration task, owned
+--     by migrations, despite its package name.
+--   - Instance branding, templates and themes — UI only.
+--   - MySQL collation self-check page (/admin/self_check) — specific to one
+--     database engine; a rebuild picks its own storage.
+--   - Go runtime memory/GC statistics on the system-status page — runtime
+--     implementation detail; only "uptime + version" survives.
+--   - `forgejo doctor recreate-table`, `doctor convert`, `migrate-storage`,
+--     `doctor cleanup-commit-status`, `avatar-strip-exif`, `avatar-resize` —
+--     storage/ORM maintenance tied to the current implementation.
+--   - Deprecated-setting warnings on the dashboard — legacy config migration.
+--   - `--name` (deprecated alias of `--username`) on `admin user create` — legacy.
+--   - Global [cron] ENABLED / RUN_AT_START switches — documented by Forgejo but
+--     ignored by its code; dropped. decided: administration 2 (each task has
+--     its own enabled flag, no global switch)
+--   - Doctor fixes from the web — repairs that change data stay CLI-only
+--     (decided: administration 9).
+--
+-- Emits (domain triggers other modules react to):
+--   InstallationCompleted(instance)
+--   RuntimeSettingChanged(key)
+--   SystemNoticeRecorded(notice)
+--   CronTaskExecutes(task, doer)                      -- generic start of any run
+--   CronTaskRunFinished(task, outcome)
+--   per-task work requests (one per registered cron task, see "Cron dispatch"):
+--     MirrorUpdateDue(pull_limit, push_limit)                       -> repositories
+--     RepositoryHealthCheckDue(timeout, args)                       -> repositories
+--     RepositoryStatsCheckDue()                                     -> repositories
+--     RepositoryArchiveCleanupDue(older_than)                       -> repositories
+--     ExternalUserSyncDue(update_existing)                          -> authentication
+--     DeletedBranchCleanupDue(older_than)                           -> code
+--     MigrationPosterIdUpdateDue()                                  -> migrations
+--     HookDeliveryCleanupDue(cleanup_type, older_than, number_to_keep) -> webhooks
+--     PackageCleanupDue(older_than)                                 -> packages
+--     InactiveAccountCleanupDue(older_than)                         -> accounts
+--     AllRepositoryArchivesDeletionDue()                            -> repositories
+--     RepositoryGarbageCollectionDue(timeout, args)                 -> repositories
+--     AuthorizedKeysRewriteDue()                                    -> keys
+--     AuthorizedPrincipalsRewriteDue()                              -> keys
+--     MissingRepositoryReinitDue()                                  -> repositories
+--     MissingRepositoryDeletionDue()                                -> repositories
+--     GeneratedRepositoryAvatarDeletionDue()                        -> repositories
+--     OldActivityDeletionDue(older_than)                            -> notifications
+--     UpdateCheckDue(http_endpoint, domain_endpoint)                -> administration
+--     OldSystemNoticeDeletionDue(older_than)                        -> administration
+--     LfsGarbageCollectionDue(older_than, last_updated_more_than_ago, number_to_check_per_repo, proportion_to_check_per_repo) -> code
+--     IssueIndexRebuildDue()                                        -> discovery
+--     ResolvedReportRemovalDue(keep_for)                            -> moderation
+--     ZombieActionsTaskStopDue()                                    -> actions
+--     EndlessActionsTaskStopDue()                                   -> actions
+--     AbandonedActionsJobCancellationDue()                          -> actions
+--     LingeringActionsLogTransferDue()                              -> actions
+--     ActionsScheduleStartDue()                                     -> actions
+--     ActionsCleanupDue()                                           -> actions
+--     OfflineRunnerCleanupDue(older_than, global_scope_only)        -> actions
+--     ActionsUserCleanupDue()                                       -> actions
+--     OrphanedUploadCleanupDue(older_than)                          -> issues
+--   AllRepositoryBranchesResyncRequested(admin)                     -> code
+--   AllRepositoryTagsResyncRequested(admin)                         -> releases
+--   AnnouncementPublished(announcement) / AnnouncementWithdrawn(kind)
+--   InstanceReadOnlyModeChanged(gate, read_only)      -- the switch lives in access/InstanceWriteGate,
+--                                                       -- which every write path (access, code push,
+--                                                       -- API, web) consults
+--   InstanceRestored(operator, instance)                -- a dump loaded into an empty instance
+--   UserCreatedByAdmin(admin, user, send_notification)  -- notifications sends the
+--                                                       -- "account created for you" mail
+--   UserEditedByAdmin(admin, user)
+--   UserRenamedByAdmin(admin, user, old_name, new_name) -- accounts keeps a redirect
+--   UserDeletedByAdmin(admin, user, purge)              -- accounts/repositories/organizations/
+--                                                       -- packages/federation cascade
+--   UserTwoFactorResetByAdmin(admin, user)              -> authentication
+--   UserPasswordSetByAdmin(admin, user, password) / UserPasswordSetByOperator(operator, user, password) -> authentication (hash + store)
+--   UserAvatarChangedByAdmin(admin, user) / UserAvatarRemovedByAdmin(admin, user)
+--   RepositoryDeletionRequestedByAdmin(admin, repository)  -> repositories (the OwnerDeletesRepository
+--                                                       -- cascade, ending in RepositoryDeleted)
+--   OrganizationCreatedForUserByAdmin(admin, user, name, visibility)  -> organizations (creates it)
+--   RepositoryCreationRequestedByAdmin(admin, user, name)  -> repositories (creates it with the
+--                                                       -- instance defaults; no creation limit)
+--   SshKeyAddedForUserByAdmin / SshKeyRemovedForUserByAdmin -> keys
+--   AccessTokenRequestedForUser(requester, user, token_name, scopes) -> authentication
+--   TestMailRequested(admin, address)                   -> notifications
+--   MassMailRequested(subject, body, recipients)        -> notifications
+--   AuthorizedKeysRegenerationRequested(operator)       -> keys
+--   ReleasesSyncWithTagsRequested(operator)             -> releases
+--   AuthSourceConfiguredFromCli(operator, kind, action, source, name, is_active, sync_enabled, settings) -> authentication
+--   AuthorizedIntegrationRequested(operator, user, name, description, issuer, claim_rules, scopes, all_repositories, repositories) -> authentication
+--   UserLoginSourceSetByAdmin(admin, user, login_source, login_name) -> authentication (rebinds the UserLogin)
+--   UserPrimaryEmailSetByAdmin(admin, user, old_address, new_address) -> accounts (announces PrimaryEmailChanged)
+--   DoctorRunRequested(operator, checks, fix)
+--   DoctorRunRequestedByAdmin(run)                    -- report-only checks started from the web
+--   InstanceDumpProduced(operator, format, contents)
+--   RunningInstanceCommanded(operator, command)
+--   ProcessCancellationRequested(admin, process)
+--
+-- Reacts to:
+--   SystemFailureReported(kind, description)  -- any module reporting a background
+--                                             -- failure (e.g. file removal failed,
+--                                             -- repository deletion left files behind)
+--   migrations/MigrationFailureReported(kind, description)
+--                                             -- a failed import, or source data an import
+--                                             -- had to drop, worth an operator's attention
+--   CronWorkCompleted(task, outcome, message) -- the owning module reporting the end
+--                                             -- of the work it was asked to do
+--   ReleaseFeedAnswered(supported_versions, error)  -- the update-check lookup result
+--   DoctorRunFinished(run, report)            -- a web-started doctor run has its report
+--   accounts/AccountPurgeFailed(purge)        -- a purge stopped short (SystemNotice)
+--   keys/ExternalSshKeyRefused(user, source, fingerprint)  -- a directory key was refused (SystemNotice)
+--   authentication/ExternalUserSyncRefused(source)  -- an LDAP sync found nobody and was refused (SystemNotice)
+--   repositories/PullMirrorSyncFailed(mirror, reason)  -- a pull mirror failed to sync (SystemNotice)
+--   repositories/RepositoryHealthCheckFailed(repository, reason)       -- git fsck failed (SystemNotice)
+--   repositories/RepositoryGarbageCollectionFailed(repository, reason) -- git gc failed (SystemNotice)
+--   discovery/IndexerStartupFailed(kind)      -- an indexer did not start in time (SystemNotice)
+--   accounts/AccountFilesLeftBehind(user_name, description)  -- a deleted account's files stayed (SystemNotice)
+--   accounts/InactiveAccountCleanupFinished(older_than)      -- the delete_inactive_accounts run is done
+--   keys/KeyFilesRewritten(kind)              -- the resync_all_sshkeys / resync_all_sshprincipals run is done
+--   migrations/RelinkSweepCompleted(outcome, message) -- the update_migration_poster_id run is done
+--   actions/ZombieTaskSweepFinished()          -- the stop_zombie_tasks run is done
+--   actions/EndlessTaskSweepFinished()         -- the stop_endless_tasks run is done
+--   actions/AbandonedJobSweepFinished()        -- the cancel_abandoned_jobs run is done
+--   actions/LingeringLogSweepFinished()        -- the transfer_lingering_logs run is done
+--   actions/ScheduleSweepFinished()            -- the start_schedule_tasks run is done
+--   actions/ActionsCleanupSweepFinished()      -- the cleanup_actions run is done
+--   actions/TrustedContributorSweepFinished()  -- the actions_action_user run is done
+--   actions/OfflineRunnerSweepFinished()       -- the cleanup_offline_runners run is done
+--   code/DeletedBranchCleanupFinished()        -- the deleted_branches_cleanup run is done
+--   code/LfsGarbageCollectionFinished()        -- the gc_lfs run is done
+--   discovery/IssueIndexRebuildTaskFinished()  -- the rebuild_issue_indexer run is done
+--   moderation/ResolvedReportRemovalFinished() -- the remove_resolved_reports run is done
+--   notifications/OldActivityDeletionFinished() -- the delete_old_actions run is done
+--   packages/PackageCleanupTaskFinished()      -- the cleanup_packages run is done
+--   repositories/MirrorUpdateSweepFinished()   -- the update_mirrors run is done
+--   repositories/ArchiveCleanupFinished()      -- the archive_cleanup run is done
+--   repositories/AllArchivesDeletionFinished() -- the delete_repo_archives run is done
+--   repositories/HealthCheckSweepFinished()    -- the repo_health_check run is done
+--   repositories/GarbageCollectionSweepFinished() -- the git_gc_repos run is done
+--   repositories/MissingRepositoryDeletionFinished() -- the delete_missing_repos run is done
+--   repositories/MissingRepositoryReinitFinished() -- the reinit_missing_repos run is done
+--   repositories/RepositoryStatsCheckFinished() -- the check_repo_stats run is done
+--   repositories/GeneratedAvatarDeletionFinished() -- the delete_generated_repository_avatars run is done
+--   webhooks/HookDeliveryCleanupFinished()     -- the cleanup_hook_task_table run is done
+--   issues/OrphanedUploadCleanupFinished()     -- the delete_orphaned_attachments run is done
+--   authentication/ExternalUserSyncFinished()  -- the sync_external_users run is done
+--   InstanceStarted(instance)                 -- process start (run-at-start tasks)
+
+use "./accounts.allium" as accounts
+use "./access.allium" as access
+use "./organizations.allium" as organizations
+use "./authentication.allium" as authentication
+use "./repositories.allium" as repositories
+use "./keys.allium" as keys
+use "./code.allium" as code
+use "./releases.allium" as releases
+use "./webhooks.allium" as webhooks
+use "./actions.allium" as actions
+use "./packages.allium" as packages
+use "./notifications.allium" as notifications
+use "./quota.allium" as quota
+use "./moderation.allium" as moderation
+use "./federation.allium" as federation
+use "./discovery.allium" as discovery
+use "./migrations.allium" as migrations
+use "./issues.allium" as issues
+
+------------------------------------------------------------
+-- Given
+------------------------------------------------------------
+
+-- No module-level given: the single Instance is passed explicitly where a rule
+-- needs it; notices, settings and tasks are instance-wide collections.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A person with a shell on the server host, running the `forgejo` binary against
+-- the instance's configuration and database. Not a Forgejo account.
+-- from: cmd/admin.go:22
+external entity Operator {
+    has_host_access: Boolean
+}
+
+-- A unit of work currently running inside the server process (a request, a cron
+-- run, a queue worker). Infrastructure-level; listed only so administrators can
+-- see and cancel runaway work.
+-- from: routers/web/admin/stacktrace.go:16
+external entity MonitoredProcess {
+    description: String
+    is_system: Boolean
+    started_at: Timestamp
+    cancelled: Boolean
+}
+
+-- A background work queue (indexers, webhook delivery, mirror sync, ...).
+-- Infrastructure-level capability.
+-- from: routers/web/admin/queue.go:15
+external entity WorkQueue {
+    name: String
+    max_workers: Integer
+    item_count: Integer
+}
+
+-- The running server process (code party on integration surfaces).
+-- from: services/cron/cron.go:23
+external entity ServerProcess {
+    is_running: Boolean
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- (none: the install form and the runtime-setting change are modelled as an
+-- entity and as trigger parameters respectively)
+
+
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum DatabaseKind { sqlite3 | mysql | postgres }
+
+-- The runtime settings an administrator may change without a restart. Each one
+-- falls back to the matching configuration-file value, then to its default.
+-- from: modules/setting/config.go:66
+enum SettingKey {
+    disable_gravatar            -- falls back to [picture] DISABLE_GRAVATAR (default: offline mode)
+    | enable_federated_avatar   -- falls back to [picture] ENABLE_FEDERATED_AVATAR
+    | open_with_editor_apps     -- "Name = URL-template" lines; default VS Code, VSCodium, IntelliJ IDEA
+}
+
+-- from: models/system/notice.go:20
+-- (`repo`, not `repository`: a rule hearing a repository's failure has a
+-- `repository` parameter, which would shadow the value)
+enum NoticeKind { repo | task }
+
+-- Outcome of one cron run as the owning module reports it.
+-- from: services/cron/tasks.go:117
+enum CronOutcome { finished | failed | cancelled }
+
+-- Which module performs the work of a cron task.
+enum OwningModule {
+    administration | accounts | authentication | repositories | keys | code
+    | releases | webhooks | actions | packages | notifications | moderation
+    | discovery | migrations | issues
+}
+
+-- A feature switch a task's registration depends on. Tasks whose feature is
+-- off are not registered at all (not listed, cannot be run).
+-- from: services/cron/tasks_basic.go:157
+enum TaskFeature { always | mirrors | migrations | packages | lfs_server | moderation | actions }
+
+-- Every cron task Forgejo registers (services/cron/tasks_basic.go,
+-- tasks_extended.go, tasks_actions.go). Names are the stable identifiers used
+-- in configuration ([cron.<name>]) and in the "run now" API.
+enum CronTaskName {
+    update_mirrors
+    | repo_health_check
+    | check_repo_stats
+    | archive_cleanup
+    | sync_external_users
+    | deleted_branches_cleanup
+    | update_migration_poster_id
+    | cleanup_hook_task_table
+    | cleanup_packages
+    | delete_inactive_accounts
+    | delete_repo_archives
+    | git_gc_repos
+    | resync_all_sshkeys
+    | resync_all_sshprincipals
+    | reinit_missing_repos
+    | delete_missing_repos
+    | delete_generated_repository_avatars
+    | delete_old_actions
+    | update_checker
+    | delete_old_system_notices
+    | gc_lfs
+    | rebuild_issue_indexer
+    | remove_resolved_reports
+    | stop_zombie_tasks
+    | stop_endless_tasks
+    | cancel_abandoned_jobs
+    | transfer_lingering_logs
+    | start_schedule_tasks
+    | cleanup_actions
+    | cleanup_offline_runners
+    | actions_action_user
+    | delete_orphaned_attachments
+}
+
+-- How the hook delivery cleanup task chooses what to delete.
+-- from: services/cron/tasks_basic.go:133
+enum HookCleanupKind { older_than | per_webhook }
+
+-- Release-support state derived from the update check.
+-- from: modules/updatechecker/update_checker.go:139
+enum ReleaseState { unknown | current | minor_update_available | major_unsupported | prerelease }
+
+-- modal: blocks the page until dismissed (Forgejo's only kind); banner: a
+-- non-blocking strip above every page, dismissable the same way.
+-- decided: administration 5 (modal or banner)
+-- from: modules/service_message/service_message.go:17
+enum AnnouncementKind { modal | banner }
+
+-- `forgejo doctor check` — every registered check. Checks marked (default) run
+-- when no --run/--all is given. Each can report, and with --fix repair.
+-- from: services/doctor/*.go (Register calls)
+enum DoctorCheck {
+    paths                               -- (default) paths and basic configuration
+    | check_db_version                  -- (default) database schema version
+    | check_user_type                   -- (default) accounts with an invalid kind
+    | authorized_keys                   -- (default) OpenSSH authorized_keys up to date
+    | synchronize_repo_heads            -- (default) repository HEAD matches default branch
+    | check_db_consistency              -- orphaned rows across tables
+    | check_user_email                  -- accounts with an invalid email address
+    | check_user_names                  -- accounts with an invalid username
+    | check_old_archives                -- legacy archive files
+    | fix_broken_repo_units             -- malformed repository unit configuration
+    | fix_owner_team_create_org_repo    -- owner teams lacking create-repo permission
+    | gc_lfs                            -- garbage-collect unreferenced LFS objects
+    | script_type                       -- configured hook script interpreter exists
+    | recalculate_stars_number          -- recount stars per repository
+    | enable_push_options               -- repositories advertise push options
+    | check_git_daemon_export_ok        -- git-daemon-export-ok matches visibility
+    | check_commit_graphs               -- commit-graph files present
+    | packages_nuget_nuspec             -- extract NuGet nuspec files
+    | fix_push_mirrors_without_git_remote
+    | delete_orphaned_repos             -- content of repositories whose owner is gone
+    | storages                          -- orphaned files in all storages
+    | storage_attachments
+    | storage_lfs
+    | storage_avatars
+    | storage_archives
+    | storage_packages
+    | disable_mirror_actions_unit       -- turn off the actions unit on pull mirrors
+}
+
+-- from: cmd/dump.go:107
+enum DumpFormat { zip | tar | tar_sz | tar_gz | tar_xz | tar_bz2 | tar_br | tar_lz4 | tar_zst }
+
+-- `forgejo manager …` commands sent to the running server over its private
+-- control channel.
+-- from: cmd/manager.go:17
+enum ManagerCommand { shutdown | restart | reload_templates | flush_queues | list_processes | cancel_process | change_logging }
+
+-- `forgejo admin auth …` sub-commands. Behaviour is authentication's.
+-- from: cmd/admin.go:55
+enum AuthSourceCliAction { add | update | list | delete }
+enum AuthSourceCliKind { oauth2 | ldap_bind_dn | ldap_simple | pam | smtp }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The running instance. Exactly one exists.
+-- from: routers/install/install.go:223, routers/web/admin/admin.go:131
+entity Instance {
+    install_status: awaiting_install | installed
+    app_name: String
+    root_url: String
+    version: String
+    started_at: Timestamp
+
+    -- reachability as last probed (health endpoint)
+    database_reachable: Boolean
+    cache_reachable: Boolean
+
+    -- release/update check (fed by the update_checker cron task)
+    supported_versions: Set<String>
+    update_check_error: String?
+    release_state: ReleaseState
+    recommended_upgrade: String?
+
+    transitions install_status {
+        awaiting_install -> installed
+        terminal: installed
+    }
+
+    -- Health: before installation only the bare "pass" is reported; afterwards
+    -- database and cache are checked and either failing makes the whole fail.
+    -- from: routers/web/healthcheck/check.go:61
+    is_installed: install_status = installed
+    health_status: if install_status = awaiting_install: pass
+                   else if database_reachable and cache_reachable: pass
+                   else: fail
+}
+
+-- One submission of the install wizard: everything it collects, plus the
+-- outcome of the environment checks run against it. Most of it is written to
+-- the instance configuration file and becomes config of other modules
+-- (registration, mail, LFS, SSH, ...); this module owns only the act of
+-- installing.
+-- from: services/forms/user_form.go (InstallForm), routers/install/install.go:223
+entity InstallSettings {
+    app_name: String
+    app_slogan: String?
+    root_url: String              -- normalised to end with "/"
+    domain: String
+    http_port: Integer
+    ssh_port: Integer             -- 0 disables SSH
+    database_kind: DatabaseKind
+    database_reachable: Boolean   -- connection test succeeded
+    database_previously_used: Boolean   -- schema version > 0 AND accounts exist
+    reinstall_confirmed: Boolean  -- all three re-install confirmations ticked
+    repository_root: String
+    lfs_root: String?             -- absent disables the built-in LFS server
+    log_root: String
+    paths_writable: Boolean       -- data, repository, LFS and log paths can be created
+    run_user_matches: Boolean     -- the configured RUN_USER is the OS user running the process
+    git_available: Boolean        -- a git binary is on PATH
+    ssh_authorized_keys_clean: Boolean  -- no unexpected keys in authorized_keys (only checked when ssh_port > 0)
+    smtp_address: String?         -- absent disables mail
+    smtp_from: String?            -- must parse as a mail address when smtp_address is set
+    register_email_confirm: Boolean
+    enable_notify_mail: Boolean
+    offline_mode: Boolean
+    disable_gravatar: Boolean
+    enable_federated_avatar: Boolean
+    disable_registration: Boolean
+    allow_only_external_registration: Boolean
+    enable_captcha: Boolean
+    require_signin_view: Boolean
+    default_keep_email_private: Boolean
+    default_allow_create_organization: Boolean
+    default_enable_timetracking: Boolean
+    no_reply_address: String
+    enable_update_checker: Boolean   -- unticked by default (decided: administration 8)
+    password_hash_algorithm: String?
+    admin_name: String?           -- absent: no administrator is created now
+    admin_email: String?
+    admin_password: String?
+    admin_password_confirm: String?
+}
+
+-- One runtime setting stored by the instance and overriding the config file.
+-- from: models/system/setting.go:19
+entity SystemSetting {
+    key: SettingKey
+    value: String           -- normalised: "true"/"false" for flags; a list of
+                            -- {display name, URL template} for editor apps
+    version: Integer        -- increments on every write
+    updated_at: Timestamp
+}
+
+-- An entry in the system-notice log: something went wrong in background work
+-- (or a cron task with notice-on-success finished). Administrators read and
+-- clear them; they age out when the cleanup task is enabled.
+-- from: models/system/notice.go:27
+entity SystemNotice {
+    kind: NoticeKind
+    description: String
+    created_at: Timestamp
+}
+
+-- A scheduled maintenance task. The set of tasks is fixed by the software (see
+-- the defaults below); configuration ([cron.<name>]) only changes enabled,
+-- run_at_start, schedule, notice_on_success and task-specific parameters.
+-- There is no global cron switch: each task's own enabled flag is the only one.
+-- decided: administration 2 (no global switch; the misleading global settings are dropped)
+-- from: services/cron/tasks.go:32
+entity CronTask {
+    name: CronTaskName
+    owner: OwningModule            -- the module whose work this task triggers
+    requires_feature: TaskFeature  -- not registered when that feature is off
+    enabled: Boolean               -- scheduled; a disabled task can still be run by hand
+    run_at_start: Boolean          -- also run once when the instance starts (if enabled)
+    schedule: String               -- cron spec or descriptor: "@midnight", "@every 10m", 5/6-field crontab
+    notice_on_success: Boolean     -- also record a SystemNotice when a run finishes cleanly
+    shown_on_dashboard: Boolean    -- offered as a one-click operation on the admin dashboard
+
+    run_state: idle | running
+    last_outcome: never_run | finished | failed | cancelled
+    last_message: String?          -- error / cancellation message of the last run
+    last_doer: accounts/User?      -- administrator who started the last run (web or API); null = the scheduler
+    last_run_at: Timestamp?        -- start of the most recent run (scheduled or manual)
+    next_run_at: Timestamp?        -- next scheduled start; null when not enabled
+    exec_times: Integer            -- runs started since the process started
+
+    transitions run_state {
+        idle -> running
+        running -> idle
+    }
+
+    is_scheduled: enabled = true
+}
+
+-- A site-wide announcement shown to signed-in users (as a modal or a banner)
+-- until each user acknowledges it, and only inside its optional start/end
+-- window. At most one per kind; publishing again replaces its text and window
+-- and re-shows it to everybody.
+-- decided: administration 5 (modal or banner, each with optional start and end times)
+-- from: models/service_message/service_message.go:21
+entity Announcement {
+    kind: AnnouncementKind
+    title: String           -- at most 255 bytes; longer titles are cut
+    text: String            -- Markdown, rendered in the modal or banner
+    starts_at: Timestamp?   -- null: shown from publication
+    ends_at: Timestamp?     -- null: shown until withdrawn
+    created_at: Timestamp
+    updated_at: Timestamp
+
+    acknowledgements: AnnouncementAcknowledgement with kind = this.kind
+
+    is_live: (starts_at = null or starts_at <= now) and (ends_at = null or ends_at > now)
+    is_pending_for(u): not acknowledgements.any(a => a.user = u and a.acknowledged_at >= updated_at)
+}
+
+-- That a user dismissed the announcement of a kind at a moment. A newer
+-- announcement (updated after that moment) shows again.
+-- from: models/user/user.go:380
+entity AnnouncementAcknowledgement {
+    user: accounts/User
+    kind: AnnouncementKind
+    acknowledged_at: Timestamp
+}
+
+-- A doctor run started from the web admin: report-only checks (never --fix),
+-- its report kept for the admin to read.
+-- decided: administration 9 (read-only checks runnable and viewable from the web)
+entity DoctorRun {
+    requested_by: accounts/User?
+    checks: Set<DoctorCheck>
+    state: running | finished
+    report: String?
+    started_at: Timestamp
+    finished_at: Timestamp?
+
+    transitions state {
+        running -> finished
+        terminal: finished
+    }
+}
+
+-- One line of the read-only configuration view. Secrets (passwords, URIs with
+-- credentials, connection strings) are shown masked.
+-- from: routers/web/admin/config.go:117
+entity ConfigEntry {
+    section: String
+    key: String
+    value: String
+    is_secret: Boolean
+
+    displayed_value: if is_secret: masked(value) else: value
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- [security] INSTALL_LOCK: once true the install wizard is gone for good.
+    -- from: modules/setting/setting.go:248
+    install_lock: Boolean = false
+
+    -- [admin]
+    -- from: modules/setting/admin.go:20
+    -- DISABLE_REGULAR_ORG_CREATION lives in organizations' config
+    -- (organizations/config.disable_regular_org_creation).
+    default_email_notifications: String = "enabled"    -- enabled | onmention | disabled; new accounts' default (notifications)
+    notify_admins_on_new_user: Boolean = false         -- SEND_NOTIFICATION_EMAIL_ON_NEW_USER (notifications)
+    -- USER_DISABLED_FEATURES / EXTERNAL_USER_DISABLE_FEATURES live in accounts'
+    -- config (accounts/config.user_disabled_features, external_user_disabled_features).
+
+    -- [ui.admin] page sizes of the admin lists
+    -- from: modules/setting/ui.go:133
+    admin_user_page_size: Integer = 50
+    admin_repo_page_size: Integer = 50
+    admin_org_page_size: Integer = 50
+    admin_notice_page_size: Integer = 25
+
+    -- Announcement title limit
+    -- from: models/service_message/service_message.go:33
+    announcement_title_max_bytes: Integer = 255
+
+    -- Per-task parameters ([cron.<name>] KEY). The common keys ENABLED,
+    -- RUN_AT_START, SCHEDULE and NOTICE_ON_SUCCESS are on each default CronTask.
+    -- from: services/cron/tasks_basic.go, tasks_extended.go, tasks_actions.go
+    update_mirrors_pull_limit: Integer = 50
+    update_mirrors_push_limit: Integer = 50
+    repo_health_check_timeout: Duration = 360.seconds      -- [git.timeout] DEFAULT
+    repo_health_check_args: String = ""
+    archive_cleanup_older_than: Duration = 24.hours
+    sync_external_users_update_existing: Boolean = true
+    deleted_branches_cleanup_older_than: Duration = 24.hours
+    cleanup_hook_task_table_cleanup_type: HookCleanupKind = older_than
+    cleanup_hook_task_table_older_than: Duration = 168.hours
+    cleanup_hook_task_table_number_to_keep: Integer = 10
+    cleanup_packages_older_than: Duration = 24.hours
+    delete_inactive_accounts_older_than: Duration = 180.minutes   -- [service] ACTIVE_CODE_LIVE_MINUTES
+    git_gc_repos_timeout: Duration = 60.seconds            -- [git.timeout] GC
+    git_gc_repos_args: String = ""                         -- [git] GC_ARGS
+    delete_old_actions_older_than: Duration = 365.days
+    update_checker_http_endpoint: String = "https://dl.gitea.com/gitea/version.json"
+    update_checker_domain_endpoint: String = "release.forgejo.org"   -- DNS TXT "forgejo_versions=..." preferred over HTTP
+    delete_old_system_notices_older_than: Duration = 365.days
+    gc_lfs_older_than: Duration = 7.days
+    gc_lfs_last_updated_more_than_ago: Duration = 3.days
+    gc_lfs_number_to_check_per_repo: Integer = 100
+    gc_lfs_proportion_to_check_per_repo: Decimal = 0.6
+    remove_resolved_reports_keep_for: Duration = moderation/config.keep_resolved_reports_for  -- [moderation] KEEP_RESOLVED_REPORTS_FOR, 180 days (decided: moderation 9)
+    delete_orphaned_attachments_older_than: Duration = issues/config.orphan_attachment_expiry
+    cleanup_offline_runners_older_than: Duration = 24.hours
+    cleanup_offline_runners_global_scope_only: Boolean = true
+}
+
+------------------------------------------------------------
+-- Defaults
+------------------------------------------------------------
+
+-- The complete, fixed catalogue of cron tasks with Forgejo's defaults.
+-- Each is overridable per instance in [cron.<name>].
+
+-- Basic tasks (enabled by default)
+-- from: services/cron/tasks_basic.go:29
+default CronTask update_mirrors = { name: update_mirrors, owner: repositories, requires_feature: mirrors, enabled: true, run_at_start: false, schedule: "@every 10m", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_basic.go:47
+default CronTask repo_health_check = { name: repo_health_check, owner: repositories, requires_feature: always, enabled: true, run_at_start: false, schedule: "@midnight", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_basic.go:67
+default CronTask check_repo_stats = { name: check_repo_stats, owner: repositories, requires_feature: always, enabled: true, run_at_start: true, schedule: "@midnight", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_basic.go:77
+default CronTask archive_cleanup = { name: archive_cleanup, owner: repositories, requires_feature: always, enabled: true, run_at_start: true, schedule: "@midnight", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_basic.go:91
+default CronTask sync_external_users = { name: sync_external_users, owner: authentication, requires_feature: always, enabled: true, run_at_start: false, schedule: "@midnight", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_basic.go:105
+default CronTask deleted_branches_cleanup = { name: deleted_branches_cleanup, owner: code, requires_feature: always, enabled: true, run_at_start: true, schedule: "@midnight", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_basic.go:120
+default CronTask update_migration_poster_id = { name: update_migration_poster_id, owner: migrations, requires_feature: migrations, enabled: true, run_at_start: true, schedule: "@midnight", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_basic.go:130
+default CronTask cleanup_hook_task_table = { name: cleanup_hook_task_table, owner: webhooks, requires_feature: always, enabled: true, run_at_start: false, schedule: "@midnight", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_basic.go:145
+default CronTask cleanup_packages = { name: cleanup_packages, owner: packages, requires_feature: packages, enabled: true, run_at_start: true, schedule: "@midnight", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+
+-- Extended tasks (mostly disabled by default; meant to be run by hand)
+-- from: services/cron/tasks_extended.go:26
+default CronTask delete_inactive_accounts = { name: delete_inactive_accounts, owner: accounts, requires_feature: always, enabled: false, run_at_start: false, schedule: "@annually", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_extended.go:39
+default CronTask delete_repo_archives = { name: delete_repo_archives, owner: repositories, requires_feature: always, enabled: false, run_at_start: false, schedule: "@annually", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_extended.go:55
+default CronTask git_gc_repos = { name: git_gc_repos, owner: repositories, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 72h", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_extended.go:70
+default CronTask resync_all_sshkeys = { name: resync_all_sshkeys, owner: keys, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 72h", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_extended.go:80
+default CronTask resync_all_sshprincipals = { name: resync_all_sshprincipals, owner: keys, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 72h", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_extended.go:90
+default CronTask reinit_missing_repos = { name: reinit_missing_repos, owner: repositories, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 72h", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_extended.go:100
+default CronTask delete_missing_repos = { name: delete_missing_repos, owner: repositories, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 72h", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_extended.go:110
+default CronTask delete_generated_repository_avatars = { name: delete_generated_repository_avatars, owner: repositories, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 72h", notice_on_success: false, shown_on_dashboard: true, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_extended.go:120
+default CronTask delete_old_actions = { name: delete_old_actions, owner: notifications, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 168h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- decided: administration 8 (off by default; admins opt in — Forgejo has it on)
+-- from: services/cron/tasks_extended.go:139
+default CronTask update_checker = { name: update_checker, owner: administration, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 168h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_extended.go:153
+default CronTask delete_old_system_notices = { name: delete_old_system_notices, owner: administration, requires_feature: always, enabled: false, run_at_start: false, schedule: "@every 168h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_extended.go:175
+default CronTask gc_lfs = { name: gc_lfs, owner: code, requires_feature: lfs_server, enabled: false, run_at_start: false, schedule: "@every 24h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_extended.go:206
+default CronTask rebuild_issue_indexer = { name: rebuild_issue_indexer, owner: discovery, requires_feature: always, enabled: false, run_at_start: false, schedule: "@annually", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_extended.go:220
+-- decided: moderation 9 (on by default; registered only while moderation is enabled)
+default CronTask remove_resolved_reports = { name: remove_resolved_reports, owner: moderation, requires_feature: moderation, enabled: true, run_at_start: false, schedule: "@every 24h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+
+-- Unlinked uploads (issue / comment / release attachments never saved into
+-- their item) expire after issues' orphan_attachment_expiry. Not in Forgejo,
+-- which keeps them indefinitely (decided by issues).
+default CronTask delete_orphaned_attachments = { name: delete_orphaned_attachments, owner: issues, requires_feature: always, enabled: true, run_at_start: false, schedule: "@every 1h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+
+-- Actions tasks (registered only when Actions is enabled)
+-- from: services/cron/tasks_actions.go:30
+default CronTask stop_zombie_tasks = { name: stop_zombie_tasks, owner: actions, requires_feature: actions, enabled: true, run_at_start: true, schedule: "@every 5m", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_actions.go:40
+default CronTask stop_endless_tasks = { name: stop_endless_tasks, owner: actions, requires_feature: actions, enabled: true, run_at_start: true, schedule: "@every 30m", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_actions.go:50
+default CronTask cancel_abandoned_jobs = { name: cancel_abandoned_jobs, owner: actions, requires_feature: actions, enabled: true, run_at_start: true, schedule: "@every 6h", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_actions.go:60
+default CronTask transfer_lingering_logs = { name: transfer_lingering_logs, owner: actions, requires_feature: actions, enabled: true, run_at_start: true, schedule: "@midnight", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_actions.go:71
+default CronTask start_schedule_tasks = { name: start_schedule_tasks, owner: actions, requires_feature: actions, enabled: true, run_at_start: false, schedule: "@every 1m", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_actions.go:83
+default CronTask cleanup_actions = { name: cleanup_actions, owner: actions, requires_feature: actions, enabled: true, run_at_start: false, schedule: "@midnight", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_actions.go:93
+default CronTask cleanup_offline_runners = { name: cleanup_offline_runners, owner: actions, requires_feature: actions, enabled: false, run_at_start: false, schedule: "@midnight", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+-- from: services/cron/tasks_actions.go:111
+default CronTask actions_action_user = { name: actions_action_user, owner: actions, requires_feature: actions, enabled: true, run_at_start: true, schedule: "@weekly", notice_on_success: false, shown_on_dashboard: false, run_state: idle, last_outcome: never_run, exec_times: 0 }
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+------------------------------------------------------------
+-- Installation
+------------------------------------------------------------
+
+-- The first-run wizard. Only reachable while the install lock is off; it tests
+-- every input, writes the configuration (setting the lock), stores the two
+-- avatar runtime settings, optionally creates the first administrator and
+-- signs them in, then hands over to the normal server.
+-- from: routers/install/install.go:223
+rule VisitorInstallsInstance {
+    when: VisitorSubmitsInstallation(visitor, instance, settings)
+    requires: instance.install_status = awaiting_install
+    requires: settings.git_available
+    requires: settings.database_reachable
+    -- a database that already holds accounts and a schema needs triple confirmation
+    requires: not settings.database_previously_used or settings.reinstall_confirmed
+    requires: settings.paths_writable
+    requires: settings.run_user_matches
+    requires: settings.ssh_port = 0 or settings.ssh_authorized_keys_clean
+    requires: settings.smtp_address = null or is_mail_address(settings.smtp_from)
+    -- closing registration without creating an administrator would lock everyone out
+    requires: not settings.disable_registration or settings.admin_name != null
+    requires: settings.password_hash_algorithm = null or is_known_hash_algorithm(settings.password_hash_algorithm)
+    ensures: instance.install_status = installed
+    ensures: instance.app_name = settings.app_name
+    ensures: instance.root_url = settings.root_url
+    ensures: SystemSetting.created(key: disable_gravatar, value: settings.disable_gravatar, version: 1, updated_at: now)
+    ensures: SystemSetting.created(key: enable_federated_avatar, value: settings.enable_federated_avatar, version: 1, updated_at: now)
+    ensures:
+        if settings.admin_name != null:
+            InstallerCreatesFirstAdmin(settings: settings)
+    ensures: InstallationCompleted(instance: instance)
+    @guidance
+        -- Also written to configuration: database, repository root, domain,
+        -- SSH (disabled when port 0), LFS (enabled with a fresh signing secret
+        -- when a path is given), mail, registration and service defaults, the
+        -- update-checker switch, a new SECRET_KEY (never overwriting an existing
+        -- one), OpenID sign-in/up off, run mode "prod". Every path is created.
+        -- Submitting again once installed just shows the "installed" page.
+        -- The wizard serves only `/`, `/post-install` and `/api/healthz`;
+        -- every other path is not-found until installation finishes.
+}
+
+-- from: routers/install/install.go:319
+rule InstallerCreatesFirstAdmin {
+    when: InstallerCreatesFirstAdmin(settings)
+    requires: is_usable_username(settings.admin_name)
+    requires: settings.admin_email != null
+    requires: settings.admin_password != null
+    requires: settings.admin_password = settings.admin_password_confirm
+    requires: password_long_enough(settings.admin_password)
+    ensures: accounts/User.created(
+        name: settings.admin_name,
+        primary_email: settings.admin_email,
+        is_admin: true,
+        is_active: true,
+        is_restricted: false,
+        prohibit_login: false
+    )
+    ensures: FirstAdminSignedIn(name: settings.admin_name)
+    @guidance
+        -- The admin checks happen before anything is written, so a rejected
+        -- admin leaves the instance uninstalled. If an account of that name
+        -- already exists (re-install into a used database) it is reused and
+        -- signed in instead of failing.
+}
+
+------------------------------------------------------------
+-- Instance start, release check
+------------------------------------------------------------
+
+-- At start, every enabled task is scheduled, and those flagged run-at-start
+-- run once immediately.
+-- from: services/cron/cron.go:32
+rule ScheduleTasksAtStart {
+    when: InstanceStarted(instance)
+    ensures:
+        for task in CronTasks where enabled = true:
+            task.next_run_at = now + time_until_next(task.schedule)
+            if task.run_at_start:
+                CronTaskRunRequested(task: task, doer: null)
+    @guidance
+        -- Disabled tasks are registered (listed, runnable by hand) but never
+        -- scheduled. No global switch overrides the per-task flags
+        -- (decided: administration 2).
+}
+
+-- The update_checker task asks the release feed which versions are supported;
+-- the answer decides the dashboard's "update available" banner.
+-- from: modules/updatechecker/update_checker.go:111
+rule RecordReleaseFeedAnswer {
+    when: ReleaseFeedAnswered(instance, supported_versions, error)
+    ensures: instance.supported_versions = supported_versions
+    ensures: instance.update_check_error = error
+    ensures: instance.release_state = release_state_of(instance.version, supported_versions)
+    ensures: instance.recommended_upgrade = recommended_upgrade_of(instance.version, supported_versions)
+    -- decided: requests 5 (the update_checker run ends with the answer; a
+    -- failed lookup is a failed run)
+    ensures:
+        for task in CronTasks where name = update_checker and run_state = running:
+            if error = null:
+                CronWorkCompleted(job: task, outcome: finished, message: null)
+            else:
+                CronWorkCompleted(job: task, outcome: failed, message: error)
+}
+
+------------------------------------------------------------
+-- Runtime settings
+------------------------------------------------------------
+
+-- from: routers/web/admin/config.go:199
+rule AdminChangesSetting {
+    when: AdminChangesSetting(admin, key, raw_value)
+    requires: admin.is_admin = true
+    let existing = SystemSetting{key: key}
+    let normalised = normalise_setting(key, raw_value)
+    ensures:
+        if exists existing:
+            existing.value = normalised
+            existing.version = existing.version + 1
+            existing.updated_at = now
+        else:
+            SystemSetting.created(key: key, value: normalised, version: 1, updated_at: now)
+    ensures: RuntimeSettingChanged(key: key)
+    @guidance
+        -- Flags accept any truthy spelling and store "true"/"false". Editor apps
+        -- are one "Display Name = URL template" per line; malformed lines are
+        -- dropped. Unknown keys are refused (the enum enforces it). Every
+        -- server process must see the change promptly (Forgejo re-reads the
+        -- store at most once a second, keyed on a global revision counter).
+}
+
+------------------------------------------------------------
+-- System notices
+------------------------------------------------------------
+
+-- from: models/system/notice.go:41
+rule RecordSystemNotice {
+    when: SystemFailureReported(kind, description)
+    ensures: SystemNotice.created(kind: kind, description: description, created_at: now)
+    ensures: SystemNoticeRecorded(kind: kind)
+}
+
+-- A failed migration, or source data an import had to drop, leaves a notice.
+-- migrations decides which of its failures merit one and words it.
+-- from: services/migrations/migrate.go:57, services/migrations/common.go:17
+rule RecordMigrationFailureNotice {
+    when: migrations/MigrationFailureReported(kind, description)
+    ensures: SystemNotice.created(kind: kind, description: description, created_at: now)
+    ensures: SystemNoticeRecorded(kind: kind)
+}
+
+-- A purge that stopped short leaves a notice so an admin resumes it.
+-- from: services/user/user.go:183
+rule RecordAccountPurgeFailureNotice {
+    when: accounts/AccountPurgeFailed(purge)
+    ensures: SystemNotice.created(kind: task, description: purge_failure_notice_text(purge), created_at: now)
+    ensures: SystemNoticeRecorded(kind: task)
+}
+
+-- A directory / OAuth2 key refused by the key policy (decided: keys 2).
+rule RecordRefusedExternalKeyNotice {
+    when: keys/ExternalSshKeyRefused(user, source, fingerprint)
+    ensures: SystemNotice.created(kind: task, description: refused_key_notice_text(user, source, fingerprint), created_at: now)
+    ensures: SystemNoticeRecorded(kind: task)
+}
+
+-- An LDAP synchronisation found nobody in the directory and was refused rather
+-- than deactivate every account of the source (decided: requests 8).
+rule RecordRefusedDirectorySyncNotice {
+    when: authentication/ExternalUserSyncRefused(source)
+    ensures: SystemNotice.created(kind: task, description: refused_sync_notice_text(source), created_at: now)
+    ensures: SystemNoticeRecorded(kind: task)
+}
+
+-- Background repository failures worth an operator's attention.
+-- from: services/mirror/mirror_pull.go:248
+rule RecordPullMirrorFailureNotice {
+    when: repositories/PullMirrorSyncFailed(mirror, reason)
+    ensures: SystemNotice.created(kind: repo, description: reason, created_at: now)
+    ensures: SystemNoticeRecorded(kind: repo)
+}
+
+-- git fsck found a broken repository (repo_health_check).
+-- from: services/repository/check.go:24
+rule RecordHealthCheckFailureNotice {
+    when: repositories/RepositoryHealthCheckFailed(repository, reason)
+    ensures: SystemNotice.created(kind: repo, description: reason, created_at: now)
+    ensures: SystemNoticeRecorded(kind: repo)
+}
+
+-- git gc failed on a repository (git_gc_repos).
+-- from: services/repository/check.go:61
+rule RecordGarbageCollectionFailureNotice {
+    when: repositories/RepositoryGarbageCollectionFailed(repository, reason)
+    ensures: SystemNotice.created(kind: repo, description: reason, created_at: now)
+    ensures: SystemNoticeRecorded(kind: repo)
+}
+
+-- An indexer did not start in time: search is unavailable until it is ready
+-- (decided: discovery 4).
+rule RecordIndexerStartupFailureNotice {
+    when: discovery/IndexerStartupFailed(kind)
+    ensures: SystemNotice.created(kind: task, description: indexer_notice_text(kind), created_at: now)
+    ensures: SystemNoticeRecorded(kind: task)
+    @guidance
+        -- indexer_notice_text: "<kind> indexer did not start in time; search
+        -- is unavailable until it is ready".
+}
+
+-- Removing a deleted account's stored files (avatar, user directory) failed.
+-- from: services/user/user.go:300
+rule RecordAccountFilesLeftBehindNotice {
+    when: accounts/AccountFilesLeftBehind(user_name, description)
+    ensures: SystemNotice.created(kind: task, description: description, created_at: now)
+    ensures: SystemNoticeRecorded(kind: task)
+}
+
+-- from: routers/web/admin/notice.go:46
+rule AdminDeletesNotices {
+    when: AdminDeletesNotices(admin, notices)
+    requires: admin.is_admin = true
+    ensures:
+        for n in notices:
+            not exists n
+}
+
+-- from: routers/web/admin/notice.go:66
+rule AdminEmptiesNotices {
+    when: AdminEmptiesNotices(admin)
+    requires: admin.is_admin = true
+    ensures:
+        for n in SystemNotices:
+            not exists n
+}
+
+------------------------------------------------------------
+-- Cron: scheduling and recording
+------------------------------------------------------------
+
+-- A task falls due on its schedule.
+-- from: services/cron/tasks.go:209
+rule CronTaskFallsDue {
+    when: task: CronTask.next_run_at <= now
+    requires: task.enabled = true
+    ensures: task.next_run_at = now + time_until_next(task.schedule)
+    ensures: CronTaskRunRequested(task: task, doer: null)
+}
+
+-- An administrator runs a task now — from the dashboard, the cron monitor page,
+-- or POST /api/v1/admin/cron/{task}. Disabled tasks can be run this way.
+-- The admin is the doer on every path (Forgejo's API path records the scheduler).
+-- decided: administration 1 (the admin who triggered it, on every path)
+-- from: routers/web/admin/admin.go:207
+rule AdminRunsCronTask {
+    when: AdminRunsCronTask(admin, task)
+    requires: admin.is_admin = true
+    ensures: CronTaskRunRequested(task: task, doer: admin)
+}
+
+-- A run starts only if the same task is not already running; a request while
+-- running is silently dropped (no queueing, no overlap).
+-- from: services/cron/tasks.go:72
+rule StartCronTaskRun {
+    when: CronTaskRunRequested(task, doer)
+    requires: task.run_state = idle
+    ensures: task.run_state = running
+    ensures: task.exec_times = task.exec_times + 1
+    ensures: task.last_run_at = now
+    ensures: task.last_doer = doer
+    ensures: CronTaskExecutes(task: task, doer: doer)
+}
+
+-- The owning module reports how the work went.
+-- from: services/cron/tasks.go:108
+rule FinishCronTaskRun {
+    when: CronWorkCompleted(job, outcome, message)
+    requires: job.run_state = running
+    ensures: job.run_state = idle
+    ensures: job.last_outcome = outcome
+    ensures: job.last_message = message
+    ensures:
+        if outcome != finished:
+            SystemNotice.created(kind: task, description: cron_notice_text(job, outcome, message), created_at: now)
+        else if job.notice_on_success:
+            SystemNotice.created(kind: task, description: cron_notice_text(job, outcome, message), created_at: now)
+    ensures: CronTaskRunFinished(task: job, outcome: outcome)
+    @guidance
+        -- A panic/crash inside the work is caught and logged; the job returns
+        -- to idle so the next schedule still fires.
+}
+
+-- accounts reports the end of the delete_inactive_accounts sweep with a
+-- trigger of its own (it is not handed the task); the run finishes here.
+rule FinishInactiveAccountCleanupRun {
+    when: accounts/InactiveAccountCleanupFinished(older_than)
+    ensures:
+        for task in CronTasks where name = delete_inactive_accounts and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+-- keys reports that the authorized_keys / authorized_principals rewrite is
+-- done (resync_all_sshkeys / resync_all_sshprincipals, or the operator's
+-- regenerate command, which runs no task: then nothing is running).
+rule FinishKeyFilesRewriteRun {
+    when: keys/KeyFilesRewritten(kind)
+    ensures:
+        for task in CronTasks where run_state = running and ((kind = authorized_keys and name = resync_all_sshkeys) or (kind = authorized_principals and name = resync_all_sshprincipals)):
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+-- migrations reports the end of its nightly re-attribution sweep
+-- (update_migration_poster_id).
+rule FinishRelinkSweepRun {
+    when: migrations/RelinkSweepCompleted(outcome, message)
+    ensures:
+        for task in CronTasks where name = update_migration_poster_id and run_state = running:
+            CronWorkCompleted(job: task, outcome: outcome, message: message)
+}
+
+-- decided: requests 5 — every other owning module reports the end of the work
+-- it was asked to do with a finished event of its own, mapped here to the
+-- running task of that name.
+
+rule FinishZombieTaskSweepRun {
+    when: actions/ZombieTaskSweepFinished()
+    ensures:
+        for task in CronTasks where name = stop_zombie_tasks and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishEndlessTaskSweepRun {
+    when: actions/EndlessTaskSweepFinished()
+    ensures:
+        for task in CronTasks where name = stop_endless_tasks and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishAbandonedJobSweepRun {
+    when: actions/AbandonedJobSweepFinished()
+    ensures:
+        for task in CronTasks where name = cancel_abandoned_jobs and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishLingeringLogSweepRun {
+    when: actions/LingeringLogSweepFinished()
+    ensures:
+        for task in CronTasks where name = transfer_lingering_logs and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishScheduleSweepRun {
+    when: actions/ScheduleSweepFinished()
+    ensures:
+        for task in CronTasks where name = start_schedule_tasks and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishActionsCleanupSweepRun {
+    when: actions/ActionsCleanupSweepFinished()
+    ensures:
+        for task in CronTasks where name = cleanup_actions and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishTrustedContributorSweepRun {
+    when: actions/TrustedContributorSweepFinished()
+    ensures:
+        for task in CronTasks where name = actions_action_user and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishOfflineRunnerSweepRun {
+    when: actions/OfflineRunnerSweepFinished()
+    ensures:
+        for task in CronTasks where name = cleanup_offline_runners and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishDeletedBranchCleanupRun {
+    when: code/DeletedBranchCleanupFinished()
+    ensures:
+        for task in CronTasks where name = deleted_branches_cleanup and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishLfsGarbageCollectionRun {
+    when: code/LfsGarbageCollectionFinished()
+    ensures:
+        for task in CronTasks where name = gc_lfs and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishIssueIndexRebuildTaskRun {
+    when: discovery/IssueIndexRebuildTaskFinished()
+    ensures:
+        for task in CronTasks where name = rebuild_issue_indexer and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishResolvedReportRemovalRun {
+    when: moderation/ResolvedReportRemovalFinished()
+    ensures:
+        for task in CronTasks where name = remove_resolved_reports and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishOldActivityDeletionRun {
+    when: notifications/OldActivityDeletionFinished()
+    ensures:
+        for task in CronTasks where name = delete_old_actions and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishPackageCleanupTaskRun {
+    when: packages/PackageCleanupTaskFinished()
+    ensures:
+        for task in CronTasks where name = cleanup_packages and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishMirrorUpdateSweepRun {
+    when: repositories/MirrorUpdateSweepFinished()
+    ensures:
+        for task in CronTasks where name = update_mirrors and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishArchiveCleanupRun {
+    when: repositories/ArchiveCleanupFinished()
+    ensures:
+        for task in CronTasks where name = archive_cleanup and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishAllArchivesDeletionRun {
+    when: repositories/AllArchivesDeletionFinished()
+    ensures:
+        for task in CronTasks where name = delete_repo_archives and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishHealthCheckSweepRun {
+    when: repositories/HealthCheckSweepFinished()
+    ensures:
+        for task in CronTasks where name = repo_health_check and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishGarbageCollectionSweepRun {
+    when: repositories/GarbageCollectionSweepFinished()
+    ensures:
+        for task in CronTasks where name = git_gc_repos and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishMissingRepositoryDeletionRun {
+    when: repositories/MissingRepositoryDeletionFinished()
+    ensures:
+        for task in CronTasks where name = delete_missing_repos and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishMissingRepositoryReinitRun {
+    when: repositories/MissingRepositoryReinitFinished()
+    ensures:
+        for task in CronTasks where name = reinit_missing_repos and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishRepositoryStatsCheckRun {
+    when: repositories/RepositoryStatsCheckFinished()
+    ensures:
+        for task in CronTasks where name = check_repo_stats and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishGeneratedAvatarDeletionRun {
+    when: repositories/GeneratedAvatarDeletionFinished()
+    ensures:
+        for task in CronTasks where name = delete_generated_repository_avatars and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishHookDeliveryCleanupRun {
+    when: webhooks/HookDeliveryCleanupFinished()
+    ensures:
+        for task in CronTasks where name = cleanup_hook_task_table and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishOrphanedUploadCleanupRun {
+    when: issues/OrphanedUploadCleanupFinished()
+    ensures:
+        for task in CronTasks where name = delete_orphaned_attachments and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+rule FinishExternalUserSyncRun {
+    when: authentication/ExternalUserSyncFinished()
+    ensures:
+        for task in CronTasks where name = sync_external_users and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+------------------------------------------------------------
+-- Cron dispatch: one rule per registered task, naming the module that owns
+-- the work and the parameters it is given.
+------------------------------------------------------------
+
+-- from: services/cron/tasks_basic.go:29
+rule DispatchUpdateMirrors {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = update_mirrors
+    ensures: MirrorUpdateDue(pull_limit: config.update_mirrors_pull_limit, push_limit: config.update_mirrors_push_limit)
+}
+
+-- from: services/cron/tasks_basic.go:47
+rule DispatchRepoHealthCheck {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = repo_health_check
+    ensures: RepositoryHealthCheckDue(timeout: config.repo_health_check_timeout, args: config.repo_health_check_args)
+}
+
+-- from: services/cron/tasks_basic.go:67
+rule DispatchCheckRepoStats {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = check_repo_stats
+    ensures: RepositoryStatsCheckDue()
+}
+
+-- from: services/cron/tasks_basic.go:77
+rule DispatchArchiveCleanup {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = archive_cleanup
+    ensures: RepositoryArchiveCleanupDue(older_than: config.archive_cleanup_older_than)
+}
+
+-- from: services/cron/tasks_basic.go:91
+rule DispatchSyncExternalUsers {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = sync_external_users
+    ensures: ExternalUserSyncDue(update_existing: config.sync_external_users_update_existing)
+}
+
+-- from: services/cron/tasks_basic.go:105
+rule DispatchDeletedBranchesCleanup {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = deleted_branches_cleanup
+    ensures: DeletedBranchCleanupDue(older_than: config.deleted_branches_cleanup_older_than)
+}
+
+-- from: services/cron/tasks_basic.go:120
+rule DispatchUpdateMigrationPosterId {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = update_migration_poster_id
+    ensures: MigrationPosterIdUpdateDue()
+}
+
+-- from: services/cron/tasks_basic.go:130
+rule DispatchCleanupHookTaskTable {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = cleanup_hook_task_table
+    ensures: HookDeliveryCleanupDue(cleanup_type: config.cleanup_hook_task_table_cleanup_type, older_than: config.cleanup_hook_task_table_older_than, number_to_keep: config.cleanup_hook_task_table_number_to_keep)
+}
+
+-- from: services/cron/tasks_basic.go:145
+rule DispatchCleanupPackages {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = cleanup_packages
+    ensures: PackageCleanupDue(older_than: config.cleanup_packages_older_than)
+}
+
+-- from: services/cron/tasks_extended.go:26
+rule DispatchDeleteInactiveAccounts {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = delete_inactive_accounts
+    ensures: InactiveAccountCleanupDue(older_than: config.delete_inactive_accounts_older_than)
+}
+
+-- from: services/cron/tasks_extended.go:39
+rule DispatchDeleteRepoArchives {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = delete_repo_archives
+    ensures: AllRepositoryArchivesDeletionDue()
+}
+
+-- from: services/cron/tasks_extended.go:55
+rule DispatchGitGcRepos {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = git_gc_repos
+    ensures: RepositoryGarbageCollectionDue(timeout: config.git_gc_repos_timeout, args: config.git_gc_repos_args)
+}
+
+-- from: services/cron/tasks_extended.go:70
+rule DispatchResyncAllSshKeys {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = resync_all_sshkeys
+    ensures: AuthorizedKeysRewriteDue()
+}
+
+-- from: services/cron/tasks_extended.go:80
+rule DispatchResyncAllSshPrincipals {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = resync_all_sshprincipals
+    ensures: AuthorizedPrincipalsRewriteDue()
+}
+
+-- from: services/cron/tasks_extended.go:90
+rule DispatchReinitMissingRepos {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = reinit_missing_repos
+    ensures: MissingRepositoryReinitDue()
+}
+
+-- from: services/cron/tasks_extended.go:100
+rule DispatchDeleteMissingRepos {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = delete_missing_repos
+    ensures: MissingRepositoryDeletionDue()
+}
+
+-- from: services/cron/tasks_extended.go:110
+rule DispatchDeleteGeneratedRepositoryAvatars {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = delete_generated_repository_avatars
+    ensures: GeneratedRepositoryAvatarDeletionDue()
+}
+
+-- from: services/cron/tasks_extended.go:120
+rule DispatchDeleteOldActions {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = delete_old_actions
+    ensures: OldActivityDeletionDue(older_than: config.delete_old_actions_older_than)
+}
+
+-- from: services/cron/tasks_extended.go:139
+rule DispatchUpdateChecker {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = update_checker
+    ensures: UpdateCheckDue(http_endpoint: config.update_checker_http_endpoint, domain_endpoint: config.update_checker_domain_endpoint)
+}
+
+-- from: services/cron/tasks_extended.go:153
+rule DispatchDeleteOldSystemNotices {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = delete_old_system_notices
+    ensures: OldSystemNoticeDeletionDue(older_than: config.delete_old_system_notices_older_than)
+}
+
+-- from: services/cron/tasks_extended.go:175
+rule DispatchGcLfs {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = gc_lfs
+    ensures: LfsGarbageCollectionDue(older_than: config.gc_lfs_older_than, last_updated_more_than_ago: config.gc_lfs_last_updated_more_than_ago, number_to_check_per_repo: config.gc_lfs_number_to_check_per_repo, proportion_to_check_per_repo: config.gc_lfs_proportion_to_check_per_repo)
+}
+
+-- from: services/cron/tasks_extended.go:206
+rule DispatchRebuildIssueIndexer {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = rebuild_issue_indexer
+    ensures: IssueIndexRebuildDue()
+}
+
+-- from: services/cron/tasks_extended.go:220
+rule DispatchRemoveResolvedReports {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = remove_resolved_reports
+    ensures: ResolvedReportRemovalDue(keep_for: config.remove_resolved_reports_keep_for)
+}
+
+rule DispatchDeleteOrphanedAttachments {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = delete_orphaned_attachments
+    ensures: OrphanedUploadCleanupDue(older_than: config.delete_orphaned_attachments_older_than)
+}
+
+-- from: services/cron/tasks_actions.go:30
+rule DispatchStopZombieTasks {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = stop_zombie_tasks
+    ensures: ZombieActionsTaskStopDue()
+}
+
+-- from: services/cron/tasks_actions.go:40
+rule DispatchStopEndlessTasks {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = stop_endless_tasks
+    ensures: EndlessActionsTaskStopDue()
+}
+
+-- from: services/cron/tasks_actions.go:50
+rule DispatchCancelAbandonedJobs {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = cancel_abandoned_jobs
+    ensures: AbandonedActionsJobCancellationDue()
+}
+
+-- from: services/cron/tasks_actions.go:60
+rule DispatchTransferLingeringLogs {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = transfer_lingering_logs
+    ensures: LingeringActionsLogTransferDue()
+}
+
+-- from: services/cron/tasks_actions.go:71
+rule DispatchStartScheduleTasks {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = start_schedule_tasks
+    ensures: ActionsScheduleStartDue()
+}
+
+-- from: services/cron/tasks_actions.go:83
+rule DispatchCleanupActions {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = cleanup_actions
+    ensures: ActionsCleanupDue()
+}
+
+-- from: services/cron/tasks_actions.go:93
+rule DispatchCleanupOfflineRunners {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = cleanup_offline_runners
+    ensures: OfflineRunnerCleanupDue(older_than: config.cleanup_offline_runners_older_than, global_scope_only: config.cleanup_offline_runners_global_scope_only)
+}
+
+-- from: services/cron/tasks_actions.go:111
+rule DispatchActionsActionUser {
+    when: CronTaskExecutes(task, doer)
+    requires: task.name = actions_action_user
+    ensures: ActionsUserCleanupDue()
+}
+
+------------------------------------------------------------
+-- Cron work this module owns itself
+------------------------------------------------------------
+
+-- from: models/system/notice.go:118
+rule DeleteOldSystemNotices {
+    when: OldSystemNoticeDeletionDue(older_than)
+    ensures:
+        for n in SystemNotices where created_at + older_than < now:
+            not exists n
+    -- decided: requests 5 (this module owns the work, so it finishes the run itself)
+    ensures:
+        for task in CronTasks where name = delete_old_system_notices and run_state = running:
+            CronWorkCompleted(job: task, outcome: finished, message: null)
+}
+
+-- The update check: DNS TXT lookup on the domain endpoint (preferred) or the
+-- HTTP version feed; the result (or the error) is recorded for the dashboard.
+-- from: modules/updatechecker/update_checker.go:37
+rule QueryReleaseFeed {
+    when: UpdateCheckDue(http_endpoint, domain_endpoint)
+    ensures: ReleaseFeedQueried(http_endpoint: http_endpoint, domain_endpoint: domain_endpoint)
+}
+
+------------------------------------------------------------
+-- Read-only (maintenance) mode
+------------------------------------------------------------
+-- Forgejo has none. While it is on, every write — web, API, git push — is
+-- refused and every page carries a banner with the admin's message; reads and
+-- the admin pages keep working, so the admin can switch it off again.
+-- The switch is access/InstanceWriteGate, the shared write gate access's
+-- repository write and contribution rules consult; every other module's
+-- user-initiated writes consult it as well.
+-- decided: administration 3 (admins switch it on; every write refused with a banner)
+
+rule AdminEntersReadOnlyMode {
+    when: AdminEntersReadOnlyMode(admin, gate, message)
+    requires: admin.is_admin = true
+    requires: not gate.read_only
+    ensures: gate.read_only = true
+    ensures: gate.message = message
+    ensures: gate.since = now
+    ensures: InstanceReadOnlyModeChanged(gate: gate, read_only: true)
+}
+
+rule AdminLeavesReadOnlyMode {
+    when: AdminLeavesReadOnlyMode(admin, gate)
+    requires: admin.is_admin = true
+    requires: gate.read_only
+    ensures: gate.read_only = false
+    ensures: gate.message = null
+    ensures: gate.since = null
+    ensures: InstanceReadOnlyModeChanged(gate: gate, read_only: false)
+}
+
+------------------------------------------------------------
+-- Dashboard one-off operations
+------------------------------------------------------------
+
+-- from: routers/web/admin/admin.go:190
+rule AdminStartsBranchResync {
+    when: AdminResyncsAllBranches(admin)
+    requires: admin.is_admin = true
+    ensures: AllRepositoryBranchesResyncRequested(admin: admin)
+}
+
+-- from: routers/web/admin/admin.go:198
+rule AdminStartsTagResync {
+    when: AdminResyncsAllTags(admin)
+    requires: admin.is_admin = true
+    ensures: AllRepositoryTagsResyncRequested(admin: admin)
+}
+
+-- from: routers/web/admin/config.go:35
+rule AdminSendsTestMail {
+    when: AdminSendsTestMail(admin, address)
+    requires: admin.is_admin = true
+    ensures: TestMailRequested(admin: admin, address: address)
+}
+
+------------------------------------------------------------
+-- Announcement (service message)
+------------------------------------------------------------
+
+-- from: routers/web/admin/service_message.go:45
+-- decided: administration 5 (modal or banner, each with optional start and end times)
+rule AdminPublishesAnnouncement {
+    when: AdminPublishesAnnouncement(admin, kind, title, text, starts_at, ends_at)
+    requires: admin.is_admin = true
+    requires: title != ""
+    requires: text != ""
+    requires: starts_at = null or ends_at = null or starts_at < ends_at
+    let existing = Announcement{kind: kind}
+    let stored_title = truncate_bytes(title, config.announcement_title_max_bytes)
+    ensures:
+        if exists existing:
+            existing.title = stored_title
+            existing.text = text
+            existing.starts_at = starts_at
+            existing.ends_at = ends_at
+            existing.updated_at = now
+        else:
+            Announcement.created(kind: kind, title: stored_title, text: text, starts_at: starts_at, ends_at: ends_at, created_at: now, updated_at: now)
+    ensures: AnnouncementPublished(kind: kind)
+    @guidance
+        -- The admin page also offers a preview of the rendered modal or
+        -- banner, which changes nothing. A modal and a banner may be live at
+        -- the same time (one of each kind).
+}
+
+-- from: routers/web/admin/service_message.go:71
+rule AdminWithdrawsAnnouncement {
+    when: AdminWithdrawsAnnouncement(admin, announcement)
+    -- read before the record goes: an emission sees the resulting state
+    let withdrawn_kind = announcement.kind
+    requires: admin.is_admin = true
+    ensures: not exists announcement
+    ensures: AnnouncementWithdrawn(kind: withdrawn_kind)
+}
+
+-- from: routers/web/user/service_message.go:15
+rule UserAcknowledgesAnnouncement {
+    when: UserAcknowledgesAnnouncement(user, announcement)
+    let existing = AnnouncementAcknowledgement{user: user, kind: announcement.kind}
+    ensures:
+        if exists existing:
+            existing.acknowledged_at = now
+        else:
+            AnnouncementAcknowledgement.created(user: user, kind: announcement.kind, acknowledged_at: now)
+}
+
+------------------------------------------------------------
+-- Admin management of users
+------------------------------------------------------------
+
+-- Create an account on someone's behalf (web form, API, also CLI below).
+-- The account is active immediately and is not subject to the email domain
+-- allow/block list (a warning only). A local password must satisfy the
+-- password policy (length, complexity, breach check).
+-- from: routers/web/admin/users.go:127
+rule AdminCreatesUser {
+    when: AdminCreatesUser(admin, name, email, password, login_source, login_name, visibility, must_change_password, restricted, send_notification)
+    requires: admin.is_admin = true
+    requires: is_usable_username(name)
+    requires: not (exists accounts/ReservedName{name: name})   -- accounts: reserved until AdminReleasesName
+    requires: not username_taken(name)
+    requires: is_valid_email(email)
+    requires: not email_in_use(email)
+    requires: login_source != null or password_acceptable(password)
+    ensures:
+        let user = accounts/User.created(
+            name: name,
+            kind: individual,
+            primary_email: email,
+            is_admin: false,
+            is_active: true,
+            is_restricted: restricted,
+            prohibit_login: false,
+            visibility: visibility,
+            created_at: now
+        )
+        accounts/EmailAddress.created(user: user, address: email, is_activated: true, is_primary: true)
+        authentication/UserLogin.created(
+            user: user,
+            source: login_source,
+            login_name: if login_name != null: login_name else: name,
+            has_password: login_source = null,
+            must_change_password: login_source = null and must_change_password,
+            password_changed_at: now,
+            last_sign_in_at: null
+        )
+        UserCreatedByAdmin(admin: admin, user: user, send_notification: send_notification)
+    @guidance
+        -- must_change_password: web form checkbox (default unchecked); API
+        -- defaults to true; CLI defaults to true except for the very first
+        -- account. Ignored for accounts bound to an external login source.
+        -- restricted: API/CLI may set it; otherwise the instance default.
+        -- The API may also back-date the creation time (`created`).
+        -- All other creation defaults are accounts' (as for self-registration,
+        -- minus reserved-prefix, cooldown and email-domain checks).
+}
+
+-- Admins weakening themselves: one guard for all of it. A self-edit that
+-- would leave no other active admin — demote, restrict, deactivate, prohibit
+-- sign-in — is refused (has_other_admin counts active administrators who may
+-- sign in).
+-- decided: administration 6 (one guard for every self-weakening edit)
+
+-- Grant or revoke site administration. The last administrator can never be
+-- demoted.
+-- from: services/user/update.go:113
+rule AdminSetsUserAdmin {
+    when: AdminSetsUserAdmin(admin, user, value)
+    requires: admin.is_admin = true
+    requires: not user.being_purged     -- accounts invariant PurgingAccountStaysDisabled
+    -- the last administrator cannot be demoted
+    requires: value = true or not user.is_admin or has_other_admin(user)
+    ensures: user.is_admin = value
+    ensures: UserEditedByAdmin(admin: admin, user: user)
+}
+
+-- from: routers/web/admin/users.go:451
+-- decided: administration 6 (restricting oneself needs another active admin)
+rule AdminSetsUserRestricted {
+    when: AdminSetsUserRestricted(admin, user, value)
+    requires: admin.is_admin = true
+    requires: user != admin or value = false or has_other_admin(admin)
+    ensures: user.is_restricted = value
+    ensures: UserEditedByAdmin(admin: admin, user: user)
+}
+
+-- Block (or unblock) sign-in. Blocking oneself is refused unless another
+-- active administrator remains (Forgejo silently forces the flag off instead).
+-- decided: administration 6 (one guard for every self-weakening edit)
+-- from: routers/web/admin/users.go:391
+rule AdminSetsProhibitLogin {
+    when: AdminSetsProhibitLogin(admin, user, value)
+    requires: admin.is_admin = true
+    requires: value = true or not user.being_purged    -- accounts invariant PurgingAccountStaysDisabled
+    requires: user != admin or value = false or has_other_admin(admin)
+    ensures: user.prohibit_login = value
+    ensures: UserEditedByAdmin(admin: admin, user: user)
+}
+
+-- decided: administration 6 (deactivating oneself needs another active admin)
+-- from: routers/web/admin/users.go:447
+rule AdminSetsUserActive {
+    when: AdminSetsUserActive(admin, user, value)
+    requires: admin.is_admin = true
+    requires: not user.being_purged     -- accounts invariant PurgingAccountStaysDisabled
+    requires: user != admin or value = true or has_other_admin(admin)
+    ensures: user.is_active = value
+    ensures: UserEditedByAdmin(admin: admin, user: user)
+}
+
+-- null = instance default, 0 = may not create repositories, n = at most n.
+-- (Forgejo encodes the default as -1.)
+-- from: routers/web/admin/users.go:451
+rule AdminSetsMaxRepoCreation {
+    when: AdminSetsMaxRepoCreation(admin, user, limit)
+    requires: admin.is_admin = true
+    requires: limit = null or limit >= 0
+    ensures: user.max_repo_creation = limit
+    ensures: UserEditedByAdmin(admin: admin, user: user)
+}
+
+-- Admins may set any visibility the instance allows for users.
+-- from: routers/web/admin/users.go:451
+rule AdminSetsUserVisibility {
+    when: AdminSetsUserVisibility(admin, user, visibility)
+    requires: admin.is_admin = true
+    ensures: user.visibility = visibility
+    ensures: UserEditedByAdmin(admin: admin, user: user)
+}
+
+-- Per-account capabilities only an admin can grant.
+-- from: routers/web/admin/users.go:451
+rule AdminSetsUserPermissions {
+    when: AdminSetsUserPermissions(admin, user, allow_git_hook, allow_import_local, allow_create_organization)
+    requires: admin.is_admin = true
+    ensures: user.allow_git_hook = allow_git_hook
+    ensures: user.allow_import_local = allow_import_local
+    ensures: user.allow_create_organization = allow_create_organization
+    ensures: UserEditedByAdmin(admin: admin, user: user)
+}
+
+-- Profile fields an admin may overwrite (full name, website, location,
+-- pronouns, description, language, hide email).
+-- from: routers/web/admin/users.go:442
+rule AdminEditsUserProfile {
+    when: AdminEditsUserProfile(admin, user, full_name, website, location, pronouns, description, keep_email_private)
+    requires: admin.is_admin = true
+    ensures: user.full_name = full_name
+    ensures: user.website = website
+    ensures: user.location = location
+    ensures: user.pronouns = pronouns
+    ensures: user.description = description
+    ensures: user.keep_email_private = keep_email_private
+    ensures: UserEditedByAdmin(admin: admin, user: user)
+}
+
+-- Set a new password (subject to the password policy), optionally forcing a
+-- change at next sign-in.
+-- from: routers/api/v1/admin/user.go:166
+rule AdminSetsUserPassword {
+    when: AdminSetsUserPassword(admin, user, password, must_change_password)
+    requires: admin.is_admin = true
+    requires: password_acceptable(password)
+    let login = authentication/UserLogin{user: user}
+    ensures: login.has_password = true
+    ensures: login.must_change_password = must_change_password
+    ensures: login.password_changed_at = now
+    ensures: UserPasswordSetByAdmin(admin: admin, user: user, password: password)
+}
+
+-- Rebind an account to a login source and login name (source and name
+-- together, via the API). decided: requests 4 — the binding is authentication's
+-- login record, so authentication applies it (RebindLoginForAdmin).
+-- from: routers/api/v1/admin/user.go:170
+rule AdminSetsUserLoginSource {
+    when: AdminSetsUserLoginSource(admin, user, login_source, login_name)
+    requires: admin.is_admin = true
+    requires: login_name != null
+    ensures: UserLoginSourceSetByAdmin(admin: admin, user: user, login_source: login_source, login_name: login_name)
+    ensures: UserEditedByAdmin(admin: admin, user: user)
+}
+
+-- Replace the primary email. Existing address of the same user is promoted;
+-- a new one is added already activated. Domain allow/block lists do not apply.
+-- from: services/user/email.go:22
+rule AdminSetsUserPrimaryEmail {
+    when: AdminSetsUserPrimaryEmail(admin, user, address)
+    requires: admin.is_admin = true
+    requires: is_valid_email(address)
+    requires: not email_used_by_other(address, user)
+    let old_primary = user.primary_email
+    let existing = accounts/EmailAddress{user: user, address: address}
+    -- the old primary stays as a secondary address
+    ensures:
+        for e in user.email_addresses where is_primary:
+            e.is_primary = false
+    ensures:
+        if exists existing:
+            existing.is_primary = true
+            existing.is_activated = true
+        else:
+            accounts/EmailAddress.created(user: user, address: address, is_activated: true, is_primary: true)
+    ensures: user.primary_email = address
+    ensures: UserPrimaryEmailSetByAdmin(admin: admin, user: user, old_address: old_primary, new_address: address)
+    ensures: UserEditedByAdmin(admin: admin, user: user)
+}
+
+-- Rename. Unlike self-service rename, works for accounts from external sources
+-- and ignores the cooldown on recently released names.
+-- from: services/user/user.go:42
+rule AdminRenamesUser {
+    when: AdminRenamesUser(admin, user, new_name)
+    requires: admin.is_admin = true
+    requires: is_usable_username(new_name)
+    requires: not username_taken(new_name) or lower(new_name) = lower(user.name)
+    requires: lower(new_name) = lower(user.name) or not (exists accounts/ReservedName{name: new_name})   -- accounts: reserved until AdminReleasesName
+    let old_name = user.name
+    ensures: user.name = new_name
+    ensures: UserRenamedByAdmin(admin: admin, user: user, old_name: old_name, new_name: new_name)
+}
+
+-- Remove every second factor (TOTP and security keys) of an account.
+-- from: routers/web/admin/users.go:466
+rule AdminResetsUserTwoFactor {
+    when: AdminResetsUserTwoFactor(admin, user)
+    requires: admin.is_admin = true
+    ensures: UserTwoFactorResetByAdmin(admin: admin, user: user)
+}
+
+-- from: routers/web/admin/users.go:542
+rule AdminChangesUserAvatar {
+    when: AdminChangesUserAvatar(admin, user, image)
+    requires: admin.is_admin = true
+    ensures: UserAvatarChangedByAdmin(admin: admin, user: user)
+}
+
+-- from: routers/web/admin/users.go:559
+rule AdminRemovesUserAvatar {
+    when: AdminRemovesUserAvatar(admin, user)
+    requires: admin.is_admin = true
+    ensures: UserAvatarRemovedByAdmin(admin: admin, user: user)
+}
+
+-- Delete an account. Without purge the account must own nothing (no
+-- repositories, no organization memberships, no packages). With purge the
+-- account is first disabled (inactive, restricted, not admin, login prohibited,
+-- password cleared, sessions told to log out), then its repositories, its
+-- packages and federated identity are deleted and it leaves every organization
+-- — organizations it was the last owner of are deleted with it.
+-- from: services/user/user.go:183
+rule AdminDeletesUser {
+    when: AdminDeletesUser(admin, user, purge)
+    requires: admin.is_admin = true
+    requires: user != admin
+    requires: not user.is_admin or has_other_admin(user)
+    requires: purge or not owns_content(user)
+    -- accounts removes the account at the end of its cascade (AdminDeletionCascades).
+    ensures: UserDeletedByAdmin(admin: admin, user: user, purge: purge)
+}
+
+-- The instance-wide email directory: (de)activate an address. Activating is
+-- refused if the same address is active on another account. (De)activating a
+-- primary address also (de)activates the account.
+-- from: models/user/email_address.go:361
+rule AdminSetsEmailActivation {
+    when: AdminSetsEmailActivation(admin, email, activate)
+    requires: admin.is_admin = true
+    requires: not activate or not email_active_elsewhere(email)
+    ensures: email.is_activated = activate
+    ensures:
+        if email.is_primary:
+            email.user.is_active = activate
+}
+
+-- A primary address cannot be deleted.
+-- from: routers/web/admin/emails.go:156
+rule AdminDeletesEmail {
+    when: AdminDeletesEmail(admin, email)
+    requires: admin.is_admin = true
+    requires: not email.is_primary
+    ensures: not exists email
+}
+
+-- Create an organization owned by a user (API).
+-- from: routers/api/v1/admin/org.go:21
+rule AdminCreatesOrganizationForUser {
+    when: AdminCreatesOrganizationForUser(admin, user, name, visibility)
+    requires: admin.is_admin = true
+    requires: is_usable_username(name)
+    requires: not (exists accounts/ReservedName{name: name})   -- accounts: reserved until AdminReleasesName
+    requires: not username_taken(name)
+    ensures: OrganizationCreatedForUserByAdmin(admin: admin, user: user, name: name, visibility: visibility)
+}
+
+-- Create a repository owned by a user (API).
+-- from: routers/api/v1/admin/repo.go:14
+rule AdminCreatesRepositoryForUser {
+    when: AdminCreatesRepositoryForUser(admin, user, name)
+    requires: admin.is_admin = true
+    -- repositories owns creation: it reacts by creating the repository with
+    -- the instance defaults (empty description, public, not a template, not
+    -- initialised, the default object format); a site admin is not held to
+    -- the owner's creation limit.
+    ensures: RepositoryCreationRequestedByAdmin(admin: admin, user: user, name: name)
+}
+
+-- Add / remove an SSH key on a user's account (API).
+-- from: routers/api/v1/admin/user.go:329
+rule AdminAddsSshKeyForUser {
+    when: AdminAddsSshKeyForUser(admin, user, key_content, title)
+    requires: admin.is_admin = true
+    ensures: SshKeyAddedForUserByAdmin(admin: admin, user: user, key_content: key_content, title: title)
+}
+
+-- from: routers/api/v1/admin/user.go:361
+rule AdminRemovesSshKeyOfUser {
+    when: AdminRemovesSshKeyOfUser(admin, user, key)
+    requires: admin.is_admin = true
+    ensures: SshKeyRemovedForUserByAdmin(admin: admin, user: user, key: key)
+}
+
+-- Manage a user's access tokens (API: list / create / delete).
+-- from: routers/api/v1/admin/user_token.go:46
+rule AdminCreatesAccessTokenForUser {
+    when: AdminCreatesAccessTokenForUser(admin, user, token_name, scopes)
+    requires: admin.is_admin = true
+    ensures: AccessTokenRequestedForUser(requester: admin, user: user, token_name: token_name, scopes: scopes)
+}
+
+------------------------------------------------------------
+-- Admin management of repositories
+------------------------------------------------------------
+
+-- Delete any repository from the admin list.
+-- from: routers/web/admin/repos.go:42
+rule AdminDeletesRepository {
+    when: AdminDeletesRepository(admin, repository)
+    requires: admin.is_admin = true
+    -- repositories owns the deletion and its cascade (RepositoryDeleted reaches
+    -- access, webhooks, packages, actions, ...); a site admin passes its check.
+    ensures: RepositoryDeletionRequestedByAdmin(admin: admin, repository: repository)
+}
+
+-- Adopting an unadopted directory, or deleting its files, is repositories'
+-- UserAdoptsRepository / UserDeletesUnadoptedRepository, for owners (when the
+-- instance allows it) and site admins alike (site admins always pass their
+-- checks); administration only owns the instance-wide listing (surface
+-- UnadoptedRepositories below).
+-- decided: administration 7 (repositories owns adopt and delete; administration the listing)
+
+------------------------------------------------------------
+-- Monitoring (infrastructure capability)
+------------------------------------------------------------
+
+-- from: routers/web/admin/stacktrace.go:42
+rule AdminCancelsProcess {
+    when: AdminCancelsProcess(admin, process)
+    requires: admin.is_admin = true
+    requires: not process.is_system
+    ensures: process.cancelled = true
+    ensures: ProcessCancellationRequested(admin: admin, process: process)
+}
+
+-- from: routers/web/admin/queue.go:40
+rule AdminSetsQueueWorkers {
+    when: AdminSetsQueueWorkers(admin, queue, max_workers)
+    requires: admin.is_admin = true
+    requires: max_workers >= 1
+    ensures: queue.max_workers = max_workers
+}
+
+-- from: routers/web/admin/queue.go:71
+rule AdminClearsQueue {
+    when: AdminClearsQueue(admin, queue)
+    requires: admin.is_admin = true
+    ensures: queue.item_count = 0
+}
+
+------------------------------------------------------------
+-- CLI (server operator)
+------------------------------------------------------------
+
+-- `forgejo admin user create`. Exactly one of --password / --random-password.
+-- must-change-password defaults to true, except for the very first account of
+-- the instance. Can also mint an access token for the new account.
+-- from: cmd/admin_user_create.go:89
+rule OperatorCreatesUser {
+    when: OperatorCreatesUser(operator, instance, name, email, password, is_admin, must_change_password, restricted, access_token_name, access_token_scopes)
+    requires: instance.install_status = installed
+    requires: is_usable_username(name)
+    requires: not (exists accounts/ReservedName{name: name})   -- accounts: reserved until AdminReleasesName
+    requires: not username_taken(name)
+    requires: not email_in_use(email)
+    let first_account = not any_account_exists()
+    ensures:
+        let user = accounts/User.created(
+            name: name,
+            kind: individual,
+            primary_email: email,
+            is_admin: is_admin,
+            is_active: true,
+            is_restricted: restricted = true,
+            prohibit_login: false,
+            created_at: now
+        )
+        accounts/EmailAddress.created(user: user, address: email, is_activated: true, is_primary: true)
+        authentication/UserLogin.created(
+            user: user,
+            source: null,
+            login_name: name,
+            has_password: true,
+            must_change_password: if must_change_password != null: must_change_password else: not first_account,
+            password_changed_at: now,
+            last_sign_in_at: null
+        )
+        if access_token_name != null:
+            AccessTokenRequestedForUser(requester: operator, user: user, token_name: access_token_name, scopes: access_token_scopes)
+}
+
+-- `forgejo admin user change-password`
+-- from: cmd/admin_user_change_password.go:64
+rule OperatorChangesPassword {
+    when: OperatorChangesPassword(operator, user, password, must_change_password)
+    requires: password_acceptable(password)
+    let login = authentication/UserLogin{user: user}
+    ensures: login.has_password = true
+    ensures: login.must_change_password = must_change_password
+    ensures: login.password_changed_at = now
+    ensures: UserPasswordSetByOperator(operator: operator, user: user, password: password)
+}
+
+-- `forgejo admin user must-change-password [--all] [--exclude u] [--unset] users…`
+-- from: cmd/admin_user_must_change_password.go:40
+rule OperatorSetsMustChangePassword {
+    when: OperatorSetsMustChangePassword(operator, users, value)
+    ensures:
+        for login in authentication/UserLogins where user in users:
+            login.must_change_password = value
+}
+
+-- `forgejo admin user reset-mfa`
+-- from: cmd/admin_user_reset_mfa.go:33
+rule OperatorResetsTwoFactor {
+    when: OperatorResetsTwoFactor(operator, user)
+    ensures: UserTwoFactorResetByAdmin(admin: operator, user: user)
+}
+
+-- `forgejo admin user delete --id|--username|--email [--purge]`
+-- from: cmd/admin_user_delete.go:48
+rule OperatorDeletesUser {
+    when: OperatorDeletesUser(operator, user, purge)
+    requires: not user.is_admin or has_other_admin(user)
+    requires: purge or not owns_content(user)
+    -- accounts removes the account at the end of its cascade (AdminDeletionCascades).
+    ensures: UserDeletedByAdmin(admin: operator, user: user, purge: purge)
+}
+
+-- `forgejo admin user generate-access-token`
+-- from: cmd/admin_user_generate_access_token.go:48
+rule OperatorGeneratesAccessToken {
+    when: OperatorGeneratesAccessToken(operator, user, token_name, scopes)
+    ensures: AccessTokenRequestedForUser(requester: operator, user: user, token_name: token_name, scopes: scopes)
+}
+
+-- `forgejo admin user create-authorized-integration` (JWT-trusting token)
+-- from: cmd/admin_user_generate_authorized_integration.go:102
+rule OperatorCreatesAuthorizedIntegration {
+    when: OperatorCreatesAuthorizedIntegration(operator, user, name, description, issuer, claim_rules, scopes, all_repositories, repositories)
+    -- authentication checks the issuer and the claim rules and generates the audience.
+    ensures: AuthorizedIntegrationRequested(operator: operator, user: user, name: name, description: description, issuer: issuer, claim_rules: claim_rules, scopes: scopes, all_repositories: all_repositories, repositories: repositories)
+    @guidance
+        -- Flags: --username, --name, --description, --issuer, --claim-eq,
+        -- --claim-in, --claim-glob, --claim-glob-in (claim=value[,value...]),
+        -- --scope (repeatable), --repo owner/name or "all".
+}
+
+-- `forgejo admin regenerate keys`
+-- from: cmd/admin_regenerate.go:20
+rule OperatorRegeneratesAuthorizedKeys {
+    when: OperatorRegeneratesAuthorizedKeys(operator)
+    ensures: AuthorizedKeysRegenerationRequested(operator: operator)
+}
+
+-- `forgejo admin repo-sync-releases`
+-- from: cmd/admin.go:109
+rule OperatorSyncsReleases {
+    when: OperatorSyncsReleases(operator)
+    ensures: ReleasesSyncWithTagsRequested(operator: operator)
+}
+
+-- `forgejo admin auth add-oauth|update-oauth|add-ldap|update-ldap|
+-- add-ldap-simple|update-ldap-simple|add-pam|update-pam|add-smtp|update-smtp|
+-- list|delete`
+-- from: cmd/admin.go:55
+rule OperatorConfiguresAuthSource {
+    when: OperatorConfiguresAuthSource(operator, kind, action, source, name, is_active, sync_enabled, settings)
+    -- source: the --id of the source for update / delete, null for add and list.
+    -- authentication creates, updates or deletes the source with the admin
+    -- form's validation; `list` changes nothing.
+    ensures: AuthSourceConfiguredFromCli(operator: operator, kind: kind, action: action, source: source, name: name, is_active: is_active, sync_enabled: sync_enabled, settings: settings)
+}
+
+-- `forgejo admin sendmail --title --content [--force]`: mail every active
+-- account with an email address. Needs mail to be configured.
+-- from: cmd/mailer.go:16
+rule OperatorMailsAllUsers {
+    when: OperatorMailsAllUsers(operator, instance, subject, body)
+    requires: instance.install_status = installed
+    requires: subject != ""
+    requires: mail_enabled()
+    ensures: MassMailRequested(subject: subject, body: body, recipients: active_accounts_with_email())
+}
+
+-- `forgejo doctor check [--list|--default|--run c…|--all] [--fix]`
+-- from: cmd/doctor.go:270
+rule OperatorRunsDoctor {
+    when: OperatorRunsDoctor(operator, checks, fix)
+    ensures: DoctorRunRequested(operator: operator, checks: checks, fix: fix)
+}
+
+-- Report-only doctor checks from the web admin: never with fix — repairs that
+-- change data stay CLI-only. The report is kept for the admin to read.
+-- decided: administration 9 (read-only checks from the web; fixes CLI-only)
+rule AdminRunsDoctorChecks {
+    when: AdminRunsDoctorChecks(admin, checks)
+    requires: admin.is_admin = true
+    requires: checks != {}
+    ensures:
+        let run = DoctorRun.created(requested_by: admin, checks: checks, state: running, report: null, started_at: now, finished_at: null)
+        DoctorRunRequestedByAdmin(run: run)
+}
+
+rule RecordDoctorReport {
+    when: DoctorRunFinished(run, report)
+    requires: run.state = running
+    ensures: run.state = finished
+    ensures: run.report = report
+    ensures: run.finished_at = now
+}
+
+-- `forgejo dump`: one archive with the configuration file, a database dump
+-- (optionally converted to another SQL dialect), repositories, LFS objects,
+-- attachments, packages, avatars, custom dir, indexes, logs — each
+-- skippable — in the chosen format, to a file or stdout.
+-- from: cmd/dump.go:246
+rule OperatorDumpsInstance {
+    when: OperatorDumpsInstance(operator, instance, format, contents)
+    requires: instance.install_status = installed
+    ensures: InstanceDumpProduced(operator: operator, format: format, contents: contents)
+}
+
+-- `forgejo restore <dump>`: load a dump (configuration, database, repositories
+-- and the other stored files) into an empty, not yet installed instance; it
+-- comes up installed exactly as dumped. Restoring over a live instance is
+-- refused. Forgejo has no counterpart (restore is manual).
+-- decided: administration 4 (CLI restore into an empty instance)
+rule OperatorRestoresInstance {
+    when: OperatorRestoresInstance(operator, instance, dump)
+    requires: instance.install_status = awaiting_install
+    requires: instance_storage_is_empty(instance)
+    requires: is_readable_dump(dump)
+    ensures: instance.install_status = installed
+    ensures: InstanceRestored(operator: operator, instance: instance)
+    @guidance
+        -- Any format `forgejo dump` writes is accepted; a database dump in
+        -- another SQL dialect is converted. Parts skipped at dump time stay
+        -- empty. The install wizard is not shown afterwards (the restored
+        -- configuration carries the install lock).
+}
+
+-- `forgejo manager shutdown|restart|reload-templates|flush-queues|processes|logging`
+-- from: cmd/manager.go:17
+rule OperatorCommandsRunningInstance {
+    when: OperatorCommandsRunningInstance(operator, command)
+    ensures: RunningInstanceCommanded(operator: operator, command: command)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- At most one announcement per kind.
+invariant OneAnnouncementPerKind {
+    for a in Announcements:
+        for b in Announcements:
+            a.kind = b.kind implies a = b
+}
+
+-- Each runtime setting key is stored once.
+invariant OneSettingPerKey {
+    for a in SystemSettings:
+        for b in SystemSettings:
+            a.key = b.key implies a = b
+}
+
+-- Every cron task name is registered once.
+invariant UniqueCronTaskNames {
+    for a in CronTasks:
+        for b in CronTasks:
+            a.name = b.name implies a = b
+}
+
+-- A task that is not enabled has no next scheduled run.
+invariant DisabledTasksAreNotScheduled {
+    for t in CronTasks:
+        t.enabled = false implies t.next_run_at = null
+}
+
+-- One acknowledgement per user and announcement kind.
+invariant OneAcknowledgementPerUserAndKind {
+    for a in AnnouncementAcknowledgements:
+        for b in AnnouncementAcknowledgements:
+            (a.user = b.user and a.kind = b.kind) implies a = b
+}
+
+-- The instance always keeps at least one administrator (demotion and deletion
+-- of the last one are refused).
+-- (accounts declares the matching invariant AtLeastOneAdmin over its Users.)
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- Administrators, signed-in users and anonymous visitors (the install wizard,
+-- a load-balancer health probe, an API client reading the version) are the
+-- shared actors access/SiteAdmin, access/SignedInUser and access/Visitor.
+
+actor ServerOperator {
+    identified_by: Operator where has_host_access = true
+}
+
+-- The server process itself and the background work of other modules,
+-- reporting into this module.
+actor BackgroundWork {
+    identified_by: ServerProcess where is_running = true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The first-run install wizard.
+surface InstallWizard {
+    facing visitor: access/Visitor
+    context instance: Instance
+
+    exposes:
+        instance.install_status
+
+    provides:
+        VisitorSubmitsInstallation(visitor, instance, settings)
+            when instance.install_status = awaiting_install
+
+    @guidance
+        -- Web: GET / (form prefilled from current config and environment),
+        -- POST / (submit), GET /post-install (done page). While not installed
+        -- every other path is 404. After success the install server shuts down
+        -- and the normal server starts.
+}
+
+-- Health endpoint for load balancers and orchestrators.
+surface HealthEndpoint {
+    facing probe: access/Visitor
+    context instance: Instance
+
+    exposes:
+        instance.health_status
+        instance.app_name
+        instance.database_reachable
+        instance.cache_reachable
+
+    @guarantee FailureIsDistinguishable
+        -- "pass" (or "warn") maps to a success response, "fail" to a failure
+        -- response, so a probe can act on the status code alone.
+
+    @guidance
+        -- GET /api/healthz, JSON shaped after draft-inadarei-api-health-check:
+        -- {status, description, checks: {"database:ping": [...], "cache:ping": [...]}}.
+        -- Before installation no component checks are run. Never cached.
+}
+
+-- Public instance information.
+surface InstanceInfo {
+    facing visitor: access/Visitor
+    context instance: Instance
+
+    exposes:
+        instance.version
+        instance.app_name
+
+    @guidance
+        -- GET /api/v1/version; GET /api/v1/settings/{ui,api,repository,attachment}
+        -- expose the public, non-secret instance limits other modules own.
+}
+
+-- The admin dashboard.
+surface AdminDashboard {
+    facing admin: access/SiteAdmin
+    context instance: Instance
+
+    exposes:
+        instance.version
+        instance.started_at
+        instance.release_state
+        instance.recommended_upgrade
+        instance.update_check_error
+        instance_statistics()
+        for task in CronTasks where shown_on_dashboard = true:
+            task.name
+
+    provides:
+        AdminRunsCronTask(admin, task)
+        AdminResyncsAllBranches(admin)
+        AdminResyncsAllTags(admin)
+
+    @guidance
+        -- Web: GET /admin, POST /admin (op=<task name>|sync_repo_branches|sync_repo_tags),
+        -- GET /admin/system_status (uptime), GET /admin/monitor/stats (entity counts).
+        -- Dashboard one-click operations: delete_inactive_accounts,
+        -- delete_repo_archives, delete_missing_repos, git_gc_repos,
+        -- resync_all_sshkeys + resync_all_sshprincipals (only when an external
+        -- SSH server is used), reinit_missing_repos, sync_external_users,
+        -- repo_health_check, delete_generated_repository_avatars,
+        -- sync_repo_branches, sync_repo_tags.
+}
+
+-- The cron monitor: one row per registered task.
+surface CronTaskMonitor {
+    facing admin: access/SiteAdmin
+    context task: CronTask
+
+    exposes:
+        task.name
+        task.schedule
+        task.enabled
+        task.next_run_at
+        task.last_run_at
+        task.exec_times
+        task.last_outcome
+        task.last_message
+        task.last_doer
+
+    provides:
+        AdminRunsCronTask(admin, task)
+
+    timeout:
+        CronTaskFallsDue
+
+    @guidance
+        -- Web: GET /admin/monitor/cron, POST /admin (op=<name>, from=monitor).
+        -- API: GET /api/v1/admin/cron (name, schedule, next, prev, exec_times),
+        -- POST /api/v1/admin/cron/{task}.
+        -- An unknown task name is reported, not run.
+}
+
+-- The system notice log.
+surface SystemNoticeLog {
+    facing admin: access/SiteAdmin
+    context notice: SystemNotice
+
+    exposes:
+        notice.kind
+        notice.description
+        notice.created_at
+        -- the audit trail access keeps of site admins opening private
+        -- repositories they hold no role in (decided: follow-up 1); shown
+        -- next to the notices, never edited, no retention of its own
+        for record in access/AdminAccessRecords:
+            record.admin
+            record.repository
+            record.unit_kind
+            record.accessed_at
+
+    provides:
+        AdminDeletesNotices(admin, notices)
+        AdminEmptiesNotices(admin)
+
+    @guidance
+        -- Web: GET /admin/notices (newest first, paged), POST /admin/notices/delete
+        -- (ids[]), POST /admin/notices/empty.
+}
+
+-- Read-only configuration with secrets masked; test mail.
+surface InstanceConfiguration {
+    facing admin: access/SiteAdmin
+    context entry: ConfigEntry
+
+    exposes:
+        entry.section
+        entry.key
+        entry.displayed_value
+
+    provides:
+        AdminSendsTestMail(admin, address)
+
+    @guarantee SecretsNeverShown
+        -- Database passwords, mailer passwords, cache/session/queue connection
+        -- strings and credentials embedded in URLs are always masked.
+
+    @guidance
+        -- Web: GET /admin/config, POST /admin/config/test_mail,
+        -- POST /admin/config/test_cache (cache round-trip timing).
+        -- Lists among others the [webhook] retry settings (max delivery
+        -- attempts, retry backoff base) and the [actions] settings other
+        -- modules own: registration_token_lifetime (1h), run_pruning_enabled /
+        -- run_retention, schedule_inactivity_disable_enabled /
+        -- schedule_inactivity_period. Instance-wide merge-message templates
+        -- are files under the custom path (pulls), with no admin UI.
+}
+
+-- Runtime-changeable settings.
+surface RuntimeSettings {
+    facing admin: access/SiteAdmin
+    context setting: SystemSetting
+
+    exposes:
+        setting.key
+        setting.value
+
+    provides:
+        AdminChangesSetting(admin, key, raw_value)
+
+    @guidance
+        -- Web: GET /admin/config/settings, POST /admin/config (key, value).
+}
+
+-- Managing the site announcement.
+surface AnnouncementAdministration {
+    facing admin: access/SiteAdmin
+    context announcement: Announcement
+
+    exposes:
+        announcement.kind
+        announcement.title
+        announcement.text
+        announcement.starts_at
+        announcement.ends_at
+        announcement.updated_at
+
+    provides:
+        AdminPublishesAnnouncement(admin, kind, title, text, starts_at, ends_at)
+        AdminWithdrawsAnnouncement(admin, announcement)
+
+    @guidance
+        -- Web: GET/POST /admin/service_message, POST /admin/service_message/delete,
+        -- POST /admin/service_message/preview, POST /admin/service_message/markup.
+}
+
+-- The announcement (modal or banner) every signed-in user sees, inside its
+-- start/end window, until they dismiss it.
+-- decided: administration 5 (modal or banner, optional start and end)
+surface AnnouncementBanner {
+    facing viewer: access/SignedInUser
+    context announcement: Announcement
+
+    exposes:
+        announcement.kind when announcement.is_live and announcement.is_pending_for(viewer)
+        announcement.title when announcement.is_live and announcement.is_pending_for(viewer)
+        announcement.text when announcement.is_live and announcement.is_pending_for(viewer)
+
+    provides:
+        UserAcknowledgesAnnouncement(viewer, announcement)
+            when announcement.is_live
+
+    @guidance
+        -- Rendered on every signed-in web page: a modal blocks the page until
+        -- dismissed, a banner sits above the content. POST /user/confirm
+        -- (sm_type, redirect_to) records the acknowledgement. Dismissing is a
+        -- per-viewer acknowledgement, still accepted in read-only mode.
+}
+
+-- Switching read-only (maintenance) mode.
+-- decided: administration 3
+surface ReadOnlyModeAdministration {
+    facing admin: access/SiteAdmin
+    context gate: access/InstanceWriteGate
+
+    exposes:
+        gate.read_only
+        gate.message
+        gate.since
+
+    provides:
+        AdminEntersReadOnlyMode(admin, gate, message)
+            when not gate.read_only
+        AdminLeavesReadOnlyMode(admin, gate)
+            when gate.read_only
+
+    @guidance
+        -- Web: /-/admin/maintenance (toggle + message); API
+        -- PUT/DELETE /api/v1/admin/read-only. Admin pages stay writable for
+        -- this switch and the rest of the admin console.
+}
+
+-- The banner every visitor sees while the instance is read-only.
+surface ReadOnlyBanner {
+    facing visitor: access/Visitor
+    context gate: access/InstanceWriteGate
+
+    exposes:
+        gate.read_only
+        gate.message when gate.read_only
+
+    @guarantee WritesRefusedWhileReadOnly
+        -- While gate.read_only, every write — web form, API call, git
+        -- push over HTTP or SSH — is refused with the banner message (API: a
+        -- distinct "instance is read-only" error); reads, clones and
+        -- downloads keep working.
+}
+
+-- Doctor checks from the web admin: report-only.
+-- decided: administration 9
+surface DoctorReports {
+    facing admin: access/SiteAdmin
+    context run: DoctorRun
+
+    exposes:
+        run.checks
+        run.state
+        run.report
+        run.started_at
+        run.requested_by
+
+    provides:
+        AdminRunsDoctorChecks(admin, checks)
+
+    @guarantee NoFixesFromTheWeb
+        -- The web never runs a check with fix; repairs are `forgejo doctor
+        -- check --fix` on the host only.
+
+    @guidance
+        -- Web: GET /-/admin/doctor (checks, past runs), POST /-/admin/doctor/run
+        -- (checks[]). Same catalogue and defaults as `forgejo doctor check`.
+}
+
+-- User administration: one account.
+surface AdminUserAccount {
+    facing admin: access/SiteAdmin
+    context subject: accounts/User
+
+    exposes:
+        subject.name
+        subject.primary_email
+        subject.is_admin
+        subject.is_active
+        subject.is_restricted
+        subject.prohibit_login
+        subject.visibility
+        subject.max_repo_creation
+        subject.login_source
+        subject.allow_git_hook
+        subject.allow_import_local
+        subject.allow_create_organization
+
+    provides:
+        AdminSetsUserAdmin(admin, subject, value)
+        AdminSetsUserRestricted(admin, subject, value)
+        AdminSetsProhibitLogin(admin, subject, value)
+        AdminSetsUserActive(admin, subject, value)
+        AdminSetsMaxRepoCreation(admin, subject, limit)
+        AdminSetsUserVisibility(admin, subject, visibility)
+        AdminSetsUserPermissions(admin, subject, allow_git_hook, allow_import_local, allow_create_organization)
+        AdminEditsUserProfile(admin, subject, full_name, website, location, pronouns, description, keep_email_private)
+        AdminSetsUserPassword(admin, subject, password, must_change_password)
+        AdminSetsUserLoginSource(admin, subject, login_source, login_name)
+        AdminSetsUserPrimaryEmail(admin, subject, address)
+        AdminRenamesUser(admin, subject, new_name)
+        AdminResetsUserTwoFactor(admin, subject)
+        AdminChangesUserAvatar(admin, subject, image)
+        AdminRemovesUserAvatar(admin, subject)
+        AdminDeletesUser(admin, subject, purge)
+            when subject != admin
+        AdminCreatesOrganizationForUser(admin, subject, name, visibility)
+        AdminCreatesRepositoryForUser(admin, subject, name)
+        AdminAddsSshKeyForUser(admin, subject, key_content, title)
+        AdminRemovesSshKeyOfUser(admin, subject, key)
+        AdminCreatesAccessTokenForUser(admin, subject, token_name, scopes)
+
+    @guidance
+        -- Web: GET /admin/users/{id} (account, its repositories, emails, orgs),
+        -- GET/POST /admin/users/{id}/edit, POST /admin/users/{id}/delete (purge),
+        -- POST /admin/users/{id}/avatar, POST /admin/users/{id}/avatar/delete.
+        -- API: PATCH/DELETE /api/v1/admin/users/{username},
+        -- POST /api/v1/admin/users/{username}/rename,
+        -- POST/DELETE /api/v1/admin/users/{username}/keys[/{id}],
+        -- GET/POST /api/v1/admin/users/{username}/orgs,
+        -- POST /api/v1/admin/users/{username}/repos,
+        -- GET/DELETE /api/v1/admin/users/{username}/emails,
+        -- GET/POST/DELETE /api/v1/admin/users/{username}/tokens[/{id}],
+        -- GET /api/v1/admin/users/{username}/quota, POST …/quota/groups (quota).
+        -- Any API call: ?sudo=<user> or Sudo header — access/SiteAdminActsAs.
+        -- The delete form offers "reserve this name": it first issues
+        -- accounts' AdminReservesName (accounts/ReservedNameAdministration)
+        -- for the account's name, then AdminDeletesUser.
+        -- The edit form applies all fields in one submit, in this order:
+        -- rename, login source/password/prohibit-login, email, profile+flags, 2FA reset.
+}
+
+-- User administration: the directory.
+surface AdminUserDirectory {
+    facing admin: access/SiteAdmin
+
+    exposes:
+        accounts/User.name
+        accounts/User.primary_email
+        accounts/User.is_admin
+        accounts/User.is_active
+        accounts/User.is_restricted
+        accounts/User.prohibit_login
+
+    provides:
+        AdminCreatesUser(admin, name, email, password, login_source, login_name, visibility, must_change_password, restricted, send_notification)
+
+    @guidance
+        -- Web: GET /admin/users (search by name/email; filters active, admin,
+        -- restricted, 2FA enabled, prohibit-login, account kind; sort; includes
+        -- reserved, bot and remote accounts), GET/POST /admin/users/new.
+        -- API: GET /api/v1/admin/users (filters login_name, source_id,
+        -- is_2fa_enabled), POST /api/v1/admin/users.
+        -- Orgs: GET /admin/orgs, GET /api/v1/admin/orgs (all visibilities).
+}
+
+-- The instance-wide email directory.
+surface AdminEmailDirectory {
+    facing admin: access/SiteAdmin
+    context email: accounts/EmailAddress
+
+    exposes:
+        email.address
+        email.user
+        email.is_primary
+        email.is_activated
+
+    provides:
+        AdminSetsEmailActivation(admin, email, activate)
+        AdminDeletesEmail(admin, email)
+            when not email.is_primary
+
+    @guidance
+        -- Web: GET /admin/emails (search, filter activated/primary, sort by
+        -- email or user), POST /admin/emails/activate, POST /admin/emails/delete.
+        -- API: GET /api/v1/admin/emails, GET /api/v1/admin/emails/search?q=.
+        -- An admin may not toggle activation of their own primary address.
+}
+
+-- Repository administration.
+surface AdminRepositoryDirectory {
+    facing admin: access/SiteAdmin
+    context repository: repositories/Repository
+
+    exposes:
+        repository.name
+        repository.owner_user
+        repository.owner_org
+        repository.is_private
+
+    provides:
+        AdminDeletesRepository(admin, repository)
+
+    @guidance
+        -- Web: GET /admin/repos (all repositories incl. private), POST /admin/repos/delete.
+}
+
+-- Directories without repositories.
+surface UnadoptedRepositories {
+    facing admin: access/SiteAdmin
+    context dir: repositories/UnadoptedRepository
+
+    exposes:
+        dir.owner_name
+        dir.name
+
+    @guidance
+        -- decided: administration 7 (repositories owns adopt and delete; the
+        -- instance-wide listing is administration's).
+        -- Adopt and delete are repositories' actions (UserAdoptsRepository,
+        -- UserDeletesUnadoptedRepository), offered on repositories/RepositoryAdministration.
+        -- Web: GET /admin/repos/unadopted?search=true&q=, POST /admin/repos/unadopted
+        -- (id=owner/name, action=adopt|delete).
+        -- API: GET /api/v1/admin/unadopted, POST/DELETE /api/v1/admin/unadopted/{owner}/{repo}.
+}
+
+-- Runtime monitoring (infrastructure capability).
+surface RuntimeMonitor {
+    facing admin: access/SiteAdmin
+    context process: MonitoredProcess
+
+    exposes:
+        process.description
+        process.started_at
+        process.is_system
+
+    provides:
+        AdminCancelsProcess(admin, process)
+            when not process.is_system
+        AdminSetsQueueWorkers(admin, queue, max_workers)
+        AdminClearsQueue(admin, queue)
+
+    @guidance
+        -- Web: GET /admin/monitor/stacktrace, POST /admin/monitor/stacktrace/cancel/{pid},
+        -- GET /admin/monitor/queue, GET /admin/monitor/queue/{qid},
+        -- POST …/set, POST …/remove-all-items,
+        -- GET /admin/monitor/diagnosis (downloadable diagnosis bundle).
+}
+
+-- Delegated admin consoles whose behaviour other modules own. Listed so the
+-- endpoint inventory is complete.
+surface DelegatedAdminConsoles {
+    facing admin: access/SiteAdmin
+    context instance: Instance
+
+    exposes:
+        instance.app_name
+
+    @guidance
+        -- authentication: /admin/auths (list, new, edit, delete auth sources);
+        --   /admin/applications (instance-wide OAuth2 apps, regenerate secret, delete).
+        -- webhooks: /admin/hooks, /admin/{default-hooks|system-hooks}/{type}/new,
+        --   /admin/hooks/{id} (edit, replay); API /api/v1/admin/hooks[/{id}];
+        --   the instance-wide delivery log (webhooks/InstanceDeliveryLog).
+        -- accounts: reserved names (accounts/ReservedNameAdministration) and
+        --   account purges (accounts/AccountPurgeAdministration).
+        -- actions: /-/admin/actions/runners, /-/admin/actions/variables
+        --   (actions' ActionsSettings at the instance scope);
+        --   API /api/v1/admin/actions/runners[...], /api/v1/admin/runners/...
+        -- packages: /admin/packages (list, delete version, cleanup expired data).
+        -- moderation: /admin/moderation/reports, /admin/abuse_reports/act.
+        -- federation: /admin/federation/hosts[/{id}], /admin/federation/users.
+        -- quota: /api/v1/admin/quota/rules[...], /api/v1/admin/quota/groups[...].
+}
+
+-- The `forgejo` CLI on the host.
+surface OperatorConsole {
+    facing operator: ServerOperator
+    context instance: Instance
+
+    exposes:
+        instance.install_status
+        instance.version
+
+    provides:
+        OperatorCreatesUser(operator, instance, name, email, password, is_admin, must_change_password, restricted, access_token_name, access_token_scopes)
+        OperatorChangesPassword(operator, user, password, must_change_password)
+        OperatorSetsMustChangePassword(operator, users, value)
+        OperatorResetsTwoFactor(operator, user)
+        OperatorDeletesUser(operator, user, purge)
+        OperatorGeneratesAccessToken(operator, user, token_name, scopes)
+        OperatorCreatesAuthorizedIntegration(operator, user, name, description, issuer, claim_rules, scopes, all_repositories, repositories)
+        OperatorRegeneratesAuthorizedKeys(operator)
+        OperatorSyncsReleases(operator)
+        OperatorConfiguresAuthSource(operator, kind, action, source, name, is_active, sync_enabled, settings)
+        OperatorMailsAllUsers(operator, instance, subject, body)
+        OperatorRunsDoctor(operator, checks, fix)
+        OperatorDumpsInstance(operator, instance, format, contents)
+        OperatorRestoresInstance(operator, instance, dump)
+        OperatorCommandsRunningInstance(operator, command)
+
+    @guidance
+        -- forgejo admin user {create,list [--admin],change-password,delete,
+        --   generate-access-token,create-authorized-integration,must-change-password,reset-mfa}
+        -- forgejo admin regenerate keys
+        -- forgejo admin auth {add,update}-{oauth,ldap,ldap-simple,pam,smtp}, list, delete
+        -- forgejo admin sendmail, forgejo admin repo-sync-releases
+        -- forgejo doctor check, forgejo dump, forgejo restore, forgejo manager …
+        -- Commands that need the running server (sendmail, manager) talk to it
+        -- over its private, host-local control API; the rest open the database
+        -- directly.
+}
+
+-- How the process and other modules' background work report into this module.
+surface BackgroundWorkReporting {
+    facing worker: BackgroundWork
+    context instance: Instance
+
+    exposes:
+        instance.install_status
+        for task in CronTasks where run_state = running:
+            task.name
+
+    provides:
+        InstanceStarted(instance)
+        CronWorkCompleted(task, outcome, message)
+        SystemFailureReported(kind, description)
+        ReleaseFeedAnswered(instance, supported_versions, error)
+        DoctorRunFinished(run, report)
+
+    timeout:
+        CronTaskFallsDue
+
+    @guidance
+        -- In-process contract, not a network API. Each module that owns cron
+        -- work answers a *Due trigger by doing the work and then reporting
+        -- CronWorkCompleted with finished / failed (error text) / cancelled
+        -- (shutdown or explicit cancel). An owner that reports completion
+        -- with a trigger of its own (accounts/InactiveAccountCleanupFinished,
+        -- keys/KeyFilesRewritten) has it mapped to its task here. Background
+        -- failures worth an operator's attention are owners' own triggers
+        -- that this module turns into SystemNotices (Reacts to).
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred time_until_next           -- see: services/cron/tasks.go:209 — duration from now to the next occurrence of a cron/descriptor schedule evaluation: "@every <dur>", "@midnight", "@daily", "@weekly", "@monthly", "@annually", 5- or 6-field crontab
+deferred release_state_of          -- see: modules/updatechecker/update_checker.go:161 — semantic-version comparison against the supported list (unsupported major, outdated minor, prerelease)
+deferred normalise_setting         -- see: services/admin_setting/admin_setting.go:14 — per-key parsing; see AdminChangesSetting guidance
+deferred instance_statistics       -- see: models/activities/statistic.go — counts of users, orgs, repos, issues, PRs, releases, packages, … (notifications/discovery data)
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- (none: all decided, see DECISIONS.md "administration")
