@@ -66,10 +66,17 @@
 --       imported content before a retry
 --   - ExternalAuthorLinked(authorship, user)     -- imported content now
 --       belongs to a local account (feeds, search re-index)
+--   - RelinkSweepCompleted(outcome, message)     -- the nightly re-attribution
+--       sweep finished (administration closes the update_migration_poster_id run)
 -- Reacts to:
 --   - authentication/ExternalLogin.created (an OAuth identity linked to an account)
 --   - administration/MigrationPosterIdUpdateDue()  -- nightly re-attribution
 --       (cron task update_migration_poster_id, @midnight, run at start)
+--   - repositories/RepositoryDeleted(repository, doer) -- the addon's records
+--       about the repository go with it
+-- Every user-initiated write here is refused while the instance is read-only
+-- (access/InstanceWriteGate; decided: administration 3). The operator's
+-- dump-repo / restore-repo commands are not gated: they run on the server.
 --
 -- Black-box predicates. Qualified calls into sibling modules cannot be
 -- simulated, so the predicates this module needs are named locally, each
@@ -837,6 +844,8 @@ default SourceProfile bitbucket_dc_profile = {
 rule UserRequestsMigration {
     when: UserRequestsMigration(doer, owner, request)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
     requires: not config.disable_migrations
     requires: owner = doer or doer.is_admin
     requires: not request.mirror or (config.mirror_enabled and not config.disable_new_pull_mirrors)
@@ -932,6 +941,8 @@ rule UserRequestsMigration {
 -- from: routers/web/repo/repo.go:86 (checkContextUser), routers/api/v1/repo/migrate.go:94
 rule UserRequestsOrgMigration {
     when: UserRequestsOrgMigration(doer, org, request)
+
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: not config.disable_migrations
     requires: can_create_in_org(doer, org)
@@ -1320,9 +1331,16 @@ rule ImportPullRequest {
                 merge_base_sha: if item.base.sha = null: merge_base_of(migration.repository, item.base.ref, item.head.sha) else: item.base.sha,
                 created_at: issue.created_at,
                 status: merged,
+                -- the source does not say which style was used
+                merge_style: merge,
                 merged_commit_sha: present_or_empty(item.merge_commit_sha),
                 merger: if merger = null: ghost_user() else: merger,
                 merged_at: first_present(item.merged_at, issue.updated_at, null),
+                merged_automatically: false,
+                conflicted_files: {},
+                changed_protected_files: {},
+                commits_ahead: 0,
+                commits_behind: 0,
                 allow_maintainer_edit: false
             )
             if item.merged_by != null and merger = null:
@@ -1347,7 +1365,13 @@ rule ImportPullRequest {
                 head_commit_sha: present_or_empty(item.head.sha),
                 merge_base_sha: if item.base.sha = null: merge_base_of(migration.repository, item.base.ref, item.head.sha) else: item.base.sha,
                 created_at: issue.created_at,
+                -- queued for pulls/CheckMergeability like any new pull request
                 status: checking,
+                check_requested_at: now,
+                conflicted_files: {},
+                changed_protected_files: {},
+                commits_ahead: commits_ahead_of(migration.repository, imported_head_branch(item), migration.repository, present_or_empty(item.base.ref)),
+                commits_behind: commits_behind_of(migration.repository, imported_head_branch(item), migration.repository, present_or_empty(item.base.ref)),
                 allow_maintainer_edit: false
             )
         if author = null:
@@ -1589,6 +1613,8 @@ rule FailMigration {
 rule RepoAdminCancelsMigration {
     when: RepoAdminCancelsMigration(admin, migration)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
     requires: is_repo_admin(admin, migration.repository)
     requires: migration.status in {queued, running}
 
@@ -1611,6 +1637,8 @@ rule RepoAdminCancelsMigration {
 -- from: services/task/task.go:138, routers/web/repo/migrate.go:270
 rule RepoAdminRetriesMigration {
     when: RepoAdminRetriesMigration(admin, migration)
+
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: is_repo_admin(admin, migration.repository) or admin = migration.doer
     requires: migration.status = failed
@@ -1637,6 +1665,8 @@ rule RepoAdminRetriesMigration {
 rule RepoAdminDiscardsFailedMigration {
     when: RepoAdminDiscardsFailedMigration(admin, migration)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+
     requires: is_repo_admin(admin, migration.repository)
     requires: migration.status = failed
 
@@ -1648,6 +1678,21 @@ rule RepoAdminDiscardsFailedMigration {
     @guidance
         -- Web: POST /{owner}/{repo}/settings action=delete, offered on the
         -- migrating page only once the migration failed.
+}
+
+-- Deleting the repository by any route takes the addon's records about it
+-- along: its migration task, authorship records and external assignees.
+-- from: services/repository/delete.go:220
+rule ForgetImportRecordsOfDeletedRepository {
+    when: repositories/RepositoryDeleted(repository, doer)
+
+    ensures:
+        for m in Migrations where repository = repository:
+            not exists m
+        for a in ExternalAuthorships where repository = repository:
+            not exists a
+        for e in ExternalAssignees where repository = repository:
+            not exists e
 }
 
 -- ===== Re-attributing imported content =====
@@ -1676,6 +1721,9 @@ rule NightlyRelink {
     when: administration/MigrationPosterIdUpdateDue()
 
     ensures: RelinkPassRequested(scope: null)
+    -- The sweep is reported finished to administration, which closes the
+    -- update_migration_poster_id run (its CronWorkCompleted).
+    ensures: RelinkSweepCompleted(outcome: finished, message: null)
 }
 
 -- One re-attribution pass: every unlinked authorship whose source identity
@@ -2139,13 +2187,13 @@ deferred is_allowed_remote              -- see: OutboundFetchPolicy.AllowBlockSe
 -- REQUEST accounts: a shared ghost placeholder account (ghost_user()) that unattributed imported content points at.
 -- REQUEST accounts/User.allow_import_local (read through may_import_local_paths(user)): per-user right to import from server paths.
 -- REQUEST authentication: linked_account_for(source_kind, host, external_id) — the local account holding an ExternalLogin whose provider speaks that source kind, whose source authenticates against that host (provider_host(source): custom URL host, or the public host such as github.com / gitlab.com) and whose external_id equals it as a string; also source_kind_for_provider(provider). The OAuth source's name plays no part (decided: migrations 5, 6).
--- REQUEST issues/Issue, issues/Comment, issues/Reaction, pulls/Review: render "originally by <name> on <source>" when a migrations/ExternalAuthorship points at the item (the core keeps no import fields of its own).
--- REQUEST pulls/PullRequest: imported pull requests enter `checking` and are checked like any other; a merged import arrives already `merged`.
+-- REQUEST issues/Issue, issues/Comment, issues/Reaction: render "originally by <name> on <source>" when a migrations/ExternalAuthorship points at the item (the core keeps no import fields of its own). (pulls/Review: done, pulls PullRequestPage guidance.)
 -- REQUEST quota: quota_account_of(user or org) and quota_account_of_owner(repository) helpers to reach the QuotaAccount for gate_migrate_repository / gate_retry_migration.
 -- REQUEST administration: dispatch MigrationPosterIdUpdateDue() (already done) — migrations reacts with NightlyRelink; report completion via CronWorkCompleted needs the task, so administration should treat the run as finished once the trigger is handled.
 -- REQUEST releases: react to RepositoryMigrated(repository) (already done) — imported releases arrive first, remaining tags become tag-only records.
 -- REQUEST webhooks / notifications: react to migrations/RepositoryMigrated(repository) (webhooks currently listens to repositories/RepositoryMigrated, which nobody emits) as a repository-created event; the actor is migrations/Migration{repository}.doer.
--- REQUEST pulls/PullRequest.merger: an imported merged pull request's merger is the original merger (a local account, or the ghost placeholder plus a migrations/ExternalAuthorship on_merge until re-attributed); render "merged by <name> on <source>" for it (decided: migrations 9).
 -- REQUEST issues/Issue: show migrations/ExternalAssignee names alongside the assignees; expose assignable_named(repository, names) / resolves_to_assignee(repository, name) over can_be_assigned (decided: migrations 11).
 -- REQUEST repositories: deleting a repository also removes its migrations/ExternalAssignee records.
 -- REQUEST webhooks: migrations imports repositories only, never stored webhooks, so mapping Forgejo `gitea` / `gogs` hooks onto `forgejo` belongs to whichever addon imports instance data (webhooks 10), not here.
+-- REQUEST administration: react to migrations/RelinkSweepCompleted(outcome, message) by closing the update_migration_poster_id run as CronWorkCompleted does (supersedes the line above about treating the run as finished on dispatch).
+-- REQUEST repositories: the removal of the addon's records on deletion is now done here (ForgetImportRecordsOfDeletedRepository on repositories/RepositoryDeleted); the two "deleting a repository ... removes its migrations/..." lines above can be dropped.

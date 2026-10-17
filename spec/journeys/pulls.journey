@@ -897,3 +897,55 @@ journey ASquashCommitUsesThePostersAccountIdentity {
 
     ends: The squash author email is ada's no-reply address.
 }
+
+-- decided (issues 1): locking stops the conversation, so on a locked pull
+-- request only triagers close, reopen or retarget it; the poster no longer can.
+journey ALockedPullRequestStaysOpenForItsPoster {
+    goal: The conversation on ada's pull request got heated and was locked.
+          Ada, who cannot triage, can no longer close it; bob, a pull-request
+          writer, still can.
+
+    given:
+        conv.is_locked = true
+
+    1. ada cannot close her locked pull request
+        stipulate can_write_pulls(ada, repo) = false
+        ada cannot do UserClosesPullRequest(ada, pr) on PullRequestAuthorControls
+
+    2. bob closes it
+        stipulate can_write_pulls(bob, repo) = true
+        stipulate can_read_pulls(bob, repo) = true
+        stipulate is_blocked_by_owner(repo, bob) = false
+        stipulate has_open_blocking_dependencies(conv) = false
+        bob does UserClosesPullRequest(bob, pr) on PullRequestPage
+        then UserClosesPullRequest fires
+        then conv.status = closed
+
+    ends: Only a triager changed the locked pull request's state.
+}
+
+-- decided: administration 3 — while the instance is read-only nothing about a
+-- pull request changes; it can still be read.
+journey ReadOnlyModeFreezesPullRequests {
+    goal: The site administrator put the instance into read-only mode. Bob
+          cannot merge ada's pull request and ada cannot close it, but carol
+          still sees its state.
+
+    cast:
+        gate: access/InstanceWriteGate
+    given:
+        gate.read_only = true
+
+    1. bob cannot merge
+        stipulate can_write_pulls(bob, repo) = true
+        bob cannot do UserMergesPullRequest(bob, pr, merge, null, null, null, false, false) on PullRequestMergeBox
+
+    2. ada cannot close it
+        ada cannot do UserClosesPullRequest(ada, pr) on PullRequestAuthorControls
+
+    3. carol still reads it
+        stipulate can_read_pulls(carol, repo) = true
+        carol sees pr.status on PullRequestPage in pr
+
+    ends: The pull request is exactly as it was.
+}

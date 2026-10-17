@@ -775,6 +775,8 @@ journey AMemberWhoMayCreateReposImportsIntoTheOrg {
         stipulate sanitized_url(addr) = "https://github.com/acme/widget"
         alice does UserRequestsOrgMigration(alice, acme, req) on MigrationForm
             creating m: Migration
+            creating made: repositories/Repository
+            where is_repo_admin(alice, made) = false
         then UserRequestsOrgMigration fires
         then m.status = queued
         then m.doer = alice
@@ -894,4 +896,27 @@ journey AnImportedMergeKeepsItsOriginalMerger {
 
     ends: The merge waits, under the ghost placeholder, for Carol to link
           her GitHub login; Alice is not recorded as its merger.
+}
+
+-- decided: administration 3 — no import starts while the instance is read-only.
+journey NoImportWhileTheInstanceIsReadOnly {
+    goal: The site administrator put the instance into read-only mode for a
+          backup. Alice's otherwise valid import is refused.
+
+    cast:
+        gate: access/InstanceWriteGate
+    given:
+        gate.read_only = true
+
+    1. alice cannot import
+        stipulate gh.supports = {milestones, labels, issue_items, comments}
+        stipulate req.wanted = {issue_items, comments}
+        stipulate length("widget") = 6
+        stipulate length("Widgets") = 7
+        stipulate within_creation_limit(alice) = true
+        stipulate quota_allows_new_repository(alice) = true
+        stipulate is_allowed_remote("https://github.com/acme/widget", alice) = true
+        alice cannot do UserRequestsMigration(alice, alice, req) on MigrationForm
+
+    ends: Nothing was created; the import can be requested once writes are back.
 }
