@@ -84,7 +84,8 @@
 --     IssueLabelsChanged, IssueLabelsCleared, IssueMilestoneChanged,
 --     IssueAssigneeChanged, IssueCommentCreated, IssueCommentEdited,
 --     IssueCommentDeleted
---   - pulls/PullRequestOpened(pull_request), PullRequestMerged(pull_request, merger),
+--   - pulls/PullRequestClosed(pull_request, doer), PullRequestReopened(pull_request, doer),
+--     pulls/PullRequestOpened(pull_request), PullRequestMerged(pull_request, merger),
 --     PullRequestAutoMerged(pull_request, merger), ReviewSubmitted(review),
 --     ReviewRequested(pull_request, requester, reviewer),
 --     ReviewRequestRemoved(pull_request, doer, reviewer),
@@ -1456,6 +1457,17 @@ rule IssueClosedIsReindexed {
 rule IssueReopenedIsReindexed {
     when: issues/IssueReopened(issue, doer, comment)
     ensures: IssueReindexRequested(issue: issue)
+}
+
+-- A pull request's close / reopen (pulls never emits IssueClosed for a PR).
+rule PullRequestClosedIsReindexed {
+    when: pulls/PullRequestClosed(pull_request, doer)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
+}
+
+rule PullRequestReopenedIsReindexed {
+    when: pulls/PullRequestReopened(pull_request, doer)
+    ensures: IssueReindexRequested(issue: pull_request.issue)
 }
 
 rule IssueTitleChangeIsReindexed {

@@ -47,6 +47,7 @@
 -- Emits:
 --   - PackageVersionCreated(version, publisher)        -- a new version became visible
 --                                                  -- (incl. every container manifest push)
+--   - CargoIndexInitialized(manager, registry)        -- repositories creates (or reuses) the owner's `_cargo-index` repository
 --   - PackageVersionDeleted(version, package, doer)  -- `version` is already gone, so listeners read `package`; a visible version was removed by a person
 --   (webhooks, actions `on: package`, notifications react to these)
 -- Reacts to:
@@ -54,6 +55,14 @@
 --   - accounts/UserPurged(user)                    -- remove everything in the user's registry
 --   - organizations/OrganizationPurgeStarted(organization) -- remove everything in the org's registry
 --   - administration/PackageCleanupDue(older_than) -- run the cleanup task now
+--
+-- Read-only mode: every write a person or a client makes here (publishing,
+-- container uploads and manifests, yank / dist-tags, deletions, linking,
+-- cleanup rules, Cargo index, Chef keys) is refused while
+-- access/InstanceWriteGate.read_only (decided: administration 3); downloads
+-- and token exchange keep working. The site admin's expired-data purge
+-- lives in the administration console and stays available; the scheduled
+-- cleanup and purge reactions are not people's writes.
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -467,14 +476,20 @@ default KindPolicy vagrant_policy = { kind: vagrant, display_name: "Vagrant", ve
 --      and limited owners).
 --      decided: "public only" means visible to anonymous visitors (Forgejo
 --      excluded only private owners).
---   6. An Actions job token reads with its workflow's mode but writes only
---      its own repository's packages: job_repository(user) names the
---      repository of the job whose automatic token authenticated the
---      request (null for every other credential), and each write rule
---      requires the package to be linked to it; a new package it publishes
---      must be in that repository's owner registry and is linked to it.
---      decided: job tokens write only their own repository's packages
---      (Forgejo let them write the whole owner registry, marked TODO).
+--   6. An Actions job token reaches only the packages linked to its own
+--      repository: job_repository(user) names the repository of the job
+--      whose automatic token authenticated the request (actions:
+--      task.job.run.repository; null for every other credential). It reads
+--      those packages, and writes them unless the job is a fork pull-request
+--      run (then can_write_packages is false for it); a new package it
+--      publishes must be in that repository's owner registry and is linked
+--      to it. It reaches no other package and no other owner registry:
+--      can_read_packages / can_write_packages are false for it on every
+--      registry but its repository owner's, and each rule naming a package
+--      requires the package to be linked to job_repository.
+--      decided (access 6, packages 5): the job token reaches only its own
+--      repository's packages (Forgejo let it read with its workflow user's
+--      mode and write the whole owner registry, marked TODO).
 --   can_read_packages is true for mode >= read; can_write_packages for
 --   mode >= write.
 --
@@ -488,10 +503,13 @@ default KindPolicy vagrant_policy = { kind: vagrant, display_name: "Vagrant", ve
 --   is_org_owner). Gates the owner package settings (cleanup rules, Cargo
 --   index). from: routers/web/web.go:836, routers/web/web.go:1189
 --
--- quota_allows_package_upload(registry): quota/quota_allows(<owner>,
---   size_assets_packages_all), i.e. the QuotaGate gate_package_upload
+-- quota_allows_package_upload(registry, incoming): quota/quota_allows(<owner>,
+--   size_assets_packages_all, incoming), i.e. the QuotaGate gate_package_upload
 --   charged to the registry owner (an organisation's quota for org
---   registries), evaluated before the upload is stored.
+--   registries), evaluated before the upload is stored. incoming is the
+--   size in bytes of what the request stores when it is known up front (a
+--   file, a chunk, a manifest, a mounted blob), else null (decided: quota 2).
+--   Deletions never ask it (decided: quota 7).
 --   from: routers/api/packages/api.go:96
 --
 -- quota_allows_new_package(registry): quota/quota_allows(<owner>,
@@ -555,11 +573,12 @@ default KindPolicy vagrant_policy = { kind: vagrant, display_name: "Vagrant", ve
 rule PublishFirstVersionOfNewPackage {
     when: PublisherUploadsPackageFile(publisher, registry, kind, name, version, file_name, composite_key, is_lead, size, sha256)
     let existing = Package{registry: registry, kind: kind, name: name}
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: kind != container
     requires: can_write_packages(publisher, registry)
     requires: valid_coordinates(kind, name, version, file_name)
-    requires: quota_allows_package_upload(registry)
+    requires: quota_allows_package_upload(registry, size)
     requires: not exists existing
     -- decided (follow-up 2): a new package and its first version are counted
     requires: quota_allows_new_package(registry)
@@ -627,11 +646,12 @@ rule PublishFirstVersionOfNewPackage {
 rule PublishNewVersionOfExistingPackage {
     when: PublisherUploadsPackageFile(publisher, registry, kind, name, version, file_name, composite_key, is_lead, size, sha256)
     let package = Package{registry: registry, kind: kind, name: name}
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: kind != container
     requires: can_write_packages(publisher, registry)
     requires: valid_coordinates(kind, name, version, file_name)
-    requires: quota_allows_package_upload(registry)
+    requires: quota_allows_package_upload(registry, size)
     requires: exists package
     -- decided: a job token writes only packages linked to its own repository
     requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
@@ -672,11 +692,12 @@ rule AddFileToExistingVersion {
     let policy = KindPolicy{kind: kind}
     let package = Package{registry: registry, kind: kind, name: name}
     let target = PackageVersion{package: package, version: version}
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: kind != container
     requires: can_write_packages(publisher, registry)
     requires: valid_coordinates(kind, name, version, file_name)
-    requires: quota_allows_package_upload(registry)
+    requires: quota_allows_package_upload(registry, size)
     requires: exists target
     -- decided: a job token writes only packages linked to its own repository
     requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
@@ -704,10 +725,11 @@ rule ReplaceFileInExistingVersion {
     let package = Package{registry: registry, kind: kind, name: name}
     let target = PackageVersion{package: package, version: version}
     let old_file = PackageFile{version: target, name: file_name, composite_key: composite_key}
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: kind != container
     requires: can_write_packages(publisher, registry)
-    requires: quota_allows_package_upload(registry)
+    requires: quota_allows_package_upload(registry, size)
     requires: exists old_file
     -- decided: a job token writes only packages linked to its own repository
     requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
@@ -822,10 +844,12 @@ rule UpdateCargoIndexEntry {
 -- from: services/packages/cargo/index.go:51
 rule OwnerInitializesCargoIndex {
     when: ManagerInitializesCargoIndex(manager, registry)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_manage_registry(manager, registry)
     requires: not exists CargoIndex{registry: registry}
     ensures: CargoIndex.created(registry: registry, repository_name: "_cargo-index", built_at: now)
+    ensures: CargoIndexInitialized(manager: manager, registry: registry)
     @guidance
         -- Creates (or reuses) the owner repository `_cargo-index` and writes
         -- config.json: { dl: download URL, api: registry API URL,
@@ -836,6 +860,7 @@ rule OwnerInitializesCargoIndex {
 rule OwnerRebuildsCargoIndex {
     when: ManagerRebuildsCargoIndex(manager, registry)
     let index = CargoIndex{registry: registry}
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_manage_registry(manager, registry)
     requires: exists index
@@ -851,6 +876,7 @@ rule OwnerRebuildsCargoIndex {
 rule UserRegeneratesChefKey {
     when: UserRegeneratesChefKeyPair(user)
     let existing = ChefClientKey{user: user}
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     ensures:
         if exists existing:
@@ -871,6 +897,7 @@ rule UserRegeneratesChefKey {
 rule CargoYanksVersion {
     when: PublisherYanksCargoVersion(publisher, version)
     let registry = version.package.registry
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: version.package.kind = cargo
     requires: can_write_packages(publisher, registry)
@@ -885,12 +912,13 @@ rule CargoYanksVersion {
 rule CargoUnyanksVersion {
     when: PublisherUnyanksCargoVersion(publisher, version)
     let registry = version.package.registry
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: version.package.kind = cargo
     requires: can_write_packages(publisher, registry)
     -- decided: a job token writes only packages linked to its own repository
     requires: job_repository(publisher) = null or version.package.repository = job_repository(publisher)
-    requires: quota_allows_package_upload(registry)
+    requires: quota_allows_package_upload(registry, null)
     requires: version.is_yanked = true
     ensures: version.is_yanked = false
     ensures: CargoIndexEntryStale(registry: registry, package: version.package)
@@ -902,6 +930,7 @@ rule CargoUnyanksVersion {
 rule NpmAddsDistTag {
     when: PublisherSetsNpmDistTag(publisher, version, tag)
     let registry = version.package.registry
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: version.package.kind = npm
     requires: can_write_packages(publisher, registry)
@@ -919,6 +948,7 @@ rule NpmAddsDistTag {
 -- from: routers/api/packages/npm/npm.go:376
 rule NpmRemovesDistTag {
     when: PublisherRemovesNpmDistTag(publisher, package, tag)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: package.kind = npm
     requires: can_write_packages(publisher, package.registry)
@@ -937,10 +967,11 @@ rule NpmRemovesDistTag {
 -- from: routers/api/packages/container/container.go:218
 rule ContainerStartsBlobUpload {
     when: ContainerClientStartsBlobUpload(publisher, registry, image)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_write_packages(publisher, registry)
     requires: valid_image_reference(image, "")
-    requires: quota_allows_package_upload(registry)
+    requires: quota_allows_package_upload(registry, null)
     ensures: BlobUpload.created(registry: registry, image: image, bytes_received: 0, created_at: now, updated_at: now)
     @guidance
         -- A monolithic upload (digest given on the POST) completes in one
@@ -950,9 +981,10 @@ rule ContainerStartsBlobUpload {
 -- from: routers/api/packages/container/container.go:300
 rule ContainerAppendsChunk {
     when: ContainerClientAppendsChunk(publisher, upload, chunk_size)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_write_packages(publisher, upload.registry)
-    requires: quota_allows_package_upload(upload.registry)
+    requires: quota_allows_package_upload(upload.registry, chunk_size)
     ensures: upload.bytes_received = upload.bytes_received + chunk_size
     ensures: upload.updated_at = now
     @guidance
@@ -968,9 +1000,10 @@ rule ContainerCompletesBlobUpload {
     let image = upload.image
     let bytes = upload.bytes_received
     let existing_blob = PackageBlob{hash_sha256: sha256}
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_write_packages(publisher, registry)
-    requires: quota_allows_package_upload(registry)
+    requires: quota_allows_package_upload(registry, null)
     requires: upload_digest_matches(upload, sha256)
     ensures:
         if exists existing_blob:
@@ -984,6 +1017,7 @@ rule ContainerCompletesBlobUpload {
 -- from: routers/api/packages/container/container.go:395
 rule ContainerCancelsBlobUpload {
     when: ContainerClientCancelsBlobUpload(publisher, upload)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_write_packages(publisher, upload.registry)
     ensures: not exists upload
@@ -994,9 +1028,10 @@ rule ContainerCancelsBlobUpload {
 -- from: services/packages/container/blob.go:110
 rule ContainerMountsBlob {
     when: ContainerClientMountsBlob(publisher, registry, image, blob)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_write_packages(publisher, registry)
-    requires: quota_allows_package_upload(registry)
+    requires: quota_allows_package_upload(registry, blob.size)
     requires: blob_readable_by(blob, publisher)
     ensures: ContainerUploadedBlob.created(registry: registry, image: image, blob: blob, uploaded_at: now)
     @guidance
@@ -1012,6 +1047,7 @@ rule ContainerMountsBlob {
 -- from: services/packages/container/blob.go:166
 rule ContainerDeletesBlob {
     when: ContainerClientDeletesBlob(publisher, registry, image, blob)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_write_packages(publisher, registry)
     ensures:
@@ -1030,10 +1066,11 @@ rule ContainerDeletesBlob {
 -- from: services/packages/container/manifest.go:388
 rule ContainerPushesManifestForNewImage {
     when: ContainerClientPushesManifest(publisher, registry, image, reference, is_tag, size, sha256)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_write_packages(publisher, registry)
     requires: valid_image_reference(image, reference)
-    requires: quota_allows_package_upload(registry)
+    requires: quota_allows_package_upload(registry, size)
     requires: not exists Package{registry: registry, kind: container, name: image}
     requires: manifest_references_resolve(registry, image, sha256)
     -- decided (follow-up 2): a new image package and its first version are counted
@@ -1063,10 +1100,11 @@ rule ContainerPushesManifestForNewImage {
 rule ContainerPushesNewReference {
     when: ContainerClientPushesManifest(publisher, registry, image, reference, is_tag, size, sha256)
     let package = Package{registry: registry, kind: container, name: image}
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_write_packages(publisher, registry)
     requires: valid_image_reference(image, reference)
-    requires: quota_allows_package_upload(registry)
+    requires: quota_allows_package_upload(registry, size)
     requires: exists package
     -- decided: a job token writes only packages linked to its own repository
     requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
@@ -1093,9 +1131,10 @@ rule ContainerRepointsReference {
     let previous = PackageVersion{package: package, version: reference}
     let carried_downloads = previous.download_count
     let carried_last_download = previous.last_downloaded_at
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_write_packages(publisher, registry)
-    requires: quota_allows_package_upload(registry)
+    requires: quota_allows_package_upload(registry, size)
     requires: exists previous
     -- decided: a job token writes only packages linked to its own repository
     requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
@@ -1158,6 +1197,7 @@ rule ContainerDeletesManifest {
     when: ContainerClientDeletesManifest(publisher, version)
     let package = version.package
     let version_name = version.version
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: package.kind = container
     requires: can_write_packages(publisher, package.registry)
@@ -1191,6 +1231,8 @@ rule DownloadLeadFileCountsDownload {
     let version = file.version
     requires: config.packages_enabled
     requires: can_read_packages(client, version.package.registry)
+    -- decided (access 6): a job token reads only packages linked to its own repository
+    requires: job_repository(client) = null or version.package.repository = job_repository(client)
     requires: file.is_lead
     ensures: version.download_count = version.download_count + 1
     ensures: version.last_downloaded_at = now
@@ -1213,6 +1255,7 @@ rule UserDeletesPackageVersion {
     let registry = package.registry
     let kind = package.kind
     let version_name = version.version
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: version.is_internal = false
     requires: can_write_packages(actor, registry)
@@ -1234,6 +1277,7 @@ rule UserDeletesPackageVersion {
 -- from: routers/api/packages/npm/npm.go:295
 rule UserDeletesWholePackage {
     when: UserRemovesPackage(actor, package)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: package.is_internal = false
     requires: can_write_packages(actor, package.registry)
@@ -1257,6 +1301,7 @@ rule UserDeletesPackageFile {
     let registry = package.registry
     let version_name = version.version
     let was_last_file = version.files.count = 1
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: version.is_internal = false
     requires: can_write_packages(actor, registry)
@@ -1279,6 +1324,7 @@ rule UserDeletesPackageFile {
 -- repository, and a linked package must be unlinked before relinking
 rule UserLinksPackageToRepository {
     when: UserLinksPackage(actor, package, repository)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_write_packages(actor, package.registry)
     requires: same_owner(package.registry, repository)
@@ -1296,6 +1342,7 @@ rule UserUnlinksPackageFromRepository {
     when: UserUnlinksPackage(actor, package)
     let repository = package.repository
     let registry = package.registry
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_write_packages(actor, registry)
     requires: repository != null
@@ -1358,6 +1405,7 @@ rule PurgeOrganizationPackages {
 -- managers (the Forgejo form renders them but never binds them)
 rule ManagerCreatesCleanupRule {
     when: ManagerAddsCleanupRule(manager, registry, kind, enabled, keep_count, keep_pattern, keep_last_download_days, remove_days, remove_last_download_days, remove_pattern, match_full_name)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_manage_registry(manager, registry)
     requires: not exists CleanupRule{registry: registry, kind: kind}
@@ -1373,6 +1421,7 @@ rule ManagerCreatesCleanupRule {
 -- from: routers/web/shared/packages/packages.go:88
 rule ManagerUpdatesCleanupRule {
     when: ManagerEditsCleanupRule(manager, rule, enabled, keep_count, keep_pattern, keep_last_download_days, remove_days, remove_last_download_days, remove_pattern, match_full_name)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_manage_registry(manager, rule.registry)
     requires: keep_count in {0, 1, 5, 10, 25, 50, 100}
@@ -1394,6 +1443,7 @@ rule ManagerUpdatesCleanupRule {
 -- from: routers/web/shared/packages/packages.go:74
 rule ManagerDeletesCleanupRule {
     when: ManagerRemovesCleanupRule(manager, rule)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.packages_enabled
     requires: can_manage_registry(manager, rule.registry)
     ensures: not exists rule
@@ -1996,5 +2046,5 @@ deferred RepositoryIndex.file_formats  -- see: detailed/package-repository-index
 -- REQUEST authentication/TokenScope: read:package / write:package and public-only flag consumed by can_read/can_write_packages.
 -- REQUEST quota: decided (follow-up 2): quota_allows(owner, count_packages, 1) and quota_allows(owner, count_package_versions, 1) back quota_allows_new_package / quota_allows_new_version; QuotaUsage.packages_count / package_versions_count count packages/Package and packages/PackageVersion with is_internal = false per owner registry - done in quota.allium.
 -- REQUEST quota/quota_allows(owner, size_assets_packages_all) (QuotaGate gate_package_upload, charged: package_owner): quota_allows_package_upload(registry) is exactly this, evaluated for the registry owner (not the uploader) before every write that stores data; quota/QuotaUsage.packages should sum packages/PackageFile sizes per owner (blob shared by two files counts twice). decided (packages 6): the former [packages] LIMIT_TOTAL_OWNER_SIZE is expressed as quota/config.default_packages, a default rule on size_assets_packages_all; done in quota.allium.
--- REQUEST webhooks, actions: react to PackageVersionCreated(version, publisher) / PackageVersionDeleted(version, package, doer) with exactly these parameter names.
--- REQUEST actions/access: job_repository(user): the repository of the Actions job whose automatic token authenticated the request, null for any other credential (consistent with access decision 6: the token reaches only its own repository and packages linked to it).
+-- RESOLVED (webhooks, actions): both react to PackageVersionCreated(version, publisher) / PackageVersionDeleted(version, package, doer) with these names.
+-- RESOLVED (actions): job_repository(user) is task.job.run.repository of the running task whose automatic token authenticated the request (actions header, "Provided to other modules"), null for any other credential; access/TaskAccessesOwnRepository carries the credential (access decision 6).

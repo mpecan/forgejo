@@ -71,8 +71,10 @@
 --
 -- Reacts to (names and parameters as the integration's canonical table gives them):
 --   issues/IssueOpened(issue, mentions)                 -- issues only (PRs: pulls/PullRequestOpened)
---   issues/IssueClosed(issue, doer, comment)            -- issues and pull requests
---   issues/IssueReopened(issue, doer, comment)          -- issues and pull requests
+--   issues/IssueClosed(issue, doer, comment)            -- issues (pulls never emits it for a PR)
+--   issues/IssueReopened(issue, doer, comment)          -- issues
+--   pulls/PullRequestClosed(pull_request, doer)         -- PRs (doer null: repository deleted, nobody told)
+--   pulls/PullRequestReopened(pull_request, doer)
 --   issues/IssueCommentCreated(issue, comment, doer, mentions)
 --   issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)
 --   issues/IssueDeleted(issue, doer)
@@ -92,7 +94,7 @@
 --   repositories/RepositoryTransferred(repository, doer, old_owner_name)
 --   repositories/RepositoryTransferRequested(repository, doer, transfer)
 --   repositories/RepositoryDeleted(repository, doer)
---   repositories/CollaboratorAdded(repository, user, doer)
+--   repositories/CollaboratorAddedDirectly(repository, user, doer)  -- a site admin's direct add
 --   repositories/RepositoryVisibilityChanged(repository, doer)
 --   repositories/RepositoryViewed(viewer, repository)
 --   repositories/MirrorSyncPushed(repository, ref_name, commits)
@@ -120,6 +122,16 @@
 --   administration/TestMailRequested(admin, address)
 --   administration/MassMailRequested(subject, body, recipients)
 --   administration/OldActivityDeletionDue(older_than)
+--   migrations/RepositoryMigrated(repository)           -- feed: create_repo by the migration's doer
+--   pulls/AutoMergeFailed(pull_request, scheduler, reason)  -- inbox and mail to the scheduler
+--   moderation/AbuseReported(content, reporter, category)   -- inbox and mail to site admins
+--   moderation/ReportReviewed(report, reporter)         -- inbox and mail to the reporter
+--   (repositories/RepositoryTransferred also tells the receiving organisation's owners)
+--
+-- Read-only mode: a person's writes here (marking threads, replying or
+-- unsubscribing by mail) are refused while access/InstanceWriteGate.read_only
+-- (decided: administration 3). Reactions to other modules' events are not
+-- gated here: the module whose user action started them gates that action.
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -132,6 +144,9 @@ use "./pulls.allium" as pulls
 use "./releases.allium" as releases
 use "./actions.allium" as actions
 use "./administration.allium" as administration
+use "./keys.allium" as keys
+use "./moderation.allium" as moderation
+use "./migrations.allium" as migrations
 
 ------------------------------------------------------------
 -- Notifier fan-out
@@ -144,10 +159,13 @@ use "./administration.allium" as administration
 -- list and who reacts (I = inbox here, M = mail here, F = activity feed here,
 -- W = webhooks, A = actions, X = search index, R = federation, P = other):
 --
---   repository created / adopted / migrated ......... F(created only) W A X
+--   repository created / adopted / migrated ......... F(created, migrated) W A X
 --   repository forked ............................... F W A X
 --   repository renamed / transferred ................ F W A X
 --   repository transfer offered (pending) ........... I M
+--   repository transferred into an organisation ..... I M (its owners)
+--   auto-merge failed ............................... I M (the scheduler)
+--   abuse reported / report reviewed ................ I M (site admins / the reporter)
 --   repository deleted .............................. W A X  (+ cleanup here)
 --   issue opened .................................... I M F W A X
 --   issue / PR closed or reopened ................... I M F W A X
@@ -204,6 +222,7 @@ use "./administration.allium" as administration
 --                                      team) in that text, who can read the issue
 --   issue_notification_audience, mail_mention_recipients, mail_eligible,
 --   transfer_recipients, in_feed_of, activity_visible_to, repository_admins,
+--   organization_owners(org) (= users with organizations/is_org_owner(org, user)),
 --   contribution_heatmap, feed_excerpt: described where they are used.
 
 ------------------------------------------------------------
@@ -234,7 +253,11 @@ enum NotificationStatus { unread | read | pinned }
 -- What a notification thread is about.
 -- decided (notifications 7): Forgejo's never-produced `commit` source is dropped.
 -- from: models/activities/notification.go:39
-enum NotificationSource { issue | pull_request | repository }
+-- repository: a pending transfer offer; repository_arrived: a repository
+-- transferred into an organisation the recipient owns; abuse_report: a new
+-- report for a site admin (decided: moderation 7); report_reviewed: the
+-- reporter's report was dealt with (decided: moderation 8).
+enum NotificationSource { issue | pull_request | repository | repository_arrived | abuse_report | report_reviewed }
 
 -- The per-user email preference is accounts/EmailNotificationPreference
 -- (enabled | on_mention | disabled | and_your_own) on accounts/User.email_notifications;
@@ -317,6 +340,10 @@ enum MailCategory {
     | pull_code_comment
     | pull_review_dismissed
     | pull_review_requested
+    | pull_auto_merge_failed    -- the scheduler's auto-merge could not be carried out
+    | repository_arrived        -- a repository was transferred into an organisation
+    | abuse_reported            -- decided (moderation 7): a new report, to site admins
+    | report_reviewed           -- decided (moderation 8): to the reporter, no outcome named
 }
 
 -- from: services/mailer/token/token.go:22
@@ -333,9 +360,10 @@ enum MailTokenPurpose { reply | unsubscribe }
 -- from: models/activities/notification.go:45
 entity Notification {
     recipient: accounts/User
-    repository: repositories/Repository
+    repository: repositories/Repository? -- absent for report threads
     source: NotificationSource
     issue: issues/Issue?                 -- set for issue / pull_request sources
+    report: moderation/AbuseReport?      -- set for abuse_report / report_reviewed sources
     comment: issues/Comment?             -- the comment that last made it unread
     status: NotificationStatus
     created_at: Timestamp
@@ -352,6 +380,7 @@ entity Notification {
 
     is_unread: status = unread
     is_about_issue: source in {issue, pull_request}
+    is_about_report: source in {abuse_report, report_reviewed}
 }
 
 -- One outbound email to one address. Every recipient gets an individually
@@ -405,7 +434,9 @@ entity MailToken {
 -- from: models/activities/action.go:203
 entity Activity {
     kind: ActivityKind
-    actor: accounts/User?                -- absent for mirror syncs, attributed to the repository owner
+    actor: accounts/User?                -- absent for mirror syncs (attributed to the repository
+                                         -- owner) and for deploy-key pushes (deploy_key set)
+    deploy_key: keys/DeployKey?          -- decided (code 4): a deploy-key push is shown as by the key
     repository: repositories/Repository
     issue: issues/Issue?
     comment: issues/Comment?
@@ -413,7 +444,7 @@ entity Activity {
     ref_name: String?                    -- branch / tag the activity concerns
     content: String                      -- issue title, abbreviated comment, old name, release title,
                                          -- or the (truncated) list of pushed commits
-    watch_category: WatchCategory
+    deploy_key: null, watch_category: WatchCategory
     created_at: Timestamp
 }
 
@@ -565,6 +596,20 @@ rule InboxOnIssueReopened {
     ensures: IssueThreadActivity(issue: issue, comment: comment, author: doer, mentions: {})
 }
 
+-- pulls never emits issues/IssueClosed / IssueReopened for a pull request; a
+-- PR's close / reopen arrives as pulls/PullRequestClosed / PullRequestReopened
+-- (doer null when a repository deletion closed it: nobody is told then).
+rule InboxOnPullRequestClosed {
+    when: pulls/PullRequestClosed(pull_request, doer)
+    requires: doer != null
+    ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: doer, mentions: {})
+}
+
+rule InboxOnPullRequestReopened {
+    when: pulls/PullRequestReopened(pull_request, doer)
+    ensures: IssueThreadActivity(issue: pull_request.issue, comment: null, author: doer, mentions: {})
+}
+
 -- Removing the work-in-progress prefix from a pull request title tells the
 -- audience it is ready for review.
 -- from: services/uinotification/notify.go:113
@@ -639,6 +684,14 @@ rule InboxOnReviewRequested {
     ensures: IssueThreadActivityFor(issue: pull_request.issue, comment: null, author: requester, receiver: reviewer)
 }
 
+-- An auto-merge that could not be carried out tells the user who scheduled
+-- it, even when they are also the one whose action made it fail; the thread
+-- points at the pull request, whose timeline comment gives the reason.
+rule InboxOnAutoMergeFailed {
+    when: pulls/AutoMergeFailed(pull_request, scheduler, reason)
+    ensures: IssueThreadActivityFor(issue: pull_request.issue, comment: null, author: scheduler, receiver: scheduler)
+}
+
 -- Expand an audience-wide event into one delivery per audience member: the
 -- standing audience, then the event's mentions through the same filters.
 -- decided (notifications 1): one audience for inbox and mail; assignees are
@@ -690,6 +743,7 @@ rule DeliverIssueNotification {
                 source: if issue.is_pull: pull_request else: issue,
                 issue: issue,
                 comment: comment,
+                report: null,
                 status: unread,
                 created_at: now,
                 updated_at: now
@@ -717,6 +771,7 @@ rule InboxOnRepoTransferOffered {
                 source: repository,
                 issue: null,
                 comment: null,
+                report: null,
                 status: unread,
                 created_at: now,
                 updated_at: now
@@ -726,6 +781,28 @@ rule InboxOnRepoTransferOffered {
         -- new owner is a user; otherwise every member of the new owner
         -- organization who may create repositories in it (owners and members
         -- of teams with repository-creation permission).
+}
+
+-- A repository transferred into an organisation tells the organisation's
+-- owners (other than the person who moved it) that it arrived and who moved
+-- it.
+rule InboxOnRepositoryArrived {
+    when: repositories/RepositoryTransferred(repository, doer, old_owner_name)
+    requires: repository.owner_org != null
+    let receivers = organization_owners(repository.owner_org) - {doer}
+    ensures:
+        for r in receivers:
+            Notification.created(
+                recipient: r,
+                repository: repository,
+                source: repository_arrived,
+                issue: null,
+                comment: null,
+                report: null,
+                status: unread,
+                created_at: now,
+                updated_at: now
+            )
 }
 
 ------------------------------------------------------------
@@ -744,12 +821,12 @@ rule ViewingIssueMarksItRead {
 }
 
 -- Opening a repository's home page marks the viewer's unread transfer-offer
--- threads for it read.
+-- and arrival threads for it read.
 -- from: models/activities/notification.go:296
 rule ViewingRepositoryMarksTransferOfferRead {
     when: repositories/RepositoryViewed(viewer, repository)
     ensures:
-        for n in Notifications where recipient = viewer and repository = repository and source = repository and status = unread:
+        for n in Notifications where recipient = viewer and repository = repository and source in {repository, repository_arrived} and status = unread:
             n.status = read
 }
 
@@ -760,6 +837,7 @@ rule ViewingRepositoryMarksTransferOfferRead {
 -- from: models/activities/notification.go:306
 rule UserMarksNotification {
     when: UserMarksNotification(user, notification, target)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: notification.recipient = user
     requires: notification.status != target
     ensures: notification.status = target
@@ -772,6 +850,7 @@ rule UserMarksNotification {
 -- from: models/activities/notification.go:334
 rule UserMarksAllNotificationsRead {
     when: UserMarksAllNotificationsRead(user)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let unread = Notifications where status = unread and recipient = user
     ensures:
         for n in unread:
@@ -787,6 +866,7 @@ rule UserMarksAllNotificationsRead {
 -- from: routers/api/v1/notify/user.go:94
 rule UserMarksNotificationsInBulk {
     when: UserMarksNotificationsInBulk(user, from_statuses, to_status, updated_before)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     ensures:
         for n in Notifications where recipient = user and status in from_statuses and updated_at <= updated_before:
             n.status = to_status
@@ -798,6 +878,7 @@ rule UserMarksNotificationsInBulk {
 -- from: routers/api/v1/notify/repo.go:134
 rule UserMarksRepoNotificationsInBulk {
     when: UserMarksRepoNotificationsInBulk(user, repository, from_statuses, to_status, updated_before)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_read_code(user, repository)
     ensures:
         for n in Notifications where recipient = user and repository = repository and status in from_statuses and updated_at <= updated_before:
@@ -941,6 +1022,20 @@ rule MailOnIssueReopened {
     ensures: IssueMailDue(issue: issue, doer: doer, category: category, comment: null, code_comment: null, mentions: {}, force_doer: false)
 }
 
+-- pulls never emits issues/IssueClosed / IssueReopened for a pull request; a
+-- PR's close / reopen arrives as pulls/PullRequestClosed / PullRequestReopened
+-- (doer null when a repository deletion closed it: nobody is told then).
+rule MailOnPullRequestClosed {
+    when: pulls/PullRequestClosed(pull_request, doer)
+    requires: doer != null
+    ensures: IssueMailDue(issue: pull_request.issue, doer: doer, category: pull_close, comment: null, code_comment: null, mentions: {}, force_doer: false)
+}
+
+rule MailOnPullRequestReopened {
+    when: pulls/PullRequestReopened(pull_request, doer)
+    ensures: IssueMailDue(issue: pull_request.issue, doer: doer, category: pull_reopen, comment: null, code_comment: null, mentions: {}, force_doer: false)
+}
+
 -- from: services/mailer/notify.go:78
 rule MailOnReadyForReview {
     when: pulls/PullRequestReadyForReview(pull_request, doer)
@@ -1016,6 +1111,20 @@ rule MailOnReviewRequested {
     requires: reviewer.email_notifications != disabled
     requires: reviewer.is_active
     ensures: IssueMailFor(issue: pull_request.issue, doer: requester, category: pull_review_requested, comment: null, code_comment: null, recipient: reviewer, via_mention: false)
+}
+
+-- The scheduler of a failed auto-merge is mailed (their mail preference
+-- applies; and_your_own is not needed, the mail is about their own schedule).
+rule MailOnAutoMergeFailed {
+    when: pulls/AutoMergeFailed(pull_request, scheduler, reason)
+    requires: config.mailer_enabled
+    requires: config.enable_notify_mail
+    requires: mail_eligible(scheduler, false)
+    ensures: IssueMailFor(issue: pull_request.issue, doer: scheduler, category: pull_auto_merge_failed, comment: null, code_comment: null, recipient: scheduler, via_mention: false)
+    @guidance
+        -- The body quotes the reason (the pr_unscheduled_to_auto_merge
+        -- timeline comment) and says the pull request can be merged by hand
+        -- or scheduled again.
 }
 
 -- Resolve the audience of a conversation mail: the thread audience, filtered
@@ -1155,6 +1264,33 @@ rule MailOnRepoTransferOffered {
                 )
 }
 
+-- The same arrival is mailed to those owners, per their mail preference.
+rule MailOnRepositoryArrived {
+    when: repositories/RepositoryTransferred(repository, doer, old_owner_name)
+    requires: config.mailer_enabled
+    requires: config.enable_notify_mail
+    requires: repository.owner_org != null
+    let receivers = organization_owners(repository.owner_org) - {doer}
+    ensures:
+        for r in receivers:
+            if mail_eligible(r, false):
+                MailMessage.created(
+                    to_address: r.primary_email,
+                    recipient: r,
+                    category: repository_arrived,
+                    subject: repository_arrived_subject(repository, doer, old_owner_name, r.language),
+                    sender_display_name: mail_sender_name(doer),
+                    language: r.language,
+                    issue: null,
+                    comment: null,
+                    code_comment: null,
+                    via_mention: false,
+                    thread_key: null,
+                    status: queued,
+                    queued_at: now
+                )
+}
+
 -- An invitation to collaborate mails the invitee — who invited them, to which
 -- repository, with links to accept or decline — however it was made (web UI
 -- or API; both go through repositories' AdminInvitesCollaborator).
@@ -1189,9 +1325,8 @@ rule MailOnCollaboratorInvited {
 -- decided (notifications 5; repositories 4)
 -- from: services/mailer/mail.go:193
 rule MailOnCollaboratorAdded {
-    when: repositories/CollaboratorAdded(repository, user, doer)
+    when: repositories/CollaboratorAddedDirectly(repository, user, doer)
     requires: config.mailer_enabled
-    requires: doer.is_admin
     requires: user.is_active
     ensures: MailMessage.created(
         to_address: user.primary_email,
@@ -1333,6 +1468,102 @@ rule MailOnScheduledWorkflowDisabled {
         -- access/is_repo_admin(user, repository) holds: the owner (or the
         -- owning organization's owners), admin collaborators and members of
         -- teams with admin access to it.
+}
+
+------------------------------------------------------------
+-- Moderation: abuse reports
+------------------------------------------------------------
+
+-- A new abuse report tells every active site administrator (other than the
+-- reporter): an inbox thread linking the moderation queue.
+-- decided (moderation 7)
+rule InboxOnAbuseReported {
+    when: moderation/AbuseReported(content, reporter, category)
+    let report = moderation/AbuseReport{content: content, reporter: reporter, status: open}
+    let admins = accounts/Users where is_admin = true and is_active = true
+    ensures:
+        for a in admins:
+            if a != reporter:
+                Notification.created(
+                    recipient: a,
+                    repository: null,
+                    source: abuse_report,
+                    issue: null,
+                    comment: null,
+                    report: report,
+                    status: unread,
+                    created_at: now,
+                    updated_at: now
+                )
+}
+
+-- ... and mails them, per each admin's mail preference.
+-- decided (moderation 7)
+rule MailOnAbuseReported {
+    when: moderation/AbuseReported(content, reporter, category)
+    requires: config.mailer_enabled
+    let admins = accounts/Users where is_admin = true and is_active = true
+    ensures:
+        for a in admins:
+            if a != reporter and mail_eligible(a, false):
+                MailMessage.created(
+                    to_address: a.primary_email,
+                    recipient: a,
+                    category: abuse_reported,
+                    subject: abuse_report_subject(content, category, a.language),
+                    sender_display_name: "",
+                    language: a.language,
+                    issue: null,
+                    comment: null,
+                    code_comment: null,
+                    via_mention: false,
+                    thread_key: null,
+                    status: queued,
+                    queued_at: now
+                )
+    @guidance
+        -- The mail names the reported item (content.reference) and the
+        -- category, and links the moderation queue; never the remarks.
+}
+
+-- A closed report tells its reporter that it was reviewed, without naming
+-- the resolution or anything done to the content.
+-- decided (moderation 8)
+rule InboxOnReportReviewed {
+    when: moderation/ReportReviewed(report, reporter)
+    ensures: Notification.created(
+        recipient: reporter,
+        repository: null,
+        source: report_reviewed,
+        issue: null,
+        comment: null,
+        report: report,
+        status: unread,
+        created_at: now,
+        updated_at: now
+    )
+}
+
+-- decided (moderation 8)
+rule MailOnReportReviewed {
+    when: moderation/ReportReviewed(report, reporter)
+    requires: config.mailer_enabled
+    requires: mail_eligible(reporter, false)
+    ensures: MailMessage.created(
+        to_address: reporter.primary_email,
+        recipient: reporter,
+        category: report_reviewed,
+        subject: report_reviewed_subject(report, reporter.language),
+        sender_display_name: "",
+        language: reporter.language,
+        issue: null,
+        comment: null,
+        code_comment: null,
+        via_mention: false,
+        thread_key: null,
+        status: queued,
+        queued_at: now
+    )
 }
 
 ------------------------------------------------------------
@@ -1558,6 +1789,7 @@ rule MailDeliveryFailed {
 -- from: services/mailer/incoming/incoming_handler.go:36
 rule AcceptReplyByMail {
     when: IncomingMailArrives(server, token, body, attachment_count, is_automatic_reply)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not is_automatic_reply
     requires: token.purpose = reply
     requires: token.is_valid
@@ -1573,6 +1805,7 @@ rule AcceptReplyByMail {
 -- from: services/mailer/incoming/incoming_handler.go:178
 rule AcceptUnsubscribeByMail {
     when: IncomingMailArrives(server, token, body, attachment_count, is_automatic_reply)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not is_automatic_reply
     requires: token.purpose = unsubscribe
     requires: token.is_valid
@@ -1593,7 +1826,7 @@ rule RecordIssueOpened {
     ensures: Activity.created(
         kind: create_issue, actor: issue.poster, repository: issue.repository,
         issue: issue, comment: null, code_comment: null, ref_name: null, content: issue.title,
-        watch_category: issues, created_at: now
+        deploy_key: null, watch_category: issues, created_at: now
     )
 }
 
@@ -1603,7 +1836,7 @@ rule RecordPullRequestOpened {
     ensures: Activity.created(
         kind: create_pull_request, actor: pull_request.issue.poster, repository: pull_request.issue.repository,
         issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: pull_request.issue.title,
-        watch_category: pull_requests, created_at: now
+        deploy_key: null, watch_category: pull_requests, created_at: now
     )
 }
 
@@ -1617,7 +1850,7 @@ rule RecordComment {
         kind: if issue.is_pull: comment_pull else: comment_issue,
         actor: doer, repository: issue.repository,
         issue: issue, comment: comment, code_comment: null, ref_name: null, content: feed_excerpt(comment.content),
-        watch_category: if issue.is_pull: pull_requests else: issues,
+        deploy_key: null, watch_category: if issue.is_pull: pull_requests else: issues,
         created_at: now
     )
 }
@@ -1629,7 +1862,7 @@ rule RecordIssueClosed {
         kind: if issue.is_pull: close_pull_request else: close_issue,
         actor: doer, repository: issue.repository,
         issue: issue, comment: comment, code_comment: null, ref_name: null, content: "",
-        watch_category: if issue.is_pull: pull_requests else: issues,
+        deploy_key: null, watch_category: if issue.is_pull: pull_requests else: issues,
         created_at: now
     )
 }
@@ -1641,8 +1874,30 @@ rule RecordIssueReopened {
         kind: if issue.is_pull: reopen_pull_request else: reopen_issue,
         actor: doer, repository: issue.repository,
         issue: issue, comment: comment, code_comment: null, ref_name: null, content: "",
-        watch_category: if issue.is_pull: pull_requests else: issues,
+        deploy_key: null, watch_category: if issue.is_pull: pull_requests else: issues,
         created_at: now
+    )
+}
+
+-- pulls never emits issues/IssueClosed / IssueReopened for a pull request; a
+-- PR's close / reopen arrives as pulls/PullRequestClosed / PullRequestReopened
+-- (doer null when a repository deletion closed it: nobody is told then).
+rule RecordPullRequestClosed {
+    when: pulls/PullRequestClosed(pull_request, doer)
+    requires: doer != null
+    ensures: Activity.created(
+        kind: close_pull_request, actor: doer, repository: pull_request.issue.repository,
+        issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: "",
+        deploy_key: null, watch_category: pull_requests, created_at: now
+    )
+}
+
+rule RecordPullRequestReopened {
+    when: pulls/PullRequestReopened(pull_request, doer)
+    ensures: Activity.created(
+        kind: reopen_pull_request, actor: doer, repository: pull_request.issue.repository,
+        issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: "",
+        deploy_key: null, watch_category: pull_requests, created_at: now
     )
 }
 
@@ -1654,7 +1909,7 @@ rule RecordPullRequestMerged {
     ensures: Activity.created(
         kind: merge_pull_request, actor: merger, repository: pull_request.issue.repository,
         issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: pull_request.issue.title,
-        watch_category: pull_requests, created_at: now
+        deploy_key: null, watch_category: pull_requests, created_at: now
     )
 }
 
@@ -1664,7 +1919,7 @@ rule RecordPullRequestAutoMerged {
     ensures: Activity.created(
         kind: auto_merge_pull_request, actor: merger, repository: pull_request.issue.repository,
         issue: pull_request.issue, comment: null, code_comment: null, ref_name: null, content: pull_request.issue.title,
-        watch_category: pull_requests, created_at: now
+        deploy_key: null, watch_category: pull_requests, created_at: now
     )
 }
 
@@ -1681,14 +1936,14 @@ rule RecordReviewSubmitted {
             Activity.created(
                 kind: comment_pull, actor: review.reviewer, repository: issue.repository,
                 issue: issue, comment: null, code_comment: cc, ref_name: null, content: feed_excerpt(cc.body),
-                watch_category: pull_requests, created_at: now
+                deploy_key: null, watch_category: pull_requests, created_at: now
             )
     ensures:
         if review.kind != comment or review.body != "":
             Activity.created(
                 kind: review_activity_kind(review), actor: review.reviewer, repository: issue.repository,
                 issue: issue, comment: null, code_comment: null, ref_name: null, content: feed_excerpt(review.body),
-                watch_category: pull_requests, created_at: now
+                deploy_key: null, watch_category: pull_requests, created_at: now
             )
     @guidance
         -- review_activity_kind: approve -> approve_pull_request,
@@ -1702,17 +1957,19 @@ rule RecordReviewDismissed {
     ensures: Activity.created(
         kind: pull_review_dismissed, actor: dismisser, repository: issue.repository,
         issue: issue, comment: null, code_comment: null, ref_name: null, content: feed_excerpt(message),
-        watch_category: pull_requests, created_at: now
+        deploy_key: null, watch_category: pull_requests, created_at: now
     )
 }
 
 -- from: services/feed/action.go:283
 rule RecordRepositoryCreated {
     when: repositories/RepositoryCreated(repository, doer)
+    -- an import's reserved record is recorded once, by RecordRepositoryMigrated
+    requires: repository.status != being_migrated
     ensures: Activity.created(
         kind: create_repo, actor: doer, repository: repository,
         issue: null, comment: null, code_comment: null, ref_name: null, content: "",
-        watch_category: everything, created_at: now
+        deploy_key: null, watch_category: everything, created_at: now
     )
 }
 
@@ -1722,7 +1979,20 @@ rule RecordRepositoryForked {
     ensures: Activity.created(
         kind: create_repo, actor: doer, repository: fork,
         issue: null, comment: null, code_comment: null, ref_name: null, content: "",
-        watch_category: everything, created_at: now
+        deploy_key: null, watch_category: everything, created_at: now
+    )
+}
+
+-- A migrated repository is recorded as created, by the user who ran the
+-- migration (migrations emits no RepositoryCreated for it).
+-- from: services/feed/action.go:283
+rule RecordRepositoryMigrated {
+    when: migrations/RepositoryMigrated(repository)
+    let migration = migrations/Migration{repository: repository}
+    ensures: Activity.created(
+        kind: create_repo, actor: migration.doer, repository: repository,
+        issue: null, comment: null, code_comment: null, ref_name: null, content: "",
+        deploy_key: null, watch_category: everything, created_at: now
     )
 }
 
@@ -1732,7 +2002,7 @@ rule RecordRepositoryRenamed {
     ensures: Activity.created(
         kind: rename_repo, actor: doer, repository: repository,
         issue: null, comment: null, code_comment: null, ref_name: null, content: old_name,
-        watch_category: everything, created_at: now
+        deploy_key: null, watch_category: everything, created_at: now
     )
 }
 
@@ -1742,12 +2012,13 @@ rule RecordRepositoryTransferred {
     ensures: Activity.created(
         kind: transfer_repo, actor: doer, repository: repository,
         issue: null, comment: null, code_comment: null, ref_name: null, content: old_owner_name,
-        watch_category: everything, created_at: now
+        deploy_key: null, watch_category: everything, created_at: now
     )
 }
 
 -- A push records commit_repo for branches, push_tag for tags, and
--- delete_branch / delete_tag for deletions. At most feed_max_commit_num
+-- delete_branch / delete_tag for deletions. A deploy-key push has no user
+-- pusher: the entry names the key (decided: code 4), never the owner. At most feed_max_commit_num
 -- commits are kept, each message cut to its excerpt; the total count and a
 -- compare link are kept too.
 -- from: services/feed/action.go:410
@@ -1765,7 +2036,7 @@ rule RecordPush {
                     actor: push.pusher, repository: push.repository,
                     issue: null, comment: null, code_comment: null, ref_name: u.ref_name,
                     content: feed_commit_summary(u, config.feed_max_commit_num),
-                    watch_category: everything, created_at: now
+                    deploy_key: push.deploy_key, watch_category: everything, created_at: now
                 )
 }
 
@@ -1774,20 +2045,24 @@ rule RecordPush {
 -- from: services/feed/action.go:441
 rule RecordBranchCreated {
     when: code/BranchCreated(branch, by)
+    -- by is null only for a deploy-key push, which RecordPush records with the key
+    requires: by != null
     ensures: Activity.created(
         kind: commit_repo, actor: by, repository: branch.repository,
         issue: null, comment: null, code_comment: null, ref_name: branch.name, content: "",
-        watch_category: everything, created_at: now
+        deploy_key: null, watch_category: everything, created_at: now
     )
 }
 
 -- from: services/feed/action.go:456
 rule RecordBranchDeleted {
     when: code/BranchDeleted(branch, by)
+    -- by is null only for a deploy-key push, which RecordPush records with the key
+    requires: by != null
     ensures: Activity.created(
         kind: delete_branch, actor: by, repository: branch.repository,
         issue: null, comment: null, code_comment: null, ref_name: branch.name, content: "",
-        watch_category: everything, created_at: now
+        deploy_key: null, watch_category: everything, created_at: now
     )
 }
 
@@ -1798,7 +2073,7 @@ rule RecordMirrorSyncPush {
     ensures: Activity.created(
         kind: mirror_sync_push, actor: null, repository: repository,
         issue: null, comment: null, code_comment: null, ref_name: ref_name, content: feed_commit_list(commits, config.feed_max_commit_num),
-        watch_category: everything, created_at: now
+        deploy_key: null, watch_category: everything, created_at: now
     )
 }
 
@@ -1808,7 +2083,7 @@ rule RecordMirrorRefCreated {
     ensures: Activity.created(
         kind: mirror_sync_create, actor: null, repository: repository,
         issue: null, comment: null, code_comment: null, ref_name: ref_name, content: "",
-        watch_category: everything, created_at: now
+        deploy_key: null, watch_category: everything, created_at: now
     )
 }
 
@@ -1818,7 +2093,7 @@ rule RecordMirrorRefDeleted {
     ensures: Activity.created(
         kind: mirror_sync_delete, actor: null, repository: repository,
         issue: null, comment: null, code_comment: null, ref_name: ref_name, content: "",
-        watch_category: everything, created_at: now
+        deploy_key: null, watch_category: everything, created_at: now
     )
 }
 
@@ -1828,7 +2103,7 @@ rule RecordReleasePublished {
     ensures: Activity.created(
         kind: publish_release, actor: release.publisher, repository: release.repository,
         issue: null, comment: null, code_comment: null, ref_name: release.tag_name, content: release.title,
-        watch_category: releases, created_at: now
+        deploy_key: null, watch_category: releases, created_at: now
     )
 }
 
@@ -1838,7 +2113,7 @@ rule RecordReleaseUnpublished {
     ensures: Activity.created(
         kind: unpublish_release, actor: doer, repository: release.repository,
         issue: null, comment: null, code_comment: null, ref_name: release.tag_name, content: release.title,
-        watch_category: releases, created_at: now
+        deploy_key: null, watch_category: releases, created_at: now
     )
 }
 
@@ -1858,7 +2133,7 @@ rule AnnounceActivity {
         -- in_feed_of(reader, activity), evaluated when the feed is read:
         --   the reader is the actor; or
         --   the reader owns the repository and the activity has no actor
-        --   (mirror syncs); or
+        --   (mirror syncs, deploy-key pushes); or
         --   the reader currently watches the repository with a watch that
         --   covers activity.watch_category; or
         --   the reader currently follows the actor (accounts/Follow);
@@ -1922,11 +2197,13 @@ invariant OneThreadPerRecipientAndIssue {
             (a.recipient = b.recipient and a.issue != null and a.issue = b.issue) implies a = b
 }
 
--- Issue/PR threads point at an issue; repository threads do not.
+-- Issue/PR threads point at an issue; repository threads at a repository
+-- only; report threads at a report only.
 invariant ThreadSubjectMatchesSource {
     for n in Notifications:
-        (n.is_about_issue implies n.issue != null)
-        and (n.source = repository implies n.issue = null)
+        (n.is_about_issue implies n.issue != null and n.repository != null and n.report = null)
+        and (n.source in {repository, repository_arrived} implies n.issue = null and n.repository != null and n.report = null)
+        and (n.is_about_report implies n.report != null and n.issue = null and n.repository = null)
 }
 
 -- A thread always belongs to the repository of its issue.
@@ -1981,6 +2258,7 @@ surface NotificationThread {
         notification.repository
         notification.issue
         notification.comment
+        notification.report
         notification.updated_at
 
     provides:
@@ -1997,8 +2275,10 @@ surface NotificationThread {
         -- (status=read|unread|pinned).
         -- API: GET /notifications/threads/{id}, PATCH /notifications/threads/{id}
         -- (to-status). Token scope: notification (read / write).
-        -- Threads whose repository, issue or comment no longer exists are
-        -- dropped from the listing.
+        -- Threads whose repository, issue, comment or report no longer exists
+        -- are dropped from the listing. A report thread links the moderation
+        -- queue (site admins) or the reported item (the reporter) and never
+        -- names a resolution.
 }
 
 -- The inbox as a whole: the badge count and the bulk operations.
@@ -2308,12 +2588,12 @@ deferred Heatmap.aggregate       -- see: models/activities/user_heatmap.go
 -- RESOLVED (integration): pulls emits both triggers for an auto-merge and sets
 --   PullRequest.merged_automatically; the plain-merge rules here skip auto-merges.
 -- REQUEST pulls: TeamReviewRequested(pull_request, requester, team) is not consumed; Forgejo notifies nobody per team member — confirm.
--- REQUEST actions/WorkflowRun.{status, notify_email, trigger_user, repository} and is_failure(status); decided (notifications 4): this module mails once per failed run attempt on WorkflowRunCompleted(run, prior_status) — not on WorkflowJobCompleted (supersedes actions' REQUEST about WorkflowJobCompleted; please update the "-- notifications mails the trigger user on failure" note in actions' Emits list to sit under WorkflowRunCompleted). WorkflowRunCompleted must fire once per attempt (prior_status non-final).
--- REQUEST actions: ScheduledWorkflowDisabledForInactivity(repository, workflow_file) is consumed (MailOnScheduledWorkflowDisabled mails the repository admins; no inbox thread, since threads are about issues or transfer offers).
+-- RESOLVED (actions): WorkflowRun.{status, notify_email, trigger_user, repository} are present; WorkflowRunCompleted(run, prior_status) fires once per attempt and actions' Emits list now puts the failure mail under it (decided notifications 4).
+-- RESOLVED (actions): ScheduledWorkflowDisabledForInactivity(repository, workflow_file) is emitted by actions and consumed by MailOnScheduledWorkflowDisabled.
 -- REQUEST access: repository_admins(repository) = individual users with is_repo_admin(user, repository) (used for the workflow-disabled mail).
 -- REQUEST issues: the thread audience (decided notifications 1) adds Issue.assignees; an explicit unsubscribe is read as issues/IssueWatch{user, issue, is_watching: false} (the inline mention / new-pull-request filters use it directly).
 -- REQUEST repositories: MailOnCollaboratorInvited mails on CollaboratorInvited (decided notifications 5, answering repositories' REQUEST); MailOnCollaboratorAdded mails only for a site admin's direct add and tells it apart by doer.is_admin — an explicit `direct: Boolean` on CollaboratorAdded would be sturdier. Telling the inviter on acceptance / decline is not done.
 -- REQUEST authentication: administration/UserPasswordSetByAdmin and UserPasswordSetByOperator revoke mail tokens here (decided notifications 3); if those resets should also send the password-changed mail, authentication should emit PasswordChanged(user) for them.
--- REQUEST federation: ActivityRecorded(activity) now fires exactly once per recorded activity (AnnounceActivity; there are no per-feed copies, decided notifications 6); the actor field is Activity.actor (not act_user), and Activity.is_private is gone — use activity.repository.is_private.
--- REQUEST federation: react to notifications/ActivityRecorded(activity) to publish to ActivityPub followers.
+-- RESOLVED (federation): FederateLocalActivity reacts once per ActivityRecorded(activity) and reads activity.actor; visibility is activity_is_public(activity) on current state (no Activity.is_private).
+-- RESOLVED (federation): FederateLocalActivity publishes it to ActivityPub followers.
 -- REQUEST authentication: react to notifications/SignOutPushed only if it needs to; the stream connection belongs here.

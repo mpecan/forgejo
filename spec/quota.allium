@@ -47,6 +47,8 @@
 --          actions honour it as `requires: quota_allows(<charged>, <subject>,
 --          <incoming bytes or null>)` in their own rules; nothing emits it as a
 --          trigger.
+--   accounts/UserAccountCreated(user)
+--       -- the new account's QuotaAccount is created.
 --   authentication/ExternalGroupsAsserted(user, source, groups)
 --       -- authentication's sign-in / registration / account link through an
 --          external source (OAuth2 or LDAP); the source's quota group mapping
@@ -442,6 +444,18 @@ rule StorageConsumptionGated {
         -- * apply-suggestion is charged to the PR head repository owner.
 }
 
+-- ---- Quota accounts ----------------------------------------------------
+
+-- Every new account gets its quota view at once (every account-creation path
+-- in accounts emits UserAccountCreated), so the gate and a first sign-in's
+-- group sync (LoginSourceSyncsQuotaGroups) find it. Organisations' quota
+-- accounts are implicit (see QuotaAccount).
+rule CreateQuotaAccountForNewUser {
+    when: accounts/UserAccountCreated(user)
+    requires: not exists QuotaAccount{user: user}
+    ensures: QuotaAccount.created(user: user, organization: null)
+}
+
 -- ---- Rule management (site admin) ------------------------------------
 
 -- from: routers/api/v1/admin/quota_rule.go:78
@@ -824,11 +838,21 @@ deferred quota_allows             -- see: models/quota/quota.go:20 (prose on Sto
 deferred subject_lineage          -- see: models/quota/rule.go:19 (the subject plus its ancestors in the QuotaSubject tree)
 deferred quota_groups_mapped_from          -- see: services/auth/source/source_quota_group_sync.go:26 (quota groups mapped from source groups the user is in; unknown group names dropped)
 deferred quota_groups_mapped_from_unclaimed -- see: services/auth/source/source_quota_group_sync.go:36 (quota groups mapped from source groups the user is NOT in)
+-- Helpers for the gated modules (decided: quota 5 for transfers; the charged
+-- party of each QuotaGate names which holder to pass):
+--   quota_account_of(holder) = QuotaAccount{user: holder} for a user,
+--     QuotaAccount{organization: holder} for an organisation;
+--   quota_account_of_owner(repository) = quota_account_of(repository.owner_user
+--     or repository.owner_org).
+-- A gated module calls quota_allows(quota_account_of_owner(repository), subject,
+-- incoming) under its own local name (e.g. code's exceeds_git_quota(r) is
+-- not quota_allows(quota_account_of_owner(r), size_repos_all, null)).
+deferred quota_account_of         -- see: models/quota/quota.go:20 (the holder's QuotaAccount; one exists for every user and organisation)
+deferred quota_account_of_owner   -- see: models/quota/quota.go:20 (quota_account_of the repository's owning user or organisation)
 deferred usage_union              -- see: models/quota/rule.go:46 (usage of the union of the subjects: each byte once, so a subject already covered by another listed ancestor adds nothing; decided quota 4. For a count subject it is that count: repos_count, packages_count or package_versions_count; decided follow-up 2)
 
 -- Requests to other modules
--- REQUEST accounts/User: a QuotaAccount must exist for every user (or accounts exposes user.quota_account).
--- REQUEST organizations/Organization: a QuotaAccount must exist for every organization; is_org_owner(organization, user) predicate.
+-- RESOLVED (accounts): CreateQuotaAccountForNewUser creates the QuotaAccount on accounts/UserAccountCreated(user).
 -- REQUEST authentication/AuthSource.quota_group_claim_name: OAuth2 claim carrying the groups used for quota sync.
 -- REQUEST authentication/AuthSource.quota_group_map: mapping source-group -> set of quota group names (validated JSON).
 -- REQUEST authentication/AuthSource.quota_group_map_removal: Boolean, remove memberships for unclaimed mapped groups.
@@ -840,6 +864,6 @@ deferred usage_union              -- see: models/quota/rule.go:46 (usage of the 
 -- REQUEST issues, releases, packages, actions: pass the incoming size to the quota gate where it is known up front (attachment, release asset, package file, artifact size), so the check is usage + size <= limit (decided quota 2).
 -- REQUEST releases, issues, packages: deleting an attachment, release asset or package version must not consult the quota gate (decided quota 7: what can only shrink storage is never refused by quota).
 -- REQUEST authentication: emit ExternalGroupsAsserted(user, source, entry.groups) on EVERY LDAP sign-in of an existing account (and on LDAP synchronisation), not only when the account is provisioned, so LDAP quota-group sync works like OAuth2's (decided quota 8). AuthSource.quota_group_map / quota_group_map_removal apply to LDAP sources too.
--- REQUEST accounts/authentication: a user provisioned by an external source needs its QuotaAccount at once, so LoginSourceSyncsQuotaGroups can run on first sign-in.
+-- RESOLVED (accounts/authentication): every provisioning path emits accounts/UserAccountCreated, so CreateQuotaAccountForNewUser gives the account its QuotaAccount before the first group sync.
 -- REQUEST packages: decided (follow-up 2): before creating a package ask quota_allows(<registry owner>, count_packages, 1) (gate_create_package), and before creating a non-internal version ask quota_allows(<registry owner>, count_package_versions, 1) (gate_create_package_version); QuotaUsage.packages_count / package_versions_count count the owner's non-internal packages / versions - done (quota_allows_new_package / quota_allows_new_version in packages.allium).
 -- REQUEST repositories, accounts, organizations: decided (follow-up 2): QuotaUsage.repos_count is the number of repositories the holder owns (accounts/User.num_repos); repositories' within_creation_limit(owner) also requires quota_allows(owner, count_repos, 1) while quota is enabled - done (repositories.allium predicate list).

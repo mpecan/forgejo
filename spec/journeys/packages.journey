@@ -27,10 +27,20 @@ world {
         maven_row:     KindPolicy { kind: maven, version_mode: additive, file_overwrite: replace_metadata, has_repository_index: false, signing: none }
         cargo_row:     KindPolicy { kind: cargo, version_mode: immutable, file_overwrite: refuse, has_repository_index: false, signing: none }
         container_row: KindPolicy { kind: container, version_mode: reference, file_overwrite: refuse, has_repository_index: false, signing: none }
-        -- Ada may write to her own registry, and it is under quota, in every story
+        -- Ada may write to her own registry, and it is under quota (for each upload
+        -- size used below), in every story
         -- here unless one says otherwise.
         can_write_packages(ada, reg) = true
-        quota_allows_package_upload(reg) = true
+        quota_allows_package_upload(reg, null) = true
+        quota_allows_package_upload(reg, 10) = true
+        quota_allows_package_upload(reg, 64) = true
+        quota_allows_package_upload(reg, 99) = true
+        quota_allows_package_upload(reg, 100) = true
+        quota_allows_package_upload(reg, 512) = true
+        quota_allows_package_upload(reg, 600) = true
+        quota_allows_package_upload(reg, 2048) = true
+        quota_allows_package_upload(reg, 4096) = true
+        quota_allows_package_upload(reg, 5000) = true
         -- and her registry may hold one more package and one more version
         -- (quota count subjects, decided: follow-up 2)
         quota_allows_new_package(reg) = true
@@ -142,7 +152,7 @@ journey AnOverQuotaRegistryRefusesUploads {
         then PublishFirstVersionOfNewPackage fires
 
     2. once her quota no longer allows package uploads, the next one is refused
-        stipulate quota_allows_package_upload(reg) = false
+        stipulate quota_allows_package_upload(reg, 10) = false
         stipulate valid_coordinates(helm, "web", "0.2.0", "web-0.2.0.tgz") = true
         ada cannot do PublisherUploadsPackageFile(ada, reg, helm, "web", "0.2.0", "web-0.2.0.tgz", null, true, 10, "small01") on PackageClientProtocol
 
@@ -477,4 +487,71 @@ journey PackageCountsAreLimitedByQuota {
 
     ends: tool 1.0.0 and 1.1.0 are stored; the other uploads were refused as
           "quota exceeded".
+}
+
+-- An Actions job token reads only its own repository's packages, even in a
+-- registry it may read.
+-- decided: access 6 (the job token reaches only packages linked to its repository)
+journey AJobTokenReadsOnlyItsRepositorysPackages {
+    goal: A workflow in Ada's repository "app" downloads the package linked
+          to "app", but not Ada's unlinked package in the same registry.
+
+    cast:
+        ci: accounts/User
+    given:
+        ci.is_admin = false
+        app:   repositories/Repository { owner_user: ada, is_private: false }
+        mine:  Package { registry: reg, kind: generic, name: "app-bin", is_internal: false, repository: app, autolink_pending: false }
+        mv1:   PackageVersion { package: mine, creator: ada, version: "1.0.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
+        mblob: PackageBlob { size: 100, hash_sha256: "m0001" }
+        mfile: PackageFile { version: mv1, blob: mblob, name: "app.tar.gz", is_lead: true }
+        loose: Package { registry: reg, kind: generic, name: "loose", is_internal: false, repository: null, autolink_pending: false }
+        lv1:   PackageVersion { package: loose, creator: ada, version: "1.0.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
+        lblob: PackageBlob { size: 100, hash_sha256: "l0001" }
+        lfile: PackageFile { version: lv1, blob: lblob, name: "loose.tar.gz", is_lead: true }
+
+    1. the job downloads its own repository's package
+        stipulate job_repository(ci) = app
+        stipulate can_read_packages(ci, reg) = true
+        ci does ClientDownloadsPackageFile(ci, mfile) on PackageClientProtocol
+        then DownloadLeadFileCountsDownload fires
+        then mv1.download_count = 1
+
+    2. but not a package that is not linked to its repository
+        ci cannot do ClientDownloadsPackageFile(ci, lfile) on PackageClientProtocol
+        then lv1.download_count = 0
+
+    ends: The job saw only what belongs to "app".
+}
+
+-- Read-only mode stops publishing and deleting; downloads keep working.
+-- decided: administration 3
+journey ReadOnlyModeFreezesTheRegistry {
+    goal: While the instance is read-only Ada can still download her package
+          but can neither publish a new version nor delete one.
+
+    cast:
+        gate: access/InstanceWriteGate
+    given:
+        gate.read_only = true
+        tool:  Package { registry: reg, kind: generic, name: "tool", is_internal: false, repository: null, autolink_pending: false }
+        v1:    PackageVersion { package: tool, creator: ada, version: "1.0.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
+        blob:  PackageBlob { size: 100, hash_sha256: "t0001" }
+        file:  PackageFile { version: v1, blob: blob, name: "tool.bin", is_lead: true }
+
+    1. a download still counts
+        stipulate can_read_packages(ada, reg) = true
+        ada does ClientDownloadsPackageFile(ada, file) on PackageClientProtocol
+        then DownloadLeadFileCountsDownload fires
+        then v1.download_count = 1
+
+    2. a new version is refused
+        stipulate valid_coordinates(generic, "tool", "1.1.0", "tool.bin") = true
+        ada cannot do PublisherUploadsPackageFile(ada, reg, generic, "tool", "1.1.0", "tool.bin", null, true, 100, "t0002") on PackageClientProtocol
+
+    3. so is deleting the old one
+        ada cannot do UserRemovesPackageVersion(ada, v1) on PackageVersionSettings
+        then v1.version = "1.0.0"
+
+    ends: The registry is unchanged until the instance is writable again.
 }

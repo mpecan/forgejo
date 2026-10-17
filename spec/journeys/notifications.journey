@@ -236,6 +236,7 @@ journey AdaRepliesFromHerMailClient {
         token.issue = issue
         token.revoked = false
         token.replied_to = null
+        token.replied_to_code = null
 
     1. the mailbox hands over her reply
         -- Token lifetimes are timestamps set when the mail is composed; a
@@ -243,8 +244,12 @@ journey AdaRepliesFromHerMailClient {
         stipulate token.is_valid = true
         stipulate can_read_issue(ada, issue) = true
         stipulate can_comment_on_issue(ada, issue) = true
+        stipulate resolve_mentions(issue, ada, "Fixed in main. Thanks!") = {}
+        stipulate cross_references(repo, ada, null, "Fixed in main. Thanks!") = {}
+        stipulate issue_notification_audience(issue, ada) = {}
         imap does IncomingMailArrives(imap, token, "Fixed in main. Thanks!", 0, false) on IncomingMailGateway
         then AcceptReplyByMail fires
+        then CommentFromMailReply fires
 
     ends: The issue has a new comment by Ada.
 }
@@ -444,6 +449,7 @@ journey AReleaseLandsInTheFeed {
         stipulate may_control_tag(ada, repo, "v1.0") = true
         stipulate target_resolves(repo, "main") = true
         stipulate release_quota_allows(repo) = true
+        stipulate commit_of(repo, "main") = "c0ffee1"
         ada does UserCreatesRelease(ada, repo, "v1.0", "main", "First release", "Notes", false, false, false) on ReleaseManagement
             creating act: Activity
         then RecordReleasePublished fires
@@ -552,4 +558,87 @@ journey AnUnsubscribedMentionStaysQuiet {
         then DeliverIssueNotification does not fire
 
     ends: Ada's opt-out holds even against a mention.
+}
+
+-- A new abuse report reaches the site administrators' inboxes; when it is
+-- closed the reporter hears that it was reviewed, and nothing more.
+-- decided: moderation 7, moderation 8
+journey AReportReachesTheAdminsAndTheReporterHearsBack {
+    goal: Bob reports a spam comment. Cora, a site admin, finds a thread about
+          the new report in her inbox. Once she closes it, Bob finds a thread
+          saying his report was reviewed.
+
+    cast:
+        cora:   accounts/User
+        author: accounts/User
+        remark: issues/Comment
+        item:   moderation/ReportableContent
+    given:
+        moderation/config.enabled = true
+        cora.is_admin = true
+        cora.is_active = true
+        cora.prohibit_login = false
+        remark.issue = issue
+        remark.ref_comment = null
+        item.kind = comment
+        item.reported_comment = remark
+        item.reported_user = null
+        item.reported_organization = null
+        item.reported_repository = null
+        item.reported_issue = null
+        item.is_deleted = false
+        item.has_user_content = true
+        item.poster = author
+
+    1. bob files the report and cora is told
+        stipulate can_read_conversation(bob, issue) = true
+        stipulate remarks_length("This comment links to a phishing site twice.") = 45
+        bob does UserReportsContent(bob, item, spam, "This comment links to a phishing site twice.") on ReportAbuse
+            creating report: moderation/AbuseReport
+            creating alert: Notification
+        then InboxOnAbuseReported fires
+        then alert.recipient = cora
+        then alert.source = abuse_report
+        then alert.report = report
+        then alert.status = unread
+
+    2. cora closes it and bob hears back
+        cora does AdminResolvesReports(cora, item, handled) on ModerationQueue
+            creating reply: Notification
+        then InboxOnReportReviewed fires
+        then reply.recipient = bob
+        then reply.source = report_reviewed
+        then reply.report = report
+
+    ends: Cora saw the new report; Bob knows it was handled, not how.
+}
+
+-- While the instance is read-only the inbox can be read but not changed.
+-- decided: administration 3
+journey ReadOnlyModeKeepsTheInboxAsItIs {
+    goal: Ada has an unread thread. During maintenance she can see it but
+          cannot mark it read, alone or with everything else.
+
+    cast:
+        gate:   access/InstanceWriteGate
+        thread: Notification
+    given:
+        gate.read_only = true
+        thread.recipient = ada
+        thread.repository = repo
+        thread.issue = issue
+        thread.source = issue
+        thread.status = unread
+
+    1. she still sees it
+        ada sees thread.status on NotificationThread in thread
+
+    2. she cannot mark it read
+        ada cannot do UserMarksNotification(ada, thread, read) on NotificationThread
+
+    3. nor everything at once
+        ada cannot do UserMarksAllNotificationsRead(ada) on NotificationInbox
+        then thread.status = unread
+
+    ends: The thread stays unread until the instance is writable again.
 }

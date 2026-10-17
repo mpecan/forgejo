@@ -548,3 +548,30 @@ journey ADeletedAccountTakesItsWebhooks {
 
     ends: Nothing of Ada's webhooks outlives her account.
 }
+
+-- Read-only mode freezes repository, organisation and user webhooks; the
+-- site administration console keeps working.
+-- decided: administration 3
+journey ReadOnlyModeFreezesRepositoryWebhooks {
+    goal: During maintenance Ada cannot add a webhook to the repository she
+          administers, while the site admin can still add a system webhook.
+
+    cast:
+        gate: access/InstanceWriteGate
+        repo: repositories/Repository
+    given:
+        gate.read_only = true
+
+    1. ada's repository webhook is refused
+        stipulate is_repo_admin(ada, repo) = true
+        stipulate cfg.is_valid = true
+        ada cannot do RepoAdminCreatesWebhook(ada, repo, cfg, true) on RepoWebhookSettings
+
+    2. the admin console still adds a system webhook
+        root does AdminCreatesSystemWebhook(root, cfg, true) on AdminWebhookSettings
+            creating hook: Webhook
+        then AdminCreatesSystemWebhook fires
+        then hook.scope = system
+
+    ends: Only the admin console changed anything.
+}

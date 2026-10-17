@@ -887,6 +887,7 @@ journey UnpublishingAReleaseIsAWorkflowEvent {
     1. she un-publishes v1.0 and Actions is told
         stipulate can_write_releases(ada, repo) = true
         stipulate qualified_ref(tag_ref, "v1.0") = "refs/tags/v1.0"
+        stipulate release_quota_allows(repo) = true
         ada does UserEditsRelease(ada, repo, rel, "One", "Notes", true, false, false) on ReleaseManagement
         then UserUnpublishesRelease fires
         then rel.state = draft
@@ -900,4 +901,37 @@ journey UnpublishingAReleaseIsAWorkflowEvent {
         then ReleaseUnpublishedStartsWorkflows does not fire
 
     ends: v1.0 raised a release event of type unpublished; v2.0's vanished tag raised none.
+}
+
+-- Read-only mode freezes a repository's Actions settings; the instance
+-- scope, managed from the admin console, keeps working.
+-- decided: administration 3
+journey ReadOnlyModeFreezesRepositoryActionsSettings {
+    goal: During maintenance Ada cannot add a repository secret; the site
+          admin can still add an instance variable.
+
+    cast:
+        gate: access/InstanceWriteGate
+        root: accounts/User
+    given:
+        gate.read_only = true
+        root.is_admin = true
+
+    1. ada's repository secret is refused
+        stipulate may_manage_actions_scope(ada, repo_scope) = true
+        stipulate valid_secret_name("deploy_key") = true
+        stipulate existing_secret(repo_scope, "deploy_key") = null
+        ada cannot do UserSetsActionsSecret(ada, repo_scope, "deploy_key", "s3cr3t") on ActionsSettings
+
+    2. the instance variable goes through
+        stipulate may_manage_actions_scope(root, site) = true
+        stipulate valid_variable_name("registry") = true
+        stipulate existing_variable(site, "registry") = null
+        stipulate upper("registry") = "REGISTRY"
+        root does UserCreatesActionsVariable(root, site, "registry", "registry.example.org") on ActionsSettings
+            creating var: Variable
+        then UserCreatesVariable fires
+        then var.name = "REGISTRY"
+
+    ends: Repository settings wait for the end of maintenance; the admin console does not.
 }

@@ -46,17 +46,20 @@
 --   repositories/MirrorSyncPushed(repository, ref_name, commits)          -> push (pull-mirror sync, sender: owner)
 --   repositories/MirrorRefCreated(repository, ref_name)                   -> create (pull-mirror sync, sender: owner)
 --   repositories/MirrorRefDeleted(repository, ref_name)                   -> delete (pull-mirror sync, sender: owner)
---   repositories/RepositoryCreated(repository, doer)      -> repository/created
+--   repositories/RepositoryCreated(repository, doer)      -> repository/created (not for an import's reserved record)
 --   migrations/RepositoryMigrated(repository)             -> repository/created (sender: the migration's doer)
 --   repositories/RepositoryForked(source, fork, doer)     -> fork (+ repository/created for org forks)
---   repositories/RepositoryDeleted(repository, doer)      -> repository/deleted; removes repo webhooks
+--   repositories/RepositoryDeletionAnnounced(repository, doer, owner_user, owner_org) -> repository/deleted
+--       (owner and system hooks; the owner the repository had)
+--   repositories/RepositoryDeleted(repository, doer)      -> removes repo webhooks
 --   repositories/Repository.created                       -> copy default webhooks
 --   repositories/RepositoryGeneratedFromTemplate(template, repository, doer, git_content, topics,
 --       git_hooks, webhooks, avatar, labels, protected_branches)  -> copy template webhooks when `webhooks`
 --   issues/IssueOpened(issue, mentions)                   -> issues/opened
 --   issues/IssueTitleChanged(issue, doer, old_title)      -> issues|pull_request/edited
 --   issues/IssueContentChanged(issue, doer, old_content)  -> issues|pull_request/edited
---   issues/IssueClosed(issue, doer, comment), issues/IssueReopened(issue, doer, comment)
+--   issues/IssueClosed(issue, doer, comment), issues/IssueReopened(issue, doer, comment)  -> issues
+--   pulls/PullRequestClosed(pull_request, doer), pulls/PullRequestReopened(pull_request, doer)  -> pull_request
 --   issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)  -> assigned / unassigned
 --   issues/IssueLabelsChanged(issue, doer, added, removed), issues/IssueLabelsCleared(issue, doer)
 --   issues/IssueMilestoneChanged(issue, doer, old_milestone)
@@ -69,9 +72,10 @@
 --   wiki/WikiPageCreated(repository, doer, page), wiki/WikiPageEdited(...), wiki/WikiPageDeleted(...)
 --   releases/ReleasePublished(release), releases/ReleaseUpdated(release, doer), releases/ReleaseDeleted(release, doer),
 --   releases/ReleaseUnpublished(release, doer)
---   packages/PackageVersionCreated(version, publisher), packages/PackageVersionDeleted(version, doer)
+--   packages/PackageVersionCreated(version, publisher), packages/PackageVersionDeleted(version, package, doer)
 --   actions/WorkflowRunStatusChanged(run, prior_status), actions/WorkflowRunCompleted(run, prior_status),
---   actions/WorkflowJobStatusChanged(job, prior_status), actions/WorkflowJobCompleted(job, prior_status)
+--   actions/WorkflowJobStatusChanged(job, prior_status), actions/WorkflowJobCompleted(job, prior_status),
+--   actions/WorkflowRunAttemptStarted(run), actions/WorkflowJobAttemptStarted(job)  -> the new attempt's status
 --   accounts/UserAccountDeleted(user, kind, purge, delete_contributions), organizations/OrganizationDeleted(organization)
 --   administration/HookDeliveryCleanupDue(cleanup_type, older_than, number_to_keep)  -> history cleanup "run now"
 --
@@ -81,6 +85,16 @@
 --   is_branch_ref(ref_name), branch_of_ref(ref_name) = code: refs/heads/<name> and its <name>
 --   mirror_pusher(repository)          = repositories/mirror_pusher(repository): the owning user
 --                                        or organisation account mirror updates are attributed to
+--
+-- Read-only mode: creating, editing, deleting, testing and redelivering a
+-- repository, organisation or user webhook is refused while
+-- access/InstanceWriteGate.read_only; system and default webhooks live in the
+-- site administration console, which stays writable (decided: administration
+-- 3). Deliveries of events keep flowing: they are not people's writes.
+--
+-- Deploy-key pushes (decided: code 4): code reports pusher = null and names
+-- the key in push.deploy_key; the push / create / delete payload's sender is
+-- then the deploy key (its name and repository), never the repository owner.
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -468,6 +482,7 @@ config {
 -- from: routers/web/repo/setting/webhook.go:199
 rule RepoAdminCreatesWebhook {
     when: RepoAdminCreatesWebhook(actor, repo, hook_config, is_active)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not config.disable_webhooks
     requires: is_repo_admin(actor, repo)
     requires: hook_config.is_valid
@@ -493,6 +508,7 @@ rule RepoAdminCreatesWebhook {
 -- from: routers/api/v1/utils/hook.go:110
 rule OrgOwnerCreatesWebhook {
     when: OrgOwnerCreatesWebhook(actor, organization, hook_config, is_active)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not config.disable_webhooks
     requires: is_org_owner(organization, actor) or actor.is_admin
     requires: hook_config.is_valid
@@ -515,6 +531,7 @@ rule OrgOwnerCreatesWebhook {
 -- from: routers/api/v1/user/hook.go:87
 rule UserCreatesOwnWebhook {
     when: UserCreatesOwnWebhook(actor, hook_config, is_active)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not config.disable_webhooks
     requires: actor.is_active and not actor.prohibit_login
     requires: hook_config.is_valid
@@ -584,6 +601,7 @@ rule AdminCreatesDefaultWebhook {
 -- from: routers/web/repo/setting/webhook.go:282
 rule ManagerEditsWebhook {
     when: ManagerEditsWebhook(actor, webhook, hook_config, is_active)
+    requires: webhook.is_admin_level or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not config.disable_webhooks
     let may_manage =
         if webhook.scope = per_repository: is_repo_admin(actor, webhook.repository)
@@ -608,6 +626,7 @@ rule ManagerEditsWebhook {
 -- from: models/webhook/webhook.go:580
 rule ManagerDeletesWebhook {
     when: ManagerDeletesWebhook(actor, webhook)
+    requires: webhook.is_admin_level or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not config.disable_webhooks
     let may_manage =
         if webhook.scope = per_repository: is_repo_admin(actor, webhook.repository)
@@ -635,6 +654,7 @@ rule ManagerDeletesWebhook {
 -- from: routers/web/repo/setting/webhook.go:401
 rule ManagerTestsWebhook {
     when: ManagerTestsWebhook(actor, webhook)
+    requires: webhook.is_admin_level or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not config.disable_webhooks
     requires: webhook.scope != default
     requires: webhook.can_fire
@@ -671,6 +691,7 @@ rule ManagerTestsWebhook {
 -- from: models/webhook/hooktask.go:154
 rule ManagerRedeliversDelivery {
     when: ManagerRedeliversDelivery(actor, delivery)
+    requires: delivery.webhook.is_admin_level or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not config.disable_webhooks
     requires: delivery.webhook.can_fire
     let may_manage =
@@ -853,12 +874,16 @@ rule PushRaisesHookEvent {
                     sender: push.pusher
                 )
     @guidance
+        -- sender is null for a deploy-key push; the payload then names
+        -- push.deploy_key as the sender (decided: code 4).
         -- pushed_commit_count(u) is the number of commits between u.old_sha
         -- and u.new_sha (all reachable commits for a new ref).
         -- The payload lists at most config.payload_commit_limit commits plus
         -- the head commit, and reports the full total_commits.
 }
 
+-- A null pusher is a deploy-key push: the payload's sender is that key
+-- (decided: code 4), as for RefDeletionRaisesHookEvent.
 -- from: services/webhook/notifier.go:770
 rule RefCreationRaisesHookEvent {
     when: code/RefCreated(repository, pusher, ref_kind, ref_name, commit_sha)
@@ -945,6 +970,8 @@ rule MirrorRefDeletionRaisesHookEvent {
 -- from: services/webhook/notifier.go:110
 rule RepositoryCreationRaisesHookEvent {
     when: repositories/RepositoryCreated(repository, doer)
+    -- a repository reserved for an import is announced once, on RepositoryMigrated
+    requires: repository.status != being_migrated
     ensures: HookEventRaised(kind: repository, action: created, source_repo: repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
@@ -971,13 +998,13 @@ rule ForkRaisesHookEvents {
 -- so only owner and system webhooks are told.
 -- from: services/webhook/notifier.go:122
 rule RepositoryDeletionRaisesHookEvent {
-    when: repositories/RepositoryDeleted(repository, doer)
+    when: repositories/RepositoryDeletionAnnounced(repository, doer, owner_user, owner_org)
     ensures: HookEventRaised(
         kind: repository,
         action: deleted,
         source_repo: null,
-        owner_user: repository.owner_user,
-        owner_org: repository.owner_org,
+        owner_user: owner_user,
+        owner_org: owner_org,
         branch: null,
         commit_count: null,
         sender: doer
@@ -1057,6 +1084,22 @@ rule ReopenRaisesHookEvent {
         commit_count: null,
         sender: doer
     )
+}
+
+-- pulls never emits issues/IssueClosed / IssueReopened for a pull request; a
+-- PR's close / reopen arrives as pulls/PullRequestClosed / PullRequestReopened
+-- (doer null when a repository deletion closed it: the deletion is announced instead).
+-- from: services/webhook/notifier.go:230
+rule PullRequestCloseRaisesHookEvent {
+    when: pulls/PullRequestClosed(pull_request, doer)
+    requires: doer != null
+    ensures: HookEventRaised(kind: pull_request, action: closed, source_repo: pull_request.issue.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
+}
+
+-- from: services/webhook/notifier.go:230
+rule PullRequestReopenRaisesHookEvent {
+    when: pulls/PullRequestReopened(pull_request, doer)
+    ensures: HookEventRaised(kind: pull_request, action: reopened, source_repo: pull_request.issue.repository, owner_user: null, owner_org: null, branch: null, commit_count: null, sender: doer)
 }
 
 -- Manual and automatic merges alike (pulls emits PullRequestMerged for
@@ -1382,6 +1425,41 @@ rule WorkflowRunCompletionRaisesHookEvent {
 rule WorkflowJobCompletionRaisesHookEvent {
     when: actions/WorkflowJobCompleted(job, prior_status)
     -- actions emits WorkflowJobCompleted only for final job statuses.
+    ensures: HookEventRaised(
+        kind: workflow_job_kind(job.status),
+        action: status_changed,
+        source_repo: job.run.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: job.run.trigger_user
+    )
+}
+
+-- A new run attempt (a run created, or re-run) and a new job attempt are
+-- announced with the status they start in (waiting or blocked); actions
+-- emits these apart from the *StatusChanged / *Completed triggers.
+-- from: services/webhook/notifier.go:926
+rule WorkflowRunAttemptRaisesHookEvent {
+    when: actions/WorkflowRunAttemptStarted(run)
+    requires: run.status in {blocked, cancelled, failure, running, skipped, success, waiting}
+    ensures: HookEventRaised(
+        kind: workflow_run_kind(run.status),
+        action: status_changed,
+        source_repo: run.repository,
+        owner_user: null,
+        owner_org: null,
+        branch: null,
+        commit_count: null,
+        sender: run.trigger_user
+    )
+}
+
+-- from: services/webhook/notifier.go:1023
+rule WorkflowJobAttemptRaisesHookEvent {
+    when: actions/WorkflowJobAttemptStarted(job)
+    requires: job.status in {blocked, cancelled, failure, running, skipped, success, waiting}
     ensures: HookEventRaised(
         kind: workflow_job_kind(job.status),
         action: status_changed,
@@ -1856,8 +1934,8 @@ deferred HookRequestRendering.render    -- see: services/webhook/ per-kind messa
 -- REQUEST code/Push.ref_updates with RefUpdate.{ref_kind, ref_name, is_deletion}; PushReceived also for refs updated by pull-mirror sync, and RefCreated / RefDeleted also emitted by mirror sync.
 -- REQUEST issues/Issue.milestone; issues/Comment.kind with value `comment` for plain conversation comments; IssueClosed must not be emitted for a merge.
 -- REQUEST pulls: PullRequestMerged is emitted for auto-merges as well (webhooks does not react to PullRequestAutoMerged); Review.{status, kind: ReviewVerdict, reviewer, pull_request}.
--- REQUEST packages/PackageVersion.package; packages/Package.repository?, owner_user?, owner_org?.
--- REQUEST actions: WorkflowRun.{status, repository, trigger_user}; Job.{status, run}.
+-- RESOLVED (packages): PackageVersion.package; Package.repository? (the optional link), owner_user / owner_org (derived from the registry).
+-- RESOLVED (actions): WorkflowRun.{status, repository, trigger_user}; Job.{status, run} are present.
 -- REQUEST migrations/Migration{repository}.doer: the sender of the repository/created event for a migration.
 -- REQUEST migrations (or whichever module owns the instance import addon): map stored Forgejo `gitea` / `gogs` webhooks onto kind `forgejo` on import (decided: webhooks 10).
 -- REQUEST administration: list the [webhook] retry settings max_delivery_attempts (default 3) and retry_backoff_base among the instance settings, and link the instance-wide delivery log (InstanceDeliveryLog) from site administration (decided: webhooks 8, 9).

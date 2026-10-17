@@ -56,6 +56,12 @@
 --   notifications/ActivityRecorded(activity)          -- public local activity -> Create(Note) to remote followers
 --   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)  -- forget the federated-user record
 --   repositories/RepositoryDeleted(repository, doer)  -- forget its following repos
+--   accounts/UserPurged(user)                         -- remove the account's federated identity (idempotent)
+--
+-- Read-only mode: a local person's writes here (following a remote person,
+-- setting a repository's following repos) are refused while
+-- access/InstanceWriteGate.read_only (decided: administration 3). Inbound
+-- activities from remote servers and the delivery queue are not gated here.
 --
 -- Black-box predicates. Qualified calls into sibling modules cannot yet be
 -- simulated, so the predicate this module needs is named locally:
@@ -749,6 +755,7 @@ rule UserLooksUpRemoteActor {
 -- from: services/federation/person_service.go:36
 rule UserFollowsRemoteActor {
     when: UserFollowsRemoteActor(user, target)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.enabled
     requires: user.kind in {individual, bot} and user.visibility = public
     requires: not exists OutboundFollow{follower: user, followed: target}
@@ -912,6 +919,7 @@ rule AttemptDelivery {
 -- from: routers/web/repo/setting/setting.go:397
 rule RepoAdminSetsFollowingRepos {
     when: RepoAdminSetsFollowingRepos(admin, target, remotes)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.enabled
     requires: is_repo_admin(admin, target)
     requires: following_input_length(remotes) <= config.max_following_repos_input_length
@@ -990,6 +998,39 @@ rule ForgetFederationStateOfDeletedLocalUser {
     ensures:
         for n in notes:
             not exists n
+}
+
+-- A purge (accounts/UserPurged, emitted again when a stalled purge is
+-- resumed) removes the account's federated identity before the account
+-- itself goes: for a remote person its FederatedUser record with its follows
+-- and notes; for a local user the remote followers, outbound follows,
+-- received notes and the actor key pair. Every step removes only what is
+-- still there, so a resumed purge finishes the rest.
+-- (accounts' purge_steps_complete(user) needs "no federated identity")
+rule PurgeFederatedIdentity {
+    when: accounts/UserPurged(user)
+    let federated = FederatedUser{user: user}
+    ensures:
+        if exists federated:
+            for f in federated.following:
+                not exists f
+            for o in federated.followed_by_locals:
+                not exists o
+            for n in federated.sent_notes:
+                not exists n
+            not exists federated
+    ensures:
+        for f in FederatedFollowers where followed = user:
+            not exists f
+    ensures:
+        for o in OutboundFollows where follower = user:
+            not exists o
+    ensures:
+        for n in FederatedActivities where recipient = user:
+            not exists n
+    ensures:
+        for k in ActorKeyPairs where owner = user:
+            not exists k
 }
 
 -- NodeInfo usage figures are recomputed at most every
@@ -1358,7 +1399,7 @@ deferred ActorIdParsing.rules    -- see: modules/forgefed/actor.go, actor_person
 -- REQUEST accounts/User.email_notifications: materialised remote users have e-mail notifications disabled.
 -- REQUEST accounts/User: creation of kind activitypub must accept fediverse handles ("@name@host[:port]") that local name rules would reject, and reserve the name "actor" for the instance actor.
 -- REQUEST repositories/Star.user, repositories/Star.repository: federated Like creates a Star; local Star creation triggers outbound Like.
--- REQUEST notifications/ActivityRecorded(activity): must fire once per action (not per watcher copy) for federation fan-out.
+-- RESOLVED (notifications): ActivityRecorded(activity) fires once per recorded activity (AnnounceActivity; decided notifications 6).
 -- REQUEST access/is_repo_admin(user, repository): repository settings gate.
 -- REQUEST authentication: activitypub routes accept tokens only with read:activitypub / write:activitypub scope; user-id routes honour public-only tokens.
 -- REQUEST repositories/RepositoryUnstarred(user, repository): local unstar triggers outbound Undo(Like) (decided: federation 5); a federated Undo(Like) deletes the remote person's Star directly.

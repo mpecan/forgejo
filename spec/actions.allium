@@ -43,11 +43,12 @@
 -- Emits:
 --   WorkflowRunAttemptStarted(run)                     -- a run was created or re-run
 --   WorkflowRunStatusChanged(run, prior_status)        -- non-final status change
---   WorkflowRunCompleted(run, prior_status)            -- run reached a final status
+--   WorkflowRunCompleted(run, prior_status)            -- run reached a final status, once per attempt;
+--       -- notifications mails the trigger user once per failed attempt when
+--       -- run.notify_email (decided: notifications 4)
 --   WorkflowJobAttemptStarted(job)                     -- a job was created or re-run
 --   WorkflowJobStatusChanged(job, prior_status)        -- non-final job status change
---   WorkflowJobCompleted(job, prior_status)            -- job reached a final status;
---       -- notifications mails the trigger user on failure when run.notify_email
+--   WorkflowJobCompleted(job, prior_status)            -- job reached a final status
 --   JobCommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
 --       -- creator = the Actions bot; code reacts and records the CommitStatus
 --       -- exactly as the commit-status API does
@@ -76,6 +77,7 @@
 --   issues/IssueOpened(issue, mentions), issues/IssueTitleChanged(issue, doer, old_title),
 --   issues/IssueContentChanged(issue, doer, old_content),
 --   issues/IssueClosed(issue, doer, comment), issues/IssueReopened(issue, doer, comment),
+--   pulls/PullRequestClosed(pull_request, doer), pulls/PullRequestReopened(pull_request, doer),
 --   issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment),
 --   issues/IssueMilestoneChanged(issue, doer, old_milestone),
 --   issues/IssueLabelsChanged(issue, doer, added, removed), issues/IssueLabelsCleared(issue, doer)
@@ -88,7 +90,7 @@
 --   pulls/PullRequestTargetBranchChanged(pull_request, doer, old_base_branch)
 --   releases/ReleasePublished(release), releases/ReleaseUpdated(release, doer),
 --   releases/ReleaseDeleted(release, doer), releases/ReleaseUnpublished(release, doer)
---   packages/PackageVersionCreated(version, publisher), packages/PackageVersionDeleted(version, doer)
+--   packages/PackageVersionCreated(version, publisher), packages/PackageVersionDeleted(version, package, doer)
 --   wiki/WikiPageCreated(repository, doer, page), wiki/WikiPageEdited(repository, doer, page),
 --   wiki/WikiPageDeleted(repository, doer, page)
 --   administration scheduled tasks (cron "run now" and the timer alike):
@@ -98,6 +100,29 @@
 --   OfflineRunnerCleanupDue(older_than, global_scope_only). Each sweep emits the
 --   same per-item internal trigger as the matching temporal rule, so the work
 --   is described once, in the rule that consumes that trigger.
+--
+-- Read-only mode: every rule a person triggers here (approving runs, trust,
+-- runners, registration tokens, secrets, variables, cancelling, re-running,
+-- deleting, prioritising, dispatching, enabling and disabling workflows,
+-- deleting artifacts) is refused while access/InstanceWriteGate.read_only,
+-- except the instance scope's runners and variables, which are managed from
+-- the site administration console (decided: administration 3; admin pages
+-- stay writable). The runner protocol and the running job's own requests are
+-- not people's writes and are not gated here; a job's git pushes go through
+-- code's gate.
+--
+-- Black boxes standing for other modules' contracts:
+--   quota_allows_artifacts(repository) = quota/quota_allows(<the repository
+--       owner's QuotaAccount>, size_assets_artifacts, null): QuotaGate
+--       gate_artifact_upload, charged to the repository owner. The size of an
+--       artifact is not known when it is created (it is reported on
+--       finalisation), so no incoming size is counted (quota 2 applies where
+--       the size is known up front).
+-- Provided to other modules:
+--   the automatic token of a running task (Task.token_is_usable) stands for
+--   the repository task.job.run.repository and nothing else (decided: access
+--   6); packages' job_repository(credential) is that repository, and
+--   Task.token_repository_access is "read" for fork pull-request runs.
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -813,6 +838,23 @@ rule IssueReopenedStartsWorkflows {
             ForgeEventObserved(repository: issue.repository, doer: doer, event: issues, activity: "reopened", ref: null, commit_sha: null, pull_request: null)
 }
 
+-- pulls never emits issues/IssueClosed / IssueReopened for a pull request; a
+-- PR's close / reopen arrives as pulls/PullRequestClosed / PullRequestReopened
+-- (doer null when a repository deletion closed it: its runs go with the repository).
+-- from: services/actions/notifier.go:114
+rule PullRequestClosedStartsWorkflows {
+    when: pulls/PullRequestClosed(pull_request, doer)
+    requires: doer != null
+    ensures: ForgeEventObserved(repository: pull_request.issue.repository, doer: doer, event: pull_request, activity: "closed", ref: null, commit_sha: null, pull_request: pull_request)
+    ensures: PullRequestClosedForActions(pull_request: pull_request)
+}
+
+-- from: services/actions/notifier.go:114
+rule PullRequestReopenedStartsWorkflows {
+    when: pulls/PullRequestReopened(pull_request, doer)
+    ensures: ForgeEventObserved(repository: pull_request.issue.repository, doer: doer, event: pull_request, activity: "reopened", ref: null, commit_sha: null, pull_request: pull_request)
+}
+
 -- from: services/actions/notifier.go:169
 rule AssigneeChangeStartsWorkflows {
     when: issues/IssueAssigneeChanged(issue, doer, assignee, removed, comment)
@@ -1397,6 +1439,7 @@ rule ApproveRun {
 -- from: services/actions/trust.go:300
 rule UserApprovesPullRequestRuns {
     when: UserApprovesPullRequestRunsOnce(user, pull_request)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_delegate_actions_trust(user, pull_request.base_repository)
     ensures:
         for run in WorkflowRuns where pull_request = pull_request and needs_approval = true:
@@ -1407,6 +1450,7 @@ rule UserApprovesPullRequestRuns {
 -- from: services/actions/trust.go:255
 rule UserAlwaysTrustsPoster {
     when: UserAlwaysTrustsPullRequestPoster(user, pull_request)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_delegate_actions_trust(user, pull_request.base_repository)
     let poster = pull_request.issue.poster
     ensures: TrustedContributor.created(
@@ -1425,6 +1469,7 @@ rule UserAlwaysTrustsPoster {
 -- from: services/actions/trust.go:285
 rule UserDeniesPullRequestRuns {
     when: UserDeniesPullRequestRuns(user, pull_request)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_delegate_actions_trust(user, pull_request.base_repository)
     ensures:
         for run in WorkflowRuns where pull_request = pull_request
@@ -1436,6 +1481,7 @@ rule UserDeniesPullRequestRuns {
 -- from: services/actions/trust.go:240
 rule UserRevokesPosterTrust {
     when: UserRevokesPullRequestPosterTrust(user, pull_request)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_delegate_actions_trust(user, pull_request.base_repository)
     let poster = pull_request.issue.poster
     ensures:
@@ -1513,6 +1559,7 @@ rule RunnerRegisters {
 -- from: routers/web/shared/actions/runners.go:252
 rule UserCreatesRunner {
     when: UserCreatesRunnerInScope(user, scope, name, description, is_ephemeral)
+    requires: scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage_actions_scope(user, scope)
     requires: valid_runner_name(name)
     ensures: Runner.created(
@@ -1546,6 +1593,7 @@ rule RunnerDeclaresCapabilities {
 -- from: routers/web/shared/actions/runners.go:319
 rule UserEditsRunner {
     when: UserEditsRunnerDetails(user, runner, name, description)
+    requires: runner.scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage_actions_scope(user, runner.scope)
     requires: valid_runner_name(name)
     ensures:
@@ -1558,6 +1606,7 @@ rule UserEditsRunner {
 -- from: routers/web/shared/actions/runners.go:374
 rule UserRegeneratesRunnerToken {
     when: UserRegeneratesRunnerSecret(user, runner)
+    requires: runner.scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage_actions_scope(user, runner.scope)
     ensures: runner.token = new_secret_token()
 }
@@ -1565,6 +1614,7 @@ rule UserRegeneratesRunnerToken {
 -- from: routers/web/shared/actions/runners.go:407
 rule UserDeletesRunner {
     when: UserDeletesRunnerFromScope(user, runner)
+    requires: runner.scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage_actions_scope(user, runner.scope)
     ensures: not exists runner
     @guidance
@@ -1578,6 +1628,7 @@ rule UserDeletesRunner {
 -- from: models/actions/runner_token.go:60
 rule UserResetsRegistrationToken {
     when: UserRequestsNewRegistrationToken(user, scope)
+    requires: scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage_actions_scope(user, scope)
     ensures:
         for old in scope.registration_tokens:
@@ -1774,6 +1825,7 @@ rule RunnerSubmitsStepSummary {
 -- from: routers/web/repo/actions/view.go:633
 rule UserCancelsRun {
     when: UserCancelsWorkflowRun(user, run)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_actions(user, run.repository)
     requires: run.status in {waiting, blocked, running}
     ensures: RunKillRequested(run: run, as_failure: false)
@@ -1784,6 +1836,7 @@ rule UserCancelsRun {
 -- from: services/actions/rerun.go:50
 rule UserRerunsRun {
     when: UserRerunsWorkflowRun(user, run)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_actions(user, run.repository)
     requires: run.pre_execution_error = null
     requires: run.status in {success, failure, cancelled, skipped}
@@ -1819,6 +1872,7 @@ rule UserRerunsRun {
 -- from: services/actions/rerun.go:118
 rule UserRerunsJob {
     when: UserRerunsWorkflowJob(user, job)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_actions(user, job.run.repository)
     requires: job.run.pre_execution_error = null
     requires: job.status in {success, failure, cancelled, skipped}
@@ -1857,6 +1911,7 @@ rule RerunSingleJob {
 -- from: services/actions/run.go:310
 rule UserDeletesRun {
     when: UserDeletesWorkflowRun(user, run)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(user, run.repository)
     requires: run.status in {success, failure, cancelled, skipped}
     ensures:
@@ -1899,6 +1954,7 @@ rule PruneRun {
 -- from: services/actions/run.go:345
 rule UserPrioritizesRun {
     when: UserPrioritizesWorkflowRun(user, run)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_actions(user, run.repository)
     requires: run.status in {waiting, blocked}
     requires: not run.prioritized
@@ -1910,6 +1966,7 @@ rule UserPrioritizesRun {
 -- from: services/actions/run.go:370
 rule UserDeprioritizesRun {
     when: UserDeprioritizesWorkflowRun(user, run)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_actions(user, run.repository)
     requires: run.prioritized
     ensures:
@@ -1922,6 +1979,7 @@ rule UserDeprioritizesRun {
 -- from: routers/web/repo/actions/view.go:880
 rule UserDisablesWorkflow {
     when: UserDisablesWorkflowFile(user, workflow)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(user, workflow.repository)
     ensures: workflow.is_disabled = true
 }
@@ -1929,6 +1987,7 @@ rule UserDisablesWorkflow {
 -- from: routers/web/repo/actions/view.go:880
 rule UserEnablesWorkflow {
     when: UserEnablesWorkflowFile(user, workflow)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(user, workflow.repository)
     ensures: workflow.is_disabled = false
 }
@@ -1939,6 +1998,7 @@ rule UserEnablesWorkflow {
 -- from: services/actions/workflows.go:79
 rule UserDispatchesWorkflow {
     when: UserDispatchesWorkflowRun(user, workflow, ref, inputs)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_actions(user, workflow.repository)
     requires: not workflow.repository.is_archived
     requires: not workflow.repository.is_empty
@@ -2051,6 +2111,7 @@ rule TaskFinalizesArtifact {
 -- from: routers/web/repo/actions/view.go:761
 rule UserDeletesArtifact {
     when: UserDeletesRunArtifact(user, artifact)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_actions(user, artifact.run.repository)
     requires: artifact.status = upload_confirmed
     ensures: artifact.status = pending_deletion
@@ -2261,6 +2322,7 @@ rule TaskRequestsIdToken {
 -- from: services/secrets/secrets.go:13
 rule UserSetsSecret {
     when: UserSetsActionsSecret(user, scope, name, value)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage_actions_scope(user, scope)
     requires: scope.kind != instance
     requires: valid_secret_name(name)
@@ -2280,6 +2342,7 @@ rule UserSetsSecret {
 -- from: services/secrets/secrets.go:47
 rule UserDeletesSecret {
     when: UserDeletesActionsSecret(user, secret)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage_actions_scope(user, secret.scope)
     ensures: not exists secret
 }
@@ -2287,6 +2350,7 @@ rule UserDeletesSecret {
 -- from: services/actions/variables.go:17
 rule UserCreatesVariable {
     when: UserCreatesActionsVariable(user, scope, name, value)
+    requires: scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage_actions_scope(user, scope)
     requires: valid_variable_name(name)
     requires: existing_variable(scope, name) = null
@@ -2300,6 +2364,7 @@ rule UserCreatesVariable {
 -- from: services/actions/variables.go:30
 rule UserUpdatesVariable {
     when: UserUpdatesActionsVariable(user, variable, name, value)
+    requires: variable.scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage_actions_scope(user, variable.scope)
     requires: valid_variable_name(name)
     ensures:
@@ -2311,6 +2376,7 @@ rule UserUpdatesVariable {
 -- from: services/actions/variables.go:47
 rule UserDeletesVariable {
     when: UserDeletesActionsVariable(user, variable)
+    requires: variable.scope.kind = instance or not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage_actions_scope(user, variable.scope)
     ensures: not exists variable
 }
@@ -3144,11 +3210,11 @@ deferred ScheduleSpec.next_cron_occurrence  -- see: github.com/gdgvda/cron (5-fi
 -- REQUEST issues: Issue.pull_request, Issue.milestone, Comment.issue (used to route issue vs pull-request activity).
 -- REQUEST pulls/PullRequest.is_fork (head repository differs from base), .head_commit_sha (present), pull_ref(pr) = refs/pull/<index>/head, merge_commit_of(pr) = merged_commit_sha.
 -- REQUEST releases/Release.publisher, .tag_name, .repository.
--- REQUEST packages/PackageVersion.package.repository (optional link).
--- REQUEST quota: quota_allows_artifacts(repository) = the repository owner's quota allows the artifacts subject; Artifact.compressed_size is provided for QuotaUsage.
--- REQUEST notifications: react to WorkflowJobCompleted(job, prior) — when the job failed and job.run.notify_email, mail the trigger user (repository owner for system-triggered runs) unless they disabled email notifications.
--- REQUEST webhooks: also react to WorkflowRunCompleted / WorkflowJobCompleted / WorkflowRunAttemptStarted / WorkflowJobAttemptStarted (this module splits final transitions out of *StatusChanged).
+-- RESOLVED (packages): PackageVersion.package.repository is the optional link (packages/Package.repository).
+-- RESOLVED (quota): quota_allows_artifacts(repository) is quota/quota_allows(<owner account>, size_assets_artifacts, null) (QuotaGate gate_artifact_upload; see the header); Artifact.compressed_size feeds QuotaUsage.artifacts.
+-- RESOLVED (notifications): superseded by decided notifications 4 — notifications mails once per failed run attempt on WorkflowRunCompleted(run, prior_status) (MailOnActionsRunFailed), never on job completion.
+-- RESOLVED (webhooks): webhooks reacts to WorkflowRunCompleted / WorkflowJobCompleted and to WorkflowRunAttemptStarted / WorkflowJobAttemptStarted (Workflow*AttemptRaisesHookEvent).
 -- REQUEST administration: cron tasks stop_zombie_tasks (5m), stop_endless_tasks (30m), cancel_abandoned_jobs (6h), transfer_lingering_logs (midnight), start_schedule_tasks (1m), cleanup_actions (midnight), cleanup_offline_runners (disabled by default), actions_action_user (weekly); none registered when actions are disabled. Admin web pages /-/admin/actions/{runners,variables} map to ActionsSettings with the instance scope.
--- REQUEST notifications: react to ScheduledWorkflowDisabledForInactivity(repository, workflow_file) by telling the repository's admins (decided actions 8).
+-- RESOLVED (notifications): MailOnScheduledWorkflowDisabled mails the repository's admins on ScheduledWorkflowDisabledForInactivity (decided actions 8).
 -- REQUEST administration: cleanup_actions also prunes finished runs older than [actions] run retention when run pruning is enabled (decided actions 7, off by default); new [actions] settings registration_token_lifetime (1h), run_pruning_enabled/run_retention, schedule_inactivity_disable_enabled/schedule_inactivity_period.
 -- REQUEST access: may_manage_actions_scope for a repository scope is is_repo_admin on web and REST alike (decided actions 2).
