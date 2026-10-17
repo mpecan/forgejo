@@ -146,3 +146,17 @@ invariants or config. Numbers refer to the question's position in its module in
 | 9 | Projects API | **Everything the web offers** is in the API too. |
 | 10 | Templates longer than the column cap | **A configuration error** at startup. |
 | 11 | Reordering cards the actor can't read | **Filtered:** a reorder only moves cards whose issues the actor can read. |
+
+## releases
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Publishing a draft whose tag exists | **Emits `ReleasePublished`,** like every draft-to-published change. |
+| 2 | Un-publishing | **A new `ReleaseUnpublished` event** on every published-to-draft change (by edit or by the tag being deleted), for webhooks and feeds. |
+| 3 | A pushed tag reviving a draft | **Emits `ReleasePublished`.** |
+| 4 | Retargeting a published release | **Drafts only.** A published release's tag is fixed; un-publish first to change it. |
+| 5 | Deleting a never-tagged draft | **Removes the record entirely.** |
+| 6 | Deleting a tag that has a published release | **Refused** (settled by code decision 7); delete the release first. |
+| 7 | Attachment size limit | **Enforced on every upload path.** |
+| 8 | Release changes on archived repositories | **All frozen,** deletes included. |
+| 9 | Permission to create a bare tag | **Code write,** wherever it happens; protected-tag rules apply. |

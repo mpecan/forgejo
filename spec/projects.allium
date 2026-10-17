@@ -18,9 +18,10 @@
 --     "deleted project" placeholder when the referenced board no longer exists).
 --   - Issue list filtering by project ("in project X" / "in no project"):
 --     owned by issues/discovery; they read ProjectCard.
---   - A REST API: Forgejo has no project endpoints in routers/api/v1 (only the
---     `has_projects` repo flag, owned by repositories). The rebuild should add one;
---     the capability surfaces below are written to cover web and API alike.
+--   - REST API routing details: Forgejo has no project endpoints in routers/api/v1
+--     (only the `has_projects` repo flag, owned by repositories). Decided: the
+--     rebuild's API offers everything the web does — every `provides` and every
+--     `exposes` of the surfaces below (see each surface's @guidance).
 --   - Legacy cards with no column (pre-1.22 data shown in the default column):
 --     a data-import concern, not behaviour.
 --   - Webhooks/notifications/activity for board changes: Forgejo emits none;
@@ -45,6 +46,11 @@
 --
 -- Reacts to:
 --   repositories/RepositoryDeleted(repository)  -- delete the repository's boards
+--   repositories/RepositoryTransferred(repository, doer, old_owner_name)
+--       -- drop the repository's issues from the old owner's boards
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+--       -- delete the user's own boards
+--   organizations/OrganizationDeleted(organization)  -- delete the organization's boards
 --   issues/IssueDeleted(issue)                  -- remove the issue's card
 --   issues/IssueCreatedWithProject(issue, poster, project)
 --       -- the new-issue / new-pull-request form may pick a board; issues emits
@@ -92,7 +98,7 @@ entity Project {
     status: open | closed
     created_at: Timestamp
     updated_at: Timestamp
-    closed_at: Timestamp when status = closed
+    closed_at: Timestamp when status = closed   -- set on close, cleared on reopen
 
     transitions status {
         open -> closed
@@ -184,8 +190,10 @@ config {
     project_list_page_size: Integer = 20
     -- True when [repository] DISABLED_REPO_UNITS contains "repo.projects".
     -- Mirrors a repositories-owned setting; see REQUEST below.
+    -- decided: one switch disables all boards — repository, user and organization
+    -- (Forgejo exempted owner boards via ignoreGlobal=true).
     -- from: routers/web/repo/projects.go:41
-    repository_projects_globally_disabled: Boolean = false
+    projects_globally_disabled: Boolean = false
 }
 
 ------------------------------------------------------------
@@ -196,7 +204,7 @@ config {
 -- from: routers/web/repo/projects.go:164
 rule UserCreatesRepositoryProject {
     when: UserCreatesRepositoryProject(user, repo, title, description, template, card_type)
-    requires: not config.repository_projects_globally_disabled
+    requires: not config.projects_globally_disabled
     requires: can_write_projects(user, repo)
     requires: not repo.is_archived
     requires: length(title) >= 1 and length(title) <= config.max_project_title_length
@@ -223,6 +231,8 @@ rule UserCreatesRepositoryProject {
 -- from: routers/web/web.go:1268
 rule UserCreatesUserProject {
     when: UserCreatesUserProject(user, title, description, template, card_type)
+    -- decided: the global switch disables user boards too
+    requires: not config.projects_globally_disabled
     requires: user.kind = individual
     requires: length(title) >= 1 and length(title) <= config.max_project_title_length
     ensures:
@@ -248,6 +258,8 @@ rule UserCreatesUserProject {
 -- from: routers/web/org/projects.go:177
 rule UserCreatesOrgProject {
     when: UserCreatesOrgProject(user, org, title, description, template, card_type)
+    -- decided: the global switch disables organization boards too
+    requires: not config.projects_globally_disabled
     requires: can_write_org_projects(user, org)
     requires: length(title) >= 1 and length(title) <= config.max_project_title_length
     ensures:
@@ -304,6 +316,11 @@ rule SeedColumnsFromTemplate {
 ------------------------------------------------------------
 
 -- Edit title, description and card type. The template cannot be changed.
+-- Editing never touches status: a closed board stays closed (Forgejo's owner
+-- board edit form sent status=open and reopened it). An empty description
+-- clears the description (Forgejo ignored an empty one).
+-- decided: editing never changes whether a board is open or closed (Forgejo reopening owner boards is a bug)
+-- decided: an empty description clears it (Forgejo ignoring it is a bug)
 -- from: services/project/project.go:192
 rule UserEditsProject {
     when: UserEditsProject(user, project, title, description, card_type)
@@ -334,6 +351,8 @@ rule UserReopensProject {
     requires: may_manage(user, project)
     requires: project.status = closed
     ensures: project.status = open
+    -- decided: closed_at is cleared on reopen; it is kept only while closed
+    ensures: project.closed_at = null
     ensures: ProjectReopened(project: project, actor: user)
 }
 
@@ -366,6 +385,51 @@ rule RepositoryDeletionRemovesProjects {
             for column in project.columns:
                 not exists column
         ensures: not exists project
+}
+
+-- Deleting a user account deletes the boards on that user's profile with
+-- their columns and cards (Forgejo left them orphaned).
+-- decided: boards are deleted with their owner; projects reacts to the owner-deletion events
+-- from: services/user/delete.go:36
+rule UserDeletionRemovesProjects {
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+    for project in Projects where owner_user = user:
+        ensures:
+            for card in project.cards:
+                not exists card
+        ensures:
+            for column in project.columns:
+                not exists column
+        ensures: not exists project
+}
+
+-- Deleting an organization deletes its boards with their columns and cards
+-- (Forgejo left them orphaned).
+-- decided: boards are deleted with their owner; projects reacts to the owner-deletion events
+-- from: services/org/org.go:22
+rule OrganizationDeletionRemovesProjects {
+    when: organizations/OrganizationDeleted(organization)
+    for project in Projects where owner_org = organization:
+        ensures:
+            for card in project.cards:
+                not exists card
+        ensures:
+            for column in project.columns:
+                not exists column
+        ensures: not exists project
+}
+
+-- When a repository moves to a new owner, its issues leave the old owner's
+-- user or organization boards (they no longer accept them). Cards on the
+-- repository's own boards move with it. No IssueProjectChanged is emitted.
+-- decided: cards are removed from the old owner's boards when the repository moves (keeps CardIssueInScope)
+-- from: services/repository/transfer.go:68
+rule RepositoryTransferRemovesOwnerBoardCards {
+    when: repositories/RepositoryTransferred(repository, doer, old_owner_name)
+    for card in ProjectCards where project.owner_kind in {individual, organization}:
+        ensures:
+            if card.issue.repository = repository:
+                not exists card
 }
 
 -- Deleting an issue removes its card.
@@ -465,9 +529,12 @@ rule UserReordersColumns {
 
 -- Drag-and-drop: put the listed cards into `column` in the given order (from
 -- the top). Every listed card must already be on this board (an issue is put
--- on a board only from the issue side); cards of other columns move here. Cards already in the column but not listed keep their
--- relative order and follow after the listed ones. Issues that no longer exist
--- are skipped with a warning.
+-- on a board only from the issue side); cards of other columns move here.
+-- Only cards whose issue the actor can read are moved; the others in the list
+-- are ignored. Cards already in the column but not moved keep their relative
+-- order and follow after the moved ones. Issues that no longer exist are
+-- skipped with a warning. A closed board's existing cards can still be moved.
+-- decided: a reorder only moves cards whose issues the actor can read
 -- from: models/project/issue.go:94
 rule UserMovesCards {
     when: UserMovesCards(user, column, ordering)
@@ -475,14 +542,15 @@ rule UserMovesCards {
     requires: may_manage(user, board)
     requires: distinct(ordering)
     requires: (ordering where project = board).count = ordering.count
-    let unlisted = column.cards - ordering
+    let readable = ordering where may_see_card(user, this)
+    let unlisted = column.cards - readable
     ensures:
-        for card in ordering:
+        for card in readable:
             card.column = column
-            card.position = index_of(ordering, card)
+            card.position = index_of(readable, card)
     ensures:
         for card in unlisted:
-            card.position = ordering.count + rank_of(unlisted, card)
+            card.position = readable.count + rank_of(unlisted, card)
     ensures: ProjectCardsMoved(column: column, actor: user)
 }
 
@@ -490,17 +558,24 @@ rule UserMovesCards {
 -- sidebar, new-issue/new-PR form, or the bulk action on the issue list.
 -- An issue is on at most one board: any existing card is removed first. The
 -- new card goes to the bottom of the board's default column; if the board has
--- no column yet, a default column is created for it.
--- Permission depends on the board's owner kind:
---   repository board:   projects unit enabled and readable, and write on the issue's unit
---   organization board: org projects unit readable, and org issues unit writable
---   user board:         write on the issue's unit
+-- no column yet, a default column is created for it. A closed board accepts
+-- no new cards (Forgejo allowed it).
+-- Permission depends on the board's owner kind (triage = may_write_issue):
+--   repository board:   projects unit enabled and readable, and triage on the issue
+--   organization board: write on the org projects unit, and triage on the issue
+--                       in its repository (Forgejo asked for the org issues unit)
+--   user board:         triage on the issue
+-- decided: adding an issue to an organization board needs board write plus triage on the issue in its repository
+-- decided: a closed board accepts no new cards; existing cards can still move
 -- from: models/issues/issue_project.go:103
 rule UserAssignsIssueToProject {
     when: UserAssignsIssueToProject(user, issue, project)
+    requires: not config.projects_globally_disabled
     requires: not issue.repository.is_archived
     requires: may_write_issue(user, issue)
+    requires: project.status = open
     requires: project.accepts_issue(issue)
+    requires: project.owner_kind != organization or can_write_org_projects(user, project.owner_org)
     requires: may_assign_to(user, issue, project)
     let existing = ProjectCard{issue: issue}
     requires: not exists existing or existing.project != project
@@ -546,9 +621,12 @@ rule UserRemovesIssueFromProject {
 -- The new-issue / new-pull-request form may name a board; the same checks as
 -- an explicit assignment apply (a failing check rejects the whole creation in
 -- Forgejo, decided by issues before it emits this).
+-- decided: a closed board accepts no new cards
 -- from: routers/web/repo/issue.go:1209
 rule IssueCreatedOnProject {
     when: issues/IssueCreatedWithProject(issue, poster, project)
+    requires: not config.projects_globally_disabled
+    requires: project.status = open
     requires: project.accepts_issue(issue)
     let target = ProjectColumn{project: project, is_default: true}
     let has_default = exists target
@@ -580,18 +658,18 @@ rule IssueCreatedOnProject {
 -- (local names because qualified calls cannot be evaluated by the journey walker)
 --
 
--- may_manage(user, project):
---   repository board:   not config.repository_projects_globally_disabled
---                       and access/can_write(user, project.owner_repository, projects)
+-- may_manage(user, project): never when config.projects_globally_disabled
+-- (decided: one switch disables all boards), and otherwise
+--   repository board:   access/can_write(user, project.owner_repository, projects)
 --                       and not project.owner_repository.is_archived
 --   organization board: organizations/can_write_unit(user, project.owner_org, projects)
 --   user board:         user = project.owner_user
 --   (repository owners/admins pass via access/can_write.)
 -- from: routers/web/web.go:1651
 --
--- may_view(viewer, project) (viewer may be anonymous):
---   repository board:   not config.repository_projects_globally_disabled
---                       and access/can_read(viewer, project.owner_repository, projects)
+-- may_view(viewer, project) (viewer may be anonymous): never when
+-- config.projects_globally_disabled, and otherwise
+--   repository board:   access/can_read(viewer, project.owner_repository, projects)
 --   organization board: organizations/can_read_unit(viewer, project.owner_org, projects)
 --                       (team members: their teams' projects access; others:
 --                       read when the org is public, or limited and signed in)
@@ -604,8 +682,9 @@ rule IssueCreatedOnProject {
 --   access/can_write(user, issue.repository, issues) otherwise.
 -- from: routers/web/web.go:1473
 --
--- may_assign_to(user, issue, project): the per-owner-kind check in
---   UserAssignsIssueToProject.
+-- may_assign_to(user, issue, project): the rest of the per-owner-kind check in
+--   UserAssignsIssueToProject (repository board: its projects unit enabled and
+--   readable by the user); the organization-board write is checked there explicitly.
 -- from: services/context/project.go:65
 --
 -- may_see_card(viewer, card): the viewer can read card.issue (its repository
@@ -632,11 +711,21 @@ invariant ExactlyOneDefaultColumn {
         p.columns.count > 0 implies p.default_column != null
 }
 
--- Column count limit (templates stay within it with the default config).
+-- Column count limit (templates stay within it; see TemplatesFitColumnCap).
 -- from: models/project/column.go:139
 invariant ColumnLimit {
     for p in Projects:
         p.columns.count <= config.max_columns_per_project
+}
+
+-- Every template, with its default column, fits under the column cap. A
+-- configuration that breaks this is a configuration error: the server refuses
+-- to start (Forgejo seeded past the cap).
+-- decided: a template longer than the column cap is a configuration error at startup
+-- from: modules/setting/project.go:12
+invariant TemplatesFitColumnCap {
+    config.basic_kanban_columns.count + 1 <= config.max_columns_per_project
+    and config.bug_triage_columns.count + 1 <= config.max_columns_per_project
 }
 
 -- Column positions are unique within a board.
@@ -703,7 +792,8 @@ surface RepositoryProjectList {
 
     @guidance
         -- Web: GET /{owner}/{repo}/projects, GET+POST /{owner}/{repo}/projects/new.
-        -- API: none in Forgejo; a rebuild should expose list/create here.
+        -- API: every provides (and exposes) here is also offered by the REST API
+        -- (decided; Forgejo has none).
 }
 
 -- The board list on a user profile.
@@ -722,15 +812,16 @@ surface UserProjectList {
 
     provides:
         UserCreatesUserProject(viewer, title, description, template, card_type)
-            when viewer = owner
+            when viewer = owner and not config.projects_globally_disabled
 
     @guarantee VisibilityFollowsOwner
         -- Visible to anyone when the owner is public, to signed-in users when
         -- limited, and only to the owner and site administrators when private.
-        -- Not affected by the global disable of the repository projects unit.
+        -- Hidden, like every board, when the projects unit is globally disabled.
 
     @guidance
         -- Web: GET /{username}/-/projects, GET+POST /{username}/-/projects/new.
+        -- API: every provides (and exposes) here is also offered by the REST API.
 }
 
 -- The board list of an organization.
@@ -749,7 +840,7 @@ surface OrgProjectList {
 
     provides:
         UserCreatesOrgProject(viewer, org, title, description, template, card_type)
-            when can_write_org_projects(viewer, org)
+            when can_write_org_projects(viewer, org) and not config.projects_globally_disabled
 
     @guarantee TeamUnitAccess
         -- Members see and manage boards per their teams' access to the
@@ -758,6 +849,7 @@ surface OrgProjectList {
 
     @guidance
         -- Web: GET /{org}/-/projects, GET+POST /{org}/-/projects/new.
+        -- API: every provides (and exposes) here is also offered by the REST API.
 }
 
 -- A single board with its columns and cards, and every management action.
@@ -827,6 +919,7 @@ surface ProjectBoard {
         -- POST /{columnID}/default; POST /{columnID}/move move cards).
         -- Web (user/org): the same under /{owner}/-/projects/{id}.
         -- Board management in a repository is refused while it is archived.
+        -- API: every provides (and exposes) here is also offered by the REST API.
 }
 
 -- The project picker on an issue or pull request.
@@ -846,12 +939,14 @@ surface IssueProjectPicker {
     provides:
         UserAssignsIssueToProject(viewer, issue, project)
             when may_write_issue(viewer, issue) and not issue.repository.is_archived
+                and project.status = open
         UserRemovesIssueFromProject(viewer, issue)
             when may_write_issue(viewer, issue) and not issue.repository.is_archived
 
     @guarantee PickerOffersOwnerAndRepoBoards
-        -- Offers open and (separately) closed boards of the issue's repository
-        -- plus those of the repository's owner (user or organization). The
+        -- Offers open boards of the issue's repository plus those of the
+        -- repository's owner (user or organization); closed boards are listed
+        -- (the current one may be closed) but cannot be chosen. The
         -- picker is shown when the repository's projects unit is writable by
         -- the viewer or the owner has boards and owner boards are enabled.
         -- The bulk action on the issue list applies to several issues and
@@ -860,35 +955,20 @@ surface IssueProjectPicker {
     @guidance
         -- Web: POST /{owner}/{repo}/issues/projects?issue_ids=..&id=<project|0>
         -- (id 0 removes). New issue/PR forms take project_id.
+        -- API: every provides (and exposes) here is also offered by the REST API.
 }
-
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Editing a user/org board in Forgejo also forces it open (the edit form sends status=open), so editing a closed owner board silently reopens it; repository boards do not. Treat as a bug (spec says edit never changes status)?"
-open question "Forgejo ignores an empty description on edit, so a description can never be cleared once set. The spec allows clearing; confirm."
-open question "User/organization boards ignore DISABLED_REPO_UNITS=repo.projects (routes pass ignoreGlobal=true) while repository boards honour it. Should a global switch disable all boards?"
-open question "Assigning an issue to an organization board needs write on the organization's issues unit (team-level), not on the issue's repository; a repo collaborator without team membership cannot use org boards. Intended?"
-open question "Projects of a deleted user or organization are not deleted in Forgejo (orphaned). The rebuild should delete them with their owner; confirm and decide which module owns the reaction."
-open question "When a repository is transferred to a new owner, cards on the old owner's boards are kept even though the board no longer accepts the issue (CardIssueInScope breaks). Remove such cards on transfer?"
-open question "Closed boards remain assignable from the issue picker. Should a closed board refuse new cards?"
-open question "Forgejo stores closed_at on reopen too and never clears it. The spec keeps closed_at only while closed."
-open question "There is no REST API for projects in Forgejo. Which operations should the rebuild's API expose (likely all surface provides)?"
-open question "Template seeding with a configured column list longer than max_columns_per_project - 1 bypasses the column cap in Forgejo. Cap the template, or reject the config?"
-open question "Moving cards via drag-and-drop on a repository board requires each issue to be from that repository; on owner boards from any repository of the owner. Should the reorder also be filtered to issues the actor can read?"
 
 ------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
 
 -- REQUEST repositories/RepositoryDeleted(repository, doer): trigger emitted when a repository is deleted, so boards can be removed.
--- REQUEST repositories/config.disabled_repo_units: the instance-wide disabled units list; this module mirrors "repo.projects" as config.repository_projects_globally_disabled.
+-- REQUEST repositories/config.disabled_repo_units: the instance-wide disabled units list; this module mirrors "repo.projects" as config.projects_globally_disabled.
 -- REQUEST issues/IssueDeleted(issue, doer): trigger emitted when an issue/PR is deleted, so its card is removed.
 -- REQUEST issues/IssueCreatedWithProject(issue, poster, project): emitted by issue/PR creation when the form named a board (after the permission checks in may_assign_to pass).
 -- REQUEST issues/Comment kind `project` with old_project/new_project: recorded in reaction to IssueProjectChanged; a deleted board renders as a placeholder title.
 -- REQUEST issues filter "project = X / no project" reading ProjectCard: owned by issues/discovery.
 -- REQUEST organizations/can_read_unit(user, org, unit) and organizations/can_write_unit(user, org, unit): org-level unit access (max over the user's teams; read for non-members of public, or limited-and-signed-in, orgs).
 -- REQUEST can_write_projects(user, repository) must be false for archived repositories or callers must check is_archived (this spec checks it explicitly).
--- REQUEST accounts/User deletion and organizations/Organization deletion triggers: to delete owner boards (see open question).
--- REQUEST repositories/RepositoryTransferred(repository, old_owner): to drop cards from the old owner's boards (see open question).
+-- REQUEST repositories: [repository] DISABLED_REPO_UNITS "repo.projects" now disables user and organization boards too (decision 3); the projects tab/unit and owner-profile project pages follow config.projects_globally_disabled.
+-- REQUEST issues: emit IssueCreatedWithProject only for an open board, and for an organization board only when the poster can write the org projects unit and triage the issue (decisions 4, 7); the project sidebar/bulk action must not offer closed boards for new cards.
