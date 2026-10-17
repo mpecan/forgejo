@@ -389,6 +389,7 @@ journey AutoMergeWaitsForRequiredChecks {
         stipulate issues_reopened_by(pr) = {}
         stipulate branch_exists(repo, "feature") = true
         stipulate merge_result_commit(pr, rebase, "") = "beef"
+        stipulate merge_attempt_fails(pr, rebase, "") = false
         stipulate issue_notification_audience(conv, bob) = {ada}
         after 1.minute
         then AutoMergeExecutes fires
@@ -657,4 +658,242 @@ journey TheMergedHeadBranchIsDeleted {
 
     ends: `feature` is gone (restorable for a day); the merged pull request
           says who deleted it.
+}
+
+-- Decided: scheduling auto-merge again replaces the schedule (style, message,
+-- scheduler); someone who may not merge cannot schedule at all.
+journey SchedulingAgainReplacesTheAutoMerge {
+    goal: Bob scheduled a rebase merge while CI runs. Carol, who cannot write
+          code, may not schedule one; root schedules a squash merge instead,
+          which replaces bob's schedule and is recorded on the timeline.
+
+    cast:
+        rule: code/ProtectedBranch
+        scheduled: AutoMerge
+    given:
+        rule.repository = repo
+        rule.rule_name = "main"
+        rule.merge_allowlist_enabled = false
+        rule.approvals_allowlist_enabled = false
+        rule.status_check_enabled = true
+        rule.required_approvals = 0
+        rule.block_on_rejected_reviews = false
+        rule.block_on_official_review_requests = false
+        rule.block_on_outdated_branch = false
+        rule.dismiss_stale_approvals = false
+        rule.ignore_stale_approvals = false
+        rule.apply_to_admins = false
+        rule.protected_file_patterns = {}
+        scheduled.pull_request = pr
+        scheduled.scheduled_by = bob
+        scheduled.style = rebase
+        scheduled.message = ""
+        scheduled.delete_branch_after_merge = false
+
+    1. carol cannot schedule a merge
+        stipulate protection_for(repo, "main") = rule
+        stipulate required_status_checks_pass(pr) = false
+        stipulate merge_style_allowed(repo, squash) = true
+        stipulate can_write_code(carol, repo) = false
+        carol cannot do UserSchedulesAutoMerge(carol, pr, squash, "Squash it", false) on PullRequestMergeBox
+
+    2. root's schedule replaces bob's
+        stipulate can_write_code(root, repo) = true
+        stipulate merge_signing_satisfied(pr, root, squash) = true
+        stipulate has_open_blocking_dependencies(conv) = false
+        root does UserSchedulesAutoMerge(root, pr, squash, "Squash it", true) on PullRequestMergeBox
+        then UserReplacesAutoMerge fires
+        then scheduled.scheduled_by = root
+        then scheduled.style = squash
+        then scheduled.message = "Squash it"
+        then scheduled.delete_branch_after_merge = true
+
+    ends: One schedule remains: root's squash merge, waiting for CI.
+}
+
+-- Decided: closing cancels a scheduled auto-merge; reopening does not bring
+-- it back.
+journey ClosingCancelsTheAutoMerge {
+    goal: Bob scheduled the merge while CI runs. Carol, a reader, may not
+          close the pull request; ada closes it, which cancels the schedule.
+          When she reopens it, nothing is scheduled.
+
+    cast:
+        rule: code/ProtectedBranch
+        scheduled: AutoMerge
+    given:
+        rule.repository = repo
+        rule.rule_name = "main"
+        rule.merge_allowlist_enabled = false
+        rule.approvals_allowlist_enabled = false
+        rule.status_check_enabled = true
+        rule.required_approvals = 0
+        rule.block_on_rejected_reviews = false
+        rule.block_on_official_review_requests = false
+        rule.block_on_outdated_branch = false
+        rule.dismiss_stale_approvals = false
+        rule.ignore_stale_approvals = false
+        rule.apply_to_admins = false
+        rule.protected_file_patterns = {}
+        scheduled.pull_request = pr
+        scheduled.scheduled_by = bob
+        scheduled.style = merge
+        scheduled.message = ""
+        scheduled.delete_branch_after_merge = false
+
+    1. carol cannot close it
+        stipulate protection_for(repo, "main") = rule
+        stipulate required_status_checks_pass(pr) = false
+        stipulate can_read_pulls(carol, repo) = true
+        stipulate can_write_pulls(carol, repo) = false
+        carol cannot do UserClosesPullRequest(carol, pr) on PullRequestPage
+
+    2. ada closes it and the schedule goes
+        stipulate is_blocked_by_owner(repo, ada) = false
+        stipulate has_open_blocking_dependencies(conv) = false
+        stipulate issue_notification_audience(conv, ada) = {bob}
+        ada does UserClosesPullRequest(ada, pr) on PullRequestAuthorControls
+        then conv.status = closed
+        then scheduled does not exist
+
+    3. reopening does not restore it
+        stipulate open_pull_request_exists(repo, "feature", repo, "main") = false
+        stipulate branch_exists(repo, "main") = true
+        stipulate branch_exists(repo, "feature") = true
+        stipulate head_commit_of(repo, "feature") = "f00d"
+        ada does UserReopensPullRequest(ada, pr) on PullRequestAuthorControls
+        then conv.status = open
+        then pr.status = checking
+        then scheduled does not exist
+
+    ends: The pull request is open again with no merge scheduled.
+}
+
+-- Decided: an auto-merge whose merge fails is removed, with the reason on the
+-- timeline and the scheduler told; the pull request stays open.
+journey AFailingAutoMergeIsRemoved {
+    goal: Bob scheduled a rebase merge. CI passes, but the rebase fails when
+          it is attempted. The schedule is removed rather than retried
+          silently, and the pull request is still open and mergeable by hand.
+
+    cast:
+        rule: code/ProtectedBranch
+        scheduled: AutoMerge
+    given:
+        rule.repository = repo
+        rule.rule_name = "main"
+        rule.merge_allowlist_enabled = false
+        rule.approvals_allowlist_enabled = false
+        rule.status_check_enabled = true
+        rule.required_approvals = 0
+        rule.block_on_rejected_reviews = false
+        rule.block_on_official_review_requests = false
+        rule.block_on_outdated_branch = false
+        rule.dismiss_stale_approvals = false
+        rule.ignore_stale_approvals = false
+        rule.apply_to_admins = false
+        rule.protected_file_patterns = {}
+        scheduled.pull_request = pr
+        scheduled.scheduled_by = bob
+        scheduled.style = rebase
+        scheduled.message = ""
+        scheduled.delete_branch_after_merge = false
+
+    1. CI passes and the merge attempt fails
+        stipulate protection_for(repo, "main") = rule
+        stipulate required_status_checks_pass(pr) = true
+        stipulate branch_exists(repo, "feature") = true
+        stipulate merge_style_allowed(repo, rebase) = true
+        stipulate merge_signing_satisfied(pr, bob, rebase) = true
+        stipulate has_open_blocking_dependencies(conv) = false
+        stipulate merge_attempt_fails(pr, rebase, "") = true
+        stipulate auto_merge_failure_reason(pr, bob, rebase) = "rebase conflict in widgets.go"
+        after 1.minute
+        then AutoMergeExecutes fires
+        then scheduled does not exist
+        then pr.status = mergeable
+        then conv.status = open
+
+    ends: Nothing is scheduled; the timeline says why and bob is told.
+}
+
+-- Decided: update-branch works for AGit pull requests, and every head move
+-- (AGit included) outdates code conversations whose lines changed.
+journey AnAgitPullRequestIsUpdatedFromBase {
+    goal: Ada's pull request came from an AGit push and main has moved on.
+          Carol, who neither wrote it nor writes code, cannot update it; ada
+          rebases it onto main on the server. Bob's comment on a line that
+          changed becomes outdated.
+
+    cast:
+        note: Review
+        thread: CodeConversation
+    given:
+        pr.flow = agit
+        pr.head_branch = "ada/widgets"
+        pr.commits_behind = 2
+        note.pull_request = pr
+        note.reviewer = bob
+        note.status = submitted
+        note.kind = comment
+        note.body = ""
+        note.commit_sha = "f00d"
+        note.is_official = false
+        note.is_stale = false
+        note.is_dismissed = false
+        thread.pull_request = pr
+        thread.review = note
+        thread.path = "widgets.go"
+        thread.line = 12
+        thread.side = proposed
+        thread.extra_lines = 0
+        thread.commit_sha = "f00d"
+        thread.is_outdated = false
+        thread.resolved_by = null
+
+    1. carol cannot update it
+        stipulate can_write_code(carol, repo) = false
+        stipulate rebase_update_allowed(repo) = true
+        carol cannot do UserUpdatesPullRequestBranch(carol, pr, rebase) on PullRequestPage
+
+    2. ada rebases it onto main
+        stipulate can_write_code(ada, repo) = false
+        stipulate can_read_pulls(ada, repo) = true
+        stipulate within_quota(repo) = true
+        stipulate updated_head(pr, rebase) = "a917"
+        stipulate protection_for(repo, "main") = null
+        stipulate diff_differs(pr, "f00d", "a917") = false
+        stipulate is_force_push(repo, "f00d", "a917") = true
+        stipulate anchored_lines_changed(thread, "a917") = true
+        stipulate commits_ahead_of(repo, "ada/widgets", repo, "main") = 2
+        stipulate commits_behind_of(repo, "ada/widgets", repo, "main") = 0
+        stipulate commits_between_shas(repo, "f00d", "a917") = "f00d..a917"
+        stipulate issue_notification_audience(conv, ada) = {bob}
+        ada does UserUpdatesPullRequestBranch(ada, pr, rebase) on PullRequestPage
+        then PullRequestHeadMoves fires
+        then pr.head_commit_sha = "a917"
+        then pr.status = checking
+        then pr.commits_behind = 0
+        then thread.is_outdated = true
+
+    ends: The AGit head is rebased onto main and being re-checked; bob's
+          comment is marked outdated.
+}
+
+-- Decided: a squash commit is authored by the poster's account identity,
+-- which honours keep-email-private.
+journey ASquashCommitUsesThePostersAccountIdentity {
+    goal: Ada keeps her email private. The merge box shows that a squash
+          merge would be authored with her no-reply address.
+
+    given:
+        ada.name = "ada"
+        ada.keep_email_private = true
+
+    1. bob sees the squash author on the merge box
+        stipulate protection_for(repo, "main") = null
+        bob sees pr.squash_author_email on PullRequestMergeBox in pr
+        then pr.squash_author_email = "ada@noreply.localhost"
+
+    ends: The squash author email is ada's no-reply address.
 }

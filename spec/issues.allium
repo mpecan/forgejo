@@ -267,7 +267,8 @@ entity Issue {
     ref: String?                         -- branch or tag the issue is about (issues only)
     deadline: Timestamp?                 -- due date, end of the chosen day
     milestone: Milestone?
-    labels: Set<Label>
+    labels: Set<Label>                   -- decided: no priority field; priority is expressed with
+                                         -- (exclusive, scoped) labels such as `priority/high`
     assignees: Set<accounts/User>
     mentioned_users: Set<accounts/User>
     read_by: Set<accounts/User>          -- users who have opened the issue page
@@ -324,12 +325,15 @@ entity Comment {
     created_at: Timestamp
     updated_at: Timestamp
 
-    -- kind = label
+    -- kind = label (label is cleared when the label is deleted; its name is kept)
     label: Label?
     label_added: Boolean?
-    -- kind = milestone
+    deleted_label_name: String?
+    -- kind = milestone (cleared when the milestone is deleted; its name is kept)
     old_milestone: Milestone?
     new_milestone: Milestone?
+    deleted_old_milestone_name: String?
+    deleted_new_milestone_name: String?
     -- kind = assignees / review_request
     assignee: accounts/User?
     assignee_team: organizations/Team?
@@ -366,6 +370,10 @@ entity Comment {
     accepts_attachments: kind = comment or kind = code or kind = review
     counts_as_conversation: kind = comment or kind = review
     is_edited: history.count > 1
+    -- decided: timeline events of a deleted label or milestone stay, marked deleted
+    label_is_deleted: deleted_label_name != null
+    old_milestone_is_deleted: deleted_old_milestone_name != null
+    new_milestone_is_deleted: deleted_new_milestone_name != null
 }
 
 -- A repository label or an organization label (usable in all the
@@ -437,9 +445,11 @@ entity IssueDependency {
 -- from: models/issues/tracked_time.go:23
 entity TrackedTime {
     issue: Issue
-    user: accounts/User
+    user: accounts/User                  -- whose time it is
+    logged_by: accounts/User             -- who recorded it (decided: differs from `user`
+                                         -- when a repository admin logs time for someone)
     amount: Duration
-    created_at: Timestamp
+    created_at: Timestamp                -- the date the time is booked on
     is_deleted: Boolean
 }
 
@@ -474,7 +484,8 @@ entity IssuePin {
 }
 
 -- A file attached to an issue, a comment or a release. An uploaded file
--- that is not linked yet is visible only to its uploader.
+-- that is not linked yet is visible only to its uploader, and expires after
+-- `orphan_attachment_expiry` (OrphanUploadExpires).
 -- from: models/repo/attachment.go:23
 entity Attachment {
     repository: repositories/Repository
@@ -547,6 +558,7 @@ config {
     attachment_allowed_types: String = ".avif,.cpuprofile,.csv,.dmp,.docx,.fodg,.fodp,.fods,.fodt,.gif,.gz,.jpeg,.jpg,.json,.jsonc,.log,.md,.mov,.mp4,.odf,.odg,.odp,.ods,.odt,.patch,.pdf,.png,.pptx,.svg,.tgz,.txt,.webm,.webp,.xls,.xlsx,.zip"
     attachment_max_size_mb: Integer = 2048
     attachment_max_files: Integer = 5
+    orphan_attachment_expiry: Duration = 24.hours   -- decided: unlinked uploads expire
 
     -- [repository.issue]
     lock_reasons: Set<String> = { "Too heated", "Off-topic", "Spam", "Resolved" }
@@ -598,13 +610,21 @@ default LabelTemplate advanced_labels = {
 -- Rules: opening and editing issues
 ------------------------------------------------------------
 
--- Metadata (labels, milestone, assignees, due date) is only applied when the
--- poster can manage the tracker; for anyone else it is silently dropped.
+-- Metadata (labels, milestone, assignees, due date, project) is only applied
+-- when the poster can manage the tracker; for anyone else all of it is
+-- silently dropped, on every path.
+-- decided: all metadata from someone who cannot triage is dropped (the web form no longer keeps milestone / assignees)
 -- Labels outside the repository / its organization are dropped; of several
 -- labels in one exclusive scope only the last is kept.
+-- `template` is the issue template the issue was opened from (null for a
+-- blank issue). When the repository's template config sets
+-- `blank_issues_enabled` to false, blank issues are refused on every path
+-- (web form and API) except for repository writers.
+-- decided: blank issues are refused when disabled, repository writers excepted
 -- from: services/issue/issue.go:31
+-- from: routers/web/repo/issue.go:1033 (chooser redirect when blank issues are disabled)
 rule UserOpensIssue {
-    when: UserOpensIssue(user, repository, title, content, labels, milestone, assignees, deadline, project, attachments)
+    when: UserOpensIssue(user, repository, title, content, labels, milestone, assignees, deadline, project, attachments, template)
     requires: can_read_tracker(user, repository)
     requires: not repository.is_archived
     requires: not is_blocked_by_owner(repository, user)
@@ -612,7 +632,10 @@ rule UserOpensIssue {
     requires: length(title) <= config.max_title_length
     requires: milestone = null or milestone in (Milestones where repository = repository)
     requires: all_assignable(assignees, repository)        -- every one satisfies can_be_assigned
+    requires: template = null or template.repository = repository
     let is_manager = can_manage_tracker(user, repository)
+    requires: template != null or is_manager
+              or not exists IssueTemplateConfig{repository: repository, blank_issues_enabled: false}
     let mentions = resolve_mentions_in(repository, user, content)
     ensures:
         let issue = Issue.created(
@@ -659,9 +682,10 @@ rule RecordInitialMetadata {
         IssueLabelsChanged(issue: issue, doer: doer, added: issue.labels, removed: {})
 }
 
--- Web form only: the poster or a triager may change the title, also while
--- the issue is locked. Via the API the poster may not while it is locked
--- (see open questions).
+-- The poster or a triager may change the title, also while the issue is
+-- locked, on every path (the API's refusal of poster edits on a locked issue
+-- is not kept for the title and description).
+-- decided: a locked issue's poster may still correct its title and description; locking stops the conversation, not corrections
 -- from: services/issue/issue.go:64
 rule UserChangesIssueTitle {
     when: UserChangesIssueTitle(user, issue, title)
@@ -684,6 +708,8 @@ rule UserChangesIssueTitle {
 
 -- Body edits are optimistic: the editor states the version they edited.
 -- The first edit also records the original body as the first revision.
+-- The poster may edit the body of a locked issue too.
+-- decided: a locked issue's poster may still correct its title and description
 -- from: models/issues/issue_update.go:257
 rule UserEditsIssueBody {
     when: UserEditsIssueBody(user, issue, content, seen_version)
@@ -700,13 +726,17 @@ rule UserEditsIssueBody {
 }
 
 -- Issues only: the branch or tag an issue is about. A set ref limits which
--- branch's commits may close the issue by keyword.
+-- branch's commits may close the issue by keyword. On a locked issue only
+-- triagers change it.
+-- decided: on a locked issue the poster keeps only title and description edits; triagers may edit everything
 -- from: services/issue/issue.go:105
+-- from: routers/api/v1/permissions/req_edit_issue.go:42 (poster edits refused while locked)
 rule UserChangesIssueRef {
     when: UserChangesIssueRef(user, issue, ref)
     requires: not issue.is_pull
     requires: can_read_issue(user, issue)
     requires: user = issue.poster or can_triage(user, issue)
+    requires: not issue.is_locked or can_triage(user, issue)
     requires: not issue.repository.is_archived
     ensures: issue.ref = ref
     ensures: Comment.created(issue: issue, poster: user, kind: change_issue_ref,
@@ -751,14 +781,17 @@ rule TriagerRemovesDueDate {
 -- open blockers cannot be closed (and the closer's stopwatch keeps running).
 -- Closing stops the closer's own stopwatch on the issue. Pull requests are
 -- closed and reopened through pulls, with the same permission and blocker
--- checks plus their own.
+-- checks plus their own. On a locked issue only triagers change the state.
+-- decided: on a locked issue the poster keeps only title and description edits; triagers may edit everything
 -- from: models/issues/issue_update.go:69
+-- from: routers/api/v1/permissions/req_edit_issue.go:42 (poster edits refused while locked)
 rule UserClosesIssue {
     when: UserClosesIssue(user, issue)
     requires: not issue.is_pull                 -- PRs: pulls/UserClosesPullRequest
     requires: issue.status = open
     requires: can_read_issue(user, issue)
     requires: user = issue.poster or can_triage(user, issue)
+    requires: not issue.is_locked or can_triage(user, issue)
     requires: not issue.repository.is_archived
     requires: not is_blocked(issue.poster, user)
     requires: not is_blocked_by_owner(issue.repository, user)
@@ -775,7 +808,9 @@ rule UserClosesIssue {
             StopwatchFinished(stopwatch: sw)
 }
 
--- Reopening is never blocked by dependencies.
+-- Reopening is never blocked by dependencies. On a locked issue only
+-- triagers reopen.
+-- decided: on a locked issue the poster keeps only title and description edits; triagers may edit everything
 -- from: models/issues/issue_update.go:46
 rule UserReopensIssue {
     when: UserReopensIssue(user, issue)
@@ -783,6 +818,7 @@ rule UserReopensIssue {
     requires: issue.status = closed
     requires: can_read_issue(user, issue)
     requires: user = issue.poster or can_triage(user, issue)
+    requires: not issue.is_locked or can_triage(user, issue)
     requires: not issue.repository.is_archived
     requires: not is_blocked(issue.poster, user)
     requires: not is_blocked_by_owner(issue.repository, user)
@@ -1057,7 +1093,7 @@ rule PushedCommitReferencesIssue {
                and (pusher = target.poster or can_triage(pusher, target))
                and branch_may_close(target, push.repository, ref.branch):
                 if ref.action = closes and ref.time_log != null:
-                    TimeLogged(user: pusher, issue: target, amount: ref.time_log, at: ref.committed_at)
+                    TimeLogged(user: pusher, issue: target, amount: ref.time_log, at: ref.committed_at, logged_by: pusher)
                 ReferenceResolved(issue: target, doer: pusher, closing: ref.action = closes)
 }
 
@@ -1065,10 +1101,12 @@ rule PushedCommitReferencesIssue {
 -- Rules: locking and pinning
 ------------------------------------------------------------
 
--- A locked conversation accepts comments and reactions only from triagers
--- (and site admins for comments). The reason must be empty or one of the
--- configured lock reasons.
+-- A locked conversation accepts comments only from triagers and site admins;
+-- reactions stay open to every reader. The reason must be empty or one of
+-- the configured lock reasons, on every path (web and API).
+-- decided: lock reasons are validated on every path: empty or one of config.lock_reasons
 -- from: models/issues/issue_lock.go:22
+-- from: routers/web/repo/issue_lock.go:27 (reason validated against LOCK_REASONS)
 rule TriagerLocksIssue {
     when: TriagerLocksIssue(user, issue, reason)
     requires: can_triage(user, issue)
@@ -1184,7 +1222,8 @@ rule TrackerManagerEditsLabel {
             label.archived_at = null
 }
 
--- Deleting a label removes it from all issues and erases its timeline events.
+-- Deleting a label removes it from all issues; its timeline events stay
+-- (see RemoveLabelEverywhere).
 -- from: models/issues/label.go:292
 rule TrackerManagerDeletesLabel {
     when: TrackerManagerDeletesLabel(user, repository, label)
@@ -1234,14 +1273,19 @@ rule OrgOwnerDeletesLabel {
     ensures: LabelRemovedEverywhere(doomed: label)
 }
 
+-- The label's timeline events are kept, showing the label's name and marked
+-- deleted (Forgejo erases them; milestones already kept theirs).
+-- decided: timeline events of deleted labels and milestones are kept for both, showing the name, marked deleted
 -- from: models/issues/label.go:292
 rule RemoveLabelEverywhere {
     when: LabelRemovedEverywhere(doomed)
+    let doomed_name = doomed.name
     ensures:
         for i in Issues where doomed in labels:
             i.labels = i.labels - { doomed }
         for c in Comments where label = doomed:
-            not exists c
+            c.deleted_label_name = doomed_name
+            c.label = null
         not exists doomed
 }
 
@@ -1382,17 +1426,25 @@ rule TrackerManagerReopensMilestone {
     ensures: milestone.closed_at = null
 }
 
--- Issues of a deleted milestone keep no milestone; their timeline shows a
--- "deleted milestone" placeholder.
+-- Issues of a deleted milestone keep no milestone; their timeline events
+-- stay, showing the milestone's name, marked deleted.
+-- decided: timeline events of deleted labels and milestones are kept for both, showing the name, marked deleted
 -- from: models/issues/milestone.go:245
 rule TrackerManagerDeletesMilestone {
     when: TrackerManagerDeletesMilestone(user, repository, milestone)
     requires: milestone.repository = repository
     requires: can_manage_tracker(user, milestone.repository)
     requires: not milestone.repository.is_archived
+    let milestone_name = milestone.name
     ensures:
         for i in milestone.issues:
             i.milestone = null
+        for c in Comments where old_milestone = milestone:
+            c.deleted_old_milestone_name = milestone_name
+            c.old_milestone = null
+        for c in Comments where new_milestone = milestone:
+            c.deleted_new_milestone_name = milestone_name
+            c.new_milestone = null
         not exists milestone
 }
 
@@ -1532,7 +1584,7 @@ rule FinishStopwatch {
     let tracker = stopwatch.user
     let spent = now - stopwatch.started_at
     ensures:
-        let t = TrackedTime.created(issue: issue, user: tracker,
+        let t = TrackedTime.created(issue: issue, user: tracker, logged_by: tracker,
                                     amount: spent, created_at: now, is_deleted: false)
         Comment.created(issue: issue, poster: tracker, kind: stop_tracking, tracked_time: t,
                         content: format_duration(spent), content_version: 0,
@@ -1552,31 +1604,36 @@ rule UserCancelsStopwatch {
 }
 
 -- Manual time: positive and at most `max_manual_time` per entry (web form:
--- hours and minutes each 0..1000). Via the API a repository admin or site
--- admin may log time for another user and back-date it.
+-- hours and minutes each 0..1000).
 -- from: models/issues/tracked_time.go:170
 rule UserAddsTime {
     when: UserAddsTime(user, issue, amount)
     requires: may_track_time(user, issue)
     requires: amount > 0.seconds
     requires: amount <= config.max_manual_time
-    ensures: TimeLogged(user: user, issue: issue, amount: amount, at: now)
+    ensures: TimeLogged(user: user, issue: issue, amount: amount, at: now, logged_by: user)
 }
 
+-- A repository admin (site admins included) may log time for another user,
+-- on a date they choose, on every path (web and API); the entry records who
+-- logged it.
+-- decided: repository admins may log time for someone else on every path, with a chosen date; the entry records who logged it
 -- from: routers/api/v1/repo/issue_tracked_time.go:201
 rule AdminAddsTimeForUser {
     when: AdminAddsTimeForUser(admin, issue, user, amount, at)
     requires: may_track_time(admin, issue)
     requires: is_repo_admin(admin, issue.repository) or admin.is_admin
     requires: amount > 0.seconds
-    ensures: TimeLogged(user: user, issue: issue, amount: amount, at: at)
+    requires: amount <= config.max_manual_time
+    ensures: TimeLogged(user: user, issue: issue, amount: amount, at: at, logged_by: admin)
 }
 
 -- from: models/issues/tracked_time.go:170
 rule LogTime {
-    when: TimeLogged(user, issue, amount, at)
+    when: TimeLogged(user, issue, amount, at, logged_by)
     ensures:
-        let t = TrackedTime.created(issue: issue, user: user, amount: amount, created_at: at, is_deleted: false)
+        let t = TrackedTime.created(issue: issue, user: user, logged_by: logged_by, amount: amount,
+                                    created_at: at, is_deleted: false)
         Comment.created(issue: issue, poster: user, kind: add_time_manual, tracked_time: t,
                         content: format_duration(amount), content_version: 0,
                         created_at: now, updated_at: now)
@@ -1614,14 +1671,14 @@ rule UserResetsOwnTime {
 -- Rules: reactions
 ------------------------------------------------------------
 
--- A user reacts at most once per emoji per target. On a locked issue only
--- triagers react.
+-- A user reacts at most once per emoji per target. The lock does not
+-- affect reactions: anyone who can read may react on a locked issue.
+-- decided: anyone who can read may react; the lock doesn't affect reactions (the API's write requirement is dropped)
 -- from: services/issue/reaction.go:14
 rule UserReactsToIssue {
     when: UserReactsToIssue(user, issue, emoji)
     requires: can_read_issue(user, issue)
     requires: not issue.repository.is_archived
-    requires: not issue.is_locked or can_triage(user, issue)
     requires: is_allowed_reaction(emoji)               -- emoji in config.allowed_reactions
     requires: not is_blocked(issue.poster, user)
     requires: not is_blocked_by_owner(issue.repository, user)
@@ -1631,6 +1688,7 @@ rule UserReactsToIssue {
         ReactionAdded(reaction: r)
 }
 
+-- decided: anyone who can read may react; the lock doesn't affect reactions
 -- from: services/issue/reaction.go:46
 rule UserReactsToComment {
     when: UserReactsToComment(user, issue, comment, emoji)
@@ -1638,7 +1696,6 @@ rule UserReactsToComment {
     requires: comment.has_content
     requires: can_read_issue(user, comment.issue)
     requires: not comment.issue.repository.is_archived
-    requires: not comment.issue.is_locked or can_triage(user, comment.issue)
     requires: is_allowed_reaction(emoji)               -- emoji in config.allowed_reactions
     requires: not is_blocked(comment.poster, user)
     requires: not is_blocked(comment.issue.poster, user)
@@ -1708,6 +1765,20 @@ rule LinkAttachments {
             if a.repository = issue.repository and not a.is_linked:
                 a.issue = issue
                 a.comment = comment
+}
+
+-- Uploads that are never linked to an issue, comment or release expire
+-- after `orphan_attachment_expiry`. Forgejo keeps them indefinitely (only a
+-- doctor check removes orphans); the sweep runs as a scheduled task
+-- registered by administration (see REQUEST).
+-- decided: orphan uploads expire when unlinked within a configurable time (default 24 hours), via a scheduled task
+-- from: models/repo/attachment.go:319 (DeleteOrphanedAttachments, doctor only)
+rule OrphanUploadExpires {
+    when: upload: Attachment.created_at + config.orphan_attachment_expiry <= now
+    requires: upload.issue = null
+    requires: upload.comment = null
+    requires: upload.release = null
+    ensures: not exists upload
 }
 
 -- The uploader removes their own upload (web); via the API whoever may edit
@@ -1959,7 +2030,7 @@ surface IssueTracker {
         config.max_pinned
 
     provides:
-        UserOpensIssue(reader, repository, title, content, labels, milestone, assignees, deadline, project, attachments)
+        UserOpensIssue(reader, repository, title, content, labels, milestone, assignees, deadline, project, attachments, template)
             when not repository.is_archived
         UserUploadsAttachment(reader, repository, name, size, head_bytes)
             when config.attachments_enabled and not repository.is_archived
@@ -1974,7 +2045,7 @@ surface IssueTracker {
     @guarantee TemplateChooser
         -- When the default branch has valid templates or contact links, "new
         -- issue" offers a chooser; when `blank_issues_enabled` is false a blank
-        -- form is not offered. Invalid template files are reported to the
+        -- form is not offered (and posting one is refused, see UserOpensIssue). Invalid template files are reported to the
         -- reader instead of silently ignored. Templates are looked up in
         -- ISSUE_TEMPLATE / issue_template under the repository root,
         -- .forgejo/, .gitea/, .github/, .gitlab/ and docs/.
@@ -2027,8 +2098,14 @@ surface IssueConversation {
             c.is_edited
             c.label.name
             c.label_added
+            c.deleted_label_name
+            c.label_is_deleted
             c.old_milestone.name
             c.new_milestone.name
+            c.deleted_old_milestone_name
+            c.deleted_new_milestone_name
+            c.old_milestone_is_deleted
+            c.new_milestone_is_deleted
             c.assignee.name
             c.assignee_removed
             c.old_title
@@ -2072,9 +2149,9 @@ surface IssueConversation {
         UserComments(reader, issue, content, attachments)
             when not issue.is_locked and not issue.repository.is_archived
         UserReactsToIssue(reader, issue, emoji)
-            when not issue.is_locked and not issue.repository.is_archived
+            when not issue.repository.is_archived
         UserReactsToComment(reader, issue, comment, emoji)
-            when not issue.is_locked and not issue.repository.is_archived
+            when not issue.repository.is_archived
         UserRemovesReaction(reader, issue, reaction)
         UserSetsIssueSubscription(reader, issue, subscriber, watching)
         UserChangesIssueTitle(reader, issue, title)
@@ -2082,11 +2159,11 @@ surface IssueConversation {
         UserEditsIssueBody(reader, issue, content, seen_version)
             when reader = issue.poster
         UserChangesIssueRef(reader, issue, ref)
-            when reader = issue.poster and not issue.is_pull
+            when reader = issue.poster and not issue.is_pull and not issue.is_locked
         UserClosesIssue(reader, issue)
-            when reader = issue.poster and issue.status = open
+            when reader = issue.poster and issue.status = open and not issue.is_locked
         UserReopensIssue(reader, issue)
-            when reader = issue.poster and issue.status = closed
+            when reader = issue.poster and issue.status = closed and not issue.is_locked
         UserEditsComment(reader, issue, comment, content, seen_version)
         UserDeletesComment(reader, issue, comment)
         UserHidesContentRevision(reader, issue, revision)
@@ -2148,6 +2225,7 @@ surface IssueTriage {
         issue.is_locked
         for t in issue.active_times:
             t.user.name
+            t.logged_by.name
             t.amount
         for w in issue.watches:
             w.user.name
@@ -2189,7 +2267,7 @@ surface IssueTriage {
         --   POST/DELETE /issues/{index}/dependencies, POST/DELETE /issues/{index}/blocks.
 }
 
--- Repository admins: pinning and deleting.
+-- Repository admins: pinning, deleting, and logging time for others.
 surface IssueAdministration {
     facing admin: IssueAdmin
     context issue: Issue
@@ -2202,12 +2280,15 @@ surface IssueAdministration {
         RepoAdminPinsIssue(admin, issue) when not issue.is_pinned
         RepoAdminUnpinsIssue(admin, issue) when issue.is_pinned
         RepoAdminDeletesIssue(admin, issue)
+        AdminAddsTimeForUser(admin, issue, user, amount, at)
+            when may_track_time(admin, issue)
 
     @guidance
         -- Web: POST /issues/{index}/pin, DELETE /issues/unpin/{index}, POST /issues/move_pin,
-        --   POST /issues/{index}/delete, POST /issues/delete (batch).
+        --   POST /issues/{index}/delete, POST /issues/delete (batch); the web
+        --   "add time" form gains a user and date picker for repository admins.
         -- API: POST/DELETE /issues/{index}/pin, PATCH /issues/{index}/pin/{position},
-        --   DELETE /issues/{index}.
+        --   DELETE /issues/{index}, POST /issues/{index}/times (user_name, created).
 }
 
 surface PinOrdering {
@@ -2353,20 +2434,6 @@ deferred template_is_valid                -- see: modules/issue/template/templat
 deferred is_allowed_file                  -- see: modules/upload (extensions, MIME types, wildcards)
 
 ------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Web lets an issue's poster change the title of a locked issue; the API refuses poster edits (title, body, ref, state) while locked. Which should the rebuild adopt? The spec follows the web for title/body and requires write for nothing else."
-open question "Web reactions ignore the lock; API reactions on a locked issue require write access. The spec follows the API (locked means only triagers react)."
-open question "Web lock form validates the reason against LOCK_REASONS; the API accepts any reason. The spec validates."
-open question "When `blank_issues_enabled` is false the web form only redirects to the chooser; posting a blank issue (or via API) is still accepted. Should blank issues be refused?"
-open question "Uploaded attachments never linked to an issue or comment are kept indefinitely (only a doctor command removes orphans). Should unlinked uploads expire?"
-open question "Non-writers creating an issue through the web form can still set a milestone and assignees (only labels are dropped); the API drops all metadata. The spec drops all metadata for non-managers."
-open question "Deleting a label erases its label timeline events, while deleting a milestone keeps its events with a 'deleted milestone' placeholder. Should both behave alike?"
-open question "Repository admins may log time for another user and back-date it via the API but not in the web UI; keep it?"
-open question "Issue `priority` exists in storage but nothing sets or shows it; dropped from the spec."
-
-------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
 -- REQUEST repositories/Repository.owner_org: used to scope organization labels (fixed name, listed for completeness)
@@ -2387,3 +2454,7 @@ open question "Issue `priority` exists in storage but nothing sets or shows it; 
 -- REQUEST projects: creates project / project_column Comment entries when an issue's project or column changes
 -- REQUEST moderation: reacts to IssueContentChanged / IssueCommentEdited / IssueCommentDeleted / IssueDeleted to keep shadow copies of reported content
 -- REQUEST quota: attachment uploads are subject to the `size:assets:attachments:issues` quota subject
+-- REQUEST administration: register a cron task (e.g. `delete_orphaned_attachments`, owning module issues, default schedule "@every 1h", enabled) that runs issues/OrphanUploadExpires — unlinked uploads older than issues' config.orphan_attachment_expiry (default 24h) are deleted
+-- REQUEST releases: web release uploads that are never saved into a release (UserLinksUploadToRelease) now expire via issues/OrphanUploadExpires after issues' config.orphan_attachment_expiry; worth a note in that rule's guidance
+-- REQUEST pulls: on a locked PR conversation the poster may still change title and description but not close / reopen or retarget; pulls/UserClosesPullRequest and UserReopensPullRequest should require `not issue.is_locked or can_triage(user, issue)` (issues decision 1)
+-- REQUEST pulls: reactions on a locked PR conversation are open to every reader (issues decision 2); issues/UserReactsToIssue / UserReactsToComment no longer check the lock

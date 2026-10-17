@@ -153,6 +153,7 @@ journey TransferAwaitsTheRecipient {
         stipulate is_blocked(bob, alice) = false
         stipulate repository_name_free(bob, "notes") = true
         stipulate within_repo_quota(bob) = true
+        stipulate within_creation_limit(bob) = true
         stipulate can_see_repository(bob, repo) = true
         alice does OwnerTransfersRepositoryToUser(alice, repo, bob) on RepositoryDangerZone
             creating offer: RepoTransfer
@@ -201,6 +202,7 @@ journey RecipientRejectsTheTransfer {
         stipulate is_blocked(bob, alice) = false
         stipulate repository_name_free(bob, "notes") = true
         stipulate within_repo_quota(bob) = true
+        stipulate within_creation_limit(bob) = true
         stipulate can_see_repository(bob, repo) = true
         alice does OwnerTransfersRepositoryToUser(alice, repo, bob) on RepositoryDangerZone
             creating offer: RepoTransfer
@@ -220,10 +222,59 @@ journey RecipientRejectsTheTransfer {
     ends: Nothing changed hands.
 }
 
--- Archiving belongs to owners, and mirrors cannot be archived.
-journey ArchivingIsForOwners {
-    goal: Carol is an admin of Alice's repository but not an owner, so she cannot archive it;
-          Alice can, and can unarchive it again. A mirror cannot be archived at all.
+-- Accepting a transfer counts against the recipient's repository limit. Decision 8.
+journey TransferStopsAtTheRecipientsLimit {
+    goal: Alice offers her repository to Bob while he is below his repository limit. By the
+          time he answers he has reached it, so he cannot accept; Carol, already at her limit,
+          cannot even be offered it. Root, a site admin, is not held to the limit.
+
+    cast:
+        repo: Repository
+        root: accounts/User
+    given:
+        repo.name = "notes"
+        repo.owner_user = alice
+        repo.owner_org = null
+        repo.status = ready
+        repo.is_private = false
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+
+    1. Carol, at her limit, cannot be offered it
+        stipulate is_repo_owner(alice, repo) = true
+        stipulate is_blocked(carol, alice) = false
+        stipulate repository_name_free(carol, "notes") = true
+        stipulate within_repo_quota(carol) = true
+        stipulate within_creation_limit(carol) = false
+        alice cannot do OwnerTransfersRepositoryToUser(alice, repo, carol) on RepositoryDangerZone
+
+    2. Alice offers it to Bob
+        stipulate is_blocked(bob, alice) = false
+        stipulate repository_name_free(bob, "notes") = true
+        stipulate within_repo_quota(bob) = true
+        stipulate within_creation_limit(bob) = true
+        stipulate can_see_repository(bob, repo) = true
+        alice does OwnerTransfersRepositoryToUser(alice, repo, bob) on RepositoryDangerZone
+            creating offer: RepoTransfer
+            where transfer_recipients(offer) = {bob}
+        then repo.status = pending_transfer
+
+    3. Bob has reached his limit meanwhile and cannot accept
+        stipulate within_creation_limit(bob) = false
+        bob cannot do RecipientAcceptsTransfer(bob, offer) on IncomingTransfer
+        then repo.owner_user = alice
+        then offer exists
+
+    ends: The offer waits until Bob has room for it, or is rejected or withdrawn.
+}
+
+-- Archiving belongs to repository admins (decision 1), and mirrors cannot be archived.
+-- (Updated: this journey used to show Carol, an admin but not an owner, being refused.)
+journey ArchivingIsForRepositoryAdmins {
+    goal: Bob, who is not an admin of Alice's repository, cannot archive it. Carol is an admin
+          but not an owner, and archives it all the same; Alice unarchives it again. A mirror
+          cannot be archived at all.
 
     cast:
         repo:   Repository
@@ -238,35 +289,39 @@ journey ArchivingIsForOwners {
         mirror.is_archived = false
         mirror.is_mirror = true
 
-    1. Carol, a repository admin, is refused
-        stipulate is_repo_owner(carol, repo) = false
-        carol cannot do OwnerArchivesRepository(carol, repo) on RepositoryDangerZone
+    1. Bob, without admin access, is refused
+        stipulate is_repo_admin(bob, repo) = false
+        bob cannot do AdminArchivesRepository(bob, repo) on RepositorySettings
 
-    2. Alice archives it
-        stipulate is_repo_owner(alice, repo) = true
-        alice does OwnerArchivesRepository(alice, repo) on RepositoryDangerZone
-        then OwnerArchivesRepository fires
+    2. Carol, a repository admin who is not an owner, archives it
+        stipulate is_repo_owner(carol, repo) = false
+        stipulate is_repo_admin(carol, repo) = true
+        carol does AdminArchivesRepository(carol, repo) on RepositorySettings
+        then AdminArchivesRepository fires
         then repo.is_archived = true
 
     3. archived repositories accept no topic changes
         stipulate is_repo_admin(alice, repo) = true
         alice cannot do AdminReplacesTopics(alice, repo, {"notes"}) on RepositorySettings
 
-    4. and she unarchives it
-        alice does OwnerUnarchivesRepository(alice, repo) on RepositoryDangerZone
+    4. and Alice unarchives it
+        alice does AdminUnarchivesRepository(alice, repo) on RepositorySettings
+        then AdminUnarchivesRepository fires
         then repo.is_archived = false
 
     5. a mirror cannot be archived
-        stipulate is_repo_owner(alice, mirror) = true
-        alice cannot do OwnerArchivesRepository(alice, mirror) on RepositoryDangerZone
+        stipulate is_repo_admin(alice, mirror) = true
+        alice cannot do AdminArchivesRepository(alice, mirror) on RepositorySettings
 
     ends: Alice's repository is active again; the mirror was never archived.
 }
 
--- Collaborators: added with write access, promoted, removed (and unsubscribed).
+-- Collaborators: invited, accepted, promoted, removed (and unsubscribed). Decision 4.
+-- (Updated: Bob used to get access the moment Alice added him.)
 journey CollaboratorsComeAndGo {
-    goal: Alice adds Bob as a collaborator (write), promotes him to admin, then removes him.
-          Carol, who is not an admin, cannot add anyone.
+    goal: Alice invites Bob as a collaborator; he has no access until he accepts, then has
+          write access. She promotes him to admin, then removes him. Carol, who is not an
+          admin, cannot invite anyone, and cannot accept Bob's invitation for him.
 
     cast:
         repo: Repository
@@ -275,33 +330,50 @@ journey CollaboratorsComeAndGo {
         repo.owner_org = null
         repo.is_archived = false
 
-    1. Carol cannot add herself
+    1. Carol cannot invite herself
         stipulate is_repo_admin(carol, repo) = false
-        carol cannot do AdminAddsCollaborator(carol, repo, carol) on RepositorySettings
+        carol cannot do AdminInvitesCollaborator(carol, repo, carol) on RepositorySettings
 
-    2. Alice adds Bob
+    2. Alice invites Bob; nothing is granted yet
         stipulate repo.owner = alice
         stipulate is_repo_admin(alice, repo) = true
         stipulate is_blocked(alice, bob) = false
         stipulate is_blocked(bob, alice) = false
+        alice does AdminInvitesCollaborator(alice, repo, bob) on RepositorySettings
+            creating invite: CollaboratorInvitation
+        then AdminInvitesCollaborator fires
+        then invite.invitee = bob
+        then invite.inviter = alice
+        then invite.access_mode = write
+        alice sees invite.invitee.name on RepositorySettings in repo
+
+    3. Bob cannot be invited twice
+        alice cannot do AdminInvitesCollaborator(alice, repo, bob) on RepositorySettings
+
+    4. only Bob can answer it
+        bob sees invite.inviter.name on IncomingCollaboratorInvitation in invite
+        carol cannot do InviteeAcceptsCollaboration(carol, invite) on IncomingCollaboratorInvitation
+
+    5. Bob accepts, and his access starts now
         -- what access derives from the grant (access recalculates it)
         stipulate explicit_mode(bob, repo) = write
         stipulate has_any_access(bob, repo) = true
-        alice does AdminAddsCollaborator(alice, repo, bob) on RepositorySettings
+        bob does InviteeAcceptsCollaboration(bob, invite) on IncomingCollaboratorInvitation
             creating collab: Collaboration
-        then AdminAddsCollaborator fires
+        then InviteeAcceptsCollaboration fires
+        then invite does not exist
         then collab.access_mode = write
         then collab.user = bob
 
-    3. Bob cannot be added twice
-        alice cannot do AdminAddsCollaborator(alice, repo, bob) on RepositorySettings
+    6. a collaborator cannot be invited again
+        alice cannot do AdminInvitesCollaborator(alice, repo, bob) on RepositorySettings
 
-    4. Alice makes him an admin
+    7. Alice makes him an admin
         stipulate explicit_mode(bob, repo) = admin
         alice does AdminChangesCollaboratorAccess(alice, repo, collab, admin) on RepositorySettings
         then collab.access_mode = admin
 
-    5. and removes him
+    8. and removes him
         -- the repository is public, so he can still read it
         stipulate explicit_mode(bob, repo) = none
         alice does AdminRemovesCollaborator(alice, repo, collab) on RepositorySettings
@@ -312,6 +384,65 @@ journey CollaboratorsComeAndGo {
         then watch.watch_issues = false
 
     ends: Bob has no explicit access and is not subscribed.
+}
+
+-- An invitation can be declined by the invitee or withdrawn by an admin; a site admin adds
+-- a collaborator directly. Decision 4.
+journey InvitationsCanBeDeclinedOrRevoked {
+    goal: Carol declines Alice's invitation and gets nothing. Alice's invitation to Bob is
+          withdrawn before he answers. Root, a site admin, adds Carol directly, with no
+          invitation to accept.
+
+    cast:
+        repo: Repository
+        root: accounts/User
+    given:
+        repo.owner_user = alice
+        repo.owner_org = null
+        repo.is_archived = false
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+
+    1. Alice invites Carol and Bob
+        stipulate repo.owner = alice
+        stipulate is_repo_admin(alice, repo) = true
+        stipulate is_blocked(alice, carol) = false
+        stipulate is_blocked(carol, alice) = false
+        stipulate is_blocked(alice, bob) = false
+        stipulate is_blocked(bob, alice) = false
+        alice does AdminInvitesCollaborator(alice, repo, carol) on RepositorySettings
+            creating to_carol: CollaboratorInvitation
+        alice does AdminInvitesCollaborator(alice, repo, bob) on RepositorySettings
+            creating to_bob: CollaboratorInvitation
+        then to_carol.invitee = carol
+        then to_bob.invitee = bob
+
+    2. Carol declines
+        carol does InviteeDeclinesCollaboration(carol, to_carol) on IncomingCollaboratorInvitation
+        then InviteeDeclinesCollaboration fires
+        then to_carol does not exist
+
+    3. Bob cannot revoke his own invitation as if he were an admin
+        stipulate is_repo_admin(bob, repo) = false
+        bob cannot do AdminRevokesCollaboratorInvitation(bob, repo, to_bob) on RepositorySettings
+
+    4. Alice withdraws the invitation to Bob, who can no longer accept it
+        alice does AdminRevokesCollaboratorInvitation(alice, repo, to_bob) on RepositorySettings
+        then AdminRevokesCollaboratorInvitation fires
+        then to_bob does not exist
+
+    5. root adds Carol directly
+        stipulate is_repo_admin(root, repo) = true
+        stipulate explicit_mode(carol, repo) = write
+        stipulate has_any_access(carol, repo) = true
+        root does AdminInvitesCollaborator(root, repo, carol) on RepositorySettings
+            creating collab: Collaboration
+        then AdminInvitesCollaborator fires
+        then collab.user = carol
+        then collab.access_mode = write
+
+    ends: Carol is a collaborator by the site admin's hand; Bob was never one.
 }
 
 -- Stars and watches.
@@ -358,10 +489,12 @@ journey StarringAndWatching {
     ends: Bob watches releases of Alice's repository and no longer stars it.
 }
 
--- Going private removes stars, and forks follow.
+-- Going private removes the stars of those who lose access (decision 3), and forks follow.
+-- (Updated: every star used to be removed.)
 journey GoingPrivateDropsStarsAndForksFollow {
-    goal: Alice makes her repository private. Its stars disappear and Bob's fork becomes private
-          too. Bob cannot make his fork public on his own.
+    goal: Alice makes her repository private. Carol, who has no grant, loses read access and
+          her star with it; Bob, a collaborator, keeps his. Bob's fork becomes private too,
+          and Bob cannot make it public again while its base is private.
 
     cast:
         repo: Repository
@@ -378,23 +511,68 @@ journey GoingPrivateDropsStarsAndForksFollow {
         fork.fork_of = repo
         fork.is_private = false
         s: Star { user: carol, repository: repo }
+        kept: Star { user: bob, repository: repo }
+        c: Collaboration { repository: repo, user: bob, access_mode: read }
 
     1. Alice makes it private
         stipulate is_repo_admin(alice, repo) = true
         stipulate repo.owner_is_private = false
         stipulate fork.owner_is_private = false
+        stipulate has_any_access(carol, repo) = false
+        stipulate has_any_access(bob, repo) = true
         alice does AdminChangesVisibility(alice, repo, true) on RepositorySettings
         then AdminChangesVisibility fires
         then repo.is_private = true
+        then AnnounceLostAccessAcrossRepository fires
+        then UnstarOnLostAccess fires
         then s does not exist
+        then kept exists
         then ForkFollowsBaseVisibility fires
         then fork.is_private = true
 
     2. Bob cannot flip his fork back to public
         stipulate is_repo_admin(bob, fork) = true
+        stipulate repo.effective_fork_privacy = true
         bob cannot do AdminChangesVisibility(bob, fork, false) on RepositorySettings
 
-    ends: Both the repository and its fork are private; nobody stars it.
+    ends: Both the repository and its fork are private; only Bob, who can still read it,
+          still stars it.
+}
+
+-- A fork of a public repository may be made private, and public again. Decision 2.
+journey AForkOfAPublicRepositoryMayGoPrivate {
+    goal: Bob makes his fork of Alice's public repository private, then public again; making a
+          fork more private than its base is always allowed, and its base does not stop it
+          from being public.
+
+    cast:
+        repo: Repository
+        fork: Repository
+    given:
+        repo.owner_user = alice
+        repo.owner_org = null
+        repo.is_private = false
+        repo.is_fork = false
+        repo.fork_of = null
+        fork.owner_user = bob
+        fork.owner_org = null
+        fork.is_fork = true
+        fork.fork_of = repo
+        fork.is_private = false
+
+    1. Bob makes his fork private
+        stipulate is_repo_admin(bob, fork) = true
+        stipulate fork.owner_is_private = false
+        bob does AdminChangesVisibility(bob, fork, true) on RepositorySettings
+        then AdminChangesVisibility fires
+        then fork.is_private = true
+
+    2. and public again, since its base is public
+        stipulate repo.effective_fork_privacy = false
+        bob does AdminChangesVisibility(bob, fork, false) on RepositorySettings
+        then fork.is_private = false
+
+    ends: Bob's fork is public, as its base is.
 }
 
 -- Renaming keeps the old name resolvable.
@@ -547,11 +725,15 @@ journey PullMirrorKeepsItselfCurrent {
         then mirror.sync_state = queued
 
     3. the fetch fails
+        stipulate mirror_retry_delay(1, 8.hours) = 10.minutes
         worker does PullMirrorFetchFailed(worker, mirror, "remote unreachable") on RepositoryWorkers
         then mirror.sync_state = idle
         then PullMirrorSyncFails fires
+        then mirror.consecutive_failures = 1
+        then mirror.last_error = "remote unreachable"
+        then mirror.health = healthy
 
-    4. the next update run tries again
+    4. the next update run tries again (the first back-off step)
         after 10.minutes
         then ScheduledPullMirrorSync fires
         then mirror.sync_state = queued
@@ -561,8 +743,76 @@ journey PullMirrorKeepsItselfCurrent {
         then mirror.sync_state = idle
         then repo.is_empty = false
         then PullMirrorSyncSucceeds fires
+        then mirror.consecutive_failures = 0
+        then mirror.last_error = null
 
     ends: The mirror is current and next due in eight hours.
+}
+
+-- A pull mirror that keeps failing backs off, is marked failing and pauses until someone
+-- syncs it. Decision 5.
+journey AFailingPullMirrorPausesUntilSynced {
+    goal: Alice's mirror has failed four times in a row. The fifth failure (the threshold) marks
+          it failing: its admins see it with the error, and no scheduled sync picks it up, even
+          a day later. Carol, a reader, cannot resume it. Alice's "Synchronise now" resumes it,
+          and a successful fetch clears the failures.
+
+    cast:
+        worker: BackgroundWorker
+        repo:   Repository
+        mirror: Mirror
+    given:
+        worker.queue = "mirror"
+        repo.owner_user = alice
+        repo.owner_org = null
+        repo.is_mirror = true
+        repo.is_archived = false
+        mirror.repository = repo
+        mirror.interval = 8.hours
+        mirror.sync_state = queued
+        mirror.consecutive_failures = 4
+        mirror.last_error = "remote unreachable"
+        mirror.health = healthy
+
+    1. the fifth fetch in a row fails
+        worker does PullMirrorFetchFailed(worker, mirror, "remote unreachable") on RepositoryWorkers
+        then PullMirrorSyncFails fires
+        then mirror.consecutive_failures = 5
+        then mirror.health = failing
+        then mirror.next_sync_at = null
+        then mirror.sync_state = idle
+
+    2. Alice sees it is failing
+        stipulate is_repo_admin(alice, repo) = true
+        alice sees mirror.health on RepositorySettings in repo
+        alice sees mirror.last_error on RepositorySettings in repo
+
+    3. a day later it is still paused
+        after 1.day
+        then ScheduledPullMirrorSync does not fire
+        then mirror.sync_state = idle
+
+    4. Carol, a reader, cannot resume it
+        stipulate can_write_code(carol, repo) = false
+        carol cannot do WriterRequestsMirrorSync(carol, mirror) on RepositoryOverview
+
+    5. Alice syncs it now
+        stipulate can_write_code(alice, repo) = true
+        stipulate repo.owner = alice
+        stipulate within_repo_quota(alice) = true
+        alice does WriterRequestsMirrorSync(alice, mirror) on RepositoryOverview
+        then mirror.sync_state = queued
+        then mirror.health = healthy
+
+    6. and the fetch succeeds
+        -- the remote has no tags
+        stipulate git_tags(repo) = {}
+        worker does PullMirrorFetchSucceeded(worker, mirror, true) on RepositoryWorkers
+        then mirror.consecutive_failures = 0
+        then mirror.last_error = null
+        then mirror.health = healthy
+
+    ends: The mirror is healthy and back on its eight-hour schedule.
 }
 
 -- Mirror sync intervals respect the minimum, and sync-now needs write access.
@@ -637,6 +887,49 @@ journey PushMirrorReportsItsLastError {
         alice sees pm.last_error on RepositorySettings in repo
 
     ends: Alice knows she must install the public key on the remote.
+}
+
+-- An archived repository's push mirrors still sync, on demand and on schedule. Decision 7.
+journey ArchivedRepositoriesKeepTheirBackupsCurrent {
+    goal: Alice's repository is archived. She can still push it to its backup mirror now, and
+          the hourly push still runs; Bob, not an admin, cannot ask for a push. She cannot
+          change the push mirror's settings while it is archived.
+
+    cast:
+        repo:   Repository
+        pm:     PushMirror
+        worker: BackgroundWorker
+    given:
+        repo.owner_user = alice
+        repo.owner_org = null
+        repo.is_archived = true
+        worker.queue = "mirror"
+        pm.repository = repo
+        pm.interval = 1.hour
+        pm.sync_state = idle
+        pm.sync_on_commit = false
+
+    1. Bob cannot ask for a push
+        stipulate is_repo_admin(bob, repo) = false
+        bob cannot do AdminRequestsPushMirrorSync(bob, repo, pm) on RepositorySettings
+
+    2. the settings stay frozen
+        stipulate is_repo_admin(alice, repo) = true
+        alice cannot do AdminUpdatesPushMirror(alice, repo, pm, 2.hours) on RepositorySettings
+
+    3. Alice pushes the backup now
+        alice does AdminRequestsPushMirrorSync(alice, repo, pm) on RepositorySettings
+        then AdminRequestsPushMirrorSync fires
+        then pm.sync_state = queued
+
+    4. the push succeeds, and the next one is due in an hour
+        worker does PushMirrorPushSucceeded(worker, pm) on RepositoryWorkers
+        then pm.sync_state = idle
+        after 1.hour
+        then ScheduledPushMirrorSync fires
+        then pm.sync_state = queued
+
+    ends: The backup of the archived repository stays current.
 }
 
 -- Download archives are generated once, reused, and expire.

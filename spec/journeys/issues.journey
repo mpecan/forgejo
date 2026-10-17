@@ -38,7 +38,7 @@ journey SomebodyReportsABug {
         stipulate all_assignable({}, repo) = true
         stipulate resolve_mentions_in(repo, ada, "Steps: ...") = {}
         stipulate cross_references(repo, ada, "Crash on save", "Steps: ...") = {}
-        ada does UserOpensIssue(ada, repo, "Crash on save", "Steps: ...", {}, null, {}, null, null, {}) on IssueTracker
+        ada does UserOpensIssue(ada, repo, "Crash on save", "Steps: ...", {}, null, {}, null, null, {}, null) on IssueTracker
             creating issue: Issue
             where issue_notification_audience(issue, ada) = {}
         then UserOpensIssue fires
@@ -128,7 +128,7 @@ journey ABlockedUserIsKeptOut {
     1. he cannot open an issue in a repository whose owner blocked him
         stipulate can_read_tracker(mallory, repo) = true
         stipulate is_blocked_by_owner(repo, mallory) = true
-        mallory cannot do UserOpensIssue(mallory, repo, "spam", "spam", {}, null, {}, null, null, {}) on IssueTracker
+        mallory cannot do UserOpensIssue(mallory, repo, "spam", "spam", {}, null, {}, null, null, {}, null) on IssueTracker
 
     2. nor comment on the issue of a poster who blocked him
         stipulate can_read_issue(mallory, bug) = true
@@ -147,7 +147,9 @@ journey ABlockedUserIsKeptOut {
 journey LockingAHeatedConversation {
     goal: A discussion has turned sour. Tess locks it as "Too heated"; from
           that moment Ada, who cannot write to the tracker, cannot comment,
-          while Tess still can. Inventing a lock reason is refused.
+          while Tess still can. Ada may still correct the title of her own
+          issue and react to it, but she can no longer close it. Inventing a
+          lock reason is refused.
 
     cast:
         bug: Issue
@@ -179,7 +181,30 @@ journey LockingAHeatedConversation {
         stipulate is_blocked_by_owner(repo, ada) = false
         ada cannot do UserComments(ada, bug, "but...", {}) on IssueConversation
 
-    4. tess still can
+    4. but she may still fix the title of her own issue
+        -- decided (issues 1): the poster keeps title / description edits while locked
+        stipulate trim("Crash on save (Linux)") = "Crash on save (Linux)"
+        stipulate length("Crash on save (Linux)") = 21
+        stipulate bug.title = "Crash on save"
+        stipulate bug.content = "Steps: open then save"
+        stipulate cross_references(repo, ada, "Crash on save (Linux)", "Steps: open then save") = {}
+        stipulate resolve_mentions(bug, ada, "Steps: open then save") = {}
+        ada does UserChangesIssueTitle(ada, bug, "Crash on save (Linux)") on IssueConversation
+        then bug.title = "Crash on save (Linux)"
+
+    5. and react to it, since the lock does not affect reactions
+        -- decided (issues 2): anyone who can read may react on a locked issue
+        stipulate is_allowed_reaction("+1") = true
+        ada does UserReactsToIssue(ada, bug, "+1") on IssueConversation
+            creating thumbs: Reaction
+        then thumbs.user = ada
+        then thumbs.issue = bug
+
+    6. but she cannot close it while it is locked
+        stipulate bug.has_open_blockers = false
+        ada cannot do UserClosesIssue(ada, bug) on IssueConversation
+
+    7. tess still can comment
         stipulate can_read_issue(tess, bug) = true
         stipulate is_blocked(ada, tess) = false
         stipulate is_blocked_by_owner(repo, tess) = false
@@ -190,7 +215,7 @@ journey LockingAHeatedConversation {
             creating reply: Comment
         then reply.poster = tess
 
-    5. and unlocks it later
+    8. and unlocks it later
         tess does TriagerUnlocksIssue(tess, bug) on IssueTriage
         then bug.is_locked = false
 
@@ -508,4 +533,208 @@ journey OnlyAdminsDeleteIssues {
         then spam does not exist
 
     ends: The spam issue and its timeline are gone.
+}
+
+-- Metadata from someone who cannot triage is dropped on every path.
+journey MetadataFromAReaderIsDropped {
+    goal: Ada, who cannot manage the tracker, opens an issue and tries to put
+          it in the 1.0 milestone and assign Tess. The issue is opened, but
+          with neither: none of the metadata is hers to set.
+          (decided, issues 6: labels, milestone, assignees and project are all dropped)
+
+    cast:
+        one: Milestone
+
+    given:
+        one.repository = repo
+
+    1. she opens the issue with a milestone and an assignee
+        stipulate can_read_tracker(ada, repo) = true
+        stipulate can_manage_tracker(ada, repo) = false
+        stipulate is_blocked_by_owner(repo, ada) = false
+        stipulate trim("Crash on load") = "Crash on load"
+        stipulate length("Crash on load") = 13
+        stipulate next_issue_index(repo) = 8
+        stipulate all_assignable({tess}, repo) = true
+        stipulate resolve_mentions_in(repo, ada, "Steps: ...") = {}
+        stipulate cross_references(repo, ada, "Crash on load", "Steps: ...") = {}
+        ada does UserOpensIssue(ada, repo, "Crash on load", "Steps: ...", {}, one, {tess}, null, null, {}, null) on IssueTracker
+            creating issue: Issue
+            where issue_notification_audience(issue, ada) = {}
+        then issue.milestone = null
+        then issue.assignees = {}
+        then issue.poster = ada
+
+    ends: Issue #8 exists without a milestone or assignees.
+}
+
+-- Blank issues can be switched off; writers are exempt.
+journey BlankIssuesAreSwitchedOff {
+    goal: The repository's template config disables blank issues. Ada, a
+          reader, cannot open a blank issue, on any path, but can open one
+          from the bug report template. Tess, who writes to the tracker, may
+          still open a blank one.
+          (decided, issues 4: blank issues are refused, repository writers excepted)
+
+    cast:
+        bug_form: IssueTemplate
+
+    given:
+        cfg: IssueTemplateConfig { repository: repo, blank_issues_enabled: false }
+        bug_form.repository = repo
+
+    1. a blank issue from ada is refused
+        stipulate can_read_tracker(ada, repo) = true
+        stipulate can_manage_tracker(ada, repo) = false
+        stipulate is_blocked_by_owner(repo, ada) = false
+        stipulate trim("It broke") = "It broke"
+        stipulate length("It broke") = 8
+        stipulate all_assignable({}, repo) = true
+        ada cannot do UserOpensIssue(ada, repo, "It broke", "", {}, null, {}, null, null, {}, null) on IssueTracker
+
+    2. the same issue from the bug report template is accepted
+        stipulate next_issue_index(repo) = 9
+        stipulate resolve_mentions_in(repo, ada, "") = {}
+        stipulate cross_references(repo, ada, "It broke", "") = {}
+        ada does UserOpensIssue(ada, repo, "It broke", "", {}, null, {}, null, null, {}, bug_form) on IssueTracker
+            creating report: Issue
+            where issue_notification_audience(report, ada) = {}
+        then report.poster = ada
+
+    3. tess, a writer, may still open a blank issue
+        stipulate can_read_tracker(tess, repo) = true
+        stipulate can_manage_tracker(tess, repo) = true
+        stipulate is_blocked_by_owner(repo, tess) = false
+        stipulate trim("Chore") = "Chore"
+        stipulate length("Chore") = 5
+        stipulate next_issue_index(repo) = 10
+        stipulate labels_usable_in({}, repo) = {}
+        stipulate without_scope_duplicates({}) = {}
+        stipulate resolve_mentions_in(repo, tess, "") = {}
+        stipulate cross_references(repo, tess, "Chore", "") = {}
+        tess does UserOpensIssue(tess, repo, "Chore", "", {}, null, {}, null, null, {}, null) on IssueTracker
+            creating chore: Issue
+            where issue_notification_audience(chore, tess) = {}
+        then chore.poster = tess
+
+    ends: Two issues exist: Ada's from the template and Tess's blank one.
+}
+
+-- Uploads never posted expire.
+journey AnUnpostedUploadExpires {
+    goal: Ada uploads a screenshot but never posts the comment it was for.
+          A day later the upload is gone; it was never linked to anything.
+          (decided, issues 5: orphan uploads expire after 24 hours by default)
+
+    1. she uploads a screenshot
+        stipulate can_read_tracker(ada, repo) = true
+        stipulate is_allowed_file("shot.png", "PNG") = true
+        ada does UserUploadsAttachment(ada, repo, "shot.png", 4096, "PNG") on IssueTracker
+            creating shot: Attachment
+        then shot.issue = null
+
+    2. it is still there after a few hours
+        after 23.hours
+        then shot exists
+
+    3. and gone after a day
+        after 2.hours
+        then OrphanUploadExpires fires
+        then shot does not exist
+
+    ends: The orphan upload has been swept.
+}
+
+-- Timeline events survive the deletion of their label or milestone.
+journey DeletedLabelsAndMilestonesStayOnTheTimeline {
+    goal: The bug was labelled "regression" and put in milestone 1.0. Tess
+          deletes both; the bug's timeline still shows that it was labelled
+          and milestoned, by name, marked as deleted.
+          (decided, issues 7: events are kept for both labels and milestones)
+
+    cast:
+        bug:  Issue
+        reg:  Label
+        one:  Milestone
+        tagged: Comment
+        planned: Comment
+
+    given:
+        bug.repository = repo
+        bug.is_pull = false
+        reg.repository = repo
+        reg.name = "regression"
+        one.repository = repo
+        one.name = "1.0"
+        bug.milestone = one
+        tagged.issue = bug
+        tagged.kind = label
+        tagged.label = reg
+        tagged.label_added = true
+        tagged.old_milestone = null
+        tagged.new_milestone = null
+        planned.issue = bug
+        planned.kind = milestone
+        planned.label = null
+        planned.old_milestone = null
+        planned.new_milestone = one
+
+    1. tess deletes the label
+        stipulate can_manage_tracker(tess, repo) = true
+        stipulate bug.labels = {reg}
+        tess does TrackerManagerDeletesLabel(tess, repo, reg) on TrackerSettings
+        then RemoveLabelEverywhere fires
+        then reg does not exist
+        then tagged exists
+        then tagged.label = null
+        then tagged.deleted_label_name = "regression"
+
+    2. and the milestone
+        tess does TrackerManagerDeletesMilestone(tess, repo, one) on TrackerSettings
+        then one does not exist
+        then planned exists
+        then planned.new_milestone = null
+        then planned.deleted_new_milestone_name = "1.0"
+
+    3. readers still see both events, marked deleted
+        stipulate can_read_issue(ada, bug) = true
+        ada sees tagged.deleted_label_name on IssueConversation in bug
+        ada sees planned.deleted_new_milestone_name on IssueConversation in bug
+
+    ends: Both events remain on the bug's timeline under their old names.
+}
+
+-- Repository admins log time for others.
+journey AnAdminLogsTimeForSomeoneElse {
+    goal: Ada spent an hour on the bug yesterday but forgot to log it. Tess,
+          the repository admin, logs it for her with yesterday's date; the
+          entry is Ada's time and records that Tess logged it. Ada, who is
+          not an admin, cannot log time for Tess.
+          (decided, issues 8: repository admins may, on every path, with a chosen date)
+
+    cast:
+        bug: Issue
+
+    given:
+        bug.repository = repo
+        bug.is_pull = false
+        bug.poster = ada
+        bug.status = open
+
+    1. ada cannot log time for tess
+        stipulate may_track_time(ada, bug) = true
+        stipulate is_repo_admin(ada, repo) = false
+        ada cannot do AdminAddsTimeForUser(ada, bug, tess, 1.hour, now) on IssueAdministration
+
+    2. tess logs an hour for ada, dated yesterday
+        stipulate may_track_time(tess, bug) = true
+        stipulate is_repo_admin(tess, repo) = true
+        tess does AdminAddsTimeForUser(tess, bug, ada, 1.hour, now - 1.day) on IssueAdministration
+            creating entry: TrackedTime
+        then LogTime fires
+        then entry.user = ada
+        then entry.logged_by = tess
+        then entry.amount = 1.hour
+
+    ends: Ada has an hour on the bug, recorded as logged by Tess.
 }

@@ -64,6 +64,9 @@
 --                                                      -- issues closes the conversation and applies closing keywords
 --   PullRequestAutoMerged(pull_request, merger)        -- emitted together with PullRequestMerged
 --   AutoMergeScheduled(pull_request, doer) / AutoMergeCancelled(pull_request, doer)
+--                                                      -- scheduled also when a schedule is replaced; cancelled also on close
+--   AutoMergeFailed(pull_request, scheduler, reason)   -- a ready auto-merge could not merge; the schedule is gone
+--                                                      -- (notifications tells the scheduler)
 --   ReviewSubmitted(review)                            -- review.pull_request; approvals re-evaluate auto-merge
 --   PullRequestCodeCommented(pull_request, comment)
 --   ReviewRequested(pull_request, requester, reviewer)
@@ -155,7 +158,22 @@ use "./issues.allium" as issues
 --   suggestion_applicable(conversation, head_sha), suggestions_overlap(conversations)
 --   count_suggestions(body): number of ```suggestion blocks
 --   code_owner_users(rules, pr), code_owner_teams(rules, pr)
---   compose_merge_message(pr, style, title, message), default_merge_message(pr, style)
+--   compose_merge_message(pr, style, title, message), default_merge_message(pr, style):
+--       the title/body template is the repository's template for the style, else
+--       the instance-wide template for the style, else the built-in default
+--       (see UserMergesPullRequest guidance)
+--   repository_merge_message_template(repository, style) -> String?:
+--       .forgejo/default_merge_message/<STYLE>_TEMPLATE.md, then .gitea/..., on the
+--       default branch (read up to config.default_merge_message_size)
+--   instance_merge_message_template(style) -> String?:
+--       <custom path>/config.instance_merge_message_templates/<STYLE>_TEMPLATE.md
+--   merge_attempt_fails(pr, style, message): carrying out the merge (git work and
+--       the merge push) fails although every precondition held — conflicts found
+--       at merge time, unrelated histories, base moved, push rejected by hooks
+--   auto_merge_failure_reason(pr, scheduler, style) -> String: why a ready
+--       auto-merge could not merge (lost merge permission, style no longer
+--       allowed, signing not possible, or the merge attempt's error)
+--   rebase_update_allowed(repository): pull-request settings allow_rebase_update
 --   issues_closed_by(pr) / issues_reopened_by(pr) -> Set<issues/Issue>: the issues whose
 --       latest keyword reference from this PR (issues/Comment with ref_issue = pr.issue
 --       and ref_action closes / reopens) is a close / reopen; one entry per issue
@@ -177,7 +195,7 @@ enum MergeStyle {
     merge                -- merge commit (--no-ff)
     | rebase             -- rebase head onto base, fast-forward base
     | rebase_merge       -- rebase head onto base, then a merge commit
-    | squash             -- one squashed commit authored by the PR poster
+    | squash             -- one squashed commit authored by the PR poster's account identity
     | fast_forward_only  -- fast-forward base to head or fail
     | manually_merged    -- not a git operation: the PR is marked as already merged
 }
@@ -236,6 +254,7 @@ entity PullRequest {
 
     -- Mergeability. `checking` is entered whenever head or base moves and left
     -- by CheckMergeability. merged / manually_merged are terminal.
+    -- decided: `ancestor` (head already in base, autodetect off) stays distinct from `empty`
     status: checking | mergeable | conflict | empty | ancestor | error | merged | manually_merged
     check_requested_at: Timestamp?    -- set while a check is queued
     last_check_outcome: MergeCheckOutcome?
@@ -302,6 +321,11 @@ entity PullRequest {
     head_branch_present: flow = agit or branch_exists(head_repository, head_branch)
     base_branch_present: branch_exists(base_repository, base_branch)
     is_ready_for_merge_state: status = mergeable or status = empty
+    -- decided: a squash commit is authored by the poster's account identity —
+    -- their commit email, which is the no-reply address when they keep their
+    -- email private — not a commit identity found among the PR's commits;
+    -- other commit authors become Co-authored-by trailers
+    squash_author_email: issue.poster.public_email
 
     -- The first branch-protection rule of the base repository matching the base
     -- branch (exact names win over globs; earliest-created glob otherwise).
@@ -331,6 +355,8 @@ entity PullRequest {
     is_official_reviewer(u): if protection = null: can_write_code(u, base_repository) else: protection.counts_approval_of(u)
     -- Poster, repository owner, collaborators, and members of org teams with
     -- read access to pull requests may change review requests.
+    -- decided: any reader of pull requests granted access (collaborator or team
+    -- member, write not needed) may request reviews, like Forgejo
     may_change_review_requests(u): u = issue.poster or is_repository_owner(u, base_repository)
         or is_collaborator(u, base_repository) or in_team_reading_pulls(u, base_repository)
     -- Poster or pull-request writers.
@@ -506,6 +532,9 @@ config {
     max_diff_line_characters: Integer = 5000
     -- [ui] DIFF_PAGING_NUM? (files per page on "files changed")
     diff_files_per_page: Integer = 20
+    -- decided: instance-wide merge-message templates, used when the repository has none
+    -- (directory under the custom path holding <STYLE>_TEMPLATE.md files)
+    instance_merge_message_templates: String = "default_merge_message"
     -- fixed limits
     max_title_length: Integer = 255
     max_suggestions_per_apply: Integer = 100
@@ -523,6 +552,8 @@ config {
 -- than max_title_length moves the rest into the description) and the
 -- description from that commit's body followed by the repository's pull
 -- request template.
+-- decided: mergeability is always checked asynchronously; a new pull request
+-- starts `checking` until CheckMergeability finishes
 -- from: services/pull/pull.go:40
 rule UserOpensPullRequest {
     when: UserOpensPullRequest(user, base_repository, base_branch, head_repository, head_branch, title, body, allow_maintainer_edit)
@@ -746,6 +777,7 @@ rule HeadBranchPushUpdatesPullRequests {
 -- reviews made against a different diff go stale (and approvals are dismissed
 -- when the protection rule says so), code conversations whose lines changed
 -- become outdated, and a push entry is added to the timeline.
+-- decided: every head move outdates code conversations, AGit pushes included
 -- from: services/pull/pull.go:378
 rule PullRequestHeadMoves {
     when: PullRequestHeadMoved(pull_request, pusher, old_commit_sha, new_commit_sha)
@@ -781,8 +813,8 @@ rule PullRequestHeadMoves {
         -- "Diff differs" compares the diff of old head vs base with new head vs
         -- base (a rebase that keeps the same changes does not make reviews
         -- stale). The push entry lists the new commit ids, or marks a force
-        -- push with old..new. Forgejo skips the outdating step for AGit pushes;
-        -- a rebuild should not.
+        -- push with old..new. Forgejo skips the outdating step for AGit pushes
+        -- (a TODO in its code); this spec outdates on every head move.
 }
 
 -- A push to a branch re-checks every open PR that targets it.
@@ -812,6 +844,9 @@ rule ProtectionChangeRechecksPullRequests {
 -- The asynchronous mergeability check. Records the merge base, conflicting
 -- files and protected files changed; detects a PR already merged outside
 -- Forgejo when the repository autodetects manual merges.
+-- decided: every check is asynchronous (Forgejo checks synchronously at
+-- creation); a new or updated PR is `checking` until this rule runs.
+-- decided: `ancestor` and `empty` stay distinct outcomes.
 -- from: services/pull/check.go:302
 rule CheckMergeability {
     when: pr: PullRequest.check_requested_at <= now
@@ -919,6 +954,7 @@ rule BranchRenameCarriesPullRequests {
 ------------------------------------------------------------
 
 -- The poster or a pull-request writer closes. Open dependencies block closing.
+-- decided: closing cancels a scheduled auto-merge; reopening does not restore it
 -- from: routers/web/repo/issue.go:3171
 rule UserClosesPullRequest {
     when: UserClosesPullRequest(user, pr)
@@ -928,20 +964,26 @@ rule UserClosesPullRequest {
     requires: not pr.is_merged
     requires: not is_blocked_by_owner(pr.base_repository, user)
     requires: not has_open_blocking_dependencies(pr.issue)
-    ensures: pr.issue.status = closed
-    ensures: pr.issue.closed_at = now
-    ensures: issues/Comment.created(issue: pr.issue, poster: user, kind: close, content: "",
-        content_version: 0, created_at: now, updated_at: now)
-    ensures: PullRequestClosed(pull_request: pr, doer: user)
+    ensures:
+        pr.issue.status = closed
+        pr.issue.closed_at = now
+        issues/Comment.created(issue: pr.issue, poster: user, kind: close, content: "",
+            content_version: 0, created_at: now, updated_at: now)
+        for schedule in AutoMerges where pull_request = pr:
+            not exists schedule
+            issues/Comment.created(issue: pr.issue, poster: user, kind: pr_unscheduled_to_auto_merge, content: "",
+                content_version: 0, created_at: now, updated_at: now)
+            AutoMergeCancelled(pull_request: pr, doer: user)
+        PullRequestClosed(pull_request: pr, doer: user)
     @guidance
         -- Web: POST /issues/{index}/comments with status=close; API: PATCH
-        -- pulls/{index} state=closed. A scheduled auto-merge stays recorded but
-        -- cannot fire while closed (see open question). The closer's stopwatch
-        -- stops (issues).
+        -- pulls/{index} state=closed. Forgejo keeps the schedule recorded
+        -- (it could fire again after reopening); this spec cancels it. The
+        -- closer's stopwatch stops (issues).
 }
 
 -- Reopening re-copies the head into the pull ref when they diverged and queues
--- a fresh check. Refused for merged PRs, when another open PR has the same
+-- a fresh check. A schedule cancelled by closing is not restored. Refused for merged PRs, when another open PR has the same
 -- head and base, or (branch flow) when the head or base branch is gone.
 -- from: routers/web/repo/issue.go:3178
 rule UserReopensPullRequest {
@@ -967,6 +1009,7 @@ rule UserReopensPullRequest {
 
 -- Deleting a branch closes the open PRs that use it as head or base (after any
 -- retargeting done by a merge cleanup).
+-- decided: closing cancels a scheduled auto-merge
 -- from: services/pull/pull.go:527
 rule DeletedBranchClosesPullRequests {
     when: code/BranchDeleted(branch, by)
@@ -974,22 +1017,33 @@ rule DeletedBranchClosesPullRequests {
             and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error)
             and ((head_repository = branch.repository and head_branch = branch.name and flow != agit)
                  or (base_repository = branch.repository and base_branch = branch.name)):
-        ensures: pr.issue.status = closed
-        ensures: pr.issue.closed_at = now
-        ensures: issues/Comment.created(issue: pr.issue, poster: by, kind: close, content: "",
-            content_version: 0, created_at: now, updated_at: now)
-        ensures: PullRequestClosed(pull_request: pr, doer: by)
+        ensures:
+            pr.issue.status = closed
+            pr.issue.closed_at = now
+            issues/Comment.created(issue: pr.issue, poster: by, kind: close, content: "",
+                content_version: 0, created_at: now, updated_at: now)
+            for schedule in AutoMerges where pull_request = pr:
+                not exists schedule
+                issues/Comment.created(issue: pr.issue, poster: by, kind: pr_unscheduled_to_auto_merge, content: "",
+                    content_version: 0, created_at: now, updated_at: now)
+                AutoMergeCancelled(pull_request: pr, doer: by)
+            PullRequestClosed(pull_request: pr, doer: by)
 }
 
 -- Deleting a repository closes open PRs from its branches into other repositories.
+-- decided: closing cancels a scheduled auto-merge
 -- from: services/pull/pull.go:556
 rule DeletedRepositoryClosesOutgoingPullRequests {
     when: repositories/RepositoryDeleted(repository, doer)
     for pr in PullRequests where head_repository = repository and base_repository != repository and issue.status = open
             and (status = checking or status = mergeable or status = conflict or status = empty or status = ancestor or status = error):
-        ensures: pr.issue.status = closed
-        ensures: pr.issue.closed_at = now
-        ensures: PullRequestClosed(pull_request: pr, doer: doer)
+        ensures:
+            pr.issue.status = closed
+            pr.issue.closed_at = now
+            for schedule in AutoMerges where pull_request = pr:
+                not exists schedule
+                AutoMergeCancelled(pull_request: pr, doer: doer)
+            PullRequestClosed(pull_request: pr, doer: doer)
 }
 
 ------------------------------------------------------------
@@ -998,20 +1052,25 @@ rule DeletedRepositoryClosesOutgoingPullRequests {
 
 -- "Update branch": bring base commits into the head by a merge commit
 -- ("Merge branch '<base>' into <head>") or by rebasing the head onto base and
--- force-pushing it. Not available for AGit PRs.
+-- force-pushing it.
+-- decided: AGit pull requests can be updated too — the server merges or rebases
+-- the base into the AGit head ref; whoever may push that ref (base code writers
+-- and the poster) may update it, by rebase only when the repository allows
+-- rebase updates. Forgejo refuses update-branch for AGit pull requests.
 -- from: services/pull/update.go:25
 rule UserUpdatesPullRequestBranch {
     when: UserUpdatesPullRequestBranch(user, pr, style)
     requires: pr.is_open
     requires: not pr.is_merged
-    requires: pr.flow = branch
     requires: pr.commits_behind > 0
-    requires: (style = merge and may_update_by_merge(user, pr)) or (style = rebase and may_update_by_rebase(user, pr))
+    requires: (pr.flow = branch and ((style = merge and may_update_by_merge(user, pr)) or (style = rebase and may_update_by_rebase(user, pr))))
+        or (pr.flow = agit and (can_write_code(user, pr.base_repository) or user = pr.issue.poster)
+            and (style = merge or rebase_update_allowed(pr.base_repository)))
     requires: within_quota(pr.head_repository)
     ensures: PullRequestHeadMoved(pull_request: pr, pusher: user, old_commit_sha: pr.head_commit_sha, new_commit_sha: updated_head(pr, style))
     ensures: PullRequestBranchUpdated(pull_request: pr, doer: user, style: style)
     @guidance
-        -- may_update_by_merge: the user may "merge into" the head branch (code
+        -- Branch flow — may_update_by_merge: the user may "merge into" the head branch (code
         -- writer of the head repository, or the head branch protection's merge
         -- allowlist), or — when maintainer edits are allowed — the same test
         -- with their base-repository permission; when the head branch is
@@ -1019,7 +1078,8 @@ rule UserUpdatesPullRequestBranch {
         -- may_update_by_rebase: as above, plus the head branch is NOT
         -- protected (a rebase needs a force push) and the head repository's
         -- pull-request settings allow_rebase_update. Conflicts abort with the
-        -- conflicting output; nothing changes.
+        -- conflicting output; nothing changes. AGit flow: the new head is
+        -- written to refs/pull/<index>/head (there is no head branch to protect).
         -- Web: POST /pulls/{index}/update?style=merge|rebase; API: POST
         -- /repos/{o}/{r}/pulls/{index}/update?style=merge|rebase. The UI
         -- default is the repository's default_update_style, else
@@ -1068,9 +1128,11 @@ rule UserMergesPullRequest {
         -- Styles: merge = merge commit; rebase = rebase head onto base then
         -- fast-forward (amending the last commit only if a REBASE template
         -- exists); rebase_merge = rebase then --no-ff merge commit; squash = one
-        -- commit authored by the poster (using the poster's own commit identity
-        -- when one of the PR's commits has it) with Co-authored-by trailers;
-        -- fast_forward_only = fails unless base can fast-forward to head.
+        -- commit authored by the poster's account identity (display name and
+        -- squash_author_email, the no-reply address when they keep their email
+        -- private; decided — Forgejo preferred a matching commit identity from
+        -- the PR's commits) with Co-authored-by trailers for the other commit
+        -- authors; fast_forward_only = fails unless base can fast-forward to head.
         -- Failures that leave the PR unmerged: merge/rebase conflicts, unrelated
         -- histories, base moved during the merge, head moved since the merger
         -- loaded the page (expected_head_sha), push rejected by hooks (the
@@ -1084,10 +1146,12 @@ rule UserMergesPullRequest {
         -- Message composition (compose_merge_message / default_merge_message):
         -- a typed title replaces the template/default title and a typed body is
         -- appended after a blank line.
-        -- Template lookup per style: .forgejo/default_merge_message/<STYLE>_TEMPLATE.md,
-        -- then .gitea/..., on the default branch (read up to
-        -- config.default_merge_message_size), then an instance-level
-        -- custom/default_merge_message/<STYLE>_TEMPLATE.md. First line = title,
+        -- Template lookup per style (decided: repository template, else the
+        -- instance-wide template, else the built-in default):
+        -- repository_merge_message_template(base_repository, style), else
+        -- instance_merge_message_template(style) from
+        -- config.instance_merge_message_templates, else the defaults below.
+        -- First line = title,
         -- rest = body; empty parts fall back to the defaults. Variables:
         -- BaseRepoOwnerName, BaseRepoName, BaseBranch, HeadRepoOwnerName,
         -- HeadRepoName, HeadBranch, PullRequestTitle, PullRequestDescription,
@@ -1181,6 +1245,8 @@ rule UserMarksPullRequestManuallyMerged {
 -- from: services/automerge/automerge.go:56
 rule UserSchedulesAutoMerge {
     when: UserSchedulesAutoMerge(user, pr, style, message, delete_branch_after_merge)
+    let existing = AutoMerge{pull_request: pr}
+    requires: not exists existing
     requires: pr.base_repository.is_archived = false
     requires: style != manually_merged
     requires: pr.allows_style(style)
@@ -1191,17 +1257,47 @@ rule UserSchedulesAutoMerge {
     requires: pr.status = mergeable or pr.status = empty
     requires: merge_signing_satisfied(pr, user, style)
     requires: not has_open_blocking_dependencies(pr.issue)
-    requires: not exists pr.auto_merge
     ensures: AutoMerge.created(pull_request: pr, scheduled_by: user, style: style,
         message: message ?? default_merge_message(pr, style),
         delete_branch_after_merge: delete_branch_after_merge, created_at: now)
-    ensures: issues/Comment.created(issue: pr.issue, poster: user, kind: pull_scheduled_merge, content: "",
+    ensures: issues/Comment.created(issue: pr.issue, poster: user, kind: pr_scheduled_to_auto_merge, content: "",
         content_version: 0, created_at: now, updated_at: now)
     ensures: AutoMergeScheduled(pull_request: pr, doer: user)
     @guidance
-        -- Web: merge form with merge_when_checks_succeed=true (replaces an
-        -- existing schedule); API: same field on POST pulls/{index}/merge
-        -- (refuses when one exists).
+        -- Web: merge form with merge_when_checks_succeed=true; API: same field
+        -- on POST pulls/{index}/merge. With a schedule already in place see
+        -- UserReplacesAutoMerge.
+}
+
+-- Scheduling when a schedule already exists replaces it: the new style,
+-- message, branch deletion choice and scheduler take over, and the timeline
+-- records the new schedule. Same checks as scheduling.
+-- decided: scheduling replaces an existing auto-merge (Forgejo's web form did,
+-- its API refused with a conflict)
+-- from: services/automerge/automerge.go:56
+rule UserReplacesAutoMerge {
+    when: UserSchedulesAutoMerge(user, pr, style, message, delete_branch_after_merge)
+    let existing = AutoMerge{pull_request: pr}
+    requires: exists existing
+    requires: pr.base_repository.is_archived = false
+    requires: style != manually_merged
+    requires: pr.allows_style(style)
+    requires: not pr.is_merged
+    requires: pr.is_open
+    requires: pr.may_merge(user)
+    requires: not pr.is_work_in_progress
+    requires: pr.status = mergeable or pr.status = empty
+    requires: merge_signing_satisfied(pr, user, style)
+    requires: not has_open_blocking_dependencies(pr.issue)
+    ensures:
+        existing.scheduled_by = user
+        existing.style = style
+        existing.message = message ?? default_merge_message(pr, style)
+        existing.delete_branch_after_merge = delete_branch_after_merge
+        existing.created_at = now
+        issues/Comment.created(issue: pr.issue, poster: user, kind: pr_scheduled_to_auto_merge, content: "",
+            content_version: 0, created_at: now, updated_at: now)
+        AutoMergeScheduled(pull_request: pr, doer: user)
 }
 
 -- from: services/automerge/automerge.go:70
@@ -1211,7 +1307,7 @@ rule UserCancelsAutoMerge {
     requires: exists pr.auto_merge
     requires: user = pr.auto_merge.scheduled_by or pr.may_merge(user)
     ensures: not exists pr.auto_merge
-    ensures: issues/Comment.created(issue: pr.issue, poster: user, kind: pull_cancel_scheduled_merge, content: "",
+    ensures: issues/Comment.created(issue: pr.issue, poster: user, kind: pr_unscheduled_to_auto_merge, content: "",
         content_version: 0, created_at: now, updated_at: now)
     ensures: AutoMergeCancelled(pull_request: pr, doer: user)
     @guidance
@@ -1219,9 +1315,16 @@ rule UserCancelsAutoMerge {
 }
 
 -- When a scheduled PR becomes mergeable with passing required checks, it is
--- merged as the scheduler — provided they may still merge and every merge
--- precondition, including branch protection, now holds. Otherwise it stays
+-- merged as the scheduler once every waiting condition holds (not WIP, branch
+-- protection satisfied, no open blocking dependencies); until then it stays
 -- scheduled and is re-evaluated on the next status, review or check event.
+-- If the merge then cannot be carried out — the scheduler may no longer merge,
+-- the style is no longer allowed, the merge cannot be signed, or the merge
+-- attempt itself fails — the schedule is removed, the timeline says why and
+-- the scheduler is told (notifications reacts to AutoMergeFailed); the pull
+-- request stays open and may be merged by hand or scheduled again.
+-- decided: a failing auto-merge removes the schedule, leaves a timeline comment
+-- with the reason and notifies the scheduler (Forgejo only logged it)
 -- from: services/automerge/automerge.go:116
 rule AutoMergeExecutes {
     when: scheduled: AutoMerge.is_ready
@@ -1232,32 +1335,37 @@ rule AutoMergeExecutes {
     let message = scheduled.message
     let delete_after = scheduled.delete_branch_after_merge
     requires: pr.status = mergeable
-    requires: pr.may_merge(scheduled.scheduled_by)
-    requires: pr.allows_style(scheduled.style)
     requires: not pr.is_work_in_progress
     requires: pr.protection_satisfied
-    requires: merge_signing_satisfied(pr, scheduled.scheduled_by, scheduled.style)
     requires: not has_open_blocking_dependencies(pr.issue)
+    let cannot_merge = not pr.may_merge(scheduled.scheduled_by) or not pr.allows_style(scheduled.style)
+        or not merge_signing_satisfied(pr, scheduled.scheduled_by, scheduled.style)
+        or merge_attempt_fails(pr, scheduled.style, scheduled.message)
     ensures:
-        pr.status = merged
-        pr.merge_style = style
-        pr.merged_commit_sha = merge_result_commit(pr, style, message)
-        pr.merger = scheduler
-        pr.merged_at = now
-        pr.check_requested_at = null
-        pr.conflicted_files = {}
-        pr.merged_automatically = true
-        PullRequestAutoMerged(pull_request: pr, merger: scheduler)
-        PullRequestMerged(pull_request: pr, merger: scheduler)
-        if delete_after:
-            PullRequestHeadBranchDeletionRequested(pull_request: pr, doer: scheduler)
+        if cannot_merge:
+            issues/Comment.created(issue: pr.issue, poster: scheduler, kind: pr_unscheduled_to_auto_merge,
+                content: auto_merge_failure_reason(pr, scheduler, style),
+                content_version: 0, created_at: now, updated_at: now)
+            AutoMergeFailed(pull_request: pr, scheduler: scheduler, reason: auto_merge_failure_reason(pr, scheduler, style))
+        else:
+            pr.status = merged
+            pr.merge_style = style
+            pr.merged_commit_sha = merge_result_commit(pr, style, message)
+            pr.merger = scheduler
+            pr.merged_at = now
+            pr.check_requested_at = null
+            pr.conflicted_files = {}
+            pr.merged_automatically = true
+            PullRequestAutoMerged(pull_request: pr, merger: scheduler)
+            PullRequestMerged(pull_request: pr, merger: scheduler)
+            if delete_after:
+                PullRequestHeadBranchDeletionRequested(pull_request: pr, doer: scheduler)
         not exists scheduled
     @guidance
         -- Triggered in Forgejo by: a commit status on the head commit
         -- (code/CommitStatusCreated), an approval, a dismissed review, and a
         -- check finishing as mergeable. The head commit must still be the one
-        -- the triggering event was about. A failing merge is only logged (see
-        -- open question).
+        -- the triggering event was about.
 }
 
 ------------------------------------------------------------
@@ -1445,6 +1553,8 @@ rule UserDeletesReviewComment {
 --     (organization-owned repositories).
 -- Any verdict fulfils the reviewer's own review request. `comment` (and
 -- request_changes) need a body or code comments.
+-- decided: reviews and code comments are allowed on closed and merged pull
+-- requests, verdicts included, like Forgejo
 -- from: models/issues/review.go:350
 rule UserSubmitsDraftReview {
     when: UserSubmitsDraftReview(user, draft, verdict, body, commit_sha)
@@ -1484,6 +1594,7 @@ rule UserSubmitsDraftReview {
 }
 
 -- Submitting without a draft creates the submitted review directly.
+-- decided: allowed on closed and merged pull requests too, like Forgejo
 -- from: models/issues/review.go:376
 rule UserSubmitsReview {
     when: UserSubmitsReview(user, pr, verdict, body, commit_sha)
@@ -1605,6 +1716,8 @@ rule RepoAdminUndismissesReview {
 -- Request a review from a user. Requesting again from someone who already
 -- reviewed is a re-request (only while the PR is open and unmerged); a request
 -- that is already pending is a no-op.
+-- decided: who may request is may_change_review_requests — read access to pull
+-- requests through ownership, collaboration or a team suffices, like Forgejo
 -- from: services/issue/assignee.go:84
 rule UserRequestsReview {
     when: UserRequestsReview(user, pr, requested)
@@ -2033,12 +2146,13 @@ surface PullRequestMergeBox {
         pr.conflicted_files
         pr.auto_merge.style
         pr.auto_merge.scheduled_by
+        pr.squash_author_email
 
     provides:
         UserMergesPullRequest(maintainer, pr, style, title, message, expected_head_sha, delete_branch_after_merge, force_merge)
             when pr.is_open and not pr.is_merged
         UserSchedulesAutoMerge(maintainer, pr, style, message, delete_branch_after_merge)
-            when pr.is_open and not exists pr.auto_merge
+            when pr.is_open
         UserCancelsAutoMerge(maintainer, pr) when exists pr.auto_merge
         UserMarksPullRequestManuallyMerged(maintainer, pr, commit_sha) when pr.is_open and not pr.is_merged
         UserChangesPullRequestTarget(maintainer, pr, new_base_branch) when pr.is_open
@@ -2118,17 +2232,7 @@ deferred MergeExecution.commit          -- see: services/pull/merge_*.go per sty
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Scheduling auto-merge when one already exists: the web form silently replaces it, the API refuses with a conflict. Which should the rebuild do?"
-open question "Closing a pull request leaves its scheduled auto-merge in place (it can fire again after reopening). Should closing cancel the schedule?"
-open question "A failing auto-merge is only logged; should the scheduler be told and the schedule removed?"
-open question "Is the 'ancestor' status (head already contained in base, autodetect off) worth keeping distinct from 'empty'?"
-open question "Submitting reviews and code comments is allowed on closed and merged pull requests; intended?"
-open question "Review requests may be added by any collaborator or org team member with pull-request read access, even without write access; intended?"
-open question "Code-comment outdating is skipped for AGit pushes in Forgejo (TODO in the code); the spec applies it to every head move."
-open question "Update-branch is unsupported for AGit pull requests; should a rebuild support it?"
-open question "Squash-merge author: the PR poster's commit identity is preferred over their primary email; keep this heuristic?"
-open question "Mergeability is checked synchronously at creation and asynchronously afterwards; the spec makes every check asynchronous."
-open question "Should merge-message templates live only in the repository (.forgejo/default_merge_message) or also at instance level?"
+-- (none: the eleven questions were decided; see DECISIONS.md "## pulls")
 
 ------------------------------------------------------------
 -- Requests to other modules
@@ -2150,3 +2254,9 @@ open question "Should merge-message templates live only in the repository (.forg
 -- REQUEST quota: within_quota(repository) for merges, branch updates and applied suggestions (size:git:all of the target repository owner).
 -- REQUEST all consumers: the journey walker binds chained-trigger parameters BY NAME, so rules reacting to pulls triggers should use the emitted parameter names (e.g. `when: pulls/PullRequestMerged(pull_request, merger)`, not `(pr, merger)`).
 -- REQUEST notifications / webhooks / actions: consume the Emits list (names and parameters reconciled here: PullRequestOpened(pull_request), PullRequestMerged(pull_request, merger), ReviewSubmitted(review), ReviewRequested(pull_request, requester, reviewer), ReviewRequestRemoved(pull_request, doer, reviewer), PullRequestSynchronized(pull_request, doer)).
+-- REQUEST notifications: react to pulls/AutoMergeFailed(pull_request, scheduler, reason) by telling the scheduler (inbox and mail), even when they are the doer; the reason is the timeline comment's content.
+-- REQUEST notifications / webhooks: closing a pull request now also emits AutoMergeCancelled(pull_request, doer) when a schedule existed; replacing a schedule emits AutoMergeScheduled again.
+-- REQUEST issues: CommentKind pr_unscheduled_to_auto_merge is now also created by pulls when an auto-merge fails, with the failure reason as content (pulls now uses the issues kind names pr_scheduled_to_auto_merge / pr_unscheduled_to_auto_merge instead of pull_scheduled_merge / pull_cancel_scheduled_merge); a dedicated kind (e.g. auto_merge_failed) would also do — pulls would switch to it.
+-- REQUEST repositories: RepoUnit.pull_request_settings.allow_rebase_update read through rebase_update_allowed(repository) (AGit update-branch by rebase).
+-- REQUEST accounts: User.public_email (no-reply address when keep_email_private) is the squash-merge author email (present).
+-- REQUEST administration: instance-wide merge-message templates live in <custom path>/config.instance_merge_message_templates/<STYLE>_TEMPLATE.md (pulls config); no admin UI needed.

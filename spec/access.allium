@@ -57,7 +57,7 @@
 -- Emits:
 --   - UserLostRepositoryAccess(user, repository)
 --       after any change that leaves a user without read access to a
---       repository (has_any_access false); repositories (watches) and issues
+--       repository (has_any_access false); repositories (watches, stars) and issues
 --       (issue subscriptions, assignees) clear what presumed access.
 --   - SiteAdminImpersonates(admin, target)
 --       an API request performed by a site administrator "as" another user (sudo).
@@ -1025,8 +1025,10 @@ rule AnnounceLostAccessOnOrganizationVisibilityChanged {
 }
 
 -- A repository-wide input changed: announce every user with a stake in the
--- repository (a watch, an issue subscription, an assignment) who is now
+-- repository (a watch, a star, an issue subscription, an assignment) who is now
 -- without access. The owning user and site administrators never lose it.
+-- (Stars: decided: repositories decision 3 - stars of people who keep read
+-- access stay when a repository goes private.)
 -- from: models/org_team.go:556
 rule AnnounceLostAccessAcrossRepository {
     when: RepositoryAccessMayHaveNarrowed(repository)
@@ -1034,6 +1036,9 @@ rule AnnounceLostAccessAcrossRepository {
         for w in repository.watches:
             if w.user != repository.owner_user and not w.user.is_admin and not has_any_access(w.user, repository):
                 UserLostRepositoryAccess(user: w.user, repository: repository)
+        for s in repository.stars:
+            if s.user != repository.owner_user and not s.user.is_admin and not has_any_access(s.user, repository):
+                UserLostRepositoryAccess(user: s.user, repository: repository)
         for iw in issues/IssueWatches where iw.issue.repository = repository:
             if iw.user != repository.owner_user and not iw.user.is_admin and not has_any_access(iw.user, repository):
                 UserLostRepositoryAccess(user: iw.user, repository: repository)

@@ -130,3 +130,19 @@ invariants or config. Numbers refer to the question's position in its module in
 | 9 | Squash-merge author | **The poster's account identity** (commit email, respecting keep-email-private); co-authors become `Co-authored-by` trailers. |
 | 10 | Mergeability checks | **Always asynchronous;** a new or updated PR is `checking` until the check finishes. |
 | 11 | Merge-message templates | **Repository template, else an instance-wide template, else the built-in default.** |
+
+## projects
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Editing a closed owner board reopens it | **Bug.** Editing never changes whether a board is open or closed. |
+| 2 | An empty description can't clear it | **Bug.** An empty description clears it. |
+| 3 | Global switch and owner boards | **One switch disables all boards:** repository, user and organization. |
+| 4 | Adding an issue to an organization board | **Board write plus triage on the issue** in its repository. |
+| 5 | Boards of a deleted user or organization | **Deleted with their owner;** projects reacts to the owner-deletion events. |
+| 6 | Cards after a repository transfer | **Removed** from the old owner's boards when the repository moves. |
+| 7 | Closed boards and new cards | **A closed board accepts no new cards;** existing cards can still move. |
+| 8 | `closed_at` after reopening | **Cleared on reopen;** kept only while closed. |
+| 9 | Projects API | **Everything the web offers** is in the API too. |
+| 10 | Templates longer than the column cap | **A configuration error** at startup. |
+| 11 | Reordering cards the actor can't read | **Filtered:** a reorder only moves cards whose issues the actor can read. |
