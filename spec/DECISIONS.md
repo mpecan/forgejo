@@ -243,3 +243,17 @@ invariants or config. Numbers refer to the question's position in its module in
 | 7 | Adopting unadopted repositories | **Repositories owns adopt and delete,** for users and admins; administration owns the instance-wide listing. |
 | 8 | Update checker default | **Off.** Admins opt in. |
 | 9 | Doctor checks from the web | **Read-only checks** can be run and viewed from the web admin; fixes that change data stay CLI-only. |
+
+## quota
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Subjects no rule covers | **Allowed.** Only a rule that covers a subject can deny it. |
+| 2 | Overshooting with one upload | **Incoming size counted** (usage + size ≤ limit) wherever the size is known up front; pushes are still checked on receipt. |
+| 3 | Wiki storage | **Measured,** as `size:wiki` and under `size:git:all`. |
+| 4 | Overlapping subjects in one rule | **Union:** each byte counts once per rule. |
+| 5 | Who a repository transfer charges | **The new owner** (user or organisation), on every path. |
+| 6 | Manual mirror sync gate | **`size:git:all`,** like a push. |
+| 7 | API file deletions | **Exempt.** Anything that can only shrink storage is never refused by quota. |
+| 8 | Quota group sync | **Every group-capable source** (OAuth2 and LDAP), through the same mapping. |
+| 9 | Pushes to protected branches | **Already decided under code #1:** an admin config, default exempt. |
