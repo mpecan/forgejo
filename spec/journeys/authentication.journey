@@ -47,6 +47,7 @@ journey SheSignsOutAgain {
         ada.prohibit_login = false
         s.status = authenticated
         s.user = ada
+        s.remember_me = null
 
     1. she signs out
         ada does UserSignsOut(s) on SecuritySettings
@@ -537,9 +538,12 @@ journey TheDirectorySyncDeactivatesPeopleWhoLeft {
     ends: Ada's account is inactive; she can no longer sign in or use tokens.
 }
 
-journey PasswordBasicAuthIsRefusedOnceASecurityKeyIsEnrolled {
-    goal: A security key makes the password insufficient for scripts too: basic auth
-          with the password is refused and a token must be used instead.
+-- Updated for the decision "tokens everywhere": this journey used to show password
+-- Basic auth refused only once a security key was enrolled; now it is refused for
+-- everybody, and the token is the way in.
+journey PasswordBasicAuthIsRefusedATokenWorks {
+    goal: Ada has no second factor at all. A script sending her account password in
+          Basic auth is still refused; her access token as the password is accepted.
 
     cast:
         req: ClientRequest
@@ -552,16 +556,335 @@ journey PasswordBasicAuthIsRefusedOnceASecurityKeyIsEnrolled {
         ada.prohibit_login = false
         ada.kind = individual
         login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
-        key: WebAuthnCredential { user: ada, name: "yubikey", sign_count: 7 }
         token: AccessToken { owner: ada, name: "git", scopes: {write_repository}, public_only: false, all_repositories: true }
 
     1. git sends ada's password
         stipulate password_matches(ada, "correct horse battery") = true
-        req cannot do ClientPresentsPassword(req, ada, "correct horse battery", null) on RequestAuthentication
+        stipulate login.has_second_factor = false
+        req does ClientPresentsPassword(req, ada, "correct horse battery") on RequestAuthentication
+        then ClientPasswordBasicAuthRefused fires
+        then ClientAuthenticatesWithAccessToken does not fire
 
     2. git sends her token instead
         req does ClientPresentsAccessToken(req, token) on RequestAuthentication
         then ClientAuthenticatesWithAccessToken fires
 
     ends: The request is authenticated as ada through the token, never the password.
+}
+
+-- Decision: signing out revokes this device's remember-me record, not only the cookie.
+journey SigningOutForgetsThisDevice {
+    goal: Ada ticked "remember me". When she signs out, the remember-me record behind
+          the cookie is revoked, so a copy of the cookie no longer signs anyone in.
+
+    cast:
+        s:     Session
+        later: Session
+        ada:   accounts/User
+
+    given:
+        s.status = anonymous
+        later.status = anonymous
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.kind = individual
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+
+    1. she signs in and asks to be remembered
+        stipulate password_matches(ada, "correct horse battery") = true
+        stipulate ada.being_purged = false
+        s does VisitorSignsInWithPassword(s, ada, "correct horse battery", true) on SignInPage
+            creating lta: LongTermAuthorization
+        then s.status = authenticated
+        then s.remember_me = lta
+        then lta.status = active
+
+    2. she signs out
+        ada does UserSignsOut(s) on SecuritySettings
+        then UserSignsOut fires
+        then s.status = destroyed
+        then lta.status = revoked
+
+    3. the remembered cookie no longer works
+        later cannot do VisitorResumesWithRememberMe(later, lta) on SignInPage
+        then later.status = anonymous
+
+    ends: Nothing on that device keeps Ada signed in.
+}
+
+-- accounts asked: an account whose purge is under way cannot sign in.
+journey AnAccountBeingPurgedCannotSignIn {
+    goal: An administrator has started purging Ada's account. Her right password no
+          longer signs her in.
+
+    cast:
+        s:   Session
+        ada: accounts/User
+
+    given:
+        s.status = anonymous
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.kind = individual
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+
+    1. she tries her password while the purge runs
+        stipulate password_matches(ada, "correct horse battery") = true
+        stipulate ada.being_purged = true
+        s cannot do VisitorSignsInWithPassword(s, ada, "correct horse battery", false) on SignInPage
+        then s.status = anonymous
+
+    ends: No session was opened for an account that is going away.
+}
+
+-- Decision 1: reset links live for reset_code_lifetime, the lifetime the mail states.
+journey AResetLinkLivesAsLongAsTheMailSays {
+    goal: The instance gives reset links one hour and activation links three. Ada's
+          reset link expires after the hour the mail promised, not three.
+
+    cast:
+        s:   Session
+        ada: accounts/User
+
+    given:
+        config.mail_service_configured = true
+        config.reset_code_lifetime = 60.minutes
+        config.activation_code_lifetime = 180.minutes
+        s.status = anonymous
+        s.last_activity_at = now
+        ada.primary_email = "ada@example.com"
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+
+    1. she asks for a reset mail
+        s does VisitorRequestsPasswordReset(s, ada) on SignInPage
+            creating code: EmailVerificationCode
+        then VisitorRequestsPasswordReset fires
+        then code.purpose = password_reset
+        then code.status = pending
+
+    2. an hour and a minute later the link is dead
+        after 61.minutes
+        then VerificationCodeExpires fires
+        then code.status = expired
+
+    ends: The link expired when the mail said it would.
+}
+
+-- Decision 6, default: one throttle covers activation resends and reset mails.
+journey ResetMailsShareTheActivationThrottleByDefault {
+    goal: Ada was just sent an activation mail. On a default instance the same
+          throttle holds back a password-reset mail for a few minutes.
+
+    cast:
+        s:   Session
+        ada: accounts/User
+
+    given:
+        config.mail_service_configured = true
+        s.status = anonymous
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+        sent: MailSendThrottle { user: ada, kind: resend }
+
+    1. she asks for a reset mail straight away
+        s cannot do VisitorRequestsPasswordReset(s, ada) on SignInPage
+
+    ends: Nothing more was mailed until the throttle lapses.
+}
+
+-- Decision 6, the admin's alternative: one throttle per kind of mail.
+journey AnAdminGivesResetMailsTheirOwnThrottle {
+    goal: The administrator turned the shared mail throttle off. A fresh activation
+          mail no longer holds back a reset mail, but two reset mails in a row are
+          still throttled.
+
+    cast:
+        s:   Session
+        ada: accounts/User
+
+    given:
+        config.mail_service_configured = true
+        config.mail_throttle_shared = false
+        s.status = anonymous
+        ada.primary_email = "ada@example.com"
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+        sent: MailSendThrottle { user: ada, kind: resend }
+
+    1. the reset mail goes out despite the activation throttle
+        s does VisitorRequestsPasswordReset(s, ada) on SignInPage
+            creating throttle: MailSendThrottle
+        then VisitorRequestsPasswordReset fires
+        then throttle.kind = password_reset
+
+    2. a second reset mail at once is held back
+        s cannot do VisitorRequestsPasswordReset(s, ada) on SignInPage
+
+    ends: Each kind of mail has its own few-minute throttle.
+}
+
+-- Decision 7: passkeys sign in on their own; plain security keys stay second factors.
+journey APasskeySignsInWithoutAPassword {
+    goal: Ada registers a passkey and signs in with it alone, no password and no
+          second-factor page. Her older, non-discoverable security key cannot do that.
+
+    cast:
+        s:     Session
+        other: Session
+        ada:   accounts/User
+
+    given:
+        s.status = anonymous
+        other.status = anonymous
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.kind = individual
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+        yubikey: WebAuthnCredential { user: ada, name: "yubikey", discoverable: false, sign_count: 7 }
+
+    1. she registers a passkey in her security settings
+        stipulate webauthn_attestation_valid(ada, "laptop-attestation") = true
+        stipulate attestation_is_discoverable("laptop-attestation") = true
+        ada does UserRegistersPasskey(ada, "laptop", "laptop-attestation") on SecuritySettings
+            creating pk: WebAuthnCredential
+        then UserRegistersPasskey fires
+        then pk.discoverable = true
+
+    2. on the sign-in page the passkey alone signs her in
+        stipulate webauthn_assertion_valid(pk) = true
+        stipulate ada.being_purged = false
+        s does VisitorSignsInWithPasskey(s, pk, 1, false) on SignInPage
+        then VisitorSignsInWithPasskey fires
+        then s.status = authenticated
+        then s.user = ada
+        then s.authenticated_via = passkey
+        then pk.sign_count = 1
+
+    3. the old security key is not a passkey
+        stipulate webauthn_assertion_valid(yubikey) = true
+        other cannot do VisitorSignsInWithPasskey(other, yubikey, 8, false) on SignInPage
+        then other.status = anonymous
+
+    ends: Ada signs in with her passkey; the security key still only serves as a second factor.
+}
+
+-- Decision 8: auto-link only on an e-mail the identity provider has verified.
+journey AnUnverifiedEmailDoesNotAutoLink {
+    goal: The instance auto-links external identities. An IdP returns Ada's address
+          but does not vouch for it, so nothing is linked: the visitor must sign in to
+          Ada's account to link it. The same address, verified, links at once.
+
+    cast:
+        s:      Session
+        s2:     Session
+        ada:    accounts/User
+        corp:   AuthSource
+
+    given:
+        config.oauth2_client_auto_registration = true
+        config.oauth2_client_account_linking = auto
+        s.status = anonymous
+        s2.status = anonymous
+        ada.prohibit_login = false
+        corp.name = "corp"
+        corp.kind = oauth2
+        corp.is_active = true
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+        shaky: ExternalIdentity { source: corp, external_id: "u-17", email: "ada@example.com", email_verified: false }
+        vouched: ExternalIdentity { source: corp, external_id: "u-18", email: "ada@example.com", email_verified: true }
+
+    1. the IdP returns her address unverified
+        stipulate remote_placeholder_for(corp, "u-17") = null
+        stipulate external_username(shaky, nickname) = "ada"
+        stipulate username_available("ada") = false
+        stipulate email_available("ada@example.com") = false
+        stipulate user_by_email("ada@example.com") = ada
+        stipulate login.has_second_factor = false
+        stipulate ada.being_purged = false
+        corp does ProviderReturnsIdentity(s, shaky) on IdentityProviderCallback
+        then ProviderIdentityAutoLinksExistingAccount does not fire
+        then ProviderIdentityNeedsLinking fires
+        then s.pending_external_identity = shaky
+        then s.status = anonymous
+
+    2. a verified address links to her account
+        stipulate remote_placeholder_for(corp, "u-18") = null
+        stipulate external_username(vouched, nickname) = "ada"
+        stipulate is_numeric_id("u-18") = false
+        corp does ProviderReturnsIdentity(s2, vouched) on IdentityProviderCallback
+            creating link: ExternalLogin
+        then ProviderIdentityAutoLinksExistingAccount fires
+        then link.user = ada
+        then s2.status = authenticated
+        then s2.user = ada
+
+    ends: Only the verified identity was linked; the other waits for Ada to sign in.
+}
+
+-- Decision 9: re-consent replaces the grant's scope; issued tokens keep theirs.
+journey ReConsentReplacesTheScope {
+    goal: Ada granted an app only "openid". It now asks for repository access too. She
+          sees the consent screen again; approving sets the grant to exactly the new
+          scopes, while the token pair it already holds keeps its old scope.
+
+    cast:
+        ada: accounts/User
+        app: OAuth2Application
+
+    given:
+        ada.is_active = true
+        ada.prohibit_login = false
+        app.owner_user = null
+        app.owner_org = null
+        app.builtin = null
+        app.confidential = true
+        app.client_id = "c0ff"
+        grant: OAuth2Grant { user: ada, application: app, scopes: {"openid"}, nonce: null, counter: 2 }
+        old: OAuth2TokenIssuance { grant: grant, scopes: {"openid"}, refresh_counter: 2, includes_id_token: true }
+
+    1. the app asks for more and Ada is asked again
+        stipulate redirect_uri_registered(app, "ci-callback") = true
+        ada does UserRequestsAuthorization(ada, app, "ci-callback", "code", none, null, {"openid", "read:repository"}, null) on OAuth2Consent
+        then UserRequestsAuthorization fires
+
+    2. she approves the new scopes
+        ada does UserGrantsConsent(ada, app, "ci-callback", {"openid", "read:repository"}, none, null, null) on OAuth2Consent
+            creating code: OAuth2AuthorizationCode
+        then UserGrantsConsent fires
+        then code.grant = grant
+        then grant.scopes = {"openid", "read:repository"}
+        then old.scopes = {"openid"}
+
+    ends: One grant with the new scopes; the old tokens carry the old scope until refreshed.
+}
+
+-- Decision 10: while 2FA is required, the last second factor stays.
+journey TheLastSecondFactorStaysWhileTwoFactorIsRequired {
+    goal: The instance requires 2FA of everyone. Ada's only factor is a security key,
+          so she cannot remove it; once she has enrolled TOTP she can.
+
+    cast:
+        ada: accounts/User
+
+    given:
+        config.global_two_factor_requirement = all
+        ada.is_active = true
+        ada.prohibit_login = false
+        ada.kind = individual
+        login: UserLogin { user: ada, source: null, login_name: "ada", has_password: true, must_change_password: false }
+        key: WebAuthnCredential { user: ada, name: "yubikey", discoverable: false, sign_count: 7 }
+
+    1. removing her only factor is refused
+        ada cannot do UserRemovesSecurityKey(ada, key) on SecuritySettings
+        then key exists
+
+    2. she enrols an authenticator app
+        stipulate enrolment_passcode_valid(ada, "492039") = true
+        ada does UserEnrolsTotp(ada, "492039") on SecuritySettings
+        then UserEnrolsTotp fires
+
+    3. now the key may go
+        ada does UserRemovesSecurityKey(ada, key) on SecuritySettings
+        then UserRemovesSecurityKey fires
+        then key does not exist
+
+    ends: Ada always holds at least one second factor.
 }

@@ -523,12 +523,15 @@ rule GitClientFetchesRepository {
     requires: repository.status = ready
     requires: client = null implies (not repository.is_private and owner_visibility_is_public(repository) and not config.require_signin_view)
     requires: client != null implies (client.is_active and not client.prohibit_login and can_read_code(client, repository))
-    requires: client != null and protocol = http and authenticated_by_password(client) implies not has_two_factor(client)
+    -- decided (authentication): no password Basic auth on git; HTTP clients authenticate
+    -- with an access token or OAuth2 token as the password, with or without 2FA.
+    requires: (client != null and protocol = http) implies not authenticated_by_password(client)
     requires: client != null and protocol = ssh and must_have_two_factor(client) implies has_two_factor(client)
     ensures: RepositoryFetched(repository: repository, by: client, protocol: protocol)
     @guidance
-        -- HTTP: an inactive *user* owner makes the repository unreachable. Users with 2FA
-        -- must use an access token, not their password, over HTTP. A token restricted to
+        -- HTTP: an inactive *user* owner makes the repository unreachable. Every user
+        -- must use an access token (or OAuth2 token) as the password over HTTP; an
+        -- account password is refused. A token restricted to
         -- other repositories is refused. An Actions job token gets the job's permission.
         -- Deploy keys (SSH) fetch with their own read/write mode instead of user permission.
         -- Partial clone (filter) is offered unless config.disable_partial_clone.
@@ -544,6 +547,8 @@ rule GitClientOpensPush {
     requires: not repository.is_archived
     requires: not repository.is_mirror
     requires: pusher.is_active and not pusher.prohibit_login
+    -- decided (authentication): no password Basic auth on git; push over HTTP with a token.
+    requires: protocol != http or not authenticated_by_password(pusher)
     requires: deploy_key != null or can_read_code(pusher, repository)
     requires: deploy_key = null or deploy_key.grants_read_on(repository)
     -- push options that change repository settings need owner/admin, never on forks
@@ -1677,7 +1682,7 @@ actor CodeWriter {
 
 -- Repository admins: access/RepoAdmin. Site administrators: access/SiteAdmin.
 
--- A git client authenticated as a user (password/token over HTTP, key over SSH).
+-- A git client authenticated as a user (token or OAuth2 token over HTTP, key over SSH).
 actor GitClient {
     identified_by: accounts/User where is_active and not prohibit_login
 }
@@ -2027,7 +2032,8 @@ surface GitTransport {
     @guidance
         -- The ref advertisement lists live branches and tags (and refs/pull/*).
         -- HTTP: GET /{o}/{r}.git/info/refs?service=..., POST /git-upload-pack,
-        -- POST /git-receive-pack (Basic auth: password or token). SSH: git-upload-pack,
+        -- POST /git-receive-pack (Basic auth with a token or OAuth2 token as the password;
+        -- an account password is refused). SSH: git-upload-pack,
         -- git-receive-pack, git-upload-archive and git-lfs-authenticate against
         -- `{o}/{r}.git` with a user or deploy key. `{r}.wiki.git` addresses the wiki
         -- repository with the wiki unit's permission; it must be enabled.
@@ -2117,7 +2123,7 @@ open question "Deleting a tag through the API is refused when a release uses it,
 -- REQUEST access/config.require_signin_view: one owner for REQUIRE_SIGNIN_VIEW (duplicated here as config.require_signin_view).
 -- REQUEST accounts/User.prohibit_login, accounts/User.is_active, accounts/User.is_admin: used by transport (fixed names).
 -- REQUEST accounts/owner_visibility_is_public(repository): owner (user or org) visibility = public, for anonymous fetch.
--- REQUEST authentication/has_two_factor(user), must_have_two_factor(user), authenticated_by_password(user): 2FA blocks password HTTP git; enforced-2FA blocks SSH.
+-- REQUEST authentication/has_two_factor(user), must_have_two_factor(user), authenticated_by_password(user): password HTTP git is always refused (decided: tokens only); enforced-2FA blocks SSH.
 -- REQUEST keys/SshKey.grants_read_on(repository) / grants_write_on(repository): deploy key modes (used directly and inside may_write_code / may_write_branch).
 -- REQUEST keys/new_commits_verified(repository, old_sha, new_sha): every new commit has a verified signature (require_signed_commits).
 -- REQUEST keys/can_sign_as(user, repository, branch): instance signing policy for CRUD actions (needed when the branch requires signed commits).

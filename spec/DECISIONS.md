@@ -32,3 +32,32 @@ invariants or config. Numbers refer to the question's position in its module in
 | 6 | Throttle between activation and reset mails | **Admin's choice.** A config setting chooses one throttle shared across account mails (Forgejo's behaviour, the default) or a separate throttle per kind of mail. |
 | 7 | Passkeys | **Passwordless passkey sign-in.** A user can register a passkey (discoverable credential) and sign in with it alone; security keys still work as a second factor. |
 | 8 | Auto-linking external accounts | **Require `email_verified`.** Auto-link matches by email only, and only when the IdP asserts the email is verified; otherwise the user signs in to the local account to link it. |
+| 9 | Re-consent with a different scope | **Re-consent replaces the scope.** The consent screen shows the requested scopes; approving sets the grant to exactly those. Existing tokens keep their scope until refreshed. |
+| 10 | Removing the last second factor when 2FA is required | **Blocked.** A user can't remove their last remaining second factor (TOTP, security key or passkey) while 2FA is required. |
+
+## keys
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | SSH keys while SSH is disabled | **Keep user keys for signing.** User SSH keys can still be added (commit-signature verification); deploy keys and principals, which only serve SSH access, are refused while SSH is disabled. |
+| 2 | Policy for externally supplied keys | **Apply the policy.** Directory/OAuth2 keys must meet the algorithm and size policy; a non-compliant key is skipped and recorded as a system notice. |
+| 3 | Trust for SSH-signed commits | **Same rule for both formats.** SSH and GPG signatures are judged by the same trust model, collaborator check included. |
+| 4 | Expired or revoked GPG keys | **Expiry-aware.** A signature made while the key was valid stays verified; one dated after expiry, or by a revoked key, is unverified with that reason. |
+| 5 | Looking up other users' keys | **Own keys, plus a visibility-respecting lookup.** Listing/getting by id returns only the caller's keys; a lookup by fingerprint names the owning user only if the caller can see their profile, and never returns deploy keys. Site admins see everything. |
+| 6 | GPG verification and the manage-keys flag | **Verification stays available** when users can't manage their GPG keys; it doesn't change the key set. |
+| 7 | Deploy keys on archived repositories and mirrors | **Refused on archived repositories; read-only only on mirrors.** |
+| 8 | `never` and `always` in a signing policy | **`never` wins**, whatever the order. |
+| 9 | Certificates with several principals | **Try every principal.** Authentication succeeds if any listed principal is registered to an active user and passes the certificate checks. |
+
+## organizations
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Renaming the Owners team | **Forbidden** by every path; the Owners team is identified by its role, not its name. |
+| 2 | Deleting the Owners team | **Forbidden** by every path. |
+| 3 | Who changes a member's membership visibility | **The member only.** Owners can't publicize or conceal someone else's membership. |
+| 4 | A team's summary access mode | **Dropped.** A team is owner, admin, or a set of per-unit grants; any summary is computed for display only. |
+| 5 | Admin creating an organization for a user | **The admin's right governs.** A site admin can create an organization owned by any user, whatever that user's own creation right. |
+| 6 | Adding a team to a repository | **Org owners, or repository admins when the org allows it,** on every path. |
+| 7 | Org blocks and team membership | **Not checked, like Forgejo.** An org block limits the blocked user's own interactions; it doesn't stop owners adding them to teams. |
+| 8 | Expired team invitations | **Kept, like Forgejo.** They stay listed as expired until an owner removes them or a new invitation replaces them. |

@@ -5,8 +5,9 @@
 --   forge issues or trusts: registration and account activation, interactive sign-in
 --   (password, second factor, remember-me, external identity providers, OpenID 2.0),
 --   sign-out and sessions, password reset/change/policy, TOTP and WebAuthn second
---   factors, personal access tokens and their scope taxonomy, request authentication
---   for the API / git / LFS (basic, token, bearer, HTTP signatures, reverse-proxy
+--   factors and passkeys, personal access tokens and their scope taxonomy, request authentication
+--   for the API / git / LFS (token or OAuth2 token as bearer or as the Basic-auth
+--   password, HTTP signatures, reverse-proxy
 --   headers, trusted external JWTs), the OAuth2/OIDC provider (applications, consent,
 --   grants, codes, PKCE, refresh, introspection, userinfo), admin-managed external
 --   authentication sources (LDAP, SMTP, PAM, OAuth2/OIDC, remote) with group mapping
@@ -64,6 +65,7 @@
 --   ExternalAvatarAsserted(user, url)                    -> accounts (avatar upload)
 --   ExternalAdminFlagsAsserted(user, is_admin, is_restricted) -> accounts
 --   RequestAuthenticated(user, method)                   -> access (scope/repository reducers), accounts (token last use)
+--   PasswordBasicAuthRefused(request)                    -> (web layer: 401 "use a token")
 --   AuthSourceDeleted(source)                            -> organizations (clear team-membership provenance)
 --   OAuth2ProviderRedirectRequested(session, source, prompt_none) -> (web layer: redirect to IdP)
 --   ConsentRequested(user, app, redirect_uri, scopes)    -> (web layer: render the consent page)
@@ -100,6 +102,7 @@ value ExternalIdentity {
     source: AuthSource
     external_id: String                 -- the provider's stable user id ("sub")
     email: String?
+    email_verified: Boolean             -- the IdP asserted email_verified = true
     nickname: String?
     preferred_username: String?
     full_name: String?
@@ -252,12 +255,14 @@ enum TokenScope {
 -- How a request proved who it is.
 -- from: services/auth/interface.go:26
 enum CredentialMethod {
-    session | password_basic | access_token | oauth2_bearer | http_signature
+    -- decided: no password_basic method: username+password Basic auth is refused on
+    -- every route (API, git, LFS); tokens and OAuth2 tokens only.
+    session | access_token | oauth2_bearer | http_signature
     | reverse_proxy | integration_jwt | actions_task_token | actions_runtime_token | lfs_token
 }
 
 -- How an interactive sign-in completed.
-enum SignInMethod { password_login | totp | scratch_code | webauthn | remember_me | external_provider | openid | reverse_proxy | activation | password_reset }
+enum SignInMethod { password_login | totp | scratch_code | webauthn | passkey | remember_me | external_provider | openid | reverse_proxy | activation | password_reset }
 
 -- from: models/auth/auth_token.go:20
 enum VerificationPurpose { user_activation | password_reset | email_activation }
@@ -289,8 +294,10 @@ enum IntegrationUi { generic | forgejo_actions_local }
 -- from: models/auth/oauth2.go:59
 enum BuiltinOAuth2App { git_credential_oauth | git_credential_manager | tea }
 
--- What a site administrator's mail-throttle protects.
-enum ThrottleKind { resend | email_change }
+-- What a site administrator's mail-throttle protects. `resend` is the throttle shared by
+-- activation resends and password-reset mails; `password_reset` is used for reset mails
+-- only when config.mail_throttle_shared is off.
+enum ThrottleKind { resend | password_reset | email_change }
 
 enum SessionStatus { anonymous | pending_second_factor | authenticated | destroyed }
 enum RememberMeStatus { active | consumed | revoked | expired }
@@ -314,6 +321,7 @@ entity Session {
     pending_external_identity: ExternalIdentity?  -- came back from an IdP, not yet linked
     pending_link: Boolean                       -- link pending_external_identity after 2FA
     pending_openid_uri: String?                 -- link this OpenID after 2FA
+    remember_me: LongTermAuthorization?         -- the remember-me record this browser holds
     last_activity_at: Timestamp
 
     is_signed_in: status = authenticated
@@ -401,7 +409,8 @@ entity UserLogin {
     requires_two_factor: user.kind = individual and (config.global_two_factor_requirement = all or (config.global_two_factor_requirement = admin and user.is_admin))
     -- The gate every authenticated request passes through (web shows the activation,
     -- prohibited, change-password or enrol-2FA page instead; API answers forbidden).
-    may_use_account: user.is_active and not user.prohibit_login and not must_change_password and (requires_two_factor = false or has_second_factor)
+    -- An account being purged (accounts/User.being_purged) is refused everywhere.
+    may_use_account: user.is_active and not user.prohibit_login and not user.being_purged and not must_change_password and (requires_two_factor = false or has_second_factor)
 }
 
 -- TOTP second factor. One per user. The scratch code is a single-use recovery code that
@@ -414,11 +423,13 @@ entity TwoFactor {
     enrolled_at: Timestamp
 }
 
--- A WebAuthn security key / passkey registered as a second factor.
+-- A WebAuthn security key or passkey. Every credential works as a second factor; a
+-- passkey (discoverable credential) also signs its user in on its own.
 -- from: models/auth/webauthn.go:44
 entity WebAuthnCredential {
     user: accounts/User
     name: String                         -- unique per user, case-insensitive
+    discoverable: Boolean                -- decided: a passkey, usable for passwordless sign-in
     sign_count: Integer
     backup_eligible: Boolean
     backup_state: Boolean
@@ -556,6 +567,7 @@ entity OAuth2AuthorizationCode {
 -- from: routers/web/auth/oauth.go:160
 entity OAuth2TokenIssuance {
     grant: OAuth2Grant
+    scopes: Set<String>                   -- the grant's scopes when issued; kept until refreshed
     refresh_counter: Integer
     access_expires_at: Timestamp
     refresh_expires_at: Timestamp
@@ -615,14 +627,16 @@ config {
     require_external_registration_password: Boolean = false     -- REQUIRE_EXTERNAL_REGISTRATION_PASSWORD
     default_user_is_restricted: Boolean = false                 -- DEFAULT_USER_IS_RESTRICTED
     activation_code_lifetime: Duration = 180.minutes            -- ACTIVE_CODE_LIVE_MINUTES
-    reset_code_lifetime: Duration = 180.minutes                 -- RESET_PASSWD_CODE_LIVE_MINUTES (see open question)
+    reset_code_lifetime: Duration = 180.minutes                 -- RESET_PASSWD_CODE_LIVE_MINUTES; decided: reset links honour it
     mail_resend_interval: Duration = 3.minutes                  -- hard-coded 180 s throttle
+    mail_throttle_shared: Boolean = true                        -- decided (new setting): one throttle for activation and reset mails (Forgejo); false = one per kind
     mail_service_configured: Boolean = false                    -- [mailer] ENABLED
 
     -- [service] sign-in
     enable_internal_signin: Boolean = true                      -- ENABLE_INTERNAL_SIGNIN
     require_signin_view: Boolean = false                        -- REQUIRE_SIGNIN_VIEW
-    enable_basic_auth: Boolean = true                           -- ENABLE_BASIC_AUTHENTICATION
+    -- decided: ENABLE_BASIC_AUTHENTICATION is gone; password Basic auth is never accepted
+    -- and a token or OAuth2 token in the Basic password is always accepted (git needs it).
     enable_reverse_proxy_auth: Boolean = false                  -- ENABLE_REVERSE_PROXY_AUTHENTICATION
     enable_reverse_proxy_auth_api: Boolean = false              -- ENABLE_REVERSE_PROXY_AUTHENTICATION_API
     enable_reverse_proxy_auto_registration: Boolean = false     -- ENABLE_REVERSE_PROXY_AUTO_REGISTRATION
@@ -660,7 +674,7 @@ config {
     oauth2_invalidate_refresh_tokens: Boolean = true            -- INVALIDATE_REFRESH_TOKENS
     oauth2_default_applications: Set<BuiltinOAuth2App> = {git_credential_oauth, git_credential_manager, tea} -- DEFAULT_APPLICATIONS
     oauth2_additional_grant_scopes: Boolean = false             -- ENABLE_ADDITIONAL_GRANT_SCOPES (groups claim honours public-only membership)
-    oauth2_authorization_code_lifetime: Duration = 10.minutes   -- not configurable in Forgejo (see open question)
+    oauth2_authorization_code_lifetime: Duration = 10.minutes   -- decided (new setting): 10 minutes, configurable; codes are single-use
 
     -- [oauth2_client] behaviour when the forge is an OAuth2 client
     oauth2_client_register_email_confirm: Boolean = false       -- REGISTER_EMAIL_CONFIRM (default = [service] value)
@@ -894,6 +908,9 @@ rule MailThrottleLapses {
 -- password is checked by the user's UserLogin source (local store, LDAP, SMTP, PAM).
 -- Unknown logins are tried against every active password source, which may
 -- auto-provision the account (see ExternalPasswordSourceProvisionsUser).
+-- decided: an unconfirmed (inactive) account is not refused here; it gets the limited
+-- session Forgejo gives it, which can only resend activation or sign out
+-- (UserLogin.may_use_account, surface AccountActivation).
 -- from: routers/web/auth/auth.go:214
 rule VisitorSignsInWithPassword {
     when: VisitorSignsInWithPassword(session, user, password, remember)
@@ -907,6 +924,7 @@ rule VisitorSignsInWithPassword {
     requires: login.source = null or login.source.is_active
     requires: password_matches(user, password)
     requires: not user.prohibit_login
+    requires: not user.being_purged             -- accounts: a purge in progress refuses sign-in
     requires: user.kind = individual
 
     let needs_second_factor = login.has_second_factor and not login.skips_local_two_factor
@@ -924,7 +942,8 @@ rule VisitorSignsInWithPassword {
             login.last_sign_in_at = now
             UserSignedIn(user: user, method: password_login)
             if remember:
-                LongTermAuthorization.created(user: user, sso_source: null, expires_at: now + config.login_remember_days, status: active)
+                let lta = LongTermAuthorization.created(user: user, sso_source: null, expires_at: now + config.login_remember_days, status: active)
+                session.remember_me = lta
 
     @guidance
         -- Web: GET/POST /user/login (form max: login 254, password 255). Failures all say
@@ -933,7 +952,8 @@ rule VisitorSignsInWithPassword {
         -- the activation page (see UserLogin.may_use_account). When the instance has
         -- internal sign-in disabled and exactly one OAuth2 source, the login page
         -- redirects straight to that provider. With WebAuthn enrolled the second-factor
-        -- page offers the security key first, falling back to TOTP.
+        -- page offers the security key first, falling back to TOTP. A passkey skips this
+        -- form altogether (VisitorSignsInWithPasskey).
 }
 
 -- An LDAP/SMTP/PAM bind succeeds for a login no local account has yet.
@@ -1003,7 +1023,8 @@ rule VisitorCompletesTotpChallenge {
         if session.pending_openid_uri != null:
             OpenIDIdentity.created(user: user, uri: session.pending_openid_uri, show_publicly: false)
         if session.remember_requested:
-            LongTermAuthorization.created(user: user, sso_source: session.pending_sso_source, expires_at: now + config.login_remember_days, status: active)
+            let lta = LongTermAuthorization.created(user: user, sso_source: session.pending_sso_source, expires_at: now + config.login_remember_days, status: active)
+            session.remember_me = lta
 
     @guidance
         -- Web: GET/POST /user/two_factor.
@@ -1032,7 +1053,8 @@ rule VisitorUsesScratchCode {
         if session.pending_openid_uri != null:
             OpenIDIdentity.created(user: user, uri: session.pending_openid_uri, show_publicly: false)
         if session.remember_requested:
-            LongTermAuthorization.created(user: user, sso_source: session.pending_sso_source, expires_at: now + config.login_remember_days, status: active)
+            let lta = LongTermAuthorization.created(user: user, sso_source: session.pending_sso_source, expires_at: now + config.login_remember_days, status: active)
+            session.remember_me = lta
 
     @guidance
         -- Web: GET/POST /user/two_factor/scratch.
@@ -1063,12 +1085,53 @@ rule VisitorCompletesWebAuthnChallenge {
         if session.pending_openid_uri != null:
             OpenIDIdentity.created(user: user, uri: session.pending_openid_uri, show_publicly: false)
         if session.remember_requested:
-            LongTermAuthorization.created(user: user, sso_source: session.pending_sso_source, expires_at: now + config.login_remember_days, status: active)
+            let lta = LongTermAuthorization.created(user: user, sso_source: session.pending_sso_source, expires_at: now + config.login_remember_days, status: active)
+            session.remember_me = lta
 
     @guidance
-        -- Web: GET /user/webauthn, GET/POST /user/webauthn/assertion. Security keys are
-        -- a second factor only; there is no passwordless (discoverable-credential)
-        -- sign-in. Legacy credentials get their backup flags filled in on first use.
+        -- Web: GET /user/webauthn, GET/POST /user/webauthn/assertion. Any credential,
+        -- passkey or not, works here as the second factor. Legacy credentials get their
+        -- backup flags filled in on first use.
+}
+
+-- Passwordless sign-in with a passkey: the discoverable credential names its user and,
+-- with user verification, stands for both factors, so no second-factor step follows.
+-- decided: passkey passwordless sign-in is part of the rebuild; security keys that are
+-- not discoverable remain second factors only.
+-- from: routers/web/auth/webauthn.go:89 (assertion check and counter rule reused)
+rule VisitorSignsInWithPasskey {
+    when: VisitorSignsInWithPasskey(session, credential, sign_count, remember)
+
+    let user = credential.user
+    let login = UserLogin{user: user}
+
+    requires: session.status = anonymous
+    requires: config.enable_internal_signin
+    requires: credential.discoverable
+    requires: webauthn_assertion_valid(credential)
+    requires: sign_count > credential.sign_count or (sign_count = 0 and credential.sign_count = 0)
+    requires: exists login
+    requires: login.source = null or login.source.is_active
+    requires: not user.prohibit_login
+    requires: not user.being_purged
+    requires: user.kind = individual
+
+    ensures: credential.sign_count = sign_count
+    ensures: session.status = authenticated
+    ensures: session.user = user
+    ensures: session.authenticated_via = passkey
+    ensures: session.last_activity_at = now
+    ensures: login.last_sign_in_at = now
+    ensures: UserSignedIn(user: user, method: passkey)
+    ensures:
+        if remember:
+            let lta = LongTermAuthorization.created(user: user, sso_source: null, expires_at: now + config.login_remember_days, status: active)
+            session.remember_me = lta
+
+    @guidance
+        -- Web: "sign in with a passkey" on /user/login runs a WebAuthn assertion with an
+        -- empty allow-list and user verification required; the authenticator picks the
+        -- credential. A non-discoverable security key cannot be used this way.
 }
 
 -- The remember-me cookie re-establishes a session.
@@ -1079,9 +1142,11 @@ rule VisitorResumesWithRememberMe {
     requires: session.status = anonymous
     requires: lta.status = active
     requires: not lta.is_sso
+    requires: not lta.user.being_purged
 
     ensures: session.status = authenticated
     ensures: session.user = lta.user
+    ensures: session.remember_me = lta
     ensures: session.authenticated_via = remember_me
     ensures: session.last_activity_at = now
     ensures: UserSignedIn(user: lta.user, method: remember_me)
@@ -1123,9 +1188,11 @@ rule LongTermAuthorizationExpires {
 -- from: models/auth/session.go:36
 rule VisitorArrives {
     when: VisitorArrives()
-    ensures: Session.created(status: anonymous, user: null, authenticated_via: null, pending_user: null, remember_requested: false, pending_sso_source: null, pending_external_identity: null, pending_link: false, pending_openid_uri: null, last_activity_at: now)
+    ensures: Session.created(status: anonymous, user: null, authenticated_via: null, pending_user: null, remember_requested: false, pending_sso_source: null, pending_external_identity: null, pending_link: false, pending_openid_uri: null, remember_me: null, last_activity_at: now)
 }
 
+-- decided: signing out revokes this device's remember-me record server-side (Forgejo
+-- only deleted the cookie); other devices stay remembered.
 -- from: routers/web/auth/auth.go:434
 rule UserSignsOut {
     when: UserSignsOut(session)
@@ -1133,11 +1200,14 @@ rule UserSignsOut {
     requires: session.status = authenticated
 
     ensures: session.status = destroyed
+    ensures:
+        if session.remember_me != null and session.remember_me.status = active:
+            session.remember_me.status = revoked
     ensures: UserSignedOut(user: session.user, session: session)
 
     @guidance
         -- Web: POST /user/logout. Clears the session and the remember-me and redirect
-        -- cookies (the remember-me record itself is left to expire), and tells the
+        -- cookies, revokes the remember-me record the cookie named, and tells the
         -- user's other open tabs via the event stream.
 }
 
@@ -1182,6 +1252,7 @@ rule ProviderReturnsKnownIdentity {
     requires: source.settings.required_claim_name = null or claim_satisfied(identity, source.settings.required_claim_name, source.settings.required_claim_value)
     requires: exists known_login or exists known_link
     requires: not user.prohibit_login
+    requires: not user.being_purged
 
     let needs_second_factor = not source.settings.skip_local_two_factor and UserLogin{user: user}.has_second_factor
 
@@ -1206,7 +1277,8 @@ rule ProviderReturnsKnownIdentity {
             session.authenticated_via = external_provider
             session.last_activity_at = now
             UserSignedIn(user: user, method: external_provider)
-            LongTermAuthorization.created(user: user, sso_source: source, expires_at: now + config.login_remember_days, status: active)
+            let lta = LongTermAuthorization.created(user: user, sso_source: source, expires_at: now + config.login_remember_days, status: active)
+            session.remember_me = lta
 
     @guidance
         -- Web: GET /user/oauth2/{source-name}/callback. Provider errors access_denied /
@@ -1303,20 +1375,27 @@ rule ProviderIdentityAutoRegisters {
         -- visitor to sign in to it, `disabled` fails.
 }
 
--- Name or e-mail collision with account_linking = auto: link silently.
+-- E-mail collision with account_linking = auto: link silently, but only to the account
+-- holding that e-mail and only when the IdP vouches for the address.
+-- decided: auto-link matches by e-mail only and requires the IdP's email_verified claim;
+-- otherwise the visitor must sign in to the local account to link it
+-- (ProviderIdentityNeedsLinking).
 -- from: routers/web/auth/auth.go:581
 rule ProviderIdentityAutoLinksExistingAccount {
     when: ProviderReturnsIdentity(session, identity)
 
     let source = identity.source
-    let existing = user_by_name_or_email(external_username(identity, config.oauth2_client_username_source), identity.email)
+    let existing = user_by_email(identity.email)
     requires: source.is_active
     requires: session.status = anonymous
     requires: not exists UserLogin{source: source, login_name: identity.external_id}
     requires: not exists ExternalLogin{source: source, external_id: identity.external_id}
     requires: config.oauth2_client_auto_registration
     requires: config.oauth2_client_account_linking = auto
+    requires: identity.email != null
+    requires: identity.email_verified
     requires: existing != null
+    requires: not existing.being_purged
     requires: not UserLogin{user: existing}.has_second_factor
 
     ensures: ExternalLogin.created(user: existing, source: source, external_id: identity.external_id, provider: source.settings.provider, email: identity.email, name: identity.full_name, nickname: identity.nickname, avatar_url: identity.avatar_url, linked_at: now)
@@ -1327,18 +1406,24 @@ rule ProviderIdentityAutoLinksExistingAccount {
     ensures: UserSignedIn(user: existing, method: external_provider)
 }
 
--- Unknown identity and no auto-registration (or missing fields, or linking = login):
--- park it in the session and offer "link to an existing account" / "register".
+-- Unknown identity and no auto-registration (or missing fields, or a collision with an
+-- existing account that may not be linked automatically): park it in the session and
+-- offer "link to an existing account" / "register".
+-- decided: an e-mail the IdP has not verified never auto-links; the collision lands here.
 -- from: routers/web/auth/oauth.go:1278
 rule ProviderIdentityNeedsLinking {
     when: ProviderReturnsIdentity(session, identity)
 
     let source = identity.source
+    let name = external_username(identity, config.oauth2_client_username_source)
+    let existing = user_by_email(identity.email)
+    let collides = (identity.email != null and not email_available(identity.email)) or (name != null and not username_available(name))
+    let auto_linkable = config.oauth2_client_account_linking = auto and identity.email_verified and existing != null and not UserLogin{user: existing}.has_second_factor
     requires: source.is_active
     requires: session.status = anonymous
     requires: not exists UserLogin{source: source, login_name: identity.external_id}
     requires: not exists ExternalLogin{source: source, external_id: identity.external_id}
-    requires: not config.oauth2_client_auto_registration or config.allow_only_internal_registration or identity.email = null
+    requires: not config.oauth2_client_auto_registration or config.allow_only_internal_registration or identity.email = null or name = null or (collides and config.oauth2_client_account_linking != disabled and not auto_linkable)
 
     ensures: session.pending_external_identity = identity
 
@@ -1358,6 +1443,7 @@ rule VisitorLinksPendingIdentityBySignIn {
     requires: config.enable_captcha = false or config.require_external_registration_captcha = false or captcha_solved(session)
     requires: password_matches(user, password)
     requires: not user.prohibit_login
+    requires: not user.being_purged
 
     let identity = session.pending_external_identity
     let needs_second_factor = UserLogin{user: user}.has_second_factor
@@ -1453,6 +1539,7 @@ rule VisitorSignsInWithOpenID {
     requires: openid_uri_allowed(uri)
     requires: openid_assertion_verified(uri)
     let identity = OpenIDIdentity{uri: uri}
+    requires: not exists identity or not identity.user.being_purged
 
     ensures:
         if exists identity:
@@ -1483,6 +1570,7 @@ rule VisitorConnectsOpenIDToAccount {
     requires: session.pending_openid_uri != null
     requires: password_matches(user, password)
     requires: not user.prohibit_login
+    requires: not user.being_purged
 
     ensures:
         if UserLogin{user: user}.has_second_factor:
@@ -1526,6 +1614,10 @@ rule UserTogglesOpenIDVisibility {
 ------------------------------------------------------------
 
 -- "Forgot password". The answer is identical whether or not the address is known.
+-- decided: the reset link lives for reset_code_lifetime, the lifetime the mail states
+-- (Forgejo used the activation lifetime).
+-- decided: the admin chooses the throttle: shared with activation resends (the default,
+-- Forgejo's behaviour) or one of its own (mail_throttle_shared = false).
 -- from: routers/web/auth/password.go:52
 rule VisitorRequestsPasswordReset {
     when: VisitorRequestsPasswordReset(session, user)
@@ -1533,11 +1625,14 @@ rule VisitorRequestsPasswordReset {
     let login = UserLogin{user: user}
     requires: config.mail_service_configured
     requires: login.may_reset_password
-    requires: not exists MailSendThrottle{user: user, kind: resend}
+    requires: (config.mail_throttle_shared and not exists MailSendThrottle{user: user, kind: resend}) or (not config.mail_throttle_shared and not exists MailSendThrottle{user: user, kind: password_reset})
 
     ensures:
-        EmailVerificationCode.created(user: user, purpose: password_reset, email: user.primary_email, expires_at: now + config.activation_code_lifetime, status: pending)
-        MailSendThrottle.created(user: user, kind: resend, until: now + config.mail_resend_interval)
+        EmailVerificationCode.created(user: user, purpose: password_reset, email: user.primary_email, expires_at: now + config.reset_code_lifetime, status: pending)
+        if config.mail_throttle_shared:
+            MailSendThrottle.created(user: user, kind: resend, until: now + config.mail_resend_interval)
+        else:
+            MailSendThrottle.created(user: user, kind: password_reset, until: now + config.mail_resend_interval)
 
     @guidance
         -- Web: GET/POST /user/forgot_password (hidden when no mailer is configured). The
@@ -1676,14 +1771,18 @@ rule UserRegeneratesScratchCode {
     ensures: twofa.scratch_code_generation = twofa.scratch_code_generation + 1
 }
 
--- Turning TOTP off is not possible while the instance requires 2FA of this user.
+-- Turning TOTP off is not possible while the instance requires 2FA of this user and it
+-- is their last second factor.
+-- decided: the last remaining second factor (TOTP, security key or passkey) cannot be
+-- removed while 2FA is required; Forgejo refused TOTP even with a key left.
 -- from: routers/web/user/setting/security/2fa.go:55
 rule UserDisablesTotp {
     when: UserDisablesTotp(user)
 
     let twofa = TwoFactor{user: user}
+    let login = UserLogin{user: user}
     requires: exists twofa
-    requires: not UserLogin{user: user}.requires_two_factor
+    requires: not login.requires_two_factor or login.has_security_keys
 
     ensures: not exists twofa
     ensures: TotpDisabled(user)
@@ -1696,20 +1795,42 @@ rule UserRegistersSecurityKey {
     requires: not exists WebAuthnCredential{user: user, name: name}
     requires: webauthn_attestation_valid(user, attestation)
 
-    ensures: WebAuthnCredential.created(user: user, name: name, sign_count: 0, backup_eligible: false, backup_state: false, created_at: now)
+    ensures: WebAuthnCredential.created(user: user, name: name, discoverable: false, sign_count: 0, backup_eligible: false, backup_state: false, created_at: now)
 
     @guidance
         -- Web: POST /user/settings/security/webauthn/request_register then /register.
         -- An empty name defaults to a timestamp. Names compare case-insensitively.
 }
 
+-- Registering a passkey: a discoverable credential with user verification. It is a
+-- second factor like any security key and also signs in on its own.
+-- decided: passkeys (discoverable credentials) may be registered for passwordless sign-in.
+rule UserRegistersPasskey {
+    when: UserRegistersPasskey(user, name, attestation)
+
+    requires: not exists WebAuthnCredential{user: user, name: name}
+    requires: webauthn_attestation_valid(user, attestation)
+    requires: attestation_is_discoverable(attestation)
+
+    ensures: WebAuthnCredential.created(user: user, name: name, discoverable: true, sign_count: 0, backup_eligible: false, backup_state: false, created_at: now)
+
+    @guidance
+        -- Same registration ceremony as a security key, asking for a resident key and
+        -- user verification. An authenticator that cannot keep a resident credential
+        -- is refused here and may still be registered as a security key.
+}
+
+-- decided: the last remaining second factor cannot be removed while 2FA is required.
 -- from: routers/web/user/setting/security/webauthn.go:114
 rule UserRemovesSecurityKey {
     when: UserRemovesSecurityKey(user, credential)
     -- read before the record goes: an emission sees the resulting state
     let key_name = credential.name
+    let login = UserLogin{user: user}
+    let keys = WebAuthnCredentials where user = user
 
     requires: credential.user = user
+    requires: not login.requires_two_factor or login.has_totp or keys.count > 1
 
     ensures: not exists credential
     ensures: SecurityKeyRemoved(user: user, name: key_name)
@@ -1726,7 +1847,9 @@ rule UserCreatesAccessToken {
     when: UserCreatesAccessToken(actor, owner, name, scopes, public_only, all_repositories, repositories, via)
 
     requires: actor = owner or actor.is_admin
-    requires: actor != owner or via in {session, password_basic, reverse_proxy}
+    -- decided: with password Basic auth gone, a user mints their own tokens from a web
+    -- session (or through the trusted proxy), never with another token.
+    requires: actor != owner or via in {session, reverse_proxy}
     requires: name != ""
     requires: not exists AccessToken{owner: owner, name: name}
     requires: scopes.count > 0 or public_only
@@ -1750,8 +1873,9 @@ rule UserCreatesAccessToken {
 
     @guidance
         -- Web: /user/settings/applications/tokens/new (GET pre-fills from query).
-        -- API: POST /users/{username}/tokens (password basic auth or reverse-proxy only —
-        -- a token cannot mint tokens; self or site admin) and POST
+        -- API: POST /users/{username}/tokens (reverse-proxy only for oneself — a token
+        -- cannot mint tokens and password Basic auth no longer exists; or a site admin
+        -- for anyone) and POST
         -- /admin/users/{username}/tokens (site admin, any credential). The secret is
         -- returned once. `all` expands to every write scope; unknown scope names are
         -- refused; duplicates are normalised away.
@@ -1771,7 +1895,7 @@ rule UserDeletesAccessToken {
     when: UserDeletesAccessToken(actor, token, via)
 
     requires: actor = token.owner or actor.is_admin
-    requires: actor != token.owner or via in {session, password_basic, reverse_proxy}
+    requires: actor != token.owner or via in {session, reverse_proxy}
 
     ensures: not exists token
 
@@ -1786,30 +1910,26 @@ rule UserDeletesAccessToken {
 ------------------------------------------------------------
 
 -- Methods are tried in order: OAuth2 bearer, HTTP signature (API only), access token,
--- Actions tokens, authorized-integration JWT, reverse proxy (if enabled), session (web),
--- password basic. The first that recognises its credential decides; a recognised but
--- wrong credential fails the request rather than falling through.
+-- Actions tokens, authorized-integration JWT, reverse proxy (if enabled), session (web).
+-- The first that recognises its credential decides; a recognised but wrong credential
+-- fails the request rather than falling through.
+--
+-- decided: tokens everywhere. `Authorization: Basic` with a username/e-mail and an
+-- account password is refused on the API, git and LFS alike (Forgejo accepted it,
+-- with X-Forgejo-OTP for TOTP users, and marked it FIXME for removal). The Basic
+-- header still carries credentials: its password may be an access token, an OAuth2
+-- access token or an integration JWT, which is how git clients authenticate.
+-- from: services/auth/method/basic.go:24 (the method this replaces)
+rule ClientPasswordBasicAuthRefused {
+    when: ClientPresentsPassword(request, user, password)
 
--- from: services/auth/method/basic.go:24
-rule ClientAuthenticatesWithPassword {
-    when: ClientPresentsPassword(request, user, password, otp)
-
-    let login = UserLogin{user: user}
-    requires: config.enable_basic_auth
-    requires: password_matches(user, password)
-    requires: not user.prohibit_login
-    requires: user.kind = individual
-    requires: not login.has_security_keys
-    requires: login.skips_local_two_factor or login.has_totp = false or (otp != null and totp_valid(TwoFactor{user: user}, otp))
-    requires: login.may_use_account
-
-    ensures: RequestAuthenticated(user: user, method: password_basic)
+    ensures: PasswordBasicAuthRefused(request: request)
 
     @guidance
-        -- `Authorization: Basic` with a username/e-mail and password. With TOTP enrolled
-        -- the current passcode goes in the X-Forgejo-OTP header; with any security key
-        -- enrolled password basic auth is refused outright (use a token). Token creation
-        -- endpoints REQUIRE this method (or reverse-proxy auth).
+        -- `Authorization: Basic` whose password is not a token is answered 401 with
+        -- "password authentication is not supported, use an access token or OAuth2";
+        -- nothing is authenticated and no credential is checked, so the answer does not
+        -- reveal whether the password was right.
 }
 
 -- from: services/auth/method/access_token.go:31
@@ -1823,7 +1943,8 @@ rule ClientAuthenticatesWithAccessToken {
 
     @guidance
         -- `Authorization: token <t>`, `Authorization: Bearer <t>`, or as the password
-        -- (or username) of basic auth — the latter is how git over HTTP uses tokens.
+        -- (or username) of basic auth — the latter is how git over HTTP uses tokens
+        -- (decided: the only Basic credential accepted).
         -- Git LFS accepts tokens only via basic auth. The request is then limited to the
         -- token's scopes, public-only flag and repository list (access.allium).
 }
@@ -2068,7 +2189,8 @@ rule BuiltinApplicationsReconciled {
 ------------------------------------------------------------
 
 -- The authorize endpoint. Public clients must use PKCE. A confidential client the user
--- has already granted gets a code without asking again.
+-- has already granted the same scopes gets a code without asking again; different
+-- scopes go back to the consent screen.
 -- from: routers/web/auth/oauth.go:423
 rule UserRequestsAuthorization {
     when: UserRequestsAuthorization(user, app, redirect_uri, response_type, pkce_method, code_challenge, scopes, nonce)
@@ -2081,7 +2203,7 @@ rule UserRequestsAuthorization {
     requires: app.confidential or pkce_method != none
 
     ensures:
-        if app.confidential and exists grant:
+        if app.confidential and exists grant and grant.scopes = scopes:
             OAuth2AuthorizationCode.created(grant: grant, redirect_uri: redirect_uri, code_challenge: code_challenge, pkce_method: pkce_method, issued_at: now, expires_at: now + config.oauth2_authorization_code_lifetime, status: issued)
             if nonce != null:
                 grant.nonce = nonce
@@ -2097,6 +2219,9 @@ rule UserRequestsAuthorization {
         -- application, its owner (or the instance) and the redirect target.
 }
 
+-- decided: re-consent replaces the scope. Approving sets the grant to exactly the
+-- requested scopes; tokens already issued keep their scope until refreshed
+-- (OAuth2TokenIssuance.scopes). Forgejo refused a grant with a different scope.
 -- from: routers/web/auth/oauth.go:595
 rule UserGrantsConsent {
     when: UserGrantsConsent(user, app, redirect_uri, scopes, pkce_method, code_challenge, nonce)
@@ -2105,10 +2230,10 @@ rule UserGrantsConsent {
 
     requires: config.oauth2_enabled
     requires: redirect_uri_registered(app, redirect_uri)
-    requires: not exists existing or existing.scopes = scopes
 
     ensures:
         if exists existing:
+            existing.scopes = scopes
             OAuth2AuthorizationCode.created(grant: existing, redirect_uri: redirect_uri, code_challenge: code_challenge, pkce_method: pkce_method, issued_at: now, expires_at: now + config.oauth2_authorization_code_lifetime, status: issued)
         else:
             let grant = OAuth2Grant.created(user: user, application: app, scopes: scopes, nonce: nonce, counter: 1, created_at: now)
@@ -2116,8 +2241,8 @@ rule UserGrantsConsent {
 
     @guidance
         -- Web: POST /login/oauth/grant. client_id/state/redirect_uri must match what the
-        -- authorize step stored in the session. A grant that exists with a different
-        -- scope is an error (the user must revoke it first).
+        -- authorize step stored in the session. The consent page lists the requested
+        -- scopes; approving a grant that existed with other scopes replaces them.
 }
 
 -- from: routers/web/auth/oauth.go:603
@@ -2128,6 +2253,8 @@ rule UserDeniesConsent {
 }
 
 -- The token endpoint, authorization_code grant. The code is single-use.
+-- decided: codes live oauth2_authorization_code_lifetime (10 minutes, configurable) and
+-- are redeemed at most once (Forgejo never set their expiry).
 -- from: routers/web/auth/oauth.go:844
 rule ClientExchangesAuthorizationCode {
     when: ClientExchangesAuthorizationCode(app, client_secret_valid, code, code_verifier, redirect_uri)
@@ -2143,7 +2270,7 @@ rule ClientExchangesAuthorizationCode {
 
     ensures: code.status = redeemed
     ensures: grant.counter = grant.counter + 1
-    ensures: OAuth2TokenIssuance.created(grant: grant, refresh_counter: grant.counter, access_expires_at: now + config.oauth2_access_token_lifetime, refresh_expires_at: now + config.oauth2_refresh_token_lifetime, includes_id_token: "openid" in grant.scopes, issued_at: now)
+    ensures: OAuth2TokenIssuance.created(grant: grant, scopes: grant.scopes, refresh_counter: grant.counter, access_expires_at: now + config.oauth2_access_token_lifetime, refresh_expires_at: now + config.oauth2_refresh_token_lifetime, includes_id_token: "openid" in grant.scopes, issued_at: now)
 
     @guidance
         -- POST /login/oauth/access_token (CORS-enabled, no CSRF). Client credentials in
@@ -2169,7 +2296,7 @@ rule ClientRefreshesToken {
     let grant = previous.grant
 
     ensures: grant.counter = grant.counter + 1
-    ensures: OAuth2TokenIssuance.created(grant: grant, refresh_counter: grant.counter, access_expires_at: now + config.oauth2_access_token_lifetime, refresh_expires_at: now + config.oauth2_refresh_token_lifetime, includes_id_token: "openid" in grant.scopes, issued_at: now)
+    ensures: OAuth2TokenIssuance.created(grant: grant, scopes: grant.scopes, refresh_counter: grant.counter, access_expires_at: now + config.oauth2_access_token_lifetime, refresh_expires_at: now + config.oauth2_refresh_token_lifetime, includes_id_token: "openid" in grant.scopes, issued_at: now)
 
     @guidance
         -- A refresh token presented a second time ("already used") is refused and logged
@@ -2556,6 +2683,8 @@ surface SignInPage {
     provides:
         VisitorSignsInWithPassword(visitor, user, password, remember)
             when config.enable_internal_signin
+        VisitorSignsInWithPasskey(visitor, credential, sign_count, remember)
+            when config.enable_internal_signin
         VisitorSignsInWithExternalPassword(visitor, source, entry, password)
             when config.enable_internal_signin
         VisitorRegisters(visitor, name, email, password)
@@ -2660,6 +2789,7 @@ surface SecuritySettings {
         login.is_local
         for key in WebAuthnCredentials where user = user:
             key.name
+            key.discoverable
             key.created_at
         for link in ExternalLogins where user = user:
             link.source.name
@@ -2681,8 +2811,9 @@ surface SecuritySettings {
         UserRegeneratesScratchCode(user)
             when login.has_totp
         UserDisablesTotp(user)
-            when login.has_totp and not login.requires_two_factor
+            when login.has_totp and (not login.requires_two_factor or login.has_security_keys)
         UserRegistersSecurityKey(user, name, attestation)
+        UserRegistersPasskey(user, name, attestation)
         UserRemovesSecurityKey(user, key)
         UserUnlinksExternalLogin(user, link)
         UserAddsOpenID(user, uri)
@@ -2843,8 +2974,7 @@ surface RequestAuthentication {
     facing caller: CredentialBearer
 
     provides:
-        ClientPresentsPassword(caller, user, password, otp)
-            when config.enable_basic_auth
+        ClientPresentsPassword(caller, user, password)
         ClientPresentsAccessToken(caller, token)
         ClientPresentsOAuth2AccessToken(caller, issuance)
             when config.oauth2_enabled
@@ -2860,12 +2990,14 @@ surface RequestAuthentication {
     @guidance
         -- Order of methods per route family:
         --   API: OAuth2, HTTP signature, access token, Actions tokens, integration JWT,
-        --        password basic, reverse proxy (when enabled for the API).
+        --        reverse proxy (when enabled for the API).
         --   git HTTP: OAuth2, access token, Actions tokens, integration JWT (basic too),
-        --        reverse proxy, password basic.
+        --        reverse proxy.
         --   LFS: LFS token, OAuth2, access token (basic only), Actions task token (basic
-        --        only), integration JWT, reverse proxy, password basic.
+        --        only), integration JWT, reverse proxy.
         --   web: reverse proxy (when enabled), session.
+        -- A Basic header whose password is an account password is refused with 401
+        -- "use a token" (decided: no password Basic auth).
 }
 
 surface ReverseProxyBoundary {
@@ -2939,28 +3071,13 @@ deferred ExternalGroupsAsserted.team_mapping -- see: organizations.allium (group
 deferred ExternalGroupsAsserted.quota_mapping -- see: quota.allium (quota_group_map)
 
 ------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Password-reset codes expire after ACTIVE_CODE_LIVE_MINUTES although RESET_PASSWD_CODE_LIVE_MINUTES is shown to the user; should reset codes honour reset_code_lifetime?"
-open question "OAuth2 authorization codes have a valid-until column that is never set, so codes never expire until used; the spec assumes a 10-minute lifetime — is that the intended behaviour?"
-open question "Sign-in does not refuse inactive accounts; they get a session that can only reach the activation page. Should an unconfirmed account rather be refused at sign-in?"
-open question "Password basic auth on the API is marked FIXME for removal; should the rebuild keep it (git clients rely on it) only for git/LFS routes?"
-open question "Signing out does not delete the remember-me record server-side (only the cookie); should sign-out revoke it?"
-open question "The mail throttle key is shared between activation resend and password reset, so one blocks the other for 3 minutes; intended?"
-open question "WebAuthn is a second factor only; should discoverable-credential (passkey) passwordless sign-in be specified for the rebuild?"
-open question "Account-link auto mode trusts an IdP-asserted e-mail or username to link to an existing local account; should this require the IdP's email_verified claim?"
-open question "A grant that exists with a different scope makes consent fail until the user revokes it; should a re-consent update the scope instead?"
-open question "Disabling TOTP is blocked when 2FA is required, but removing the last security key is not; should that be blocked too?"
-
-------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
 -- REQUEST accounts/User.kind: individual | bot | ... — used to refuse password sign-in for non-individuals.
--- REQUEST accounts/username_available(name): black-box check covering syntax, reserved names, cooldown, uniqueness.
+-- REQUEST accounts/username_available(name): black-box check covering syntax, reserved names (the fixed lists and every accounts/ReservedName, case-insensitive), cooldown, uniqueness.
 -- REQUEST accounts/email_available(email): black-box uniqueness check across all addresses.
 -- REQUEST accounts/user_count(): number of user accounts (first account becomes admin).
--- REQUEST accounts/user_by_name_or_email(name, email): lookup for account-link auto mode.
+-- REQUEST accounts/user_by_email(email): the account holding this activated address, for account-link auto mode (decided: e-mail only, no name match).
 -- REQUEST accounts: react to ExternalAvatarAsserted(user, url), ExternalAdminFlagsAsserted(user, is_admin, is_restricted).
 -- REQUEST accounts: User.login_source duplicates authentication/UserLogin.source; keep one (UserLogin also carries login_name and must_change_password).
 -- REQUEST accounts: UserLogin is created by authentication for self-registration; administration's "admin creates user" must create a UserLogin (with must_change_password) too.

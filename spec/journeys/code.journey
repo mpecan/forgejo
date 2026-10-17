@@ -167,6 +167,7 @@ journey AProtectedBranchTakesOnlyAllowlistedPushes {
         stipulate prot.push_allowlist_teams = {}
         stipulate member_of_any_team(carol, {}) = false
         stipulate can_read_code(carol, repo) = true
+        stipulate authenticated_by_password(carol) = false
         carol does GitClientPushes(carol, repo, http, null, null, null, null, null, null, null, false) on GitTransport
             creating carols: Push
 
@@ -253,7 +254,8 @@ journey TheFirstPushFillsAnEmptyRepository {
     given:
         repo.is_empty = true
 
-    1. she pushes trunk
+    1. she pushes trunk with a token
+        stipulate authenticated_by_password(alice) = false
         alice does GitClientPushes(alice, repo, http, null, null, null, null, null, null, null, false) on GitTransport
             creating push: Push
         stipulate may_write_branch(alice, push, "trunk") = true
@@ -294,11 +296,37 @@ journey AnArchiveIsReadOnly {
     3. bob cannot fetch a private repository he cannot read
         stipulate can_read_code(bob, repo) = false
         stipulate must_have_two_factor(bob) = false
-        stipulate authenticated_by_password(bob) = true
+        stipulate authenticated_by_password(bob) = false
         stipulate has_two_factor(bob) = false
         bob cannot do GitClientFetches(bob, repo, http) on GitTransport
 
     ends: The archive serves reads to its readers and refuses every write.
+}
+
+-- Git over HTTP takes a token, never the account password (decided in authentication:
+-- no password Basic auth), whether or not the user has a second factor.
+journey GitOverHttpTakesATokenNotAPassword {
+    goal: Bob has no second factor. git sends his account password and is refused;
+          with an access token as the password the same clone works, and so does a push.
+
+    1. git sends bob's password
+        stipulate can_read_code(bob, repo) = true
+        stipulate has_two_factor(bob) = false
+        stipulate authenticated_by_password(bob) = true
+        bob cannot do GitClientFetches(bob, repo, http) on GitTransport
+        bob cannot do GitClientPushes(bob, repo, http, null, null, null, null, null, null, null, false) on GitTransport
+
+    2. git sends his token instead
+        stipulate authenticated_by_password(bob) = false
+        bob does GitClientFetches(bob, repo, http) on GitTransport
+        then GitClientFetchesRepository fires
+
+    3. a push with the token is admitted too
+        bob does GitClientPushes(bob, repo, http, null, null, null, null, null, null, null, false) on GitTransport
+            creating push: Push
+        then push.pusher = bob
+
+    ends: Bob clones and pushes with a token; his password never opens git.
 }
 
 -- AGit: a reader proposes a change without a fork.
