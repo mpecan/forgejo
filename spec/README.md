@@ -23,15 +23,15 @@ allium-inspect                              # browse it (reads .allium-inspect.t
 
 | | |
 |---|---|
-| Modules | 22 `.allium` files, about 40,200 lines |
-| Entities | 196, plus 18 external entities and 54 value types |
-| Rules | 1,184 |
-| Surfaces | 206, for 67 actors |
-| Invariants | 214 |
+| Modules | 22 `.allium` files, about 42,800 lines |
+| Entities | 200, plus 18 external entities and 54 value types |
+| Rules | 1,224 |
+| Surfaces | 216, for 68 actors |
+| Invariants | 225 |
 | Config parameters | every `app.ini` setting that changes behaviour, with Forgejo's default |
-| Open questions | 201 ([`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md)) |
-| Journeys | 319 in 22 files: **all 703 steps hold** with allium-journey 0.1.4, with no walker diagnostics |
-| Cross-module reactions | 306; every one matches its emitter's trigger name and argument names |
+| Open questions | none left: all 201 were decided ([`DECISIONS.md`](DECISIONS.md)) |
+| Journeys | 452 in 22 files: **all 1,025 steps hold** with allium-journey 0.1.4, with no walker diagnostics |
+| Cross-module reactions | 320; every one matches its emitter's trigger name and argument names |
 | `allium check .` | 0 errors |
 
 ## Modules
@@ -94,10 +94,11 @@ Every module follows the same layout:
   (`exposes`) and can do (`provides`). The concrete web routes and API endpoints
   each surface covers are listed in its `@guidance`. That is the endpoint
   inventory for the rebuild, kept out of the normative spec.
-- **`open question`s**: places where Forgejo's web UI, API and code disagree, or
-  where the code's behaviour looks accidental. Each one needs a decision before
-  the rebuild implements that part. [`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md)
-  collects all of them.
+- **`-- decided:`** comments: where Forgejo's web UI, API and code disagreed, or
+  its behaviour looked accidental, the distillation raised an `open question`.
+  All of them have since been decided; [`DECISIONS.md`](DECISIONS.md) records
+  each decision and the spec carries it as a `-- decided:` comment beside the
+  behaviour it shaped.
 - **`-- REQUEST`** lines at the end: things a module needed from another one that
   are not yet fully specified there.
 
@@ -209,4 +210,10 @@ The Allium `distill` process, run as a fan-out:
    all), catches several creations per act, and answers module-qualified
    calls. It turned up eight more rules that reported fields of a record they
    had just deleted. After fixing those, all 703 steps hold.
+7. The 201 open questions were then decided with the project owner, module by
+   module, and recorded in [`DECISIONS.md`](DECISIONS.md). One agent per module
+   applied its decisions: removing the question, changing rules where the
+   decision changed behaviour, and adding journeys for the new behaviour
+   (often a refusal). Two follow-up questions that came up while applying them
+   are recorded too. The set grew to 452 journeys, and all 1,025 steps hold.
 
