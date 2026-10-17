@@ -600,6 +600,20 @@ rule SystemPurgesOrganization {
         -- owner) and moderation (admin acting on an abuse report).
 }
 
+-- A site admin deletes an organization with purge: everything it owns
+-- (repositories, packages) is removed with it, as for a user purge.
+-- Web: POST /-/admin/orgs/{org}/delete with purge. API: DELETE /orgs/{org}?purge=true (site admin).
+-- from: services/org/org.go:23 (DeleteOrganization's purge flag)
+-- decided (packages 8): organisation deletion has a purge option, as for users
+rule AdminPurgesOrganization {
+    when: AdminDeletesOrganizationWithPurge(admin, org, confirmation_name)
+
+    requires: admin.is_admin
+    requires: confirmation_name = org.name
+
+    ensures: OrganizationPurgeRequested(organization: org)
+}
+
 -- A site admin deletes an organization in response to an abuse report.
 -- from: routers/web/admin/reports.go:329
 rule ModeratorPurgesOrganization {
@@ -1783,7 +1797,8 @@ surface OrganizationSettings {
 
     @guarantee DeleteNeedsEmptyOrganization
         -- An organization that still owns repositories or packages cannot be
-        -- deleted by its owners.
+        -- deleted by its owners; a site administrator may delete it with
+        -- purge (OrganizationAdministration).
 
     @guidance
         -- Web: /org/{org}/settings (options, avatar, delete,
@@ -1926,6 +1941,7 @@ surface OrganizationAdministration {
 
     provides:
         AdminSetsOrganizationRepoLimit(admin, org, limit)
+        AdminDeletesOrganizationWithPurge(admin, org, confirmation_name)
 
     @guidance
         -- Web: GET /admin/orgs (list all, including private). API: GET
@@ -1999,7 +2015,7 @@ deferred Organization.unit_permission    -- see: access.allium (org-level read o
 -- REQUEST repositories: when an org repository is created and no team gives its creator admin, add the creator as an admin Collaboration; check can_create_repository_in(user, org) and Organization.max_repo_creation for creation, forks, transfers and push-to-create.
 -- REQUEST repositories: react to TeamMemberAdded / TeamRepositoryAdded with auto-watch when AUTO_WATCH_NEW_REPOS; react to TeamMemberRemoved / OrgMemberRemoved / TeamRepositoryRemoved by unwatching repositories the user can no longer read; react to OrganizationPurgeStarted by deleting all org repositories.
 -- REQUEST issues: react to TeamMemberRemoved / OrgMemberRemoved / TeamRepositoryRemoved by removing IssueWatch and assignments the user can no longer hold.
--- REQUEST packages: react to OrganizationPurgeStarted by deleting all org packages; expose owned package count.
+-- REQUEST packages: react to OrganizationPurgeStarted by deleting all org packages (done: packages/PurgeOrganizationPackages); expose owned package count.
 -- REQUEST actions: react to OrganizationDeleted by deleting org secrets, variables, runners and runner registration tokens.
 -- REQUEST code: react to TeamDeleted by removing the team from ProtectedBranch / ProtectedTag allow lists.
 -- REQUEST pulls: react to TeamDeleted by removing team ReviewRequests.

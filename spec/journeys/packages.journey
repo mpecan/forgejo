@@ -20,17 +20,21 @@ world {
         ada.is_admin = false
         bob.is_admin = false
         eve.is_admin = false
-        generic_row:   KindPolicy { kind: generic, version_mode: additive, file_overwrite: refuse, has_repository_index: false, signing: none, size_limit: -1 }
-        npm_row:       KindPolicy { kind: npm, version_mode: immutable, file_overwrite: refuse, has_repository_index: false, signing: none, size_limit: -1 }
-        helm_row:      KindPolicy { kind: helm, version_mode: additive, file_overwrite: replace, has_repository_index: false, signing: none, size_limit: 1000 }
-        debian_row:    KindPolicy { kind: debian, version_mode: additive, file_overwrite: refuse, has_repository_index: true, signing: pgp, size_limit: -1 }
-        maven_row:     KindPolicy { kind: maven, version_mode: additive, file_overwrite: replace_metadata, has_repository_index: false, signing: none, size_limit: -1 }
-        cargo_row:     KindPolicy { kind: cargo, version_mode: immutable, file_overwrite: refuse, has_repository_index: false, signing: none, size_limit: -1 }
-        container_row: KindPolicy { kind: container, version_mode: reference, file_overwrite: refuse, has_repository_index: false, signing: none, size_limit: -1 }
+        generic_row:   KindPolicy { kind: generic, version_mode: additive, file_overwrite: refuse, has_repository_index: false, signing: none }
+        npm_row:       KindPolicy { kind: npm, version_mode: immutable, file_overwrite: refuse, has_repository_index: false, signing: none }
+        helm_row:      KindPolicy { kind: helm, version_mode: additive, file_overwrite: replace, has_repository_index: false, signing: none }
+        debian_row:    KindPolicy { kind: debian, version_mode: additive, file_overwrite: refuse, has_repository_index: true, signing: pgp }
+        maven_row:     KindPolicy { kind: maven, version_mode: additive, file_overwrite: replace_metadata, has_repository_index: false, signing: none }
+        cargo_row:     KindPolicy { kind: cargo, version_mode: immutable, file_overwrite: refuse, has_repository_index: false, signing: none }
+        container_row: KindPolicy { kind: container, version_mode: reference, file_overwrite: refuse, has_repository_index: false, signing: none }
         -- Ada may write to her own registry, and it is under quota, in every story
         -- here unless one says otherwise.
         can_write_packages(ada, reg) = true
         quota_allows_package_upload(reg) = true
+        -- Nobody here is an Actions job token unless a story says so.
+        job_repository(ada) = null
+        job_repository(bob) = null
+        job_repository(eve) = null
 }
 
 -- The happy path of the generic registry: the first upload of a new name
@@ -118,18 +122,27 @@ journey BobCannotPublishIntoAdasRegistry {
     ends: Nothing was stored.
 }
 
--- A per-kind size limit stops an oversized upload.
-journey AnOversizedHelmChartIsRefused {
-    goal: The instance limits Helm uploads to 1000 bytes; Ada's chart is
-          bigger.
+-- Package storage is limited by quota alone: there is no per-kind size limit
+-- any more, and the owner's package quota stops the next upload.
+-- (Updated for decision packages 6: this journey used to show a 1000-byte
+-- Helm LIMIT_SIZE refusing a 5000-byte chart.)
+journey AnOverQuotaRegistryRefusesUploads {
+    goal: Ada pushes a large Helm chart, which is fine, and then her package
+          quota is used up, so her next chart is refused.
 
-    1. a chart bigger than the limit is refused
+    1. a large chart is accepted: no per-kind size limit applies
         stipulate valid_coordinates(helm, "web", "0.1.0", "web-0.1.0.tgz") = true
         stipulate reg.stored_size = 0
         stipulate reg.visible_version_count = 0
-        ada cannot do PublisherUploadsPackageFile(ada, reg, helm, "web", "0.1.0", "web-0.1.0.tgz", null, true, 5000, "big999") on PackageClientProtocol
+        ada does PublisherUploadsPackageFile(ada, reg, helm, "web", "0.1.0", "web-0.1.0.tgz", null, true, 5000, "big999") on PackageClientProtocol
+        then PublishFirstVersionOfNewPackage fires
 
-    ends: The chart was not stored.
+    2. once her quota no longer allows package uploads, the next one is refused
+        stipulate quota_allows_package_upload(reg) = false
+        stipulate valid_coordinates(helm, "web", "0.2.0", "web-0.2.0.tgz") = true
+        ada cannot do PublisherUploadsPackageFile(ada, reg, helm, "web", "0.2.0", "web-0.2.0.tgz", null, true, 10, "small01") on PackageClientProtocol
+
+    ends: web 0.1.0 is stored; 0.2.0 was refused as "quota exceeded".
 }
 
 -- Downloading the lead file counts a download; visibility follows the owner.
@@ -182,24 +195,88 @@ journey AdaDeletesADebianVersion {
           Release files are rebuilt and signed with Ada's registry key.
 }
 
--- Linking a package to a repository needs write on both sides.
+-- Linking a package to a repository needs write on both sides, and a linked
+-- package must be unlinked before it is relinked. Unlinking needs the same
+-- (package write plus write on the linked repository), not ownership.
 journey AdaLinksAPackageToHerRepository {
     given:
-        repo: repositories/Repository { owner_user: ada, is_private: false }
-        pkg:  Package { registry: reg, kind: generic, name: "tool", is_internal: false, repository: null, autolink_pending: false }
+        repo:  repositories/Repository { owner_user: ada, is_private: false }
+        other: repositories/Repository { owner_user: ada, is_private: false }
+        pkg:   Package { registry: reg, kind: generic, name: "tool", is_internal: false, repository: null, autolink_pending: false }
 
-    1. she links it
+    1. without write on the repository she cannot link to it
+        stipulate same_owner(reg, other) = true
+        stipulate can_write_repo_packages(ada, other) = false
+        ada cannot do UserLinksPackage(ada, pkg, other) on PackageVersionSettings
+
+    2. she links it to a repository she can write
         stipulate same_owner(reg, repo) = true
         stipulate can_write_repo_packages(ada, repo) = true
         ada does UserLinksPackage(ada, pkg, repo) on PackageVersionSettings
         then UserLinksPackageToRepository fires
         then pkg.repository = repo
 
-    2. bob, who cannot write packages here, cannot unlink it
+    3. relinking a linked package is refused until it is unlinked
+        stipulate can_write_repo_packages(ada, other) = true
+        ada cannot do UserLinksPackage(ada, pkg, other) on PackageVersionSettings
+
+    4. bob, who cannot write packages here, cannot unlink it
         stipulate can_write_packages(bob, reg) = false
         bob cannot do UserUnlinksPackage(bob, pkg) on PackageVersionSettings
 
-    ends: The package appears on the repository's Packages tab.
+    5. with package write but no write on the repository he still cannot
+        stipulate can_write_packages(bob, reg) = true
+        stipulate can_write_repo_packages(bob, repo) = false
+        bob cannot do UserUnlinksPackage(bob, pkg) on PackageVersionSettings
+
+    6. with write on both he can unlink it, though he does not own the registry
+        stipulate can_write_repo_packages(bob, repo) = true
+        bob does UserUnlinksPackage(bob, pkg) on PackageVersionSettings
+        then UserUnlinksPackageFromRepository fires
+        then pkg.repository = null
+
+    ends: The package is unlinked again and may now be linked elsewhere.
+}
+
+-- An Actions job token writes only its own repository's packages: what it
+-- publishes is linked to its repository, and other packages are read-only to it.
+journey AJobTokenPublishesOnlyForItsRepository {
+    goal: A workflow in Ada's repository "app" publishes a new package and a
+          new version of it, but cannot touch Ada's unlinked package.
+
+    cast:
+        ci: accounts/User
+    given:
+        ci.is_admin = false
+        app:   repositories/Repository { owner_user: ada, is_private: false }
+        loose: Package { registry: reg, kind: generic, name: "loose", is_internal: false, repository: null, autolink_pending: false }
+        lv1:   PackageVersion { package: loose, creator: ada, version: "1.0.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
+
+    1. the job publishes a new package, which is linked to its repository
+        stipulate job_repository(ci) = app
+        stipulate can_write_packages(ci, reg) = true
+        stipulate same_owner(reg, app) = true
+        stipulate valid_coordinates(generic, "app-bin", "1.0.0", "app.tar.gz") = true
+        stipulate reg.stored_size = 0
+        stipulate reg.visible_version_count = 1
+        ci does PublisherUploadsPackageFile(ci, reg, generic, "app-bin", "1.0.0", "app.tar.gz", null, true, 100, "ci0001") on PackageClientProtocol
+            creating built: PackageVersion
+        then PublishFirstVersionOfNewPackage fires
+        then built.package.repository = app
+
+    2. it may add a version to that package
+        stipulate valid_coordinates(generic, "app-bin", "1.1.0", "app.tar.gz") = true
+        ci does PublisherUploadsPackageFile(ci, reg, generic, "app-bin", "1.1.0", "app.tar.gz", null, true, 100, "ci0002") on PackageClientProtocol
+        then PublishNewVersionOfExistingPackage fires
+
+    3. but not to a package that is not linked to its repository
+        stipulate valid_coordinates(generic, "loose", "2.0.0", "loose.tar.gz") = true
+        ci cannot do PublisherUploadsPackageFile(ci, reg, generic, "loose", "2.0.0", "loose.tar.gz", null, true, 100, "ci0003") on PackageClientProtocol
+
+    4. nor delete one of its versions
+        ci cannot do UserRemovesPackageVersion(ci, lv1) on PackageVersionSettings
+
+    ends: app-bin 1.0.0 and 1.1.0 belong to "app"; "loose" is untouched.
 }
 
 -- A Cargo version can be yanked and unyanked without deleting it.

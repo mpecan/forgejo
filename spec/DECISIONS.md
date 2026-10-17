@@ -220,6 +220,11 @@ invariants or config. Numbers refer to the question's position in its module in
 
 | # | Question | Decision |
 |---|---|---|
+| 1 | Inbox vs mail audience | **Unified.** One audience: subscribers, kind-specific watchers, participants, assignees and mentions, minus the actor, unsubscribers and users who blocked the actor. Mail goes to that audience filtered by each person's mail preference. |
 | 2 | Filters for new pull requests | **Applied.** New pull requests go through the same unsubscribe and block filters as every other notification. |
 | 3 | Mail reply/unsubscribe tokens on password change | **Revoked explicitly** on password change and account reset. |
 | 4 | Job-failure mail | **Exactly one mail per failed run attempt.** |
+| 5 | Collaborator mail | **Every path.** The invitation mail goes out however the invitation is made. |
+| 6 | Activity feeds | **Computed on read:** events from what the reader follows or watches now, filtered by current visibility. |
+| 7 | The `commit` notification source | **Dropped.** |
+| 8 | Release mail for prereleases | **Prereleases are mailed too.** |

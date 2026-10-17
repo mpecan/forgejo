@@ -22,8 +22,9 @@
 --   reporting (web storage overview + API), OAuth2 group-claim sync into
 --   quota groups.
 -- Excludes:
---   - Per-package-type size/count limits ([packages].LIMIT_*): owned by
---     packages.allium; they are a separate mechanism from quota groups.
+--   - (decided, packages 6: the former [packages] LIMIT_TOTAL_OWNER_* and
+--     LIMIT_SIZE_<KIND> limits are gone; package storage is limited only by
+--     quota rules on size:assets:packages:all, see config.default_packages.)
 --   - How each storage figure is measured on disk (git object size, LFS size,
 --     blob dedup): the measuring belongs to code/packages/actions; quota only
 --     consumes the figures (see QuotaUsage).
@@ -256,6 +257,12 @@ config {
     -- size:all) used when a holder has neither explicit nor default groups.
     -- -1 = unlimited. Accepts byte-size notation ("1 GiB").
     default_total: Integer = -1
+    -- decided (packages 6): package limits are default quota rules. Limit of
+    -- a second built-in fallback rule (subject size:assets:packages:all) in
+    -- the same fallback group; replaces [packages] LIMIT_TOTAL_OWNER_SIZE.
+    -- -1 = unlimited. Holders with explicit or default groups get package
+    -- limits from rules on size:assets:packages:all in those groups.
+    default_packages: Integer = -1
 }
 
 ------------------------------------------------------------
@@ -308,14 +315,18 @@ default QuotaGate gate_artifact_upload = { operation: upload_actions_artifact, s
 -- quota_allows(account, subject), precisely:
 --   0. when config.enabled is false: always true (nothing is gated).
 --   1. groups := account's explicit groups; if none, the existing groups
---      named in config.default_groups; if still none, a built-in group with a
---      single rule { limit: config.default_total, subjects: {size_all} }.
+--      named in config.default_groups; if still none, a built-in group with
+--      the rules { limit: config.default_total, subjects: {size_all} } and
+--      { limit: config.default_packages, subjects: {size_assets_packages_all} }
+--      (both must permit a package upload).
 --   2. allowed iff SOME group in groups both matches(subject) and
 --      permits(subject, account.usage).
 --   Consequence: a holder whose groups contain no rule covering the subject
 --   is DENIED (see open question), and one permissive group overrides any
 --   number of restrictive ones.
 -- from: models/quota/quota.go:20
+-- decided (packages 6): the built-in fallback group also carries the default
+-- package rule (config.default_packages); packages has no limits of its own
 rule StorageConsumptionGated {
     when: StorageConsumptionRequested(requester, account, subject, operation)
     requires: not config.enabled or quota_allows(account, subject)
@@ -628,7 +639,8 @@ surface OwnStorageOverview {
     @guarantee EffectiveGroupsShown
         -- The overview shows the groups that actually govern the holder: the
         -- explicit ones, else the default groups, else a synthetic "global
-        -- quota" with the [quota.default] TOTAL limit on size:all.
+        -- quota" with the [quota.default] TOTAL limit on size:all and the
+        -- default package limit on size:assets:packages:all.
 
     @guidance
         -- Web: /user/settings/storage_overview (per-subject bars).

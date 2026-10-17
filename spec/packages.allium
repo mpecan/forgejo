@@ -11,7 +11,7 @@
 --     deduplicated across the whole instance), package/version/file properties
 --     and metadata extracted from uploads
 --   - KindPolicy: the per-kind behaviour table (version immutability, file
---     overwrite, repository indexes, signing, size limits, endpoint roots)
+--     overwrite, repository indexes, signing, endpoint roots)
 --   - publishing (generic path, additive versions, file overwrite), container
 --     (OCI) chunked blob uploads, blob mounting, manifests, tags vs digests,
 --     image auto-linking to repositories
@@ -25,8 +25,8 @@
 --   - CleanupRule (keep count, keep pattern, last-download windows, remove
 --     age, remove pattern, full-name matching, enable/disable, preview) and
 --     the scheduled cleanup task, expired-data purge
---   - instance limits LIMIT_TOTAL_OWNER_COUNT, LIMIT_TOTAL_OWNER_SIZE,
---     LIMIT_SIZE_<KIND>, DEFAULT_RPM_SIGN_ENABLED, ENABLED
+--   - instance settings DEFAULT_RPM_SIGN_ENABLED, ENABLED (package storage
+--     limits are quota rules, see quota.allium)
 --   - owner package settings pages, site-admin package overview
 -- Excludes:
 --   - the per-ecosystem wire protocols (URL layouts, JSON/XML/tar formats,
@@ -52,6 +52,7 @@
 -- Reacts to:
 --   - repositories/RepositoryDeleted(repository, doer) -- unlink all packages linked to it
 --   - accounts/UserPurged(user)                    -- remove everything in the user's registry
+--   - organizations/OrganizationPurgeStarted(organization) -- remove everything in the org's registry
 --   - administration/PackageCleanupDue(older_than) -- run the cleanup task now
 
 use "./accounts.allium" as accounts
@@ -176,8 +177,6 @@ entity KindPolicy {
     -- are regenerated after every change.
     has_repository_index: Boolean
     signing: SigningScheme
-    -- Maximum bytes of a single uploaded file; -1 means unlimited.
-    size_limit: Integer
     -- Root under which the client protocol for this kind is served,
     -- relative to the instance URL; {owner} is the registry owner's name.
     endpoint_root: String
@@ -383,34 +382,11 @@ config {
     packages_enabled: Boolean = true
     -- [service] REQUIRE_SIGNIN_VIEW, owned by access
     require_signin_view: Boolean = access/config.require_signin_view
-    -- [packages] LIMIT_TOTAL_OWNER_COUNT: max visible versions per owner, -1 unlimited
-    limit_total_owner_count: Integer = -1
-    -- [packages] LIMIT_TOTAL_OWNER_SIZE: max bytes stored per owner, -1 unlimited
-    limit_total_owner_size: Integer = -1
-    -- [packages] LIMIT_SIZE_<KIND>: max bytes of one uploaded file, -1 unlimited
-    limit_size_alpine: Integer = -1
-    limit_size_alt: Integer = -1
-    limit_size_arch: Integer = -1
-    limit_size_cargo: Integer = -1
-    limit_size_chef: Integer = -1
-    limit_size_composer: Integer = -1
-    limit_size_conan: Integer = -1
-    limit_size_conda: Integer = -1
-    limit_size_container: Integer = -1
-    limit_size_cran: Integer = -1
-    limit_size_debian: Integer = -1
-    limit_size_generic: Integer = -1
-    limit_size_go: Integer = -1
-    limit_size_helm: Integer = -1
-    limit_size_maven: Integer = -1
-    limit_size_npm: Integer = -1
-    limit_size_nuget: Integer = -1
-    limit_size_pub: Integer = -1
-    limit_size_pypi: Integer = -1
-    limit_size_rpm: Integer = -1
-    limit_size_rubygems: Integer = -1
-    limit_size_swift: Integer = -1
-    limit_size_vagrant: Integer = -1
+    -- decided: [packages] LIMIT_TOTAL_OWNER_COUNT, LIMIT_TOTAL_OWNER_SIZE and
+    -- LIMIT_SIZE_<KIND> are folded into quota: the per-type limits are dropped
+    -- and an owner's package storage is limited by quota rules on
+    -- size:assets:packages:all (quota/config.default_packages for holders
+    -- without groups).
     -- [packages] DEFAULT_RPM_SIGN_ENABLED: sign every uploaded RPM with the
     -- owner's RPM key even when the uploader did not ask for it
     default_rpm_sign_enabled: Boolean = false
@@ -433,29 +409,29 @@ config {
 ------------------------------------------------------------
 
 -- from: routers/api/packages/api.go:200 (endpoint roots) and the Create* call per kind
-default KindPolicy alpine_policy = { kind: alpine, display_name: "Alpine", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: true, signing: rsa, size_limit: config.limit_size_alpine, endpoint_root: "/api/packages/{owner}/alpine" }
-default KindPolicy alt_policy = { kind: alt, display_name: "ALT", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: true, signing: none, size_limit: config.limit_size_alt, endpoint_root: "/api/packages/{owner}/alt" }
-default KindPolicy arch_policy = { kind: arch, display_name: "Arch", version_mode: additive, file_overwrite: replace, name_case_sensitive: false, has_repository_index: true, signing: pgp, size_limit: config.limit_size_arch, endpoint_root: "/api/packages/{owner}/arch" }
-default KindPolicy cargo_policy = { kind: cargo, display_name: "Cargo", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_cargo, endpoint_root: "/api/packages/{owner}/cargo" }
-default KindPolicy chef_policy = { kind: chef, display_name: "Chef", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_chef, endpoint_root: "/api/packages/{owner}/chef" }
-default KindPolicy composer_policy = { kind: composer, display_name: "Composer", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_composer, endpoint_root: "/api/packages/{owner}/composer" }
-default KindPolicy conan_policy = { kind: conan, display_name: "Conan", version_mode: additive, file_overwrite: replace, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_conan, endpoint_root: "/api/packages/{owner}/conan" }
-default KindPolicy conda_policy = { kind: conda, display_name: "Conda", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_conda, endpoint_root: "/api/packages/{owner}/conda" }
-default KindPolicy container_policy = { kind: container, display_name: "Container", version_mode: reference, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_container, endpoint_root: "/v2/{owner}" }
-default KindPolicy cran_policy = { kind: cran, display_name: "CRAN", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_cran, endpoint_root: "/api/packages/{owner}/cran" }
-default KindPolicy debian_policy = { kind: debian, display_name: "Debian", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: true, signing: pgp, size_limit: config.limit_size_debian, endpoint_root: "/api/packages/{owner}/debian" }
-default KindPolicy generic_policy = { kind: generic, display_name: "Generic", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_generic, endpoint_root: "/api/packages/{owner}/generic" }
-default KindPolicy go_policy = { kind: go, display_name: "Go", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_go, endpoint_root: "/api/packages/{owner}/go" }
-default KindPolicy helm_policy = { kind: helm, display_name: "Helm", version_mode: additive, file_overwrite: replace, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_helm, endpoint_root: "/api/packages/{owner}/helm" }
-default KindPolicy maven_policy = { kind: maven, display_name: "Maven", version_mode: additive, file_overwrite: replace_metadata, name_case_sensitive: true, has_repository_index: false, signing: none, size_limit: config.limit_size_maven, endpoint_root: "/api/packages/{owner}/maven" }
-default KindPolicy npm_policy = { kind: npm, display_name: "npm", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_npm, endpoint_root: "/api/packages/{owner}/npm" }
-default KindPolicy nuget_policy = { kind: nuget, display_name: "NuGet", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_nuget, endpoint_root: "/api/packages/{owner}/nuget" }
-default KindPolicy pub_policy = { kind: pub, display_name: "Pub", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_pub, endpoint_root: "/api/packages/{owner}/pub" }
-default KindPolicy pypi_policy = { kind: pypi, display_name: "PyPI", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_pypi, endpoint_root: "/api/packages/{owner}/pypi" }
-default KindPolicy rpm_policy = { kind: rpm, display_name: "RPM", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: true, signing: pgp, size_limit: config.limit_size_rpm, endpoint_root: "/api/packages/{owner}/rpm" }
-default KindPolicy rubygems_policy = { kind: rubygems, display_name: "RubyGems", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_rubygems, endpoint_root: "/api/packages/{owner}/rubygems" }
-default KindPolicy swift_policy = { kind: swift, display_name: "Swift", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_swift, endpoint_root: "/api/packages/{owner}/swift" }
-default KindPolicy vagrant_policy = { kind: vagrant, display_name: "Vagrant", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, size_limit: config.limit_size_vagrant, endpoint_root: "/api/packages/{owner}/vagrant" }
+default KindPolicy alpine_policy = { kind: alpine, display_name: "Alpine", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: true, signing: rsa, endpoint_root: "/api/packages/{owner}/alpine" }
+default KindPolicy alt_policy = { kind: alt, display_name: "ALT", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: true, signing: none, endpoint_root: "/api/packages/{owner}/alt" }
+default KindPolicy arch_policy = { kind: arch, display_name: "Arch", version_mode: additive, file_overwrite: replace, name_case_sensitive: false, has_repository_index: true, signing: pgp, endpoint_root: "/api/packages/{owner}/arch" }
+default KindPolicy cargo_policy = { kind: cargo, display_name: "Cargo", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/cargo" }
+default KindPolicy chef_policy = { kind: chef, display_name: "Chef", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/chef" }
+default KindPolicy composer_policy = { kind: composer, display_name: "Composer", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/composer" }
+default KindPolicy conan_policy = { kind: conan, display_name: "Conan", version_mode: additive, file_overwrite: replace, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/conan" }
+default KindPolicy conda_policy = { kind: conda, display_name: "Conda", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/conda" }
+default KindPolicy container_policy = { kind: container, display_name: "Container", version_mode: reference, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/v2/{owner}" }
+default KindPolicy cran_policy = { kind: cran, display_name: "CRAN", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/cran" }
+default KindPolicy debian_policy = { kind: debian, display_name: "Debian", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: true, signing: pgp, endpoint_root: "/api/packages/{owner}/debian" }
+default KindPolicy generic_policy = { kind: generic, display_name: "Generic", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/generic" }
+default KindPolicy go_policy = { kind: go, display_name: "Go", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/go" }
+default KindPolicy helm_policy = { kind: helm, display_name: "Helm", version_mode: additive, file_overwrite: replace, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/helm" }
+default KindPolicy maven_policy = { kind: maven, display_name: "Maven", version_mode: additive, file_overwrite: replace_metadata, name_case_sensitive: true, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/maven" }
+default KindPolicy npm_policy = { kind: npm, display_name: "npm", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/npm" }
+default KindPolicy nuget_policy = { kind: nuget, display_name: "NuGet", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/nuget" }
+default KindPolicy pub_policy = { kind: pub, display_name: "Pub", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/pub" }
+default KindPolicy pypi_policy = { kind: pypi, display_name: "PyPI", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/pypi" }
+default KindPolicy rpm_policy = { kind: rpm, display_name: "RPM", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: true, signing: pgp, endpoint_root: "/api/packages/{owner}/rpm" }
+default KindPolicy rubygems_policy = { kind: rubygems, display_name: "RubyGems", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/rubygems" }
+default KindPolicy swift_policy = { kind: swift, display_name: "Swift", version_mode: immutable, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/swift" }
+default KindPolicy vagrant_policy = { kind: vagrant, display_name: "Vagrant", version_mode: additive, file_overwrite: refuse, name_case_sensitive: false, has_repository_index: false, signing: none, endpoint_root: "/api/packages/{owner}/vagrant" }
 
 ------------------------------------------------------------
 -- Rules
@@ -483,8 +459,18 @@ default KindPolicy vagrant_policy = { kind: vagrant, display_name: "Vagrant", ve
 --      the derived mode.
 --   5. A request authenticated with a scoped token additionally needs
 --      read:package (read) / write:package (write); a public-only token is
---      refused on a private owner's registry. Actions task tokens act with
---      their workflow user's mode.
+--      refused on every registry not visible to anonymous visitors (private
+--      and limited owners).
+--      decided: "public only" means visible to anonymous visitors (Forgejo
+--      excluded only private owners).
+--   6. An Actions job token reads with its workflow's mode but writes only
+--      its own repository's packages: job_repository(user) names the
+--      repository of the job whose automatic token authenticated the
+--      request (null for every other credential), and each write rule
+--      requires the package to be linked to it; a new package it publishes
+--      must be in that repository's owner registry and is linked to it.
+--      decided: job tokens write only their own repository's packages
+--      (Forgejo let them write the whole owner registry, marked TODO).
 --   can_read_packages is true for mode >= read; can_write_packages for
 --   mode >= write.
 --
@@ -504,6 +490,7 @@ default KindPolicy vagrant_policy = { kind: vagrant, display_name: "Vagrant", ve
 --   registries), evaluated before the upload is stored.
 --   from: routers/api/packages/api.go:96
 --
+-- job_repository(user): see step 6 above.
 -- same_owner(registry, repository): repository.owner_user = registry.owner_user
 --   and repository.owner_org = registry.owner_org.
 -- valid_coordinates(kind, name, version, file_name), valid_image_reference
@@ -552,7 +539,6 @@ default KindPolicy vagrant_policy = { kind: vagrant, display_name: "Vagrant", ve
 -- from: services/packages/packages.go:174
 rule PublishFirstVersionOfNewPackage {
     when: PublisherUploadsPackageFile(publisher, registry, kind, name, version, file_name, composite_key, is_lead, size, sha256)
-    let policy = KindPolicy{kind: kind}
     let existing = Package{registry: registry, kind: kind, name: name}
     requires: config.packages_enabled
     requires: kind != container
@@ -560,9 +546,9 @@ rule PublishFirstVersionOfNewPackage {
     requires: valid_coordinates(kind, name, version, file_name)
     requires: quota_allows_package_upload(registry)
     requires: not exists existing
-    requires: publisher.is_admin or policy.size_limit < 0 or size <= policy.size_limit
-    requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + size <= config.limit_total_owner_size
-    requires: publisher.is_admin or config.limit_total_owner_count < 0 or registry.visible_version_count < config.limit_total_owner_count
+    -- decided: an Actions job token may publish a new package only into its
+    -- own repository's owner registry, and the package is linked to that repository
+    requires: job_repository(publisher) = null or same_owner(registry, job_repository(publisher))
     ensures:
         let package = Package.created(
             registry: registry,
@@ -570,7 +556,7 @@ rule PublishFirstVersionOfNewPackage {
             name: name,
             semver_compatible: is_semver_kind(kind),
             is_internal: false,
-            repository: null,
+            repository: job_repository(publisher),
             properties: extracted_package_properties(kind, sha256),
             autolink_pending: false
         )
@@ -607,8 +593,10 @@ rule PublishFirstVersionOfNewPackage {
         -- CRAN/NuGet/Composer/Chef/RubyGems/Conan names follow their
         -- ecosystem rules. Metadata is parsed from the artefact itself and an
         -- unparseable artefact is refused.
-        -- Site administrators bypass the per-kind size limit and the owner
-        -- count/size limits, but not the quota module.
+        -- decided: package storage is limited only by quota (the gate
+        -- quota_allows_package_upload, charged to the registry owner); there
+        -- are no per-kind file-size or per-owner count/size limits, and site
+        -- administrators are gated like everyone else.
         -- RPM uploads are re-signed with the owner's RPM key when
         -- config.default_rpm_sign_enabled or the uploader asks (?sign=true);
         -- Arch packages uploaded without a detached signature get one made
@@ -620,7 +608,6 @@ rule PublishFirstVersionOfNewPackage {
 -- from: services/packages/packages.go:213
 rule PublishNewVersionOfExistingPackage {
     when: PublisherUploadsPackageFile(publisher, registry, kind, name, version, file_name, composite_key, is_lead, size, sha256)
-    let policy = KindPolicy{kind: kind}
     let package = Package{registry: registry, kind: kind, name: name}
     requires: config.packages_enabled
     requires: kind != container
@@ -628,11 +615,10 @@ rule PublishNewVersionOfExistingPackage {
     requires: valid_coordinates(kind, name, version, file_name)
     requires: quota_allows_package_upload(registry)
     requires: exists package
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
     requires: package.is_internal = false
     requires: not exists PackageVersion{package: package, version: version}
-    requires: publisher.is_admin or policy.size_limit < 0 or size <= policy.size_limit
-    requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + size <= config.limit_total_owner_size
-    requires: publisher.is_admin or config.limit_total_owner_count < 0 or registry.visible_version_count < config.limit_total_owner_count
     ensures:
         let new_version = PackageVersion.created(
             package: package,
@@ -672,11 +658,11 @@ rule AddFileToExistingVersion {
     requires: valid_coordinates(kind, name, version, file_name)
     requires: quota_allows_package_upload(registry)
     requires: exists target
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
     requires: target.is_internal = false
     requires: policy.version_mode = additive
     requires: not exists PackageFile{version: target, name: file_name, composite_key: composite_key}
-    requires: publisher.is_admin or policy.size_limit < 0 or size <= policy.size_limit
-    requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + size <= config.limit_total_owner_size
     ensures:
         FileStored(version: target, file_name: file_name, composite_key: composite_key, is_lead: is_lead, size: size, sha256: sha256)
         RegistryContentChanged(registry: registry, kind: kind, package: package)
@@ -703,9 +689,9 @@ rule ReplaceFileInExistingVersion {
     requires: can_write_packages(publisher, registry)
     requires: quota_allows_package_upload(registry)
     requires: exists old_file
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
     requires: policy.file_overwrite = replace or (policy.file_overwrite = replace_metadata and is_registry_metadata_file(kind, file_name))
-    requires: publisher.is_admin or policy.size_limit < 0 or size <= policy.size_limit
-    requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + size <= config.limit_total_owner_size
     ensures: not exists old_file
     ensures:
         FileStored(version: target, file_name: file_name, composite_key: composite_key, is_lead: is_lead, size: size, sha256: sha256)
@@ -868,6 +854,8 @@ rule CargoYanksVersion {
     requires: config.packages_enabled
     requires: version.package.kind = cargo
     requires: can_write_packages(publisher, registry)
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(publisher) = null or version.package.repository = job_repository(publisher)
     requires: version.is_yanked = false
     ensures: version.is_yanked = true
     ensures: CargoIndexEntryStale(registry: registry, package: version.package)
@@ -880,6 +868,8 @@ rule CargoUnyanksVersion {
     requires: config.packages_enabled
     requires: version.package.kind = cargo
     requires: can_write_packages(publisher, registry)
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(publisher) = null or version.package.repository = job_repository(publisher)
     requires: quota_allows_package_upload(registry)
     requires: version.is_yanked = true
     ensures: version.is_yanked = false
@@ -895,6 +885,8 @@ rule NpmAddsDistTag {
     requires: config.packages_enabled
     requires: version.package.kind = npm
     requires: can_write_packages(publisher, registry)
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(publisher) = null or version.package.repository = job_repository(publisher)
     requires: tag != ""
     requires: not is_valid_version_string(tag)
     ensures:
@@ -910,6 +902,8 @@ rule NpmRemovesDistTag {
     requires: config.packages_enabled
     requires: package.kind = npm
     requires: can_write_packages(publisher, package.registry)
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
     ensures:
         for v in package.versions:
             if tag in v.dist_tags:
@@ -953,14 +947,11 @@ rule ContainerCompletesBlobUpload {
     -- read before the upload goes: postconditions see the resulting state
     let image = upload.image
     let bytes = upload.bytes_received
-    let policy = KindPolicy{kind: container}
     let existing_blob = PackageBlob{hash_sha256: sha256}
     requires: config.packages_enabled
     requires: can_write_packages(publisher, registry)
     requires: quota_allows_package_upload(registry)
     requires: upload_digest_matches(upload, sha256)
-    requires: publisher.is_admin or policy.size_limit < 0 or upload.bytes_received <= policy.size_limit
-    requires: publisher.is_admin or config.limit_total_owner_size < 0 or registry.stored_size + upload.bytes_received <= config.limit_total_owner_size
     ensures:
         if exists existing_blob:
             ContainerUploadedBlob.created(registry: registry, image: image, blob: existing_blob, uploaded_at: now)
@@ -1019,16 +1010,17 @@ rule ContainerDeletesBlob {
 -- from: services/packages/container/manifest.go:388
 rule ContainerPushesManifestForNewImage {
     when: ContainerClientPushesManifest(publisher, registry, image, reference, is_tag, size, sha256)
-    let policy = KindPolicy{kind: container}
     requires: config.packages_enabled
     requires: can_write_packages(publisher, registry)
     requires: valid_image_reference(image, reference)
     requires: quota_allows_package_upload(registry)
     requires: not exists Package{registry: registry, kind: container, name: image}
     requires: manifest_references_resolve(registry, image, sha256)
-    requires: publisher.is_admin or config.limit_total_owner_count < 0 or registry.visible_version_count < config.limit_total_owner_count
+    -- decided: a job token pushes a new image only into its own repository's
+    -- owner registry, linked to that repository
+    requires: job_repository(publisher) = null or same_owner(registry, job_repository(publisher))
     ensures:
-        let package = Package.created(registry: registry, kind: container, name: image, semver_compatible: false, is_internal: false, repository: null, properties: {}, autolink_pending: true)
+        let package = Package.created(registry: registry, kind: container, name: image, semver_compatible: false, is_internal: false, repository: job_repository(publisher), properties: {}, autolink_pending: true)
         let new_version = PackageVersion.created(package: package, creator: publisher, version: reference, created_at: now, is_internal: false, metadata: extracted_image_metadata(sha256), properties: extracted_image_properties(sha256), download_count: 0, last_downloaded_at: null, is_tagged: is_tag, is_yanked: false, dist_tags: {})
         FileStored(version: new_version, file_name: manifest_file_name(sha256), composite_key: null, is_lead: true, size: size, sha256: sha256)
         ContainerManifestLayersAttached(version: new_version, registry: registry, image: image, manifest_sha256: sha256)
@@ -1053,9 +1045,10 @@ rule ContainerPushesNewReference {
     requires: valid_image_reference(image, reference)
     requires: quota_allows_package_upload(registry)
     requires: exists package
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
     requires: not exists PackageVersion{package: package, version: reference}
     requires: manifest_references_resolve(registry, image, sha256)
-    requires: publisher.is_admin or config.limit_total_owner_count < 0 or registry.visible_version_count < config.limit_total_owner_count
     ensures:
         let new_version = PackageVersion.created(package: package, creator: publisher, version: reference, created_at: now, is_internal: false, metadata: extracted_image_metadata(sha256), properties: extracted_image_properties(sha256), download_count: 0, last_downloaded_at: null, is_tagged: is_tag, is_yanked: false, dist_tags: {})
         FileStored(version: new_version, file_name: manifest_file_name(sha256), composite_key: null, is_lead: true, size: size, sha256: sha256)
@@ -1079,6 +1072,8 @@ rule ContainerRepointsReference {
     requires: can_write_packages(publisher, registry)
     requires: quota_allows_package_upload(registry)
     requires: exists previous
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
     requires: manifest_references_resolve(registry, image, sha256)
     ensures: not exists previous
     ensures:
@@ -1141,6 +1136,8 @@ rule ContainerDeletesManifest {
     requires: config.packages_enabled
     requires: package.kind = container
     requires: can_write_packages(publisher, package.registry)
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(publisher) = null or package.repository = job_repository(publisher)
     ensures: not exists version
     ensures: PackageVersionDeleted(version: version, package: package, doer: publisher)
 }
@@ -1194,6 +1191,8 @@ rule UserDeletesPackageVersion {
     requires: config.packages_enabled
     requires: version.is_internal = false
     requires: can_write_packages(actor, registry)
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(actor) = null or package.repository = job_repository(actor)
     ensures:
         for f in version.files:
             not exists f
@@ -1213,6 +1212,8 @@ rule UserDeletesWholePackage {
     requires: config.packages_enabled
     requires: package.is_internal = false
     requires: can_write_packages(actor, package.registry)
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(actor) = null or package.repository = job_repository(actor)
     requires: package.visible_versions.count > 0
     ensures:
         for v in package.visible_versions:
@@ -1234,6 +1235,8 @@ rule UserDeletesPackageFile {
     requires: config.packages_enabled
     requires: version.is_internal = false
     requires: can_write_packages(actor, registry)
+    -- decided: a job token writes only packages linked to its own repository
+    requires: job_repository(actor) = null or package.repository = job_repository(actor)
     ensures: not exists file
     ensures:
         if was_last_file:
@@ -1246,7 +1249,9 @@ rule UserDeletesPackageFile {
 -- Linking packages to repositories
 ------------------------------------------------------------
 
--- from: services/packages/package_update.go:19
+-- from: routers/api/v1/packages/package.go:241 (the API's checks)
+-- decided: web and API both require package write plus write on the
+-- repository, and a linked package must be unlinked before relinking
 rule UserLinksPackageToRepository {
     when: UserLinksPackage(actor, package, repository)
     requires: config.packages_enabled
@@ -1254,10 +1259,14 @@ rule UserLinksPackageToRepository {
     requires: same_owner(package.registry, repository)
     requires: package.repository = null
     requires: can_write_repo_packages(actor, repository)
+    -- a job token cannot link: the package is not yet linked to its repository
+    requires: job_repository(actor) = null
     ensures: package.repository = repository
 }
 
 -- from: services/packages/package_update.go:41
+-- decided: symmetric with linking: package write plus write on the linked
+-- repository (Forgejo also demanded site admin, owning user or org owner)
 rule UserUnlinksPackageFromRepository {
     when: UserUnlinksPackage(actor, package)
     let repository = package.repository
@@ -1266,7 +1275,7 @@ rule UserUnlinksPackageFromRepository {
     requires: can_write_packages(actor, registry)
     requires: repository != null
     requires: can_write_repo_packages(actor, repository)
-    requires: actor.is_admin or registry.owner_user = actor or (registry.owner_is_org and is_org_owner(registry.owner_org, actor))
+    requires: job_repository(actor) = null or repository = job_repository(actor)
     ensures: package.repository = null
 }
 
@@ -1300,11 +1309,28 @@ rule PurgeOwnerPackages {
         -- leftovers are removed by the next expired-data purge.
 }
 
+-- Purging an organisation (site admin delete with purge, last owner's
+-- account purged, or moderation) removes everything in its registry first,
+-- exactly as for users. No PackageVersionDeleted events are emitted.
+-- from: services/packages/packages.go:719 (the user purge, applied to organisations)
+-- decided: organisation deletion has a purge option, as for users
+rule PurgeOrganizationPackages {
+    when: organizations/OrganizationPurgeStarted(organization)
+    let registry = OwnerRegistry{owner_org: organization}
+    requires: exists registry
+    ensures:
+        for p in registry.packages:
+            for v in p.versions:
+                not exists v
+}
+
 ------------------------------------------------------------
 -- Cleanup rules (owner settings)
 ------------------------------------------------------------
 
 -- from: routers/web/shared/packages/packages.go:88
+-- decided: keep/remove last-download windows are user-editable by package
+-- managers (the Forgejo form renders them but never binds them)
 rule ManagerCreatesCleanupRule {
     when: ManagerAddsCleanupRule(manager, registry, kind, enabled, keep_count, keep_pattern, keep_last_download_days, remove_days, remove_last_download_days, remove_pattern, match_full_name)
     requires: config.packages_enabled
@@ -1390,6 +1416,8 @@ rule RunPackageCleanup {
 }
 
 -- from: services/packages/cleanup/cleanup.go:36
+-- decided: keep the split: cleanup rules never touch container digest
+-- versions or "latest"; dangling digests are purged by PurgeExpiredPackageData
 rule ApplyCleanupRule {
     when: CleanupRuleDue(rule)
     requires: rule.enabled
@@ -1634,15 +1662,15 @@ surface PackageClientProtocol {
     @guarantee ScopedCredentialsAreHonoured
         -- A request authenticated with a scoped token needs read:package to
         -- read and write:package to change anything; a token restricted to
-        -- public resources is refused on a private owner's registry.
+        -- public resources is refused on any registry whose owner is not
+        -- visible to anonymous visitors (private or limited). An Actions
+        -- job token writes only packages linked to its own repository.
         -- Site administrators bypass the access mode check but not the
         -- token scope check.
 
     @guarantee LimitsAreReportedDistinctly
-        -- Exceeding a per-kind size limit, the owner size limit or the owner
-        -- version count is refused as a limit violation; exceeding the quota
-        -- module's limit is refused as "quota exceeded"; a duplicate version
-        -- or file is refused as a conflict.
+        -- Exceeding the owner's package quota is refused as "quota
+        -- exceeded"; a duplicate version or file is refused as a conflict.
 
     @guidance
         -- Credentials accepted: OAuth2 bearer, access tokens (basic or
@@ -1924,14 +1952,8 @@ deferred RepositoryIndex.file_formats  -- see: detailed/package-repository-index
 -- Open Questions
 ------------------------------------------------------------
 
-open question "The web settings page links a package to any repository of the same owner without checking the user's write access to that repository and without requiring the package to be unlinked first, while the REST API checks both. The spec adopts the API behaviour for both; confirm."
-open question "Unlinking requires the actor to be a site admin, the owning user, or an organisation owner, on top of package write access; linking only needs package write and repository write. Is this asymmetry intended?"
-open question "The cleanup-rule form renders keep/remove last-download-days fields but never binds them, so they cannot be set from the UI today. The spec lets managers set them; confirm they should be user-editable."
-open question "A token restricted to public resources is refused only for private owners; limited owners are allowed. Should 'public only' also exclude limited owners?"
-open question "Actions workflow tokens can publish to the repository owner's registry with the owner's package permissions (marked TODO in Forgejo). Should they be narrowed to the workflow's own repository / linked packages?"
-open question "Owner count/size limits (LIMIT_TOTAL_OWNER_*) and the quota module overlap. Should a rebuild keep both mechanisms or express the LIMIT_* settings as default quota rules?"
-open question "Dangling container digest versions are purged only by the expired-data cleanup; cleanup rules deliberately skip them and the 'latest' tag. Keep this split?"
-open question "Owner deletion: users/orgs are refused deletion while they own packages unless purged; org purge does not exist. Should organisation deletion also be able to purge packages?"
+-- (none: all decided, see spec/DECISIONS.md "## packages")
+
 
 ------------------------------------------------------------
 -- Requests to other modules
@@ -1939,13 +1961,14 @@ open question "Owner deletion: users/orgs are refused deletion while they own pa
 -- REQUEST accounts/UserPurged(user): emitted when an admin deletes a user with purge; packages removes the user's registry content.
 -- REQUEST accounts/owns_packages(user): answer with packages/OwnerRegistry{owner_user: user}.has_packages (non-internal versions exist); refuse non-purge deletion while true.
 -- REQUEST accounts/UserRenamed: no package reaction needed; image and registry coordinates are derived from the owner's current name.
--- REQUEST organizations/Organization.deletion: refuse deletion while packages/OwnerRegistry{owner_org: org}.has_packages.
--- REQUEST organizations/is_org_owner(org, user): used by can_manage_registry and unlinking.
+-- REQUEST organizations/Organization.deletion: refuse non-purge deletion while packages/OwnerRegistry{owner_org: org}.has_packages; offer a site-admin delete with purge that emits OrganizationPurgeStarted(organization), to which packages reacts (PurgeOrganizationPackages). Done in organizations.allium (AdminPurgesOrganization).
+-- REQUEST organizations/is_org_owner(org, user): used by can_manage_registry.
 -- REQUEST organizations/TeamUnitAccess for unit `packages`: needed to derive can_read/can_write_packages for org registries (max of team authorize level and team packages-unit access).
 -- REQUEST repositories/RepositoryDeleted(repository, doer): already emitted; packages unlinks linked packages.
 -- REQUEST repositories/Repository: creating the `_cargo-index` repository on behalf of the owner (OwnerInitializesCargoIndex).
 -- REQUEST can_write_repo_packages(user, repository) and can_read_repo_code(user, repository): used for linking and for showing linked repositories.
 -- REQUEST access/config.require_signin_view: imported as config.require_signin_view (used by can_read_packages and the container token exchange).
 -- REQUEST authentication/TokenScope: read:package / write:package and public-only flag consumed by can_read/can_write_packages.
--- REQUEST quota/quota_allows(owner, size_assets_packages_all) (QuotaGate gate_package_upload, charged: package_owner): quota_allows_package_upload(registry) is exactly this, evaluated for the registry owner (not the uploader) before every write that stores data; quota/QuotaUsage.packages should sum packages/PackageFile sizes per owner (blob shared by two files counts twice, as LIMIT_TOTAL_OWNER_SIZE does).
+-- REQUEST quota/quota_allows(owner, size_assets_packages_all) (QuotaGate gate_package_upload, charged: package_owner): quota_allows_package_upload(registry) is exactly this, evaluated for the registry owner (not the uploader) before every write that stores data; quota/QuotaUsage.packages should sum packages/PackageFile sizes per owner (blob shared by two files counts twice). decided (packages 6): the former [packages] LIMIT_TOTAL_OWNER_SIZE is expressed as quota/config.default_packages, a default rule on size_assets_packages_all; done in quota.allium.
 -- REQUEST webhooks, actions: react to PackageVersionCreated(version, publisher) / PackageVersionDeleted(version, package, doer) with exactly these parameter names.
+-- REQUEST actions/access: job_repository(user): the repository of the Actions job whose automatic token authenticated the request, null for any other credential (consistent with access decision 6: the token reaches only its own repository and packages linked to it).

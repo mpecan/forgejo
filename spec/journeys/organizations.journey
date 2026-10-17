@@ -380,6 +380,43 @@ journey DeletingAnEmptyAcme {
     ends: acme is gone and its name is free.
 }
 
+-- A site administrator may delete an organization that still owns packages
+-- by purging it, as for users (decision packages 8); its packages go too.
+journey AnAdminPurgesAcmeWithItsPackages {
+    goal: acme still owns packages, so Alice cannot delete it; a site admin
+          deletes it with purge and the packages are removed with it.
+
+    cast:
+        root: accounts/User
+    given:
+        root.kind = individual
+        root.is_admin = true
+        root.is_active = true
+        root.prohibit_login = false
+        acme_reg: packages/OwnerRegistry { owner_user: null, owner_org: org }
+        tool:     packages/Package { registry: acme_reg, kind: generic, name: "tool", is_internal: false, repository: null, autolink_pending: false }
+        tool_v1:  packages/PackageVersion { package: tool, creator: alice, version: "1.0.0", is_internal: false, download_count: 0, is_tagged: false, is_yanked: false }
+
+    1. the owner cannot delete it while it owns packages
+        stipulate owned_repository_count(org) = 0
+        stipulate owned_package_count(org) = 1
+        alice cannot do OwnerDeletesOrganization(alice, org, "acme") on OrganizationSettings
+
+    2. an ordinary user cannot purge it
+        alice cannot do AdminDeletesOrganizationWithPurge(alice, org, "acme") on OrganizationAdministration
+
+    3. the site admin purges it
+        root does AdminDeletesOrganizationWithPurge(root, org, "acme") on OrganizationAdministration
+        then AdminPurgesOrganization fires
+        then SystemPurgesOrganization fires
+        then PurgeOrganizationPackages fires
+        then tool_v1 does not exist
+        then org does not exist
+
+    ends: acme and its package versions are gone; the expired-data purge
+          removes the empty package and its blobs.
+}
+
 -- Who sees what.
 journey ConcealedMembersStayConcealed {
     goal: Bob's membership of acme is concealed, Alice's is public. Carol, an
