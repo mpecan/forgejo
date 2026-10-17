@@ -7,23 +7,26 @@
 --   * Grant sources: site administrator, repository owner (user), the owning
 --     organization's owner team and admin teams, team access modes and per-unit
 --     team access (incl. teams that include all repositories), collaborators,
---     the public default for signed-in users, the "everyone may write" unit
---     setting (globally writable wiki), anonymous read of public repositories.
+--     the public default for signed-in users, per-unit default access for
+--     signed-in users and anonymous visitors (incl. public units of private
+--     repositories and "everyone may write"), anonymous read of public
+--     repositories.
 --   * Denials and reductions: private repositories, owner visibility
 --     (limited/private users and organizations), restricted users,
 --     REQUIRE_SIGNIN_VIEW, disabled units, archived repositories (read-only),
 --     mirrors (code is read-only), blocked users, credential restrictions
 --     (fine-grained tokens / authorized integrations: public-only and
---     listed-repository reach), Actions task tokens.
+--     listed-repository reach, admin scope), Actions task tokens (own
+--     repository only).
 --   * Organization, team, profile and site-administration gates
 --     (reqOrgOwnership, reqOrgMembership, reqTeamMembership, reqSiteAdmin,
 --     reqSelfOrAdmin, individual-owner visibility).
---   * The materialised explicit-access index (Forgejo's `access` table) and
---     exactly when it is recalculated.
+--   * Announcing that a user lost read access to a repository, whenever an
+--     input of the derivation changes (UserLostRepositoryAccess).
 --   * The operation -> required-permission table (see "Authorization table").
 --
 -- Includes: AccessMode, OperationClass, GrantBasis, CredentialRestriction,
---   RepoAccess, AccessDecision, AnonymousVisitor, RequestParty, ForgeComponent,
+--   AccessDecision, AnonymousVisitor, RequestParty, ForgeComponent,
 --   AuthorizationPolicy contract, and the shared actors Visitor,
 --   SignedInUser, SiteAdmin and RepoAdmin (see "Actor Declarations").
 --
@@ -39,55 +42,50 @@
 --     (owned by code and pulls; referenced as the branch-level write gate).
 --   - Package-registry permission resolution (owned by packages; it reuses
 --     `can_see_owner` and org unit permission defined here).
---   - The `ignore team` variant of team-access recalculation: an artefact of
---     recalculating before the team link is deleted; a rebuild recalculates
---     after the change instead.
---   - The omission of redundant "read on a public repository" rows from the
---     access table (`applyMinVisibility`): a storage optimisation; the index
---     here stores every explicit grant >= read.
+--   - The explicit-access index (Forgejo's `access` table) and its
+--     recalculation: permission is derived live from current state; an index
+--     or cache is an implementation detail that must give the same answers.
+--     decided: access decision 1 (permission is computed live)
 --   - Collaborator-plus-team quirk where a collaborator's mode on every unit of
 --     an organization repository becomes the access-table maximum (includes
---     team access mode): treated as accidental; see open questions.
+--     team access mode). decided: access decision 2 - per unit, the strongest
+--     of the collaboration mode and that unit's team grant (Derivation step 6).
 --   - go-get meta responses for inaccessible repositories (Go tooling compat).
 --   - HTTP status choice (404 vs 403 vs 423): implementation; the rule is that a
 --     party who may not see a resource is told it does not exist.
 --
 -- Emits:
 --   - UserLostRepositoryAccess(user, repository)
---       after a recalculation leaves a user with no access to a repository;
---       repositories (watches), issues (assignees, issue watches) react.
+--       after any change that leaves a user without read access to a
+--       repository (has_any_access false); repositories (watches) and issues
+--       (issue subscriptions, assignees) clear what presumed access.
 --   - SiteAdminImpersonates(admin, target)
 --       an API request performed by a site administrator "as" another user (sudo).
---   - RecalculateUserRepositoryAccess(repository, user),
---     RecalculateRepositoryAccess(repository),
---     RecalculateUserAccessForRepositories(user, repositories)
---       internal chain; also callable by other modules through
---       AccessIndexMaintenance.
+--   - RepositoryAccessMayHaveNarrowed(repository)
+--       internal: a repository-wide input changed; every user with a stake
+--       in the repository (watch, issue subscription, assignment) who is left
+--       without access is announced.
 --
--- Reacts to:
---   - repositories/CollaboratorAdded(repository, user, doer)
---   - repositories/CollaboratorAccessChanged(repository, user, doer)
+-- Reacts to (only the changes that can take access away; grants need no
+-- reaction because permission is derived live):
 --   - repositories/CollaboratorRemoved(repository, user, doer)
---   - repositories/RepositoryCreated(repository, doer)
 --   - repositories/RepositoryTransferred(repository, doer, old_owner_name)
 --   - repositories/RepositoryVisibilityChanged(repository, doer)
---   - repositories/RepositoryDeleted(repository, doer)
---   - organizations/TeamMemberAdded(team, user)
+--   - repositories/RepositoryUnitsChanged(repository, doer)   (unit disabled, unit defaults lowered)
 --   - organizations/TeamMemberRemoved(team, user)
---   - organizations/TeamRepositoryAdded(team, repository)
 --   - organizations/TeamRepositoryRemoved(team, repository)
 --   - organizations/TeamAccessChanged(team)   (team kind, unit access, includes-all)
 --   - organizations/TeamDeleted(team)
 --   - organizations/OrganizationVisibilityChanged(organization)
 --   - accounts/AccountStatusChanged(user)          (restricted flag may have changed)
 --   - accounts/UserVisibilityChanged(user, old_visibility, new_visibility)
---   - accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
 use "./repositories.allium" as repositories
 use "./authentication.allium" as authentication
 use "./actions.allium" as actions
+use "./issues.allium" as issues
 
 ------------------------------------------------------------
 -- Authorization table
@@ -102,10 +100,12 @@ use "./actions.allium" as actions
 -- Notation: R = target repository, U = unit, P(x,R,U) = effective unit mode
 -- (see "Derivation"), "!archived" = refused while R is archived,
 -- "!mirror" = refused while R is a pull mirror, "signed" = a signed-in user
--- (an Actions task token counts as signed for API purposes).
+-- (an Actions task token counts as signed for API purposes, but only on its
+-- own repository: see "Actions task tokens").
 --
 -- A. Anonymous-capable reads (web + API), refused to anonymous visitors when
---    REQUIRE_SIGNIN_VIEW is set:
+--    REQUIRE_SIGNIN_VIEW is set; on a private repository only its public units
+--    (unit default read, Derivation steps 1, 5, 6) are readable this way:
 --    A1 view repository home / metadata         any unit readable (HasAccess)   scope: repository
 --       GET /{o}/{r}, GET /repos/{o}/{r}, /topics (list), /languages, /activities/feeds,
 --       /stargazers, /subscribers, /issue_templates, /issue_config
@@ -182,7 +182,8 @@ use "./actions.allium" as actions
 --       scope (API delete): user or organization category of R's owner
 --    E2 repository-level Actions secrets, variables, runners (API)
 --
--- F. Organization operations:
+-- F. Organization operations (never with an Actions task token; decided:
+--    access decision 6):
 --    F1 org owner (owner-team member or site admin): edit/delete/rename org, members
 --       remove, create/edit/delete team, team members & invitations, team repos
 --       (plus repo admin on the repo), org labels, org webhooks, org avatar,
@@ -200,33 +201,50 @@ use "./actions.allium" as actions
 --       (creation/deletion additionally needs password or reverse-proxy auth)
 --    G2 signed: own settings, keys, emails, applications, notifications, follow,
 --       block/unblock, own repos/orgs, quota
---    G3 site admin (and a credential that allows admin override): /admin/*,
+--    G3 site admin (through a token only when it carries the admin scope and
+--       reaches all repositories; decided: access decision 5): /admin/*,
 --       repository flags, adopt/delete unadopted repositories, system hooks,
 --       instance runners, quota rules/groups, cron, sudo (act as another user)
 --    G4 create organization: site admin, or allowed to create orgs and regular
 --       org creation not disabled
 --
--- Derivation of P(x, R, U) (normative; GetUserRepoPermission):
---   1. Anonymous x: R private -> none. R's owner not public -> none.
---      REQUIRE_SIGNIN_VIEW -> none. Otherwise read on every enabled unit.
+-- Derivation of P(x, R, U) (normative; GetUserRepoPermission). It is computed
+-- live from the current collaborations, team memberships, team repositories,
+-- team unit access, unit settings and visibilities; there is no stored index
+-- (decided: access decision 1).
+--   1. Anonymous x: REQUIRE_SIGNIN_VIEW -> none. R's owner not public -> none.
+--      R public -> read on every enabled unit. R private -> read on each
+--      enabled unit whose anonymous default (RepoUnit.anonymous_access_mode)
+--      is read, none elsewhere (decided: access decisions 3, 4).
 --   2. Signed-in x who cannot see R's owner (can_see_owner) and is not a
 --      collaborator on R -> none.
---   3. x is site admin, or x is the owning user -> owner on every enabled unit.
---   4. Explicit grant E = strongest of: x's collaboration mode on R; for
---      every team of R's owning organization that includes R (explicitly or
---      via includes-all) and contains x: owner/admin for an owner/admin team
---      (organizations/Team.kind), else the strongest of its unit grants (a
---      unit-grants team has no summary mode; organizations decision 4).
---      If any such team is an owner/admin team -> that mode on every unit.
---   5. Owning user (not org): every enabled unit gets E, or read when R is
---      public and x is not restricted and E is none; a unit marked
---      everyone-writable gives write to those same non-restricted users.
+--   3. x is site admin, or x is the owning user -> owner on every enabled unit
+--      (through a credential, the site-admin part needs the admin scope; step 8).
+--   4. Explicit grant E = explicit_mode(x, R) = strongest of: x's collaboration
+--      mode on R; for every team of R's owning organization that includes R
+--      (explicitly or via includes-all) and contains x: owner/admin for an
+--      owner/admin team (organizations/Team.kind), else the strongest of its
+--      unit grants (a unit-grants team has no summary mode; organizations
+--      decision 4). E decides administration (>= admin) and ownership (= owner).
+--   5. Owning user (not org): every enabled unit gets the strongest of E and
+--      the unit default D(x, U).
 --   6. Owning organization: each unit gets the strongest of x's collaboration
---      mode and the unit access of each of x's teams that include R; when no
---      team grants that unit and R is public and x is not restricted, the unit
---      falls back to read (write when everyone-writable).
+--      mode, owner/admin for x's owner/admin teams that include R, the unit
+--      access of each of x's other teams that include R, and D(x, U). A
+--      team's grant on one unit never raises another unit (decided: access
+--      decision 2 - per-unit strongest). Steps 5 and 6 without D are
+--      explicit_unit_mode(x, R, U).
+--      Unit default D(x, U), for a non-restricted x who can see R's owner
+--      (restricted x: none): R public -> read, raised to the unit's
+--      everyone_access_mode (write = "everyone may write"); R private -> read
+--      when the unit's everyone_access_mode or anonymous_access_mode is read
+--      or write, else none - a private repository's public units are never
+--      writable by default (decided: access decisions 3, 4).
 --   7. External wiki / external tracker units never exceed read.
---   8. A restricted credential then reduces every unit mode (reduce_by_credential).
+--   8. A restricted credential then reduces every unit mode
+--      (reduce_by_credential): scope and repository reach always apply, to
+--      site administrators too; site-admin powers through a credential need
+--      its admin scope (decided: access decision 5).
 --   9. Operation gates (archived, mirror, blocked, disabled unit) are applied by
 --      the operation class, not by P.
 
@@ -235,8 +253,8 @@ use "./actions.allium" as actions
 ------------------------------------------------------------
 
 -- Another component of the forge (a sibling module, a background job) that
--- asks this module to recalculate the explicit-access index or to evaluate the
--- authorization policy. Managed outside this specification.
+-- asks this module to evaluate the authorization policy. Managed outside this
+-- specification.
 -- from: models/perm/access/access.go:259
 external entity ForgeComponent {
     name: String
@@ -254,6 +272,8 @@ external entity ForgeComponent {
 contract AuthorizationPolicy {
     -- P(user, repository, unit) of the derivation above, before operation
     -- gates; user = null means an anonymous visitor.
+    -- All functions are derived live from current state (decided: access
+    -- decision 1); a cache may serve them only if it gives the same answers.
     unit_access_mode: (user: accounts/User?, repository: repositories/Repository, unit: repositories/UnitKind) -> AccessMode
     -- unit_access_mode >= read and the unit is enabled.
     can_read: (user: accounts/User?, repository: repositories/Repository, unit: repositories/UnitKind) -> Boolean
@@ -277,11 +297,19 @@ contract AuthorizationPolicy {
     can_be_assigned: (user: accounts/User, repository: repositories/Repository) -> Boolean
     -- organization-level unit permission (projects, packages, code pages).
     organization_unit_mode: (viewer: accounts/User?, organization: organizations/Organization, unit: repositories/UnitKind) -> AccessMode
+    -- E of Derivation step 4: the strongest explicit grant (collaboration,
+    -- teams of the owning organization); none without one.
+    explicit_mode: (user: accounts/User, repository: repositories/Repository) -> AccessMode
+    -- Derivation steps 5-6 without the unit default: on a user-owned
+    -- repository explicit_mode; on an organization repository the per-unit
+    -- strongest of collaboration mode, owner/admin team mode and team unit
+    -- access (decided: access decision 2).
+    explicit_unit_mode: (user: accounts/User, repository: repositories/Repository, unit: repositories/UnitKind) -> AccessMode
 
     @invariant Monotone
         -- Adding a grant (collaboration, team membership, team repository,
-        -- team unit access, site admin flag) never lowers any result;
-        -- removing one never raises any result.
+        -- team unit access, unit default access, site admin flag) never
+        -- lowers any result; removing one never raises any result.
 
     @invariant OwnerDominates
         -- is_repo_owner implies is_repo_admin implies can_write on every
@@ -313,7 +341,7 @@ enum GrantBasis {
     site_admin | repository_owner | explicit_grant | public_default
     | everyone_writable | anonymous_public | organization_member
     | organization_owner | team_member | organization_visible | profile_visible
-    | self | own_task | public_fallback
+    | self | own_task
 }
 
 ------------------------------------------------------------
@@ -346,32 +374,21 @@ external entity RequestParty {
 --   listed_repositories  listed repositories keep their mode; other public
 --                        repositories of public owners are reduced to read;
 --                        everything else none
--- Only all_repositories allows site-admin and repo-admin overrides.
+-- Only all_repositories allows repo-admin overrides. Site-admin powers
+-- additionally need the token's admin scope: the token limits everything,
+-- for site administrators too.
+-- decided: access decision 5 (scope and repository restrictions always apply;
+-- admin powers need a token with the admin scope)
 -- from: services/authz/authorization_reducer.go:11
 entity CredentialRestriction {
     token: authentication/AccessToken?
     reach: all_repositories | public_only | listed_repositories
     listed: Set<repositories/Repository>
+    -- the credential carries the admin scope category (read:admin / write:admin)
+    has_admin_scope: Boolean
 
     allows_admin_override: reach = all_repositories
-}
-
--- The materialised explicit-access index (Forgejo's `access` table): the
--- strongest explicit grant a user holds on a repository through a
--- collaboration or through teams of the owning organization. The repository
--- owner (user) is never in it. Kept consistent by the recalculation rules.
--- Used for "repositories I can access" listings, assignee and reviewer
--- candidates, readers/writers lists, and as the repository-wide mode in the
--- grant rules below.
--- from: models/perm/access/access.go:25
-entity RepoAccess {
-    user: accounts/User
-    repository: repositories/Repository
-    mode: AccessMode
-    recalculated_at: Timestamp
-
-    is_admin_grant: mode in {admin, owner}
-    is_owner_grant: mode = owner
+    allows_site_admin: reach = all_repositories and has_admin_scope
 }
 
 -- The outcome of evaluating one guarded operation for one party. Only granted
@@ -420,8 +437,12 @@ config {
 ------------------------------------------------------------
 -- Trigger UserReadsUnit(subject, unit, credential?) is raised by every
 -- operation of class read_unit (table A2-A9). Each rule below is one grant
--- source; the read is permitted when at least one fires.
+-- source; the read is permitted when at least one fires. Every rule reads
+-- current state only (decided: access decision 1).
 
+-- Through a credential a site administrator acts as one only when the
+-- credential carries the admin scope, and still only within its reach.
+-- decided: access decision 5 (the token limits everything)
 -- from: models/perm/access/repo_permission.go:240
 rule ReadUnitAsSiteAdmin {
     when: UserReadsUnit(subject, unit, credential?)
@@ -429,7 +450,7 @@ rule ReadUnitAsSiteAdmin {
     let owner_public = repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
     requires: subject.is_admin
     requires: unit.enabled
-    requires: credential = null or credential?.reach = all_repositories or (credential?.reach = listed_repositories and repository in credential?.listed) or (not repository.is_private and owner_public)
+    requires: credential = null or (credential?.has_admin_scope = true and (credential?.reach = all_repositories or (credential?.reach = listed_repositories and repository in credential?.listed) or (not repository.is_private and owner_public)))
     ensures: AccessDecision.created(subject: subject, repository: repository, unit_kind: unit.kind, operation: read_unit, basis: site_admin, decided_at: now)
 }
 
@@ -444,34 +465,37 @@ rule ReadUnitAsRepositoryOwner {
     ensures: AccessDecision.created(subject: subject, repository: repository, unit_kind: unit.kind, operation: read_unit, basis: repository_owner, decided_at: now)
 }
 
--- Collaborators and team members. On a user-owned repository the
--- repository-wide explicit mode applies to every unit; on an organization
--- repository an admin/owner team grant applies to every unit and otherwise the
--- per-unit team access (explicit_unit_mode) decides.
+-- Collaborators and team members: explicit_unit_mode (Derivation steps 5-6
+-- without the unit default). On an organization repository each unit takes
+-- the strongest of the collaboration mode and that unit's team grant.
+-- decided: access decision 1 (derived live, no index); decision 2 (per-unit
+-- strongest of collaboration and team grant)
 -- from: models/perm/access/repo_permission.go:286
 rule ReadUnitByExplicitGrant {
     when: UserReadsUnit(subject, unit, credential?)
     let repository = unit.repository
-    let grant = RepoAccess{user: subject, repository: repository}
     let owner_public = repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
-    requires: exists grant
+    requires: explicit_unit_mode(subject, repository, unit.kind) in {read, write, admin, owner}
     requires: unit.enabled
-    requires: grant.is_admin_grant or repository.owner_org = null or explicit_unit_mode(subject, repository, unit.kind) in {read, write, admin, owner}
     requires: credential = null or credential?.reach = all_repositories or (credential?.reach = listed_repositories and repository in credential?.listed) or (not repository.is_private and owner_public)
     ensures: AccessDecision.created(subject: subject, repository: repository, unit_kind: unit.kind, operation: read_unit, basis: explicit_grant, decided_at: now)
 }
 
 -- Any non-restricted signed-in user may read every enabled unit of a public
--- repository whose owner they can see. Limited owners are visible to all
--- signed-in users; private organizations only to their members; private
--- users to nobody else.
+-- repository whose owner they can see, and the public units of a private one
+-- (unit default read or write for signed-in users, or read for anonymous
+-- visitors). Limited owners are visible to all signed-in users; private
+-- organizations only to their members; private users to nobody else.
+-- decided: access decisions 3 and 4 (public units of private repositories;
+-- per-unit defaults)
 -- from: models/perm/access/repo_permission.go:277
 rule ReadUnitByPublicDefault {
     when: UserReadsUnit(subject, unit, credential?)
     let repository = unit.repository
     let owner_public = repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
     let owner_visible = (repository.owner_user != null and repository.owner_user.visibility in {public, limited}) or (repository.owner_org != null and (repository.owner_org.visibility in {public, limited} or exists organizations/OrgMembership{organization: repository.owner_org, user: subject}))
-    requires: not repository.is_private
+    let has_default = not repository.is_private or unit.everyone_access_mode in {read, write} or unit.anonymous_access_mode = read
+    requires: has_default
     requires: not subject.is_restricted
     requires: owner_visible
     requires: unit.enabled
@@ -484,13 +508,16 @@ rule ReadUnitByPublicDefault {
 ------------------------------------------------------------
 
 -- Anonymous visitors read every enabled unit of a public repository whose
--- owner is public, unless the instance requires sign-in to view anything.
+-- owner is public, and the units of a private repository of a public owner
+-- that a repository admin made public (anonymous default read), unless the
+-- instance requires sign-in to view anything.
+-- decided: access decisions 3 and 4 (public units of private repositories)
 -- from: models/perm/access/repo_permission.go:209
 rule ReadUnitAnonymously {
     when: AnonymousReadsUnit(visitor, unit)
     let repository = unit.repository
     requires: not config.require_signin_view
-    requires: not repository.is_private
+    requires: not repository.is_private or unit.anonymous_access_mode = read
     requires: repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
     requires: unit.enabled
     ensures: AccessDecision.created(visitor: visitor, repository: repository, unit_kind: unit.kind, operation: read_unit, basis: anonymous_public, decided_at: now)
@@ -505,6 +532,7 @@ rule ReadUnitAnonymously {
 -- need a repository that can accept them (not a mirror, not empty, pull
 -- requests enabled) - that gate is owned by pulls (table B2).
 
+-- decided: access decision 5 (site-admin powers through a token need its admin scope)
 -- from: services/issue/issue.go:33
 rule ContributeAsSiteAdmin {
     when: UserContributesToRepository(subject, unit, credential?)
@@ -515,7 +543,7 @@ rule ContributeAsSiteAdmin {
     requires: not repository.is_archived
     requires: repository.owner_user = null or not (exists accounts/UserBlock{blocker: repository.owner_user, blocked: subject})
     requires: repository.owner_org = null or not (exists accounts/UserBlock{blocker_organization: repository.owner_org, blocked: subject})
-    requires: credential = null or credential?.reach = all_repositories or (credential?.reach = listed_repositories and repository in credential?.listed) or (credential?.reach = public_only and not repository.is_private and owner_public)
+    requires: credential = null or (credential?.has_admin_scope = true and (credential?.reach = all_repositories or (credential?.reach = listed_repositories and repository in credential?.listed) or (credential?.reach = public_only and not repository.is_private and owner_public)))
     ensures: AccessDecision.created(subject: subject, repository: repository, unit_kind: unit.kind, operation: contribute, basis: site_admin, decided_at: now)
 }
 
@@ -531,14 +559,13 @@ rule ContributeAsRepositoryOwner {
     ensures: AccessDecision.created(subject: subject, repository: repository, unit_kind: unit.kind, operation: contribute, basis: repository_owner, decided_at: now)
 }
 
+-- decided: access decisions 1 and 2 (live, per-unit strongest)
 -- from: services/issue/comments.go:51
 rule ContributeByExplicitGrant {
     when: UserContributesToRepository(subject, unit, credential?)
     let repository = unit.repository
-    let grant = RepoAccess{user: subject, repository: repository}
     let owner_public = repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
-    requires: exists grant
-    requires: grant.is_admin_grant or repository.owner_org = null or explicit_unit_mode(subject, repository, unit.kind) in {read, write, admin, owner}
+    requires: explicit_unit_mode(subject, repository, unit.kind) in {read, write, admin, owner}
     requires: unit.enabled
     requires: not repository.is_archived
     requires: repository.owner_user = null or not (exists accounts/UserBlock{blocker: repository.owner_user, blocked: subject})
@@ -547,13 +574,15 @@ rule ContributeByExplicitGrant {
     ensures: AccessDecision.created(subject: subject, repository: repository, unit_kind: unit.kind, operation: contribute, basis: explicit_grant, decided_at: now)
 }
 
+-- decided: access decisions 3 and 4 (public units of private repositories accept contributions from those who may read them)
 -- from: services/pull/pull.go:42
 rule ContributeByPublicDefault {
     when: UserContributesToRepository(subject, unit, credential?)
     let repository = unit.repository
     let owner_public = repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
     let owner_visible = (repository.owner_user != null and repository.owner_user.visibility in {public, limited}) or (repository.owner_org != null and (repository.owner_org.visibility in {public, limited} or exists organizations/OrgMembership{organization: repository.owner_org, user: subject}))
-    requires: not repository.is_private
+    let has_default = not repository.is_private or unit.everyone_access_mode in {read, write} or unit.anonymous_access_mode = read
+    requires: has_default
     requires: not subject.is_restricted
     requires: owner_visible
     requires: unit.enabled
@@ -572,6 +601,7 @@ rule ContributeByPublicDefault {
 -- exceed read (external wiki, external tracker), and - when the operation
 -- changes git content - on pull mirrors.
 
+-- decided: access decision 5 (site-admin powers through a token need its admin scope)
 -- from: models/perm/access/repo_permission.go:240
 rule WriteUnitAsSiteAdmin {
     when: UserWritesUnit(subject, unit, changes_git_content, credential?)
@@ -582,7 +612,7 @@ rule WriteUnitAsSiteAdmin {
     requires: not unit.is_external
     requires: not repository.is_archived
     requires: not (changes_git_content and repository.is_mirror)
-    requires: credential = null or credential?.reach = all_repositories or (credential?.reach = listed_repositories and repository in credential?.listed) or (credential?.reach = public_only and not repository.is_private and owner_public)
+    requires: credential = null or (credential?.has_admin_scope = true and (credential?.reach = all_repositories or (credential?.reach = listed_repositories and repository in credential?.listed) or (credential?.reach = public_only and not repository.is_private and owner_public)))
     ensures: AccessDecision.created(subject: subject, repository: repository, unit_kind: unit.kind, operation: write_unit, basis: site_admin, decided_at: now)
 }
 
@@ -600,14 +630,13 @@ rule WriteUnitAsRepositoryOwner {
     ensures: AccessDecision.created(subject: subject, repository: repository, unit_kind: unit.kind, operation: write_unit, basis: repository_owner, decided_at: now)
 }
 
+-- decided: access decisions 1 and 2 (live, per-unit strongest)
 -- from: models/perm/access/repo_permission.go:301
 rule WriteUnitByExplicitGrant {
     when: UserWritesUnit(subject, unit, changes_git_content, credential?)
     let repository = unit.repository
-    let grant = RepoAccess{user: subject, repository: repository}
     let owner_public = repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
-    requires: exists grant
-    requires: grant.is_admin_grant or (repository.owner_org = null and grant.mode = write) or (repository.owner_org != null and explicit_unit_mode(subject, repository, unit.kind) in {write, admin, owner})
+    requires: explicit_unit_mode(subject, repository, unit.kind) in {write, admin, owner}
     requires: unit.enabled
     requires: not unit.is_external
     requires: not repository.is_archived
@@ -616,9 +645,12 @@ rule WriteUnitByExplicitGrant {
     ensures: AccessDecision.created(subject: subject, repository: repository, unit_kind: unit.kind, operation: write_unit, basis: explicit_grant, decided_at: now)
 }
 
--- A unit marked everyone-writable (Forgejo: the "globally writable" wiki) can
--- be written by any non-restricted signed-in user who can read the public
--- repository.
+-- A unit whose default for signed-in users is write ("everyone may write",
+-- formerly offered for the wiki only) can be written by any non-restricted
+-- signed-in user who can read the public repository. On a private repository
+-- the unit defaults give read at most.
+-- decided: access decision 4 (per-unit defaults generalised to every unit);
+-- decision 3 (visitors get read only on public units of private repositories)
 -- from: models/perm/access/repo_permission.go:263
 rule WriteUnitByEveryoneWritable {
     when: UserWritesUnit(subject, unit, changes_git_content, credential?)
@@ -630,6 +662,7 @@ rule WriteUnitByEveryoneWritable {
     requires: not subject.is_restricted
     requires: owner_visible
     requires: unit.enabled
+    requires: not unit.is_external
     requires: not repository.is_archived
     requires: not (changes_git_content and repository.is_mirror)
     requires: credential = null or credential?.reach = all_repositories or (credential?.reach = listed_repositories and repository in credential?.listed) or (credential?.reach = public_only and not repository.is_private and owner_public)
@@ -641,13 +674,16 @@ rule WriteUnitByEveryoneWritable {
 ------------------------------------------------------------
 -- A restricted credential (anything but all_repositories reach) never
 -- confers administration or ownership, even to a site administrator or a
--- repository administrator (AllowAdminOverride = false).
+-- repository administrator (AllowAdminOverride = false). A site
+-- administrator acting through a credential additionally needs its admin
+-- scope (decided: access decision 5).
 
+-- decided: access decision 5 (admin powers need a token with the admin scope)
 -- from: routers/api/v1/permissions/req_admin.go:14
 rule AdministerRepositoryAsSiteAdmin {
     when: UserAdministersRepository(subject, repository, credential?)
     requires: subject.is_admin
-    requires: credential = null or credential?.allows_admin_override
+    requires: credential = null or credential?.allows_site_admin
     ensures: AccessDecision.created(subject: subject, repository: repository, operation: administer_repository, basis: site_admin, decided_at: now)
 }
 
@@ -660,21 +696,21 @@ rule AdministerRepositoryAsOwner {
 }
 
 -- Admin collaborators, admin teams and the owner team.
+-- decided: access decision 1 (derived live from current grants)
 -- from: models/perm/access/repo_permission.go:358
 rule AdministerRepositoryByExplicitGrant {
     when: UserAdministersRepository(subject, repository, credential?)
-    let grant = RepoAccess{user: subject, repository: repository}
-    requires: exists grant
-    requires: grant.is_admin_grant
+    requires: explicit_mode(subject, repository) in {admin, owner}
     requires: credential = null or credential?.allows_admin_override
     ensures: AccessDecision.created(subject: subject, repository: repository, operation: administer_repository, basis: explicit_grant, decided_at: now)
 }
 
+-- decided: access decision 5 (admin powers need a token with the admin scope)
 -- from: routers/api/v1/permissions/req_owner.go:14
 rule OwnRepositoryAsSiteAdmin {
     when: UserPerformsOwnerAction(subject, repository, credential?)
     requires: subject.is_admin
-    requires: credential = null or credential?.allows_admin_override
+    requires: credential = null or credential?.allows_site_admin
     ensures: AccessDecision.created(subject: subject, repository: repository, operation: own_repository, basis: site_admin, decided_at: now)
 }
 
@@ -687,12 +723,11 @@ rule OwnRepositoryAsOwner {
 }
 
 -- Members of the owning organization's owner team hold owner mode.
+-- decided: access decision 1 (derived live from current grants)
 -- from: models/perm/access/repo_permission.go:311
 rule OwnRepositoryAsOwnerTeamMember {
     when: UserPerformsOwnerAction(subject, repository, credential?)
-    let grant = RepoAccess{user: subject, repository: repository}
-    requires: exists grant
-    requires: grant.is_owner_grant
+    requires: explicit_mode(subject, repository) = owner
     requires: credential = null or credential?.allows_admin_override
     ensures: AccessDecision.created(subject: subject, repository: repository, operation: own_repository, basis: explicit_grant, decided_at: now)
 }
@@ -702,8 +737,12 @@ rule OwnRepositoryAsOwnerTeamMember {
 ------------------------------------------------------------
 -- A running Actions task authenticates with its own token. On the repository
 -- that runs it, it has write (read only when the run was triggered by a pull
--- request from a fork). On any other repository it is an unprivileged
--- identity that can only read public repositories of public owners.
+-- request from a fork). It reaches nothing else: no other repository (public
+-- or not) and no organization endpoint - no rule of this module grants a task
+-- anything there. Packages linked to its repository are resolved by packages
+-- (see REQUEST).
+-- decided: access decision 6 (repository-scoped only; organization endpoints
+-- refuse it)
 
 -- from: models/perm/access/repo_permission.go:143
 rule TaskAccessesOwnRepository {
@@ -715,21 +754,11 @@ rule TaskAccessesOwnRepository {
     ensures: AccessDecision.created(task: task, repository: repository, unit_kind: unit.kind, operation: actions_task, basis: own_task, decided_at: now)
 }
 
--- from: routers/api/v1/permissions/repo_access.go:14
-rule TaskReadsOtherPublicRepository {
-    when: ActionsTaskAccessesRepository(task, unit, level)
-    let repository = unit.repository
-    requires: task.job.run.repository != repository
-    requires: level = read
-    requires: not repository.is_private
-    requires: repository.owner_user?.visibility = public or repository.owner_org?.visibility = public
-    requires: unit.enabled
-    ensures: AccessDecision.created(task: task, repository: repository, unit_kind: unit.kind, operation: actions_task, basis: public_fallback, decided_at: now)
-}
-
 ------------------------------------------------------------
 -- Rules: organizations and teams
 ------------------------------------------------------------
+-- These gates are raised for signed-in users only; an Actions task token is
+-- refused on every organization endpoint (decided: access decision 6).
 
 -- from: models/organization/org.go:475
 rule ViewOrganizationAsSiteAdmin {
@@ -763,11 +792,12 @@ rule ViewOrganizationAnonymously {
     ensures: AccessDecision.created(visitor: visitor, organization: organization, operation: view_organization, basis: organization_visible, decided_at: now)
 }
 
+-- decided: access decision 5 (admin powers need a token with the admin scope)
 -- from: routers/api/v1/permissions/req_org_membership.go:12
 rule ActAsOrganizationMemberAsSiteAdmin {
     when: UserActsAsOrganizationMember(subject, organization, credential?)
     requires: subject.is_admin
-    requires: credential = null or credential?.allows_admin_override
+    requires: credential = null or credential?.allows_site_admin
     ensures: AccessDecision.created(subject: subject, organization: organization, operation: organization_member, basis: site_admin, decided_at: now)
 }
 
@@ -779,11 +809,12 @@ rule ActAsOrganizationMember {
     ensures: AccessDecision.created(subject: subject, organization: organization, operation: organization_member, basis: organization_member, decided_at: now)
 }
 
+-- decided: access decision 5 (admin powers need a token with the admin scope)
 -- from: routers/api/v1/permissions/req_org_ownership.go:12
 rule ActAsOrganizationOwnerAsSiteAdmin {
     when: UserActsAsOrganizationOwner(subject, organization, credential?)
     requires: subject.is_admin
-    requires: credential = null or credential?.allows_admin_override
+    requires: credential = null or credential?.allows_site_admin
     ensures: AccessDecision.created(subject: subject, organization: organization, operation: organization_owner, basis: site_admin, decided_at: now)
 }
 
@@ -796,11 +827,12 @@ rule ActAsOrganizationOwner {
     ensures: AccessDecision.created(subject: subject, organization: organization, operation: organization_owner, basis: organization_owner, decided_at: now)
 }
 
+-- decided: access decision 5 (admin powers need a token with the admin scope)
 -- from: routers/api/v1/permissions/req_team_membership.go:12
 rule ActAsTeamMemberAsSiteAdmin {
     when: UserActsAsTeamMember(subject, team, credential?)
     requires: subject.is_admin
-    requires: credential = null or credential?.allows_admin_override
+    requires: credential = null or credential?.allows_site_admin
     ensures: AccessDecision.created(subject: subject, team: team, organization: team.organization, operation: team_member, basis: site_admin, decided_at: now)
 }
 
@@ -861,11 +893,12 @@ rule ViewProfileAnonymously {
 -- Rules: site administration and impersonation
 ------------------------------------------------------------
 
+-- decided: access decision 5 (admin powers need a token with the admin scope)
 -- from: routers/api/v1/permissions/req_site_admin.go:12
 rule ActAsSiteAdmin {
     when: UserActsAsSiteAdmin(subject, credential?)
     requires: subject.is_admin
-    requires: credential = null or credential?.allows_admin_override
+    requires: credential = null or credential?.allows_site_admin
     ensures: AccessDecision.created(subject: subject, operation: site_admin, basis: site_admin, decided_at: now)
 }
 
@@ -880,218 +913,139 @@ rule SiteAdminSudo {
 }
 
 ------------------------------------------------------------
--- Rules: explicit-access index recalculation
+-- Rules: announcing lost access
 ------------------------------------------------------------
--- The index row for (user, repository) always equals explicit_mode(user,
--- repository): the strongest of the user's collaboration mode and, for each
--- team of the owning organization that includes the repository and contains
--- the user, owner/admin for an owner/admin team or else the strongest of its
--- unit grants (step 4 above). It is recalculated whenever an input changes.
+-- Permission is derived live, so a grant needs no bookkeeping here. What does
+-- need announcing is a change that leaves a user without read access to a
+-- repository (has_any_access false): repositories clears their watch, issues
+-- their issue subscriptions and the assignments they may no longer hold.
+-- The announcement is made for every such change, whatever its cause. It
+-- means "has no read access now": receivers clear only what exists, so
+-- announcing it for a user who never had access changes nothing.
+-- decided: access decision 1 (no index, no recalculation); decision 7
+-- (watches and subscriptions are cleared immediately whenever a user loses
+-- read access, for any reason)
 
--- from: models/perm/access/access.go:277
-rule RecalculateOneUsersAccess {
-    when: RecalculateUserRepositoryAccess(repository, user)
-    let mode = explicit_mode(user, repository)
-    let existing = RepoAccess{user: user, repository: repository}
-    requires: repository.owner_user != user
-    ensures:
-        if mode = none:
-            not exists existing
-        else:
-            if exists existing:
-                existing.mode = mode
-                existing.recalculated_at = now
-            else:
-                RepoAccess.created(user: user, repository: repository, mode: mode, recalculated_at: now)
-}
-
--- After a recalculation, a user who can no longer reach the repository at all
--- loses everything that presumed access: other modules unwatch the
--- repository, drop issue subscriptions and unassign the user.
--- from: models/org_team.go:556
-rule AnnounceLostAccess {
-    when: RecalculateUserRepositoryAccess(repository, user)
+-- from: services/repository/collaboration.go:41
+rule AnnounceLostAccessOnCollaboratorRemoved {
+    when: repositories/CollaboratorRemoved(repository, user, doer)
     requires: not has_any_access(user, repository)
     ensures: UserLostRepositoryAccess(user: user, repository: repository)
 }
 
--- Full recalculation for one repository: every user who holds or held an
--- explicit grant (a collaborator, a member of a team covering it, or anybody
--- with an index row).
--- from: models/perm/access/access.go:285
-rule RecalculateWholeRepository {
-    when: RecalculateRepositoryAccess(repository)
-    ensures:
-        for c in repository.collaborations:
-            RecalculateUserRepositoryAccess(repository: repository, user: c.user)
-    ensures:
-        for link in organizations/TeamRepositories where link.repository = repository:
-            for m in link.team.memberships:
-                RecalculateUserRepositoryAccess(repository: repository, user: m.user)
-    ensures:
-        for stale in RepoAccesses where repository = repository:
-            RecalculateUserRepositoryAccess(repository: repository, user: stale.user)
-}
-
--- from: models/perm/access/access.go:291
-rule RecalculateUserAcrossRepositories {
-    when: RecalculateUserAccessForRepositories(user, repositories)
-    ensures:
-        for repository in repositories:
-            RecalculateUserRepositoryAccess(repository: repository, user: user)
-}
-
--- Reactions: when each input of explicit_mode changes.
-
--- from: modules/repository/collaborator.go:44
-rule RecalculateOnCollaboratorAdded {
-    when: repositories/CollaboratorAdded(repository, user, doer)
-    ensures: RecalculateUserRepositoryAccess(repository: repository, user: user)
-}
-
--- from: modules/repository/collaborator.go:80
-rule RecalculateOnCollaboratorAccessChanged {
-    when: repositories/CollaboratorAccessChanged(repository, user, doer)
-    ensures: RecalculateUserRepositoryAccess(repository: repository, user: user)
-}
-
--- from: modules/repository/collaborator.go:106
-rule RecalculateOnCollaboratorRemoved {
-    when: repositories/CollaboratorRemoved(repository, user, doer)
-    ensures: RecalculateUserRepositoryAccess(repository: repository, user: user)
-}
-
--- New organization repositories are picked up by includes-all teams.
--- from: modules/repository/create.go:151
-rule RecalculateOnRepositoryCreated {
-    when: repositories/RepositoryCreated(repository, doer)
-    ensures: RecalculateRepositoryAccess(repository: repository)
-}
-
--- from: services/repository/transfer.go:192
-rule RecalculateOnRepositoryTransferred {
-    when: repositories/RepositoryTransferred(repository, doer, old_owner_name)
-    ensures: RecalculateRepositoryAccess(repository: repository)
-}
-
--- from: modules/repository/create.go:262
-rule RecalculateOnVisibilityChanged {
-    when: repositories/RepositoryVisibilityChanged(repository, doer)
-    ensures: RecalculateRepositoryAccess(repository: repository)
-}
-
--- from: services/repository/delete.go:440
-rule DropAccessOnRepositoryDeleted {
-    when: repositories/RepositoryDeleted(repository, doer)
-    ensures:
-        for row in RepoAccesses where repository = repository:
-            not exists row
-}
-
--- from: models/org_team.go:431
-rule RecalculateOnTeamMemberAdded {
-    when: organizations/TeamMemberAdded(team, user)
-    ensures:
-        for link in team.repository_links:
-            RecalculateUserRepositoryAccess(repository: link.repository, user: user)
-}
-
+-- Leaving a team (or the organization) may take away every repository of
+-- the organization the team covered, including through includes-all.
 -- from: models/org_team.go:494
-rule RecalculateOnTeamMemberRemoved {
+rule AnnounceLostAccessOnTeamMemberRemoved {
     when: organizations/TeamMemberRemoved(team, user)
     ensures:
-        for link in team.repository_links:
-            RecalculateUserRepositoryAccess(repository: link.repository, user: user)
-}
-
--- from: models/org_team.go:49
-rule RecalculateOnTeamRepositoryAdded {
-    when: organizations/TeamRepositoryAdded(team, repository)
-    ensures: RecalculateRepositoryAccess(repository: repository)
+        for repository in repositories/Repositories where owner_org = team.organization:
+            if not has_any_access(user, repository):
+                UserLostRepositoryAccess(user: user, repository: repository)
 }
 
 -- from: models/org_team.go:135
-rule RecalculateOnTeamRepositoryRemoved {
+rule AnnounceLostAccessOnTeamRepositoryRemoved {
     when: organizations/TeamRepositoryRemoved(team, repository)
-    ensures: RecalculateRepositoryAccess(repository: repository)
+    ensures:
+        for m in team.memberships:
+            if not has_any_access(m.user, repository):
+                UserLostRepositoryAccess(user: m.user, repository: repository)
 }
 
--- Access mode, per-unit access, or includes-all changed.
+-- Team kind, per-unit access or includes-all changed.
 -- from: models/org_team.go:297
-rule RecalculateOnTeamAccessChanged {
+rule AnnounceLostAccessOnTeamAccessChanged {
     when: organizations/TeamAccessChanged(team)
     ensures:
-        for repository in repositories/Repositories where repository.owner_org = team.organization:
-            RecalculateRepositoryAccess(repository: repository)
+        for repository in repositories/Repositories where owner_org = team.organization:
+            for m in team.memberships:
+                if not has_any_access(m.user, repository):
+                    UserLostRepositoryAccess(user: m.user, repository: repository)
 }
 
+-- The deleted team's members are no longer known; check everybody.
 -- from: models/org_team.go:316
-rule RecalculateOnTeamDeleted {
+rule AnnounceLostAccessOnTeamDeleted {
     when: organizations/TeamDeleted(team)
     ensures:
-        for repository in repositories/Repositories where repository.owner_org = team.organization:
-            RecalculateRepositoryAccess(repository: repository)
+        for repository in repositories/Repositories where owner_org = team.organization:
+            RepositoryAccessMayHaveNarrowed(repository: repository)
 }
 
--- Not recalculated by Forgejo; required for the index to stay consistent
--- with has_any_access (see open questions). AccountStatusChanged covers the
--- restricted flag.
+-- from: services/repository/transfer.go:192
+rule AnnounceLostAccessOnRepositoryTransferred {
+    when: repositories/RepositoryTransferred(repository, doer, old_owner_name)
+    ensures: RepositoryAccessMayHaveNarrowed(repository: repository)
+}
+
+-- Making a repository private takes it away from everybody without a grant.
+-- from: modules/repository/create.go:262
+rule AnnounceLostAccessOnVisibilityChanged {
+    when: repositories/RepositoryVisibilityChanged(repository, doer)
+    ensures: RepositoryAccessMayHaveNarrowed(repository: repository)
+}
+
+-- A disabled unit, or a lowered unit default, may hide a private
+-- repository's last public unit.
+-- decided: access decisions 3, 4 and 7
+-- from: services/repository/setting.go:18
+rule AnnounceLostAccessOnUnitsChanged {
+    when: repositories/RepositoryUnitsChanged(repository, doer)
+    ensures: RepositoryAccessMayHaveNarrowed(repository: repository)
+}
+
+-- Not checked by Forgejo; required by decision 7 ("for any reason").
+-- AccountStatusChanged covers the restricted flag.
 -- from: services/user/update.go:109
-rule RecalculateOnUserRestrictionChanged {
+rule AnnounceLostAccessOnUserRestrictionChanged {
     when: accounts/AccountStatusChanged(user)
     ensures:
-        for row in RepoAccesses where user = user:
-            RecalculateUserRepositoryAccess(repository: row.repository, user: user)
+        for repository in repositories/Repositories:
+            if repository.owner_user != user and not user.is_admin and not has_any_access(user, repository):
+                UserLostRepositoryAccess(user: user, repository: repository)
 }
 
--- Repositories of a user whose visibility changed may have become
--- (in)visible to non-collaborators; announce lost access where it applies.
+-- Repositories of a user whose visibility changed may have become invisible
+-- to non-collaborators.
 -- from: models/organization/org.go:475
-rule RecalculateOnOwnerVisibilityChanged {
+rule AnnounceLostAccessOnOwnerVisibilityChanged {
     when: accounts/UserVisibilityChanged(user, old_visibility, new_visibility)
     ensures:
-        for repository in repositories/Repositories where repository.owner_user = user:
-            RecalculateRepositoryAccess(repository: repository)
+        for repository in repositories/Repositories where owner_user = user:
+            RepositoryAccessMayHaveNarrowed(repository: repository)
 }
 
 -- from: models/organization/org.go:475
-rule RecalculateOnOrganizationVisibilityChanged {
+rule AnnounceLostAccessOnOrganizationVisibilityChanged {
     when: organizations/OrganizationVisibilityChanged(organization)
     ensures:
-        for repository in repositories/Repositories where repository.owner_org = organization:
-            RecalculateRepositoryAccess(repository: repository)
+        for repository in repositories/Repositories where owner_org = organization:
+            RepositoryAccessMayHaveNarrowed(repository: repository)
 }
 
--- from: services/user/delete.go:106
-rule DropAccessOnUserDeleted {
-    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+-- A repository-wide input changed: announce every user with a stake in the
+-- repository (a watch, an issue subscription, an assignment) who is now
+-- without access. The owning user and site administrators never lose it.
+-- from: models/org_team.go:556
+rule AnnounceLostAccessAcrossRepository {
+    when: RepositoryAccessMayHaveNarrowed(repository)
     ensures:
-        for row in RepoAccesses where user = user:
-            not exists row
+        for w in repository.watches:
+            if w.user != repository.owner_user and not w.user.is_admin and not has_any_access(w.user, repository):
+                UserLostRepositoryAccess(user: w.user, repository: repository)
+        for iw in issues/IssueWatches where iw.issue.repository = repository:
+            if iw.user != repository.owner_user and not iw.user.is_admin and not has_any_access(iw.user, repository):
+                UserLostRepositoryAccess(user: iw.user, repository: repository)
+        for i in issues/Issues where i.repository = repository:
+            for a in i.assignees:
+                if a != repository.owner_user and not a.is_admin and not has_any_access(a, repository):
+                    UserLostRepositoryAccess(user: a, repository: repository)
 }
 
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
-
--- One index row per (user, repository).
-invariant OneAccessRowPerUserAndRepository {
-    for a in RepoAccesses:
-        for b in RepoAccesses:
-            (a.user = b.user and a.repository = b.repository) implies a = b
-}
-
--- The index only records real grants, never `none`.
-invariant AccessRowsAreGrants {
-    for a in RepoAccesses:
-        a.mode != none
-}
-
--- The owning user is never in the index; ownership is structural.
-invariant OwnerIsNotIndexed {
-    for a in RepoAccesses:
-        a.repository.owner_user != a.user
-}
 
 -- A collaboration confers at most admin; owner comes only from ownership or
 -- the owner team.
@@ -1101,10 +1055,12 @@ invariant CollaborationNeverOwner {
         c.access_mode in {read, write, admin}
 }
 
--- The index row always equals the derivation.
-invariant AccessIndexMatchesDerivation {
-    for a in RepoAccesses:
-        a.mode = explicit_mode(a.user, a.repository)
+-- Unit defaults: anonymous visitors get at most read, signed-in users at
+-- most write; external units never more than read.
+-- decided: access decisions 3 and 4
+invariant UnitDefaultsAreBounded {
+    for u in repositories/RepoUnits:
+        u.anonymous_access_mode in {none, read} and u.everyone_access_mode in {none, read, write} and (u.is_external implies u.everyone_access_mode != write)
 }
 
 -- Instance-wide disabled units are never enabled on any repository.
@@ -1121,17 +1077,25 @@ invariant ExternalUnitsAreReadOnly {
         d.operation = write_unit implies d.unit_kind not in {external_wiki, external_tracker}
 }
 
--- Nothing is ever granted to an anonymous visitor on a private repository, or
--- on any repository when sign-in is required.
+-- Nothing is ever granted to an anonymous visitor when sign-in is required,
+-- nor on a private repository beyond the units made public to anonymous
+-- visitors (decided: access decision 3).
 invariant AnonymousNeverSeesPrivate {
     for d in AccessDecisions:
-        (d.visitor != null and d.repository != null) implies (not d.repository.is_private and not config.require_signin_view)
+        (d.visitor != null and d.repository != null) implies (not config.require_signin_view and (not d.repository.is_private or d.repository.units.any(u => u.kind = d.unit_kind and u.anonymous_access_mode = read)))
 }
 
 -- Archived repositories are read-only for content.
 invariant ArchivedIsReadOnly {
     for d in AccessDecisions:
         (d.operation in {write_unit, contribute} and d.repository != null) implies not d.repository.is_archived
+}
+
+-- A task token is only ever granted on the repository that runs it.
+-- decided: access decision 6
+invariant TaskTokensStayInTheirRepository {
+    for d in AccessDecisions:
+        d.task != null implies (d.repository = d.task.job.run.repository and d.organization = null)
 }
 
 -- Restricted users are only ever granted through explicit grants, ownership,
@@ -1194,16 +1158,18 @@ actor ForgeInternals {
 ------------------------------------------------------------
 
 -- What an anonymous visitor can see and read on a repository. The surface
--- exists only for enabled units of public repositories of public owners;
--- for anything else there is nothing to face (the repository "does not
--- exist"). REQUIRE_SIGNIN_VIEW removes it entirely (rule ReadUnitAnonymously).
+-- exists only for enabled units of public repositories of public owners and
+-- for the public units (anonymous default read) of private repositories of
+-- public owners; for anything else there is nothing to face (the repository
+-- "does not exist"). REQUIRE_SIGNIN_VIEW removes it entirely (rule
+-- ReadUnitAnonymously). decided: access decision 3
 -- Web: GET /{owner}/{repo}/... read routes grouped under `ignSignIn`.
 -- API: GET /api/v1/repos/{owner}/{repo}/... read routes (repoAssignment +
 -- repoAccess, no reqToken). Git: anonymous HTTP clone/fetch of public repos.
 surface AnonymousRepositoryAccess {
     facing visitor: AnonymousVisitor
 
-    context unit: repositories/RepoUnit where enabled and not repository.is_private and ((repository.owner_user != null and repository.owner_user.visibility = public) or (repository.owner_org != null and repository.owner_org.visibility = public))
+    context unit: repositories/RepoUnit where enabled and (not repository.is_private or anonymous_access_mode = read) and ((repository.owner_user != null and repository.owner_user.visibility = public) or (repository.owner_org != null and repository.owner_org.visibility = public))
 
     exposes:
         visitor.channel
@@ -1214,9 +1180,9 @@ surface AnonymousRepositoryAccess {
         AnonymousReadsUnit(visitor, unit)
 
     @guarantee PrivateRepositoriesDoNotExist
-        -- A private repository, a repository of a non-public owner, or any
-        -- repository when sign-in is required is answered exactly as a
-        -- repository that does not exist.
+        -- A private repository (apart from its public units), a repository
+        -- of a non-public owner, or any repository when sign-in is required
+        -- is answered exactly as a repository that does not exist.
 
     @guidance
         -- Anonymous SSH access is never possible (SSH needs a key);
@@ -1225,14 +1191,14 @@ surface AnonymousRepositoryAccess {
 
 -- Which repositories a signed-in user can see at all (has_any_access):
 -- listings, search, the repository header, redirects. Owned, explicitly
--- granted, administered (site admin), or public with a visible owner for a
--- non-restricted user.
+-- granted, administered (site admin), or - for a non-restricted user with a
+-- visible owner - public or with at least one public unit.
 -- Web: dashboard, explore, /{owner}; API: /repos/search, /user/repos,
 -- /users/{u}/repos, /orgs/{org}/repos (AccessibleRepositoryCondition).
 surface VisibleRepository {
     facing user: SignedInUser
 
-    context repository: repositories/Repository where owner_user = user or user.is_admin or exists RepoAccess{user: user, repository: this} or (not is_private and not user.is_restricted and ((owner_user != null and owner_user.visibility in {public, limited}) or (owner_org != null and (owner_org.visibility in {public, limited} or exists organizations/OrgMembership{organization: owner_org, user: user}))))
+    context repository: repositories/Repository where owner_user = user or user.is_admin or explicit_mode(user, this) != none or ((not is_private or units.any(u => u.enabled and (u.anonymous_access_mode = read or u.everyone_access_mode in {read, write}))) and not user.is_restricted and ((owner_user != null and owner_user.visibility in {public, limited}) or (owner_org != null and (owner_org.visibility in {public, limited} or exists organizations/OrgMembership{organization: owner_org, user: user}))))
 
     exposes:
         repository.name
@@ -1328,16 +1294,19 @@ surface RepositoryAccessAdministration {
 
 -- Who holds explicit access, as seen by the repository's administrators
 -- (settings > collaborators / teams; API collaborators list and
--- permission report).
+-- permission report). Each mode is derived live (decided: access decision 1).
 surface ExplicitAccessList {
     facing user: SignedInUser
 
-    context repository: repositories/Repository where owner_user = user or user.is_admin or exists RepoAccess{user: user, repository: this, mode: admin} or exists RepoAccess{user: user, repository: this, mode: owner}
+    context repository: repositories/Repository where owner_user = user or user.is_admin or explicit_mode(user, this) in {admin, owner}
 
     exposes:
-        for grant in RepoAccesses where repository = repository:
-            grant.user
-            grant.mode
+        for c in repository.collaborations:
+            c.user
+            c.access_mode
+            explicit_mode(c.user, repository)
+        for link in organizations/TeamRepositories where repository = repository:
+            link.team.name
 }
 
 -- What a signed-in user can learn about the restriction carried by the
@@ -1491,8 +1460,9 @@ surface SiteAdministration {
 }
 
 -- What a running Actions task can do with its automatic token.
--- API: every /repos/{o}/{r}/* route accepts the task token
--- (RepoAccess check), reqToken treats it as signed.
+-- API: the /repos/{o}/{r}/* routes of the task's own repository accept the
+-- task token, reqToken treats it as signed; every other repository and every
+-- organization endpoint refuse it (decided: access decision 6).
 surface ActionsTaskAccess {
     facing task: RunningTask
 
@@ -1504,61 +1474,55 @@ surface ActionsTaskAccess {
     @guarantee ForkRunsAreReadOnly
         -- A run triggered by a pull request from a fork never writes to the
         -- repository it runs in.
+
+    @guarantee OwnRepositoryOnly
+        -- A task token reaches its own repository (and, through packages,
+        -- the packages linked to it) and nothing else; another repository,
+        -- even a public one, and organization endpoints answer as for a
+        -- party with no access.
 }
 
--- The authorization service and access-index maintenance offered to every
--- other module.
-surface AccessIndexMaintenance {
+-- The authorization service offered to every other module. It holds no
+-- state of its own: every answer is derived live from current state
+-- (decided: access decision 1).
+surface AuthorizationService {
     facing component: ForgeInternals
 
     context repository: repositories/Repository
 
     exposes:
         component.name
-        for grant in RepoAccesses where repository = repository:
-            grant.user
-            grant.mode
-
-    provides:
-        RecalculateUserRepositoryAccess(repository, user)
-        RecalculateRepositoryAccess(repository)
-        RecalculateUserAccessForRepositories(user, repositories)
+        for c in repository.collaborations:
+            c.user
+            explicit_mode(c.user, repository)
 
     contracts:
         fulfils AuthorizationPolicy
 
-    @guarantee RecalculationIsAtomic
-        -- A recalculation and the change that caused it commit together; no
-        -- request ever observes the new grant inputs with the old index.
+    @guarantee AnswersFollowCurrentState
+        -- An answer reflects every change committed before the request; no
+        -- request observes a grant input change without its effect on
+        -- permission. A cache, if any, is invalidated with the change.
 }
 
 ------------------------------------------------------------
 -- Deferred Specifications
 ------------------------------------------------------------
 
-deferred AuthorizationPolicy.explicit_unit_mode    -- see: access.allium "Derivation" step 6: strongest of collaboration mode and the unit access of each team that includes the repository (organizations/TeamUnitAccess)
-
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Forgejo does not recalculate the access index when a user's restricted flag or an owner's visibility changes; the index is only an optimisation there. Should a rebuild recalculate (as specified here) or never depend on the index for those decisions?"
-open question "On an organization repository a user who is both a collaborator and a team member gets the access-table maximum (including the team's access mode) on every unit, bypassing per-unit team limits. Accidental (spec assumes per-unit strongest of collaboration and team unit access) or intended?"
-open question "Anonymous visitors cannot read individual public units of a private repository (TODO in GetUserRepoPermission). Should per-unit anonymous/public access on private repositories be supported?"
-open question "Everyone-writable is only offered for the wiki unit. Should the per-unit default permission for signed-in users (and an anonymous access mode) be generalised to every unit?"
-open question "A site administrator using a fine-grained token keeps owner mode on repositories the token reaches but loses the admin override on admin-only endpoints. Is that asymmetry intended?"
-open question "Actions task tokens are treated as signed-in for reqToken but have no user; should organization-level endpoints accept them?"
-open question "Visibility of repositories after a repository is made private: forks inherit privacy and stars are cleared (repositories). Should watches and issue subscriptions of users who lost access be cleared immediately via UserLostRepositoryAccess as specified?"
+deferred AuthorizationPolicy.explicit_mode         -- see: access.allium "Derivation" step 4: strongest of collaboration mode and each including team's owner/admin mode or strongest unit grant
+deferred AuthorizationPolicy.explicit_unit_mode    -- see: access.allium "Derivation" steps 5-6: per unit, strongest of collaboration mode, owner/admin team mode and the unit access of each team that includes the repository (organizations/TeamUnitAccess)
 
 ------------------------------------------------------------
 -- Requests to other modules
 ------------------------------------------------------------
 -- REQUEST repositories/Collaborations, repositories/RepoUnits: entity collection names used by invariants CollaborationNeverOwner and DisabledUnitsAreNeverEnabled.
--- REQUEST repositories: react to access/UserLostRepositoryAccess(user, repository) by removing the user's watch (WatchRepoExplicitly none).
--- REQUEST issues: react to access/UserLostRepositoryAccess(user, repository) by removing the user's issue subscriptions and the assignments that access/can_be_assigned no longer allows.
+-- REQUEST repositories/RepoUnit.everyone_access_mode, anonymous_access_mode (per-unit defaults; everyone_can_write = everyone_access_mode = write) and AdminSetsUnitDefaultAccess: done in repositories.allium (decisions 3, 4).
+-- REQUEST repositories, issues: react to access/UserLostRepositoryAccess(user, repository) - done (repositories/UnwatchOnLostAccess, issues/ClearInvolvementOnLostAccess; decision 7).
 -- REQUEST repositories: its local predicates can_see_repository / can_read_code / can_write_code / is_repo_admin / is_repo_owner map to access/has_any_access, can_read(.., code), can_write(.., code), is_repo_admin, is_repo_owner.
--- REQUEST accounts/AccountStatusChanged(user): must be emitted when is_restricted changes (drives RecalculateOnUserRestrictionChanged).
+-- REQUEST accounts/AccountStatusChanged(user): must be emitted when is_restricted changes (drives AnnounceLostAccessOnUserRestrictionChanged).
 -- REQUEST accounts/User.allow_git_hook is used for table D2 (git hooks editing).
--- REQUEST authentication: derive access/CredentialRestriction from authentication/AccessToken (all_repositories and not public_only -> all_repositories; public_only -> public_only; not all_repositories -> listed_repositories with `repositories`) and likewise from AuthorizedIntegration; scope-category checks stay in authentication (table column "scope").
--- REQUEST actions: Task reaches its repository as task.job.run.repository; access treats status = running as the token being usable.
+-- REQUEST authentication: derive access/CredentialRestriction from authentication/AccessToken (all_repositories and not public_only -> all_repositories; public_only -> public_only; not all_repositories -> listed_repositories with `repositories`; has_admin_scope = the token's scopes include the admin category, read:admin/write:admin or all) and likewise from AuthorizedIntegration; scope-category checks stay in authentication (table column "scope"). decided (access 5): a site administrator acting through a token gets no admin power without the admin scope.
+-- REQUEST actions: Task reaches its repository as task.job.run.repository; access treats status = running as the token being usable. decided (access 6): the task token reaches only its own repository (rule TaskReadsOtherPublicRepository removed).
+-- REQUEST packages: decided (access 6): an Actions task token reaches only the packages linked to its own repository (read; write unless a fork pull-request run) and no other package or owner registry; replace "Actions task tokens act with their workflow user's mode" accordingly.
+-- REQUEST organizations: decided (access 6): organization endpoints refuse Actions task tokens.
 -- REQUEST pulls/PullRequest.allow_maintainer_edit: Boolean; branch-scoped write delegation (table C1).

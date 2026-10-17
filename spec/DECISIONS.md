@@ -114,3 +114,19 @@ invariants or config. Numbers refer to the question's position in its module in
 | 7 | Timeline events of deleted labels and milestones | **Kept for both,** showing the name at the time, marked deleted. |
 | 8 | Logging time for someone else | **Repository admins may,** on every path, with a chosen date; the entry records who logged it. |
 | 9 | Issue priority | **Dropped.** Priority is expressed with scoped labels. |
+
+## pulls
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Scheduling auto-merge when one exists | **Replaces it** (style, message, who scheduled it); the timeline shows the change. |
+| 2 | Closing a PR with auto-merge scheduled | **Closing cancels the schedule;** reopening doesn't restore it. |
+| 3 | A failing auto-merge | **Notify and remove:** the schedule is removed, a timeline comment says why, and whoever scheduled it is notified. |
+| 4 | `ancestor` vs `empty` | **Kept distinct.** |
+| 5 | Reviews on closed or merged PRs | **Allowed, like Forgejo,** comments and verdicts alike. |
+| 6 | Who can request reviews | **Any reader of pull requests, like Forgejo.** |
+| 7 | Outdated code comments on AGit pushes | **Every head move outdates,** AGit included. |
+| 8 | Update branch for AGit PRs | **Supported:** the server can merge or rebase the base into the AGit head ref. |
+| 9 | Squash-merge author | **The poster's account identity** (commit email, respecting keep-email-private); co-authors become `Co-authored-by` trailers. |
+| 10 | Mergeability checks | **Always asynchronous;** a new or updated PR is `checking` until the check finishes. |
+| 11 | Merge-message templates | **Repository template, else an instance-wide template, else the built-in default.** |

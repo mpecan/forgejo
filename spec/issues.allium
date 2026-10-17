@@ -85,6 +85,7 @@
 --   pulls/IssueClosedByPullRequest(issue, pull_request, doer)    -- apply closing references
 --   pulls/IssueReopenedByPullRequest(issue, pull_request, doer)  -- apply reopening references
 --   repositories/RepositoryDeleted(repository, doer)   -- the tracker goes with the repository
+--   access/UserLostRepositoryAccess(user, repository)  -- issue subscriptions and assignments there are dropped
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -1754,6 +1755,20 @@ rule TrackerDeletedWithRepository {
             not exists a
         for p in IssuePins where repository = repository:
             not exists p
+}
+
+-- A user who loses read access to a repository, for any reason, loses their issue
+-- subscriptions there and every assignment in it they may no longer hold.
+-- decided: access decision 7: subscriptions are cleared immediately on losing read access
+-- from: models/org_team.go:538
+rule ClearInvolvementOnLostAccess {
+    when: access/UserLostRepositoryAccess(user, repository)
+    ensures:
+        for w in IssueWatches where w.user = user and w.issue.repository = repository:
+            not exists w
+        for i in Issues where i.repository = repository and user in i.assignees:
+            if not can_be_assigned(user, repository):
+                i.assignees = i.assignees - { user }
 }
 
 ------------------------------------------------------------

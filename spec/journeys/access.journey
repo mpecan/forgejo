@@ -10,7 +10,7 @@
 -- owner, and a stranger.
 world {
     cast:
-        olga:     SignedInUser
+        olga:     accounts/User
         sam:      SignedInUser
         repo:     repositories/Repository
         code:     repositories/RepoUnit
@@ -21,6 +21,8 @@ world {
         olga.is_admin = false
         olga.is_restricted = false
         olga.visibility = public
+        olga.is_active = true
+        olga.prohibit_login = false
         sam.is_admin = false
         sam.is_restricted = false
         sam.visibility = public
@@ -33,10 +35,17 @@ world {
         code.repository = repo
         code.kind = code
         code.enabled = true
-        code.everyone_can_write = false
+        code.everyone_access_mode = none
+        code.anonymous_access_mode = none
         code.is_external = false
         visitor.channel = web
         internals.name = "repositories"
+        -- nobody holds an explicit grant until a journey says so (derived
+        -- live, decision 1)
+        explicit_unit_mode(olga, repo, code) = none
+        explicit_mode(olga, repo) = none
+        explicit_unit_mode(sam, repo, code) = none
+        explicit_mode(sam, repo) = none
 }
 
 journey AnonymousVisitorReadsAPublicRepository {
@@ -67,6 +76,7 @@ journey PrivateRepositoriesDoNotExistForStrangers {
         visitor cannot see repo.name on AnonymousRepositoryAccess in code
 
     2. Sam, signed in but with no grant, is refused too
+        stipulate explicit_unit_mode(sam, repo, code) = none
         sam cannot do UserReadsUnit(sam, code) on RepositoryUnitAccess
 
     3. Olga owns it and reads it
@@ -114,61 +124,99 @@ journey PrivateProfilesAreSeenOnlyByThoseTheyKnow {
     ends: Private means "people I have a relationship with".
 }
 
-journey ACollaboratorGainsWriteWhenTheIndexIsRecalculated {
+-- Updated for access decision 1: there is no index to recalculate; the
+-- grant counts the moment it exists.
+journey ACollaboratorGainsWriteAsSoonAsTheGrantExists {
     goal: Sam can read Olga's public repository but not push to it. Olga adds
-          him as a write collaborator; the explicit-access index is
-          recalculated and from then on he can write.
+          him as a write collaborator; permission is derived from the grant
+          itself, so from then on he can write.
 
     1. before the grant Sam reads but cannot write
+        stipulate explicit_unit_mode(sam, repo, code) = none
+        stipulate explicit_mode(sam, repo) = none
         sam does UserReadsUnit(sam, code) on RepositoryUnitAccess
         sam cannot do UserWritesUnit(sam, code, true) on RepositoryUnitAccess
 
-    2. the collaboration is recorded and the index recalculated for Sam
+    2. the collaboration exists: Sam pushes, with nothing recalculated
+        stipulate explicit_unit_mode(sam, repo, code) = write
         stipulate explicit_mode(sam, repo) = write
-        stipulate has_any_access(sam, repo) = true
-        internals does RecalculateUserRepositoryAccess(repo, sam) on AccessIndexMaintenance
-            creating grant: RepoAccess
-        then RecalculateOneUsersAccess fires
-        then AnnounceLostAccess does not fire
-        then grant.mode = write
-
-    3. now Sam pushes
         sam does UserWritesUnit(sam, code, true) on RepositoryUnitAccess
             creating decision: AccessDecision
         then WriteUnitByExplicitGrant fires
         then decision.basis = explicit_grant
 
-    4. but a write collaborator is not a repository administrator
+    3. but a write collaborator is not a repository administrator
         sam cannot do UserAdministersRepository(sam, repo) on RepositoryAccessAdministration
 
-    ends: Write comes from an explicit grant; administration needs more.
+    ends: Write comes from an explicit grant, live; administration needs more.
 }
 
+-- Updated for access decisions 1 and 7: the removal is seen at once, and
+-- the rest of the forge clears what presumed access.
 journey RemovingTheLastGrantTakesAccessAway {
     goal: Sam was a write collaborator on Olga's private repository. Olga
-          removes him; the index drops his row and the rest of the forge is
-          told he lost access.
+          removes him; he loses access at once, and the forge is told so.
 
     given:
         repo.is_private = true
-        grant: RepoAccess { user: sam, repository: repo, mode: write }
+        collab: repositories/Collaboration { repository: repo, user: sam, access_mode: write }
 
     1. while the grant stands Sam writes
+        stipulate explicit_unit_mode(sam, repo, code) = write
         sam does UserWritesUnit(sam, code, true) on RepositoryUnitAccess
 
-    2. the collaboration is removed and the index recalculated
-        stipulate explicit_mode(sam, repo) = none
+    2. the collaboration is removed and his lost access announced
+        stipulate is_repo_admin(olga, repo) = true
+        stipulate explicit_unit_mode(sam, repo, code) = none
         stipulate has_any_access(sam, repo) = false
-        internals does RecalculateUserRepositoryAccess(repo, sam) on AccessIndexMaintenance
-        then RecalculateOneUsersAccess fires
-        then AnnounceLostAccess fires
-        then grant does not exist
+        olga does AdminRemovesCollaborator(olga, repo, collab) on RepositorySettings
+        then collab does not exist
+        then AnnounceLostAccessOnCollaboratorRemoved fires
 
     3. and Sam can no longer even read
         sam cannot do UserReadsUnit(sam, code) on RepositoryUnitAccess
 
     ends: Losing the last grant on a private repository makes it vanish for
           the user, and watches/assignments are cleaned up by their owners.
+}
+
+journey GoingPrivateClearsOutsidersWatchesAndSubscriptions {
+    goal: Sam watches Olga's public repository, follows one of its issues and
+          is assigned to it. Olga makes the repository private; Sam has no
+          grant, so he loses read access, and his watch, his issue
+          subscription and his assignment are cleared at once (decision 7).
+
+    cast:
+        bug: issues/Issue
+
+    given:
+        repo.is_fork = false
+        repo.fork_of = null
+        watch: repositories/Watch { user: sam, repository: repo, source: explicit, watch_issues: true, watch_pull_requests: true, watch_releases: true }
+        bug.repository = repo
+        bug.assignees = {sam}
+        sub: issues/IssueWatch { user: sam, issue: bug, is_watching: true }
+
+    1. Olga makes it private and Sam is told he lost access
+        stipulate is_repo_admin(olga, repo) = true
+        stipulate repo.owner_is_private = false
+        stipulate has_any_access(sam, repo) = false
+        stipulate can_be_assigned(sam, repo) = false
+        olga does AdminChangesVisibility(olga, repo, true) on RepositorySettings
+        then AnnounceLostAccessOnVisibilityChanged fires
+        then AnnounceLostAccessAcrossRepository fires
+        then UnwatchOnLostAccess fires
+        then ClearInvolvementOnLostAccess fires
+        then watch.watch_issues = false
+        then watch.watch_releases = false
+        then sub does not exist
+        then bug.assignees = {}
+
+    2. and the repository is gone for him
+        stipulate explicit_unit_mode(sam, repo, code) = none
+        sam cannot do UserReadsUnit(sam, code) on RepositoryUnitAccess
+
+    ends: Losing read access, for whatever reason, ends what presumed it.
 }
 
 journey ArchivedRepositoriesAreReadOnly {
@@ -229,14 +277,15 @@ journey RestrictedUsersSeeOnlyWhatTheyAreGiven {
         rita.prohibit_login = false
 
     1. a public repository is still closed to her, and hidden from her
+        stipulate explicit_unit_mode(rita, repo, code) = none
+        stipulate explicit_mode(rita, repo) = none
         rita cannot do UserReadsUnit(rita, code) on RepositoryUnitAccess
         rita cannot see repo.name on VisibleRepository in repo
 
-    2. she is added as a read collaborator
+    2. she is added as a read collaborator, which counts at once
+        stipulate explicit_unit_mode(rita, repo, code) = read
         stipulate explicit_mode(rita, repo) = read
         stipulate has_any_access(rita, repo) = true
-        internals does RecalculateUserRepositoryAccess(repo, rita) on AccessIndexMaintenance
-            creating grant: RepoAccess
 
     3. and now reads it, through the grant and nothing else
         rita does UserReadsUnit(rita, code) on RepositoryUnitAccess
@@ -273,6 +322,8 @@ journey PrivateOrganizationsAreVisibleOnlyToMembers {
         ocode.kind = code
         ocode.enabled = true
         ocode.is_external = false
+        ocode.everyone_access_mode = none
+        ocode.anonymous_access_mode = none
         membership: organizations/OrgMembership { organization: org, user: mia, is_public: false }
 
     1. Sam cannot see the organization
@@ -280,6 +331,7 @@ journey PrivateOrganizationsAreVisibleOnlyToMembers {
         sam cannot see org.name on VisibleOrganization in org
 
     2. nor read its public repository
+        stipulate explicit_unit_mode(sam, orepo, code) = none
         sam cannot do UserReadsUnit(sam, ocode) on RepositoryUnitAccess
 
     3. Mia, a member, sees the organization
@@ -289,6 +341,7 @@ journey PrivateOrganizationsAreVisibleOnlyToMembers {
         mia sees org.name on VisibleOrganization in org
 
     4. and reads its public repository
+        stipulate explicit_unit_mode(mia, orepo, code) = none
         mia does UserReadsUnit(mia, ocode) on RepositoryUnitAccess
         then ReadUnitByPublicDefault fires
 
@@ -320,10 +373,13 @@ journey LimitedOrganizationsNeedASignedInViewer {
     ends: Limited is "members of this instance only".
 }
 
+-- Decision 2: Tom is also a read collaborator; per unit he gets the
+-- strongest of that and the unit's team grant - never the team's best grant
+-- on every unit.
 journey TeamUnitAccessDecidesPerUnit {
-    goal: Tom is in a team of an organization that grants write on issues but
-          only read on code for a private repository. He can triage issues
-          and read code, but cannot push.
+    goal: Tom is a read collaborator on a private organization repository and
+          in a team that grants write on issues but only read on code. He can
+          triage issues and read code, but cannot push.
 
     cast:
         tom:    SignedInUser
@@ -346,15 +402,17 @@ journey TeamUnitAccessDecidesPerUnit {
         ocode.kind = code
         ocode.enabled = true
         ocode.is_external = false
-        ocode.everyone_can_write = false
+        ocode.everyone_access_mode = none
+        ocode.anonymous_access_mode = none
         tracker.repository = orepo
         tracker.kind = issues
         tracker.enabled = true
         tracker.is_external = false
-        tracker.everyone_can_write = false
-        grant: RepoAccess { user: tom, repository: orepo, mode: write }
+        tracker.everyone_access_mode = none
+        tracker.anonymous_access_mode = none
+        collab: repositories/Collaboration { repository: orepo, user: tom, access_mode: read }
 
-    1. the team grants write on issues and read on code
+    1. per unit, the strongest of his read collaboration and the team's unit grant
         stipulate explicit_unit_mode(tom, orepo, issues) = write
         stipulate explicit_unit_mode(tom, orepo, code) = read
 
@@ -389,10 +447,10 @@ journey AdminTeamsAdministerButOnlyOwnersDelete {
         otto.is_admin = false
         orepo.owner_user = null
         orepo.owner_org = org
-        adagrant: RepoAccess { user: ada, repository: orepo, mode: admin }
-        ottogrant: RepoAccess { user: otto, repository: orepo, mode: owner }
 
     1. Ada administers the repository
+        stipulate explicit_mode(ada, orepo) = admin
+        stipulate explicit_mode(otto, orepo) = owner
         ada does UserAdministersRepository(ada, orepo) on RepositoryAccessAdministration
         then AdministerRepositoryByExplicitGrant fires
 
@@ -424,6 +482,7 @@ journey AFineGrainedTokenNarrowsEvenAnAdministrator {
         ash.is_active = true
         ash.prohibit_login = false
         token.reach = public_only
+        token.has_admin_scope = false
         prepo.owner_user = olga
         prepo.owner_org = null
         prepo.is_private = true
@@ -433,10 +492,14 @@ journey AFineGrainedTokenNarrowsEvenAnAdministrator {
         pcode.kind = code
         pcode.enabled = true
         pcode.is_external = false
-        pcode.everyone_can_write = false
+        pcode.everyone_access_mode = none
+        pcode.anonymous_access_mode = none
 
-    1. he reads public code through the token
+    1. he reads public code through the token, as any user would
+        stipulate explicit_unit_mode(ash, repo, code) = none
         ash does UserReadsUnit(ash, code, token) on RepositoryUnitAccess
+        then ReadUnitByPublicDefault fires
+        then ReadUnitAsSiteAdmin does not fire
 
     2. a private repository is out of the token's reach
         ash cannot do UserWritesUnit(ash, pcode, true, token) on RepositoryUnitAccess
@@ -504,4 +567,171 @@ journey AForkPullRequestRunIsReadOnly {
         then decision.basis = own_task
 
     ends: Untrusted code from forks never gets write.
+}
+
+journey ASiteAdminsTokenNeedsTheAdminScope {
+    goal: Ash, a site administrator, holds two tokens reaching every
+          repository; only one carries the admin scope. Through the other he
+          is an ordinary user: Olga's private repository is closed to him and
+          the admin endpoints refuse him (decision 5).
+
+    cast:
+        ash:     accounts/User
+        plain:   CredentialRestriction
+        admintok: CredentialRestriction
+
+    given:
+        ash.is_admin = true
+        ash.is_restricted = false
+        ash.is_active = true
+        ash.prohibit_login = false
+        plain.reach = all_repositories
+        plain.has_admin_scope = false
+        admintok.reach = all_repositories
+        admintok.has_admin_scope = true
+        repo.is_private = true
+
+    1. without the admin scope he cannot read the private repository
+        stipulate explicit_unit_mode(ash, repo, code) = none
+        ash cannot do UserReadsUnit(ash, code, plain) on RepositoryUnitAccess
+
+    2. nor administer it, nor the instance
+        stipulate explicit_mode(ash, repo) = none
+        ash cannot do UserAdministersRepository(ash, repo, plain) on RepositoryAccessAdministration
+        ash cannot do UserActsAsSiteAdmin(ash, plain) on SiteAdministration
+
+    3. with the admin scope he reads it as a site administrator
+        ash does UserReadsUnit(ash, code, admintok) on RepositoryUnitAccess
+            creating decision: AccessDecision
+        then ReadUnitAsSiteAdmin fires
+        then decision.basis = site_admin
+
+    4. and uses the admin endpoints
+        ash does UserActsAsSiteAdmin(ash, admintok) on SiteAdministration
+        then ActAsSiteAdmin fires
+
+    ends: The token limits everything; admin powers need the admin scope.
+}
+
+journey ATaskTokenStaysInItsRepository {
+    goal: A normal workflow run reads and writes the repository it runs in,
+          but its token cannot even read another public repository
+          (decision 6).
+
+    cast:
+        task:   RunningTask
+        run:    actions/WorkflowRun
+        job:    actions/Job
+        other:  repositories/Repository
+        ocode:  repositories/RepoUnit
+
+    given:
+        run.repository = repo
+        job.run = run
+        task.job = job
+        task.status = running
+        task.is_fork_pull_request = false
+        other.owner_user = olga
+        other.owner_org = null
+        other.is_private = false
+        other.is_archived = false
+        ocode.repository = other
+        ocode.kind = code
+        ocode.enabled = true
+        ocode.is_external = false
+
+    1. the task reads its own repository
+        task does ActionsTaskAccessesRepository(task, code, read) on ActionsTaskAccess
+        then TaskAccessesOwnRepository fires
+
+    2. but not another one, public as it is
+        task cannot do ActionsTaskAccessesRepository(task, ocode, read) on ActionsTaskAccess
+
+    ends: A job token is repository-scoped.
+}
+
+journey APrivateRepositoryWithAPublicIssueTracker {
+    goal: Olga keeps her repository private but opens its issue tracker to
+          everyone. Visitors read the issues - only the issues - and nobody
+          without a grant may write there (decisions 3 and 4).
+
+    cast:
+        tracker: repositories/RepoUnit
+
+    given:
+        repo.is_private = true
+        tracker.repository = repo
+        tracker.kind = issues
+        tracker.enabled = true
+        tracker.is_external = false
+        tracker.everyone_access_mode = none
+        tracker.anonymous_access_mode = none
+
+    1. an anonymous default of write is refused
+        stipulate is_repo_admin(olga, repo) = true
+        olga cannot do AdminSetsUnitDefaultAccess(olga, repo, tracker, write, write) on RepositorySettings
+
+    2. Olga makes the tracker public: read for visitors, write for signed-in users
+        stipulate has_any_access(olga, repo) = true
+        olga does AdminSetsUnitDefaultAccess(olga, repo, tracker, write, read) on RepositorySettings
+        then tracker.anonymous_access_mode = read
+        then tracker.everyone_access_mode = write
+
+    3. an anonymous visitor reads the issues but not the code
+        visitor does AnonymousReadsUnit(visitor, tracker) on AnonymousRepositoryAccess
+            creating decision: AccessDecision
+        then ReadUnitAnonymously fires
+        visitor cannot do AnonymousReadsUnit(visitor, code) on AnonymousRepositoryAccess
+
+    4. Sam, signed in, reads the issues and sees the repository
+        stipulate explicit_unit_mode(sam, repo, issues) = none
+        stipulate explicit_unit_mode(sam, repo, code) = none
+        stipulate explicit_mode(sam, repo) = none
+        sam does UserReadsUnit(sam, tracker) on RepositoryUnitAccess
+        then ReadUnitByPublicDefault fires
+        sam sees repo.name on VisibleRepository in repo
+
+    5. but not the code, and he cannot triage: a private repository's public unit is read-only
+        sam cannot do UserReadsUnit(sam, code) on RepositoryUnitAccess
+        sam cannot do UserWritesUnit(sam, tracker, false) on RepositoryUnitAccess
+
+    ends: Units, not only repositories, can be public.
+}
+
+journey AUnitDefaultLetsEveryoneWrite {
+    goal: On Olga's public repository the projects board lets every signed-in
+          user write; Sam edits it, but a restricted user may not (decision 4).
+
+    cast:
+        board: repositories/RepoUnit
+        rita:  accounts/User
+
+    given:
+        board.repository = repo
+        board.kind = projects
+        board.enabled = true
+        board.is_external = false
+        board.everyone_access_mode = write
+        board.anonymous_access_mode = none
+        rita.is_admin = false
+        rita.is_restricted = true
+        rita.is_active = true
+        rita.prohibit_login = false
+
+    1. Sam, with no grant, writes on the board
+        stipulate explicit_unit_mode(sam, repo, projects) = none
+        sam does UserWritesUnit(sam, board, false) on RepositoryUnitAccess
+            creating decision: AccessDecision
+        then WriteUnitByEveryoneWritable fires
+        then decision.basis = everyone_writable
+
+    2. but not on the code, which keeps the default
+        stipulate explicit_unit_mode(sam, repo, code) = none
+        sam cannot do UserWritesUnit(sam, code, false) on RepositoryUnitAccess
+
+    3. and a restricted user gets nothing from the default
+        stipulate explicit_unit_mode(rita, repo, projects) = none
+        rita cannot do UserWritesUnit(rita, board, false) on RepositoryUnitAccess
+
+    ends: "Everyone may write" is a per-unit setting, no longer the wiki's alone.
 }

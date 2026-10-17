@@ -14,7 +14,8 @@
 --   - Rename and RepoRedirect; ownership transfer with pending acceptance/reject/cancel
 --   - Archive / unarchive, visibility change (with fork propagation), deletion and its cascade
 --   - RepoUnit (enable/disable units, per-unit settings: issue tracker, pull requests,
---     external tracker URL formats, external wiki, globally editable wiki)
+--     external tracker URL formats, external wiki, per-unit default access for signed-in
+--     users and anonymous visitors)
 --   - Collaboration (add / change access mode / remove)
 --   - Star, Watch (explicit vs automatic watch, per-category watch selection)
 --   - Topic (count, length and format rules)
@@ -96,6 +97,8 @@
 --   ForkDetached(repository, doer)
 --
 -- Reacts to:
+--   access/UserLostRepositoryAccess(user, repository)
+--                                    -- the user's watch on the repository is removed (UnwatchOnLostAccess)
 --   code/PushReceived(push)          -- push mirrors with sync-on-commit, auto-watch on changes, size refresh
 --   migrations/ImportCompleted(repository, remote_address, has_credentials, interval, lfs_enabled, lfs_endpoint)
 --                                    -- the import finished: ready, and a mirror import becomes a pull mirror
@@ -356,8 +359,16 @@ entity RepoUnit {
     pull_request_settings: PullRequestSettings?       -- kind = pull_requests
     external_tracker: ExternalTrackerSettings?        -- kind = external_tracker
     external_wiki_url: String?                        -- kind = external_wiki
-    -- Wiki only: every signed-in user may edit the wiki, not only writers.
-    everyone_can_write: Boolean
+    -- Per-unit defaults, set by a repository admin: the mode every non-restricted signed-in
+    -- user (none / read / write) and every anonymous visitor (none / read) gets on this unit
+    -- on top of what the repository's visibility already gives; they never lower it. On a
+    -- private repository they make individual units public (access derivation steps 1, 5, 6).
+    -- decided: access decisions 3 and 4 (public units of private repositories; per-unit
+    -- defaults generalised from the wiki-only "anyone may edit" to every unit)
+    everyone_access_mode: access/AccessMode
+    anonymous_access_mode: access/AccessMode
+    -- The former wiki-only "anyone may edit" option: every signed-in user may write.
+    everyone_can_write: everyone_access_mode = write
 
     -- External units are read-only links; other units can be granted up to admin.
     is_external: kind in { external_wiki, external_tracker }
@@ -769,7 +780,7 @@ rule ProvisionRepository {
                     pull_request_settings: null,
                     external_tracker: null,
                     external_wiki_url: null,
-                    everyone_can_write: false
+                    everyone_access_mode: none, anonymous_access_mode: none
                 )
         if config.auto_watch_new_repos:
             AutoWatchRequested(user: doer, repository: repository)
@@ -1178,7 +1189,7 @@ rule AdminEnablesUnit {
             RepoUnit.created(
                 repository: repository, kind: kind, enabled: true,
                 issues_settings: null, pull_request_settings: null, external_tracker: null,
-                external_wiki_url: null, everyone_can_write: false
+                external_wiki_url: null, everyone_access_mode: none, anonymous_access_mode: none
             )
         if kind = issues:
             for u in repository.units:
@@ -1245,7 +1256,7 @@ rule AdminSetsExternalTracker {
         RepoUnit.created(
             repository: repository, kind: external_tracker, enabled: true,
             issues_settings: null, pull_request_settings: null, external_tracker: settings,
-            external_wiki_url: null, everyone_can_write: false
+            external_wiki_url: null, everyone_access_mode: none, anonymous_access_mode: none
         )
         RepositoryUnitsChanged(repository: repository, doer: user)
 }
@@ -1264,19 +1275,25 @@ rule AdminSetsExternalWiki {
         RepoUnit.created(
             repository: repository, kind: external_wiki, enabled: true,
             issues_settings: null, pull_request_settings: null, external_tracker: null,
-            external_wiki_url: url, everyone_can_write: false
+            external_wiki_url: url, everyone_access_mode: none, anonymous_access_mode: none
         )
         RepositoryUnitsChanged(repository: repository, doer: user)
 }
 
--- Let every signed-in user edit the built-in wiki.
+-- Set a unit's default access for signed-in users and anonymous visitors. External units
+-- never exceed read. The wiki's "anyone may edit" option is everyone_mode = write.
+-- decided: access decisions 3 and 4: any unit, also on a private repository
 -- from: routers/web/repo/setting/setting.go:152
-rule AdminSetsWikiEditableByEveryone {
-    when: AdminSetsWikiEditableByEveryone(user, repository, unit, editable)
+rule AdminSetsUnitDefaultAccess {
+    when: AdminSetsUnitDefaultAccess(user, repository, unit, everyone_mode, anonymous_mode)
     requires: unit.repository = repository
     requires: is_repo_admin(user, unit.repository)
-    requires: unit.kind = wiki
-    ensures: unit.everyone_can_write = editable
+    requires: everyone_mode in { none, read, write }
+    requires: anonymous_mode in { none, read }
+    requires: not unit.is_external or everyone_mode != write
+    ensures: unit.everyone_access_mode = everyone_mode
+    ensures: unit.anonymous_access_mode = anonymous_mode
+    ensures: RepositoryUnitsChanged(repository: repository, doer: user)
 }
 
 ------------------------------------------------------------
@@ -1627,6 +1644,18 @@ rule SetWatchSelection {
         else:
             Watch.created(user: user, repository: repository, source: explicit, watch_issues: issues, watch_pull_requests: pull_requests, watch_releases: releases, created_at: now, updated_at: now)
         WatchChanged(user: user, repository: repository)
+}
+
+-- A user who loses read access to the repository, for any reason, stops watching it: the
+-- watch becomes an explicit "nothing" choice, so a later push cannot auto-watch it back.
+-- decided: access decision 7: watches are cleared immediately on losing read access
+-- from: models/org_team.go:556
+rule UnwatchOnLostAccess {
+    when: access/UserLostRepositoryAccess(user, repository)
+    let existing = Watch{user: user, repository: repository}
+    requires: exists existing
+    requires: existing.is_watching
+    ensures: WatchSelectionChosen(user: user, repository: repository, issues: false, pull_requests: false, releases: false)
 }
 
 -- Automatic watching: the creator of a new repository (auto_watch_new_repos) and a pusher
@@ -2587,7 +2616,8 @@ surface RepositorySettings {
             u.pull_request_settings
             u.external_tracker
             u.external_wiki_url
-            u.everyone_can_write
+            u.everyone_access_mode
+            u.anonymous_access_mode
         for c in repository.collaborations:
             c.user.name
             c.access_mode
@@ -2624,7 +2654,7 @@ surface RepositorySettings {
         AdminConfiguresPullRequests(admin, repository, unit, settings)
         AdminSetsExternalTracker(admin, repository, settings)
         AdminSetsExternalWiki(admin, repository, url)
-        AdminSetsWikiEditableByEveryone(admin, repository, unit, editable)
+        AdminSetsUnitDefaultAccess(admin, repository, unit, everyone_mode, anonymous_mode)
         AdminAddsCollaborator(admin, repository, collaborator)
         AdminChangesCollaboratorAccess(admin, repository, collaboration, access_mode)
         AdminRemovesCollaborator(admin, repository, collaboration)

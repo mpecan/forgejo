@@ -170,6 +170,9 @@ journey TransferAwaitsTheRecipient {
         carol cannot do RecipientAcceptsTransfer(carol, offer) on IncomingTransfer
 
     4. Bob accepts
+        -- the repository is public, so nobody watching it loses access (access checks)
+        stipulate has_any_access(bob, repo) = true
+        stipulate has_any_access(alice, repo) = true
         bob does RecipientAcceptsTransfer(bob, offer) on IncomingTransfer
             creating redirect: RepoRedirect
         then OwnershipMovesToUser fires
