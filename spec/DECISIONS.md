@@ -312,3 +312,7 @@ invariants or config. Numbers refer to the question's position in its module in
 | 6 | Non-numeric external ids | **Re-attributed too;** ids are opaque strings. |
 | 7 | Visibility on restore | **The archive's visibility** (`FORCE_PRIVATE` still forces private). |
 | 8 | Host policy for `dump-repo` | **Operators exempt;** the policy guards user-initiated migrations. |
+| 9 | Merger of imported merged pull requests | **The original merger,** as an external identity (re-attributed when it maps to a local user), else empty. |
+| 10 | Milestones without a deadline | **Far-future deadline** (9999-01-01), as Forgejo stores it. |
+| 11 | Assignees | **Imported** when they resolve to local users with access; others are kept as external names. |
+| 12 | Repository-wide retry | **The requester or a repository admin.** |
