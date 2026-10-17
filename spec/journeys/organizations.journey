@@ -591,3 +591,86 @@ journey BlockedBobCanStillBeAdded {
 
     ends: Bob is on devs despite the block.
 }
+
+-- decided: administration 3 — while the instance is read-only, nothing about
+-- an organization changes, whoever asks; reading it keeps working.
+journey ReadOnlyModeFreezesTheOrganization {
+    goal: The site administrator has put the instance into read-only mode.
+          Alice, an owner, cannot create a team, rename acme or add Bob;
+          Bob cannot leave his team. Carol still sees the organization.
+
+    cast:
+        gate: access/InstanceWriteGate
+
+    given:
+        gate.read_only = true
+        bob_on_devs: TeamMembership { team: devs, organization: org, user: bob, reason: added_by_user }
+        bob_in_org:  OrgMembership { organization: org, user: bob, is_public: true }
+
+    1. alice cannot create a team
+        stipulate is_alpha_dash_dot("leads") = true
+        stipulate length("leads") = 5
+        stipulate lower("leads") = "leads"
+        stipulate team_name_taken(org, "leads") = false
+        alice cannot do OwnerCreatesTeam(alice, org, "leads", "", admin, {}, true, false) on OrganizationSettings
+
+    2. nor rename the organization
+        stipulate is_usable_owner_name("acme-corp") = true
+        stipulate length("acme-corp") = 9
+        stipulate owner_name_available("acme-corp") = true
+        stipulate owner_name_claimable("acme-corp", org) = true
+        alice cannot do OwnerRenamesOrganization(alice, org, "acme-corp") on OrganizationSettings
+
+    3. bob cannot leave devs
+        stipulate can_view_team(devs, bob) = true
+        bob cannot do MemberLeavesTeam(bob, devs) on TeamPage
+
+    4. carol still sees acme and its public members
+        stipulate sees_concealed_members(org, carol) = false
+        carol sees org.name on OrganizationProfile in org
+        carol sees bob_in_org.user.name on OrganizationProfile in org
+
+    ends: acme is exactly as it was; reads keep working.
+}
+
+-- A repository transferred into the organization joins the teams the doer
+-- named and every team that includes all repositories.
+journey ATransferredRepositoryJoinsItsTeams {
+    goal: Alice moves her own "tool" repository into acme and names devs.
+          Being an owner she may create repositories there, so it moves at
+          once: devs and the Owners team (which includes every repository)
+          now cover it.
+
+    cast:
+        tool: repositories/Repository
+
+    given:
+        tool.name = "tool"
+        tool.owner_user = alice
+        tool.owner_org = null
+        tool.status = ready
+        tool.is_private = false
+
+    1. alice transfers tool to acme with devs
+        stipulate is_repo_owner(alice, tool) = true
+        stipulate repository_name_free(org, "tool") = true
+        stipulate within_repo_quota(org) = true
+        stipulate within_creation_limit(org) = true
+        stipulate can_create_in_org(alice, org) = true
+        stipulate team_covers(devs, tool) = false
+        stipulate team_covers(owners, tool) = false
+        stipulate has_any_access(alice, tool) = true
+        alice does OwnerTransfersRepositoryToOrg(alice, tool, org, {devs}) on RepositoryDangerZone
+            creating devs_tool: TeamRepository
+            creating owners_tool: TeamRepository
+        then OwnershipMovesToOrg fires
+        then LinkTeamsNamedOnTransfer fires
+        then RelinkTeamsOfTransferredRepository fires
+        then tool.owner_org = org
+        then devs_tool.team = devs
+        then devs_tool.repository = tool
+        then owners_tool.team = owners
+        then owners_tool.repository = tool
+
+    ends: tool belongs to acme, and devs and Owners cover it.
+}

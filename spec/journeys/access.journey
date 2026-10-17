@@ -818,3 +818,32 @@ journey ASiteAdminReadsAPrivateRepositoryAndIsRecorded {
     ends: Administrators can open any repository; every role-less read of a
           private one leaves an audit record.
 }
+
+-- decided: administration 3 — a workflow's own token cannot write while the
+-- instance is read-only either; it can still read its repository.
+journey ReadOnlyModeStopsTaskTokenWrites {
+    goal: The instance is read-only for a backup. A running workflow can still
+          check out its repository's code, but its token cannot push.
+
+    cast:
+        gate:  InstanceWriteGate
+        task:  RunningTask
+        run:   actions/WorkflowRun
+        job:   actions/Job
+
+    given:
+        gate.read_only = true
+        run.repository = repo
+        job.run = run
+        task.job = job
+        task.status = running
+        task.is_fork_pull_request = false
+
+    1. the task reads
+        task does ActionsTaskAccessesRepository(task, code, read) on ActionsTaskAccess
+
+    2. but cannot write
+        task cannot do ActionsTaskAccessesRepository(task, code, write) on ActionsTaskAccess
+
+    ends: Even the automatic token writes nothing while the instance is read-only.
+}

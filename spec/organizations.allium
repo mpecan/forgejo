@@ -74,9 +74,11 @@
 --   TeamRepositoryRemoved(team, repository)
 --
 -- Reacts to:
---   repositories/Repository.created  -- add new org repo to includes-all teams
---   OrgRepositoryArrived(repository) / OrgRepositoryDeparted(repository, organization)
---       (see REQUESTs: emitted by repositories on transfer/delete)
+--   repositories/Repository.created  -- add new org repo to includes-all teams (every creation path)
+--   repositories/TeamsReceiveTransferredRepository(repository, teams)  -- named teams get it
+--   repositories/RepositoryTransferred(repository, doer, old_owner_name)
+--       -- leave the old org's teams, join the new org's includes-all teams
+--   repositories/RepositoryDeleted(repository, doer)  -- drop its team links
 --   authentication/ExternalGroupsAsserted(user, source, groups)  -- group-to-team sync
 --   authentication/AuthSourceDeleted(source)                      -- forget provenance
 --   accounts/UserPurged(user)  -- leave every org; purge orgs where last owner
@@ -295,11 +297,20 @@ config {
 -- Rules: creating an organization
 ------------------------------------------------------------
 
+-- Read-only mode: every rule a person triggers here (owners, members,
+-- invitees, repository admins and site admins alike) is refused while the
+-- instance is read-only (access/InstanceWriteGate). Reactions to other
+-- modules' events (purges, sign-in group sync, repository creation,
+-- transfer and deletion) and invitation expiry are not gated here: the
+-- module whose user action started them gates that action.
+-- decided: administration 3 (read-only mode refuses every write)
+
 -- A signed-in person founds an organization and becomes its first owner.
 -- from: models/organization/org.go:268
 rule UserCreatesOrganization {
     when: UserCreatesOrganization(creator, name, visibility, repo_admin_change_team_access)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: creator.is_admin
         or (creator.allow_create_organization and not config.disable_regular_org_creation)
     requires: is_usable_owner_name(name)
@@ -359,6 +370,7 @@ rule UserCreatesOrganization {
 rule CreateOrganizationForUserByAdmin {
     when: administration/OrganizationCreatedForUserByAdmin(admin, user, name, visibility)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let owner = user
     requires: owner.kind in {individual, bot}
     -- decided: the admin's right governs; the owner's own creation right is not checked.
@@ -418,6 +430,7 @@ rule CreateOrganizationForUserByAdmin {
 rule OwnerUpdatesOrganizationProfile {
     when: OwnerUpdatesOrganizationProfile(actor, org, full_name, description, website, location, email)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(org, actor) or actor.is_admin
     requires: full_name = null or length(full_name) <= config.max_full_name_length
     requires: description = null or length(description) <= config.max_description_length
@@ -441,6 +454,7 @@ rule OwnerUpdatesOrganizationProfile {
 rule OwnerChangesOrganizationVisibility {
     when: OwnerChangesOrganizationVisibility(actor, org, visibility)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(org, actor) or actor.is_admin
     requires: visibility != org.visibility
 
@@ -459,6 +473,7 @@ rule OwnerChangesOrganizationVisibility {
 rule OwnerSetsRepoAdminTeamAccess {
     when: OwnerSetsRepoAdminTeamAccess(actor, org, allowed)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(org, actor) or actor.is_admin
 
     ensures: org.repo_admin_change_team_access = allowed
@@ -468,6 +483,7 @@ rule OwnerSetsRepoAdminTeamAccess {
 rule AdminSetsOrganizationRepoLimit {
     when: AdminSetsOrganizationRepoLimit(admin, org, limit)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: admin.is_admin
 
     ensures: org.max_repo_creation = limit
@@ -480,6 +496,7 @@ rule AdminSetsOrganizationRepoLimit {
 rule OwnerRenamesOrganization {
     when: OwnerRenamesOrganization(actor, org, new_name)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(org, actor) or actor.is_admin
     requires: new_name != org.name
     requires: is_usable_owner_name(new_name)
@@ -505,6 +522,7 @@ rule OwnerRenamesOrganization {
 rule OwnerUploadsOrganizationAvatar {
     when: OwnerUploadsOrganizationAvatar(actor, org, image)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(org, actor) or actor.is_admin
     requires: is_acceptable_avatar(image)
 
@@ -521,6 +539,7 @@ rule OwnerUploadsOrganizationAvatar {
 rule OwnerDeletesOrganizationAvatar {
     when: OwnerDeletesOrganizationAvatar(actor, org)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(org, actor) or actor.is_admin
 
     ensures: org.has_custom_avatar = false
@@ -541,6 +560,7 @@ rule OwnerDeletesOrganizationAvatar {
 rule OwnerDeletesOrganization {
     when: OwnerDeletesOrganization(actor, org, confirmation_name)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(org, actor) or actor.is_admin
     requires: confirmation_name = org.name
     requires: owned_repository_count(org) = 0
@@ -608,6 +628,7 @@ rule SystemPurgesOrganization {
 rule AdminPurgesOrganization {
     when: AdminDeletesOrganizationWithPurge(admin, org, confirmation_name)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: admin.is_admin
     requires: confirmation_name = org.name
 
@@ -632,6 +653,7 @@ rule ModeratorPurgesOrganization {
 rule MemberChangesMembershipVisibility {
     when: MemberChangesMembershipVisibility(actor, org, membership, is_public)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: membership.organization = org
     -- decided: the member only; owners cannot publicize or conceal someone else's membership.
     requires: actor = membership.user
@@ -651,6 +673,7 @@ rule MemberChangesMembershipVisibility {
 rule MemberLeavesOrganization {
     when: MemberLeavesOrganization(user, org)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let membership = OrgMembership{organization: org, user: user}
 
     requires: exists membership
@@ -673,6 +696,7 @@ rule MemberLeavesOrganization {
 rule OwnerRemovesOrgMember {
     when: OwnerRemovesOrgMember(actor, org, user)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let membership = OrgMembership{organization: org, user: user}
 
     requires: is_org_owner(org, actor) or actor.is_admin
@@ -698,6 +722,7 @@ rule OwnerRemovesOrgMember {
 rule OwnerAddsMemberToOrganization {
     when: OwnerAddsMemberToOrganization(actor, org, user, teams)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(org, actor) or actor.is_admin
     requires: user.kind in {individual, bot, remote}
     requires: not is_org_member(org, user)
@@ -764,6 +789,7 @@ rule DropOrgMembershipWithoutTeams {
 rule OwnerCreatesTeam {
     when: OwnerCreatesTeam(actor, org, name, description, access_mode, grants, includes_all_repositories, can_create_org_repo)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(org, actor) or actor.is_admin
     requires: is_alpha_dash_dot(name)
     requires: length(name) <= config.max_team_name_length
@@ -836,6 +862,7 @@ rule OwnerCreatesTeam {
 rule OwnerEditsTeam {
     when: OwnerEditsTeam(actor, team, name, description, access_mode, grants, includes_all_repositories, can_create_org_repo)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(team.organization, actor) or actor.is_admin
     requires: not team.is_owners_team
     requires: is_alpha_dash_dot(name)
@@ -898,6 +925,7 @@ rule OwnerEditsTeam {
 rule OwnerEditsOwnersTeamDescription {
     when: OwnerEditsOwnersTeamDescription(actor, team, description)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(team.organization, actor) or actor.is_admin
     requires: team.is_owners_team
     requires: description = null or length(description) <= config.max_team_description_length
@@ -910,6 +938,7 @@ rule OwnerEditsOwnersTeamDescription {
 rule OwnerDeletesTeam {
     when: OwnerDeletesTeam(actor, team)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(team.organization, actor) or actor.is_admin
     -- decided: deleting the Owners team is forbidden on every path (Forgejo only hides the button).
     requires: not team.is_owners_team
@@ -947,6 +976,7 @@ rule OwnerDeletesTeam {
 rule OwnerAddsTeamMember {
     when: OwnerAddsTeamMember(actor, team, user)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(team.organization, actor) or actor.is_admin
     requires: user.kind in {individual, bot, remote}
     requires: not is_team_member(team, user)
@@ -1000,6 +1030,7 @@ rule OwnerAddsTeamMember {
 rule OwnerInvitesEmailToTeam {
     when: OwnerInvitesEmailToTeam(actor, team, email)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(team.organization, actor) or actor.is_admin
     requires: mail_service_enabled()
     requires: is_valid_email(email)
@@ -1030,6 +1061,7 @@ rule OwnerInvitesEmailToTeam {
 rule OwnerJoinsTeam {
     when: OwnerJoinsTeam(actor, team)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(team.organization, actor) or actor.is_admin
     requires: not is_team_member(team, actor)
 
@@ -1063,6 +1095,7 @@ rule OwnerJoinsTeam {
 rule MemberLeavesTeam {
     when: MemberLeavesTeam(user, team)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let tm = TeamMembership{team: team, user: user}
 
     requires: exists tm
@@ -1079,6 +1112,7 @@ rule MemberLeavesTeam {
 rule OwnerRemovesTeamMember {
     when: OwnerRemovesTeamMember(actor, team, user)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let tm = TeamMembership{team: team, user: user}
 
     requires: is_org_owner(team.organization, actor) or actor.is_admin
@@ -1184,6 +1218,7 @@ rule AuthSourceSyncRemovesTeamMember {
 rule InviteeAcceptsTeamInvite {
     when: InviteeAcceptsTeamInvite(user, invite, hide_membership)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: invite.status = pending
     requires: (invite.invited_user = null or invite.invited_user = user)
     requires: not is_team_member(invite.team, user)
@@ -1228,6 +1263,7 @@ rule InviteeAcceptsTeamInvite {
 rule InviteeDeclinesTeamInvite {
     when: InviteeDeclinesTeamInvite(user, invite)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: invite.status = pending
     requires: (invite.invited_user = null or invite.invited_user = user)
 
@@ -1243,6 +1279,7 @@ rule InviteeDeclinesTeamInvite {
 rule OwnerRevokesTeamInvite {
     when: OwnerRevokesTeamInvite(actor, team, invite)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: invite.team = team
     requires: is_org_owner(invite.organization, actor) or actor.is_admin
 
@@ -1274,6 +1311,7 @@ rule TeamInviteExpires {
 rule OwnerAddsRepositoryToTeam {
     when: OwnerAddsRepositoryToTeam(actor, team, repository)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(team.organization, actor) or actor.is_admin
     requires: repository.owner_org = team.organization
     requires: not team_covers(team, repository)
@@ -1295,6 +1333,7 @@ rule OwnerAddsRepositoryToTeam {
 rule RepoAdminAddsTeamToRepository {
     when: RepoAdminAddsTeamToRepository(actor, repository, team)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(actor, repository) or actor.is_admin
     requires: repository.owner_org = team.organization
     requires: team.organization.repo_admin_change_team_access
@@ -1314,6 +1353,7 @@ rule RepoAdminAddsTeamToRepository {
 rule OwnerRemovesRepositoryFromTeam {
     when: OwnerRemovesRepositoryFromTeam(actor, team, repository)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let link = TeamRepository{team: team, repository: repository}
 
     requires: is_org_owner(team.organization, actor) or actor.is_admin
@@ -1334,6 +1374,7 @@ rule OwnerRemovesRepositoryFromTeam {
 rule RepoAdminRemovesTeamFromRepository {
     when: RepoAdminRemovesTeamFromRepository(actor, repository, team)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let link = TeamRepository{team: team, repository: repository}
 
     requires: is_repo_admin(actor, repository) or actor.is_admin
@@ -1354,6 +1395,7 @@ rule RepoAdminRemovesTeamFromRepository {
 rule OwnerAddsAllRepositoriesToTeam {
     when: OwnerAddsAllRepositoriesToTeam(actor, team)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(team.organization, actor) or actor.is_admin
 
     ensures:
@@ -1371,6 +1413,7 @@ rule OwnerAddsAllRepositoriesToTeam {
 rule OwnerRemovesAllRepositoriesFromTeam {
     when: OwnerRemovesAllRepositoriesFromTeam(actor, team)
 
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(team.organization, actor) or actor.is_admin
     requires: not team.includes_all_repositories
 
@@ -1400,30 +1443,59 @@ rule IncludeNewRepositoryInAllRepoTeams {
         -- collaborator when no team already gives them admin.
 }
 
--- A repository transferred into the org joins every includes-all team.
--- from: services/repository/transfer.go:186
-rule IncludeTransferredRepositoryInAllRepoTeams {
-    when: OrgRepositoryArrived(repository)
+-- Teams the doer named when transferring a repository into the org get it.
+-- from: services/repository/transfer.go:56
+rule LinkTeamsNamedOnTransfer {
+    when: repositories/TeamsReceiveTransferredRepository(repository, teams)
 
     requires: repository.owner_org != null
 
     ensures:
-        for t in repository.owner_org.teams where includes_all_repositories = true:
+        for t in teams where organization = repository.owner_org:
             if not team_covers(t, repository):
                 TeamRepository.created(team: t, repository: repository)
                 TeamRepositoryAdded(team: t, repository: repository)
+
+    @guidance
+        -- API: POST /repos/{owner}/{repo}/transfer with team_ids. Teams of
+        -- another organization are ignored.
 }
 
--- A repository that leaves the org (transfer out, deletion) leaves every team.
--- from: models/organization/org.go:612
-rule DropTeamLinksOfDepartedRepository {
-    when: OrgRepositoryDeparted(repository, org)
+-- A transferred repository leaves every team of the organization it left and
+-- joins every includes-all team of the organization it arrived in.
+-- from: services/repository/transfer.go:186
+rule RelinkTeamsOfTransferredRepository {
+    when: repositories/RepositoryTransferred(repository, doer, old_owner_name)
 
     ensures:
-        for t in org.teams:
-            for tr in t.repository_links where repository = repository:
+        for tr in TeamRepositories where repository = repository:
+            if tr.team.organization != repository.owner_org:
+                let old_team = tr.team
                 not exists tr
-                TeamRepositoryRemoved(team: t, repository: repository)
+                TeamRepositoryRemoved(team: old_team, repository: repository)
+    ensures:
+        if repository.owner_org != null:
+            for t in repository.owner_org.teams where includes_all_repositories = true:
+                if not team_covers(t, repository):
+                    TeamRepository.created(team: t, repository: repository)
+                    TeamRepositoryAdded(team: t, repository: repository)
+
+    @guidance
+        -- A transfer between two organizations does both. Members of the old
+        -- organization's teams who lose read access are announced by access
+        -- (it reacts to TeamRepositoryRemoved and RepositoryTransferred).
+}
+
+-- A deleted repository leaves every team. No TeamRepositoryRemoved is
+-- announced: the repository is gone, and repositories' own deletion cascade
+-- clears watches and stars.
+-- from: services/repository/delete.go:122
+rule DropTeamLinksOfDeletedRepository {
+    when: repositories/RepositoryDeleted(repository, doer)
+
+    ensures:
+        for tr in TeamRepositories where repository = repository:
+            not exists tr
 }
 
 ------------------------------------------------------------
@@ -1535,7 +1607,7 @@ invariant AccountInviteAddressed {
 ------------------------------------------------------------
 
 -- Signed-in users, site administrators and anonymous visitors are the shared
--- actors access/SignedInUser, access/SiteAdmin and access/Visitor.
+-- actors access/SignedInUser, access/SiteAdmin and access/Anonymous.
 
 -- A member of the Owners team (site admins act as owners everywhere).
 actor OrgOwner {
@@ -1589,7 +1661,7 @@ surface OrganizationCreation {
 -- The org profile as an anonymous visitor sees it: public orgs only, public
 -- members only, no teams.
 surface AnonymousOrganizationProfile {
-    facing visitor: access/Visitor
+    facing visitor: access/Anonymous
 
     context org: Organization where visibility = public
 
@@ -1971,6 +2043,12 @@ deferred Organization.unit_permission    -- see: access.allium (org-level read o
 --   team_covers(team, repository)      -- team.covers(repository)
 --   can_view_team(team, user)          -- team.can_be_viewed_by(user)
 --   can_create_repository_in(user, org)-- org.lets_create_repo(user)
+--                                      -- also requested as can_create_org_repo(user, org) (code)
+--                                      -- and can_create_in_org(user, org) (repositories): same predicate
+--   repository_creators(org)           -- the members u of org with org.lets_create_repo(u): the Owners
+--                                      -- team and every team with can_create_org_repo (who may accept
+--                                      -- or be told of a repository transferred to the org; notifications)
+--   member_of_any_team(user, teams)    -- teams.any(t => t.has_member(user)) (code's allow lists)
 --   sees_concealed_members(org, user)  -- org.sees_concealed_members(user)
 --   organization_visible_to(org, user) -- org.is_visible_to(user); anonymous: org.is_public
 --                                      -- (same as access/can_see_organization(viewer, org))
@@ -2010,7 +2088,7 @@ deferred Organization.unit_permission    -- see: access.allium (org-level read o
 -- REQUEST accounts: react to OrganizationRenamed(organization, old_name, new_name) with RenameNamespace semantics (UserRedirect with organization set, MAX_USER_REDIRECTS); react to OrganizationCreated by dropping any redirect holding the new name; follows and blocks of an org removed on OrganizationDeleted.
 -- REQUEST accounts: OrganizationBlocksUser should also require that the blocked user is not the acting owner (Forgejo refuses blocking yourself).
 -- REQUEST accounts: owner-name namespace — a name may be held by a User or an Organization, never both (is_usable_owner_name, owner_name_available, owner_name_claimable as black boxes over accounts' rules).
--- REQUEST access: derive repository permission for org repositories from TeamRepository + TeamUnitAccess + Team.kind (owner/admin teams: that mode on all units; unit_grants teams: their TeamUnitAccess rows only — there is no team summary mode), and org-level unit read (projects/packages/code) from team units or org visibility.
+-- REQUEST access: derive repository permission for org repositories from TeamRepository + TeamUnitAccess + Team.kind (owner/admin teams: that mode on all units; unit_grants teams: their TeamUnitAccess rows only — there is no team summary mode), and org-level unit read (projects/packages/code) from team units or org visibility. - already (access Derivation steps 4-6, explicit_mode / explicit_unit_mode / organization_unit_mode).
 -- REQUEST repositories: emit OrgRepositoryArrived(repository) after a transfer into an org, and OrgRepositoryDeparted(repository, organization) when an org repository is transferred out or deleted.
 -- REQUEST repositories: when an org repository is created and no team gives its creator admin, add the creator as an admin Collaboration; check can_create_repository_in(user, org) and Organization.max_repo_creation for creation, forks, transfers and push-to-create.
 -- REQUEST repositories: react to TeamMemberAdded / TeamRepositoryAdded with auto-watch when AUTO_WATCH_NEW_REPOS; react to TeamMemberRemoved / OrgMemberRemoved / TeamRepositoryRemoved by unwatching repositories the user can no longer read; react to OrganizationPurgeStarted by deleting all org repositories.

@@ -27,12 +27,12 @@
 --
 -- Includes: AccessMode, OperationClass, GrantBasis, CredentialRestriction, InstanceWriteGate,
 --   AccessDecision, AdminAccessRecord, AnonymousVisitor, RequestParty, ForgeComponent,
---   AuthorizationPolicy contract, and the shared actors Visitor,
+--   AuthorizationPolicy contract, and the shared actors Visitor, Anonymous,
 --   SignedInUser, SiteAdmin and RepoAdmin (see "Actor Declarations").
 --
--- Shared actors: other modules reference access/Visitor, access/SignedInUser,
--- access/SiteAdmin and access/RepoAdmin (within: repositories/Repository)
--- rather than declaring their own.
+-- Shared actors: other modules reference access/Visitor, access/Anonymous,
+-- access/SignedInUser, access/SiteAdmin and access/RepoAdmin (within:
+-- repositories/Repository) rather than declaring their own.
 --
 -- Excludes:
 --   - Token scope categories/levels and how a token is parsed (owned by
@@ -319,6 +319,23 @@ contract AuthorizationPolicy {
     -- strongest of collaboration mode, owner/admin team mode and team unit
     -- access (decided: access decision 2).
     explicit_unit_mode: (user: accounts/User, repository: repositories/Repository, unit: repositories/UnitKind) -> AccessMode
+    -- the individual users with is_repo_admin(user, repository), site
+    -- administrators excluded unless they hold admin by a grant or own it:
+    -- the owning user, admin collaborators, members of the owning
+    -- organization's owner and admin teams that include the repository
+    -- (notifications mails them, e.g. when a workflow is disabled).
+    repository_admins: (repository: repositories/Repository) -> Set<accounts/User>
+    -- the owning user, a collaborator, or a member of a team of the owning
+    -- organization that includes the repository with a code grant:
+    -- repository.owner_user = user or explicit_unit_mode(user, repository, code) != none
+    -- (keys trusts signatures of such people; IsOwnerMemberCollaborator).
+    -- from: models/repo/collaboration.go:101
+    is_owner_member_or_collaborator: (user: accounts/User, repository: repositories/Repository) -> Boolean
+    -- the repository of the running Actions task whose automatic token
+    -- authenticated the current request as `user`; null for any other
+    -- credential. The token reaches that repository and the packages linked
+    -- to it, nothing else (decided: access decision 6).
+    job_repository: (user: accounts/User) -> repositories/Repository?
 
     @invariant Monotone
         -- Adding a grant (collaboration, team membership, team repository,
@@ -820,6 +837,7 @@ rule TaskAccessesOwnRepository {
     requires: task.job.run.repository = repository
     requires: unit.enabled
     requires: level = read or (level = write and not task.is_fork_pull_request and not repository.is_archived)
+    requires: level = read or not exists InstanceWriteGate{read_only: true}   -- decided: administration 3 (read-only mode refuses every write)
     ensures: AccessDecision.created(task: task, repository: repository, unit_kind: unit.kind, operation: actions_task, basis: own_task, decided_at: now)
 }
 
@@ -1183,8 +1201,8 @@ invariant RestrictedUsersOnlyThroughExplicitGrants {
 -- Actor Declarations
 ------------------------------------------------------------
 
--- SHARED ACTORS. Visitor, SignedInUser, SiteAdmin and RepoAdmin are the
--- forge-wide actors: every other module faces them as access/Visitor,
+-- SHARED ACTORS. Visitor, Anonymous, SignedInUser, SiteAdmin and RepoAdmin are the
+-- forge-wide actors: every other module faces them as access/Visitor, access/Anonymous,
 -- access/SignedInUser, access/SiteAdmin and access/RepoAdmin instead of
 -- declaring its own copy (OrgOwner lives in organizations). Facing an actor
 -- documents who stands at a boundary; the permission itself is always a
@@ -1215,6 +1233,16 @@ actor SiteAdmin {
 actor RepoAdmin {
     within: repositories/Repository
     identified_by: accounts/User where is_repo_admin(this, within)
+}
+
+-- Somebody with no identity: the party behind a request that is not signed
+-- in. Surfaces of other modules that only anonymous visitors face (public
+-- repository pages, public profiles, public organizations, public issue
+-- trackers) face access/Anonymous; the permission is still the rule's
+-- `requires` (ReadUnitAnonymously, ViewOrganizationAnonymously,
+-- ViewProfileAnonymously, REQUIRE_SIGNIN_VIEW).
+actor Anonymous {
+    identified_by: RequestParty where is_signed_in = false
 }
 
 -- A running Actions task presenting its automatic token.
@@ -1619,6 +1647,6 @@ deferred AuthorizationPolicy.explicit_unit_mode    -- see: access.allium "Deriva
 -- REQUEST authentication: derive access/CredentialRestriction from authentication/AccessToken (all_repositories and not public_only -> all_repositories; public_only -> public_only; not all_repositories -> listed_repositories with `repositories`; has_admin_scope = the token's scopes include the admin category, read:admin/write:admin or all) and likewise from AuthorizedIntegration; scope-category checks stay in authentication (table column "scope"). decided (access 5): a site administrator acting through a token gets no admin power without the admin scope.
 -- REQUEST actions: Task reaches its repository as task.job.run.repository; access treats status = running as the token being usable. decided (access 6): the task token reaches only its own repository (rule TaskReadsOtherPublicRepository removed).
 -- REQUEST packages: decided (access 6): an Actions task token reaches only the packages linked to its own repository (read; write unless a fork pull-request run) and no other package or owner registry; replace "Actions task tokens act with their workflow user's mode" accordingly.
--- REQUEST organizations: decided (access 6): organization endpoints refuse Actions task tokens.
+-- REQUEST organizations: decided (access 6): organization endpoints refuse Actions task tokens. - already: no organizations rule or surface accepts a task (they face signed-in people only; table F).
 -- REQUEST pulls/PullRequest.allow_maintainer_edit: Boolean; branch-scoped write delegation (table C1).
 -- REQUEST administration: decided (follow-up 1): show access/AdminAccessRecord (or react to access/SiteAdminReadWithoutRole(admin, repository, unit_kind)) in the site-administration audit log next to the system notices, with its own retention if one is wanted; access already keeps the record.
