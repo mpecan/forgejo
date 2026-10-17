@@ -131,7 +131,13 @@ use "./actions.allium" as actions
 --                                       = over the changes that are web uploads (FileChange.is_upload):
 --                                         how many, the largest size in MB, all of an allowed type
 --   member_of_any_team(user, teams)     = organizations team membership
---   exceeds_git_quota(r), exceeds_lfs_quota(r)    = quota for the repository owner
+--   exceeds_git_quota(r), exceeds_lfs_quota(r)    = quota for the repository owner (current usage;
+--                                         size not known up front, e.g. a push checked on receipt)
+--   exceeds_git_quota_with(r, changes)  = quota size:repos:all for the repository owner counting
+--                                         the changes' incoming content size (usage + size <= limit);
+--                                         false for a change set that only deletes files
+--   exceeds_lfs_quota_with(r, pointers) = quota size:git:lfs for the repository owner counting
+--                                         the sizes of the objects not already stored
 --   commit_exists, commit_summary, commit_body, commit_time, full_sha, divergence,
 --   branch_contains, branch_name_conflicts, valid_ref_name, lfs_* , normalise_path  = git facts
 
@@ -1399,7 +1405,9 @@ rule UserCommitsFileChanges {
     requires: all_paths_valid(changes)                       -- every path cleans to a valid tree path
     requires: none_locked_by_other(repository, changes, user) -- no path holds another user's LFS lock
     requires: author_email = null or is_activated_email_of(user, author_email)
-    requires: not exceeds_git_quota(repository)
+    -- decided (quota 2): the incoming size is counted; (quota 7): a change set that only
+    -- deletes files is never refused by quota (Forgejo gated API deletions too).
+    requires: not exceeds_git_quota_with(repository, changes)
     -- decided (code 3): upload limits are enforced on the server, whatever the client
     -- (Forgejo only checks them in the browser widget).
     requires: upload_count(changes) = 0 or config.upload_enabled
@@ -1555,7 +1563,8 @@ rule LfsClientRequestsUpload {
     when: LfsClientRequestsUpload(user, repository, pointers)
     requires: config.lfs_start_server
     requires: can_write_code(user, repository)
-    requires: not exceeds_lfs_quota(repository)
+    -- decided (quota 2): the announced sizes of the objects to upload are counted
+    requires: not exceeds_lfs_quota_with(repository, pointers)
     requires: config.lfs_max_batch_size = 0 or pointers.count <= config.lfs_max_batch_size
     ensures:
         for p in pointers:
@@ -1574,7 +1583,8 @@ rule LfsClientUploadsObject {
     when: LfsClientUploadsObject(user, repository, pointer, content_sha256, content_size)
     requires: config.lfs_start_server
     requires: can_write_code(user, repository)
-    requires: not exceeds_lfs_quota(repository)
+    -- decided (quota 2): the object's size is counted
+    requires: not exceeds_lfs_quota_with(repository, {pointer})
     requires: content_sha256 = pointer.oid
     requires: content_size = pointer.size
     requires: config.lfs_max_file_size = 0 or pointer.size <= config.lfs_max_file_size

@@ -12,7 +12,8 @@
 --   (explicitly, via configured default groups, or via OAuth2 group claims at
 --   sign-in). Before any operation that would grow a holder's storage, the
 --   holder's current usage is evaluated against their effective groups and the
---   operation is refused when the holder is over quota for that subject.
+--   operation is refused when the holder is over quota for that subject (or
+--   would be, counting the incoming size, where that size is known up front).
 -- Includes:
 --   QuotaSubject hierarchy, QuotaRule, QuotaGroup, QuotaGroupRule (group<->rule
 --   link), QuotaAccount (the quota view of a user or organization),
@@ -30,22 +31,22 @@
 --     consumes the figures (see QuotaUsage).
 --   - The 413 response format / HTML "Quota exceeded" page: transport detail.
 --   - The legacy `Rule.Acceptable` (<=) helper: unused by any caller.
---   - Wiki usage measurement: Forgejo always reports 0 for size:wiki (see open
---     question); a rule on size:wiki is still enforced through its ancestors.
 -- Emits:
 --   StorageConsumptionAdmitted(account, subject, operation)
 --       -- the quota gate let a storage-growing operation through.
 --   QuotaGroupsChanged(account)
 --       -- a holder's explicit group set changed (admin or login sync).
 -- Reacts to:
---   StorageConsumptionRequested(requester, account, subject, operation)
+--   StorageConsumptionRequested(requester, account, subject, operation, incoming)
 --       -- the gate contract (surface QuotaGateReference). Gated operations in
 --          repositories, code, releases, issues, wiki, pulls, packages and
---          actions honour it as `requires: quota_allows(<charged>, <subject>)`
---          in their own rules; nothing emits it as a trigger.
+--          actions honour it as `requires: quota_allows(<charged>, <subject>,
+--          <incoming bytes or null>)` in their own rules; nothing emits it as a
+--          trigger.
 --   authentication/ExternalGroupsAsserted(user, source, groups)
 --       -- authentication's sign-in / registration / account link through an
---          external source; the source's quota group mapping applies.
+--          external source (OAuth2 or LDAP); the source's quota group mapping
+--          applies.
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -66,6 +67,8 @@ use "./access.allium" as access
 -- OWNER of the thing, never to whoever uploaded it: attachments, artifacts and
 -- LFS objects in a repository count against the repository's owner; packages
 -- count against the package owner.
+-- decided (quota 3): wiki storage is measured, as size:wiki, and counts under
+-- size:git:all (it is git data), no longer under size:assets:all.
 -- from: models/quota/used.go:17
 value QuotaUsage {
     -- git size of the holder's public repositories
@@ -85,11 +88,12 @@ value QuotaUsage {
     -- or via a repository the holder owns); a blob shared by many versions
     -- counts once
     packages: Integer
-    -- wiki storage; Forgejo does not measure it (always 0)
+    -- git size of the wikis of all the holder's repositories (measured by
+    -- wiki; Forgejo reported 0)
     wiki: Integer
 
     repos_all: repos_public + repos_private
-    git_all: repos_all + git_lfs
+    git_all: repos_all + git_lfs + wiki
     attachments_all: attachments_issues + attachments_releases
     assets_all: attachments_all + artifacts + packages
     all: git_all + assets_all
@@ -122,17 +126,19 @@ value QuotaRuleSpec {
 --   size:all                                   all
 --   ├─ size:git:all                            git_all
 --   │  ├─ size:git:lfs                         git_lfs
---   │  └─ size:repos:all                       repos_all
---   │     ├─ size:repos:public                 repos_public
---   │     └─ size:repos:private                repos_private
+--   │  ├─ size:repos:all                       repos_all
+--   │  │  ├─ size:repos:public                 repos_public
+--   │  │  └─ size:repos:private                repos_private
+--   │  └─ size:wiki                            wiki
 --   └─ size:assets:all                         assets_all
 --      ├─ size:assets:attachments:all          attachments_all
 --      │  ├─ size:assets:attachments:issues    attachments_issues
 --      │  └─ size:assets:attachments:releases  attachments_releases
 --      ├─ size:assets:artifacts                artifacts
---      ├─ size:assets:packages:all             packages
---      └─ size:assets:wiki                     wiki
+--      └─ size:assets:packages:all             packages
 --
+-- decided (quota 3): size:wiki sits under size:git:all (Forgejo listed it
+-- under size:assets:all and never measured it).
 -- from: models/quota/limit_subject.go:13
 enum QuotaSubject {
     size_all
@@ -178,8 +184,11 @@ enum MembershipOrigin {
 -- Entities and Variants
 ------------------------------------------------------------
 
--- A byte limit over a set of subjects. The limit applies to the SUM of the
--- usage of every listed subject (overlapping subjects are summed twice).
+-- A byte limit over a set of subjects. The limit applies to the usage of the
+-- UNION of the listed subjects: each byte counts once per rule, so a rule on
+-- {size:all, size:git:all} measures exactly size:all.
+-- decided (quota 4): union, not a sum (Forgejo summed overlapping subjects twice).
+-- decided (quota 2): the incoming size is counted where it is known up front.
 -- from: models/quota/rule.go:13
 entity QuotaRule {
     name: String                      -- unique, immutable identity
@@ -193,8 +202,12 @@ entity QuotaRule {
     -- The rule governs `subject` when it names the subject or any ancestor of it.
     covers(s): subjects.any(x => x in subject_lineage(s))
 
-    -- Strictly below the limit: a holder exactly AT the limit is over quota.
-    permits(u): limit = -1 or usage_sum(u, subjects) < limit
+    -- With a known incoming size: usage + incoming <= limit. With no size known
+    -- up front (a push, checked on receipt): strictly below the limit, so a
+    -- holder exactly AT the limit is over quota.
+    permits(u, incoming): limit = -1
+        or (incoming = null and usage_union(u, subjects) < limit)
+        or (incoming != null and usage_union(u, subjects) + incoming <= limit)
 }
 
 -- A named bundle of rules.
@@ -210,7 +223,7 @@ entity QuotaGroup {
 
     -- Every covering rule must permit; the first covering rule that does not
     -- permit decides "deny" for this group.
-    permits(s, u): rule_links.all(l => not l.rule.covers(s) or l.rule.permits(u))
+    permits(s, u, incoming): rule_links.all(l => not l.rule.covers(s) or l.rule.permits(u, incoming))
 }
 
 -- A rule belongs to any number of groups.
@@ -278,6 +291,8 @@ default QuotaGate gate_generate_repository = { operation: generate_repository_fr
 default QuotaGate gate_fork_repository = { operation: fork_repository, subject: size_repos_all, charged: target_owner }
 default QuotaGate gate_migrate_repository = { operation: migrate_repository, subject: size_repos_all, charged: target_owner }
 default QuotaGate gate_retry_migration = { operation: retry_migration, subject: size_repos_all, charged: repository_owner }
+-- decided (quota 5): a transfer charges the new owner (user or organisation) on every path,
+-- web and API, request and acceptance alike (Forgejo's web accept charged the accepting user)
 default QuotaGate gate_transfer_repository = { operation: transfer_repository, subject: size_repos_all, charged: transfer_recipient }
 default QuotaGate gate_accept_transfer = { operation: accept_repository_transfer, subject: size_repos_all, charged: transfer_recipient }
 default QuotaGate gate_git_push = { operation: git_push, subject: size_repos_all, charged: repository_owner }
@@ -296,7 +311,8 @@ default QuotaGate gate_wiki = { operation: edit_wiki_page, subject: size_wiki, c
 default QuotaGate gate_merge_pull = { operation: merge_pull_request, subject: size_git_all, charged: repository_owner }
 default QuotaGate gate_update_pull = { operation: update_pull_request_branch, subject: size_git_all, charged: repository_owner }
 default QuotaGate gate_apply_suggestion = { operation: apply_review_suggestion, subject: size_git_all, charged: head_repository_owner }
-default QuotaGate gate_mirror_manual = { operation: sync_mirror_manually, subject: size_repos_all, charged: repository_owner }
+-- decided (quota 6): a manual mirror sync is gated on size:git:all, like a push, on web and API
+default QuotaGate gate_mirror_manual = { operation: sync_mirror_manually, subject: size_git_all, charged: repository_owner }
 default QuotaGate gate_mirror_scheduled = { operation: sync_mirror_scheduled, subject: size_repos_all, charged: repository_owner }
 default QuotaGate gate_package_upload = { operation: upload_package, subject: size_assets_packages_all, charged: package_owner }
 default QuotaGate gate_artifact_upload = { operation: upload_actions_artifact, subject: size_assets_artifacts, charged: repository_owner }
@@ -307,29 +323,36 @@ default QuotaGate gate_artifact_upload = { operation: upload_actions_artifact, s
 
 -- ---- The gate ----------------------------------------------------------
 
--- The single decision every gated operation defers to. The check is made
--- against CURRENT usage before the operation, not against usage plus the
--- incoming size: a holder just under a limit may make one upload that takes
--- them over it, after which further growth is refused.
+-- The single decision every gated operation defers to. Where the operation
+-- knows its size up front (web file edits and uploads, LFS objects, wiki
+-- pages, attachments, packages, artifacts) `incoming` carries it and the check
+-- is usage + incoming <= limit; where it does not (a git push, checked on
+-- receipt; repository creation, migration, transfer) `incoming` is null and
+-- the check is current usage strictly below the limit.
 --
--- quota_allows(account, subject), precisely:
+-- quota_allows(account, subject, incoming), precisely:
 --   0. when config.enabled is false: always true (nothing is gated).
 --   1. groups := account's explicit groups; if none, the existing groups
 --      named in config.default_groups; if still none, a built-in group with
 --      the rules { limit: config.default_total, subjects: {size_all} } and
 --      { limit: config.default_packages, subjects: {size_assets_packages_all} }
 --      (both must permit a package upload).
---   2. allowed iff SOME group in groups both matches(subject) and
---      permits(subject, account.usage).
---   Consequence: a holder whose groups contain no rule covering the subject
---   is DENIED (see open question), and one permissive group overrides any
---   number of restrictive ones.
+--   2. if NO group in groups matches(subject): allowed.
+--   3. otherwise allowed iff SOME group in groups both matches(subject) and
+--      permits(subject, account.usage, incoming).
+--   Consequence: only a rule that covers a subject can deny it, and one
+--   permissive group overrides any number of restrictive ones.
 -- from: models/quota/quota.go:20
+-- decided (quota 1): a subject no rule covers is allowed (Forgejo denied it).
+-- decided (quota 2): the incoming size is counted wherever it is known up front.
+-- decided (quota 7): an operation that can only shrink storage (deleting
+-- files through the API or web editor, deleting refs, pages, attachments,
+-- packages) never asks the gate, so quota never refuses it.
 -- decided (packages 6): the built-in fallback group also carries the default
 -- package rule (config.default_packages); packages has no limits of its own
 rule StorageConsumptionGated {
-    when: StorageConsumptionRequested(requester, account, subject, operation)
-    requires: not config.enabled or quota_allows(account, subject)
+    when: StorageConsumptionRequested(requester, account, subject, operation, incoming)
+    requires: not config.enabled or quota_allows(account, subject, incoming)
     ensures: StorageConsumptionAdmitted(account: account, subject: subject, operation: operation)
     @guidance
         -- Enforcement points (web, API, git, LFS, package registry, Actions
@@ -337,6 +360,13 @@ rule StorageConsumptionGated {
         -- * git push (pre-receive): only ref updates that are not deletions are
         --   refused; deleting branches/tags is always allowed so a holder can
         --   free space. AGit refs (refs/for/*) and refs/pull/* are not gated.
+        --   Pushes to PROTECTED branches are exempt while
+        --   code/config.quota_exempts_protected_branches is true (the default,
+        --   Forgejo's behaviour); an admin who sets it false gets them checked
+        --   like every other push (decided under code 1, quota 9).
+        -- * file changes through the web editor or API: a change set that only
+        --   deletes files is not gated (decided, quota 7).
+        -- * manual mirror sync (web and API): size:git:all (decided, quota 6).
         -- * LFS: the batch "upload" operation and the object PUT are gated only
         --   when the object is not already stored.
         -- * scheduled pull-mirror sync is silently skipped (not failed) while
@@ -488,17 +518,19 @@ rule AdminSetsHolderQuotaGroups {
 
 -- ---- Login-source sync ------------------------------------------------
 
--- An OAuth2 login source may map claimed identity-provider groups to quota
--- groups. On each sign-in / auto-registration / account link through that
--- source: for every mapped source group the user IS in, the user is added to
+-- A group-capable login source (OAuth2 or LDAP) may map the identity
+-- provider's groups to quota groups, through the same mapping
+-- (AuthSource.quota_group_map). On each sign-in / auto-registration / account
+-- link through that source: for every mapped source group the user IS in, the user is added to
 -- each mapped quota group (if not already); when the source has "remove
 -- unmapped" enabled, the user is removed from each quota group mapped from a
 -- source group they are NOT in. Quota groups named by the mapping that do not
--- exist are skipped. LDAP sources do not sync quota groups (their mapping is
--- empty, so the black boxes return nothing). The mapping reads the source's
--- quota-group claim (AuthSource.quota_group_claim_name) from what the provider
--- asserted.
+-- exist are skipped. For OAuth2 the groups are read from the source's
+-- quota-group claim (AuthSource.quota_group_claim_name); for LDAP from the
+-- entry's group memberships, as authentication asserts them.
 -- from: services/auth/source/source_quota_group_sync.go:15
+-- decided (quota 8): every group-capable source syncs quota groups, LDAP
+-- included (Forgejo synced OAuth2 only).
 rule LoginSourceSyncsQuotaGroups {
     when: authentication/ExternalGroupsAsserted(user, source, groups)
     let account = QuotaAccount{user: user}
@@ -629,8 +661,9 @@ surface OwnStorageOverview {
         account.usage.attachments_releases when config.enabled
         account.usage.artifacts when config.enabled
         account.usage.packages when config.enabled
+        account.usage.wiki when config.enabled
         account.usage.all when config.enabled
-        quota_allows(account, subject) when config.enabled
+        quota_allows(account, subject, null) when config.enabled
         for m in account.memberships:
             for l in m.group.rule_links:
                 l.rule.limit when config.enabled
@@ -665,8 +698,9 @@ surface OrganizationStorageOverview {
         account.usage.attachments_releases when config.enabled
         account.usage.artifacts when config.enabled
         account.usage.packages when config.enabled
+        account.usage.wiki when config.enabled
         account.usage.all when config.enabled
-        quota_allows(account, subject) when config.enabled
+        quota_allows(account, subject, null) when config.enabled
 
     @guidance
         -- Web: /org/{org}/settings/storage_overview.
@@ -676,7 +710,8 @@ surface OrganizationStorageOverview {
 }
 
 -- The integration boundary every storage-growing operation crosses: the
--- contract each gated operation honours (as quota_allows in its own requires),
+-- contract each gated operation honours (as quota_allows in its own requires;
+-- `incoming` is the operation's size in bytes when known up front, else null),
 -- stated here as one stimulus so the gate itself can be exercised. Named apart
 -- from the QuotaGate value (one row of the enforcement table).
 surface QuotaGateReference {
@@ -684,7 +719,7 @@ surface QuotaGateReference {
     context account: QuotaAccount
 
     provides:
-        StorageConsumptionRequested(consumer, account, subject, operation)
+        StorageConsumptionRequested(consumer, account, subject, operation, incoming)
 
     @guarantee OverQuotaIsRefusedBeforeWork
         -- When the gate refuses, the operation has no effect at all and the
@@ -698,25 +733,11 @@ surface QuotaGateReference {
 -- Deferred Specifications
 ------------------------------------------------------------
 
-deferred quota_allows             -- see: models/quota/quota.go:20 (prose on StorageConsumptionGated)
+deferred quota_allows             -- see: models/quota/quota.go:20 (prose on StorageConsumptionGated; incoming null = size not known up front)
 deferred subject_lineage          -- see: models/quota/rule.go:19 (the subject plus its ancestors in the QuotaSubject tree)
 deferred quota_groups_mapped_from          -- see: services/auth/source/source_quota_group_sync.go:26 (quota groups mapped from source groups the user is in; unknown group names dropped)
 deferred quota_groups_mapped_from_unclaimed -- see: services/auth/source/source_quota_group_sync.go:36 (quota groups mapped from source groups the user is NOT in)
-deferred usage_sum                -- see: models/quota/rule.go:46 (sum over subjects of the QuotaUsage figure each names)
-
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Deny when uncovered: a holder whose (explicit or default) groups contain no rule covering the checked subject is denied, while a holder with no groups at all falls back to an unlimited size:all rule. Intentional deny-by-default, or should an uncovered subject be allowed?"
-open question "Forgejo exempts pushes to PROTECTED branches from the quota check (only unprotected branches, tags and other refs are gated). This looks accidental; the spec gates every non-deleting push. Confirm."
-open question "The check uses current usage only (strictly below the limit), so a single upload can overshoot a limit arbitrarily. Should the incoming size be counted (usage + size <= limit)?"
-open question "Wiki storage is never measured (always 0); size:wiki rules can never deny by themselves. Should wiki git size be measured, and should it then also count under size:git:all rather than size:assets:all?"
-open question "Overlapping subjects in one rule (e.g. size:all and size:git:all) are summed twice. Should a rule's usage be the union instead?"
-open question "Web 'accept transfer' charges the accepting user (doer) while the API charges the recipient (which may be an organization). The spec charges the recipient."
-open question "Manual mirror sync is gated on size:repos:all in the web UI but on size:git:all in the API. The spec uses size:repos:all for both."
-open question "Several gated API file operations include DELETE of a file, which can only shrink a repository. Should deletions be exempt as they are for git push?"
-open question "Quota group sync from login sources exists only for OAuth2 sources; should LDAP group membership also map to quota groups?"
+deferred usage_union              -- see: models/quota/rule.go:46 (usage of the union of the subjects: each byte once, so a subject already covered by another listed ancestor adds nothing; decided quota 4)
 
 -- Requests to other modules
 -- REQUEST accounts/User: a QuotaAccount must exist for every user (or accounts exposes user.quota_account).
@@ -727,3 +748,9 @@ open question "Quota group sync from login sources exists only for OAuth2 source
 -- REQUEST repositories, code, releases, issues, wiki, pulls, packages, actions: guard each operation listed in the QuotaGate defaults with `requires: quota/quota_allows(<charged account>, <subject>)` (the contract stated by surface QuotaGateReference).
 -- REQUEST repositories/Repository.git_size, lfs_size; issues/Attachment.size (+ whether it belongs to a release); actions/Artifact.compressed_size and status; packages/PackageBlob.size: the figures QuotaUsage is computed from.
 -- REQUEST repositories (mirror scheduler): skip a scheduled pull-mirror sync, without error, while the owner's quota does not allow size_repos_all.
+-- REQUEST wiki: measure each wiki's git size (bytes of the wiki repository) and hand it to quota as QuotaUsage.wiki for the repository owner (decided quota 3).
+-- REQUEST repositories: WriterRequestsMirrorSync (manual sync, web and API) should check the owner's size:git:all quota rather than the repository-size subject (decided quota 6; gate_mirror_manual).
+-- REQUEST issues, releases, packages, actions: pass the incoming size to the quota gate where it is known up front (attachment, release asset, package file, artifact size), so the check is usage + size <= limit (decided quota 2).
+-- REQUEST releases, issues, packages: deleting an attachment, release asset or package version must not consult the quota gate (decided quota 7: what can only shrink storage is never refused by quota).
+-- REQUEST authentication: emit ExternalGroupsAsserted(user, source, entry.groups) on EVERY LDAP sign-in of an existing account (and on LDAP synchronisation), not only when the account is provisioned, so LDAP quota-group sync works like OAuth2's (decided quota 8). AuthSource.quota_group_map / quota_group_map_removal apply to LDAP sources too.
+-- REQUEST accounts/authentication: a user provisioned by an external source needs its QuotaAccount at once, so LoginSourceSyncsQuotaGroups can run on first sign-in.

@@ -434,7 +434,7 @@ journey LfsIsOffUntilTheInstanceEnablesIt {
         alice cannot do UserLocksLfsPath(alice, repo, "assets/logo.psd") on LfsApi
 
     2. nor upload an object
-        stipulate exceeds_lfs_quota(repo) = false
+        stipulate exceeds_lfs_quota_with(repo, {}) = false
         alice cannot do LfsClientRequestsUpload(alice, repo, {}) on LfsApi
 
     ends: With LFS disabled, pointer files are just small text files in git.
@@ -497,6 +497,7 @@ journey AnEditGoesToANewBranchWhenMainIsProtected {
         stipulate upload_count({"README.md"}) = 0
         stipulate largest_upload_mb({"README.md"}) = 0
         stipulate uploads_have_allowed_types({"README.md"}, "") = true
+        stipulate exceeds_git_quota_with(repo, {"README.md"}) = false
         alice cannot do UserCommitsFileChanges(alice, main, direct, null, {"README.md"}, "Fix README", null, false) on BranchView
 
     2. committing to a new branch works
@@ -693,6 +694,7 @@ journey UploadLimitsHoldWhateverTheClient {
         stipulate upload_count({"1", "2", "3", "4", "5", "6"}) = 6
         stipulate largest_upload_mb({"1", "2", "3", "4", "5", "6"}) = 1
         stipulate uploads_have_allowed_types({"1", "2", "3", "4", "5", "6"}, "") = true
+        stipulate exceeds_git_quota_with(repo, {"1", "2", "3", "4", "5", "6"}) = false
         alice cannot do UserCommitsFileChanges(alice, main, new_branch, "uploads", {"1", "2", "3", "4", "5", "6"}, "Upload files", null, false) on BranchView
 
     2. a 60 MB file is too large
@@ -701,6 +703,7 @@ journey UploadLimitsHoldWhateverTheClient {
         stipulate upload_count({"big.bin"}) = 1
         stipulate largest_upload_mb({"big.bin"}) = 60
         stipulate uploads_have_allowed_types({"big.bin"}, "") = true
+        stipulate exceeds_git_quota_with(repo, {"big.bin"}) = false
         alice cannot do UserCommitsFileChanges(alice, main, new_branch, "uploads", {"big.bin"}, "Upload big.bin", null, false) on BranchView
 
     3. two small files are accepted
@@ -709,6 +712,7 @@ journey UploadLimitsHoldWhateverTheClient {
         stipulate upload_count({"a.png", "b.png"}) = 2
         stipulate largest_upload_mb({"a.png", "b.png"}) = 1
         stipulate uploads_have_allowed_types({"a.png", "b.png"}, "") = true
+        stipulate exceeds_git_quota_with(repo, {"a.png", "b.png"}) = false
         stipulate commit_for_changes(main, {"a.png", "b.png"}, "Upload files", alice) = "a2b2c2"
         alice does UserCommitsFileChanges(alice, main, new_branch, "uploads", {"a.png", "b.png"}, "Upload files", null, false) on BranchView
             creating uploads: Branch
@@ -816,4 +820,50 @@ journey APublishedReleaseKeepsItsTag {
         then rc does not exist
 
     ends: v1.0 stays until its release is deleted; the draft's tag is gone.
+}
+
+-- Quota counts what a change adds and never stands in the way of a deletion
+-- (decisions quota 2 and 7).
+journey OverQuotaAWriterCanStillDeleteFiles {
+    goal: Alice's repository is at its size limit. Adding a large file would take it
+          over, so that commit is refused; deleting an old file only frees space, so
+          it goes through even though the owner is over quota.
+
+    -- `{"new.bin"}` stands for one FileChange (create new.bin, 50 MB); `{"old.bin"}`
+    -- for one FileChange (delete old.bin).
+    cast:
+        main: Branch
+
+    given:
+        main.repository = repo
+        main.name = "main"
+        main.head_commit_sha = "aaa111"
+        main.status = live
+        exceeds_git_quota(repo) = true
+
+    1. adding a file that would overshoot the limit is refused
+        stipulate may_write_branch_as_user(alice, repo, "main") = true
+        stipulate all_paths_valid({"new.bin"}) = true
+        stipulate none_locked_by_other(repo, {"new.bin"}, alice) = true
+        stipulate protection_allows_files(main, alice, {"new.bin"}) = true
+        stipulate upload_count({"new.bin"}) = 0
+        stipulate largest_upload_mb({"new.bin"}) = 0
+        stipulate uploads_have_allowed_types({"new.bin"}, "") = true
+        stipulate exceeds_git_quota_with(repo, {"new.bin"}) = true
+        alice cannot do UserCommitsFileChanges(alice, main, direct, null, {"new.bin"}, "Add new.bin", null, false) on BranchView
+
+    2. deleting a file is never refused by quota
+        stipulate all_paths_valid({"old.bin"}) = true
+        stipulate none_locked_by_other(repo, {"old.bin"}, alice) = true
+        stipulate protection_allows_files(main, alice, {"old.bin"}) = true
+        stipulate upload_count({"old.bin"}) = 0
+        stipulate largest_upload_mb({"old.bin"}) = 0
+        stipulate uploads_have_allowed_types({"old.bin"}, "") = true
+        -- a change set that only deletes never exceeds the quota
+        stipulate exceeds_git_quota_with(repo, {"old.bin"}) = false
+        stipulate commit_for_changes(main, {"old.bin"}, "Remove old.bin", alice) = "d3d3d3"
+        alice does UserCommitsFileChanges(alice, main, direct, null, {"old.bin"}, "Remove old.bin", null, false) on BranchView
+        then UserCommitsFileChanges fires
+
+    ends: The repository shrank; nothing grew past the limit.
 }

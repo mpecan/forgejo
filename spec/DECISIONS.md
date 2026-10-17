@@ -286,3 +286,12 @@ invariants or config. Numbers refer to the question's position in its module in
 | 8 | Outbound retries | **One retrying queue with exponential backoff** for every activity, Likes included. |
 | 9 | Replay protection | **Per remote actor.** |
 | 10 | Remote people in counts | **Excluded** from NodeInfo totals and the user explore page; they appear only where they act. |
+
+## discovery
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | go-get on unreadable repositories | **Instance default branch,** so nothing about the real repository leaks. |
+| 2 | Private accounts in user search | **Unified with profile visibility:** search shows exactly the accounts whose profile the searcher may view. |
+| 3 | API user search when the explore users page is off | **Kept for signed-in users;** only the public directory is hidden. |
+| 4 | Indexer not ready at startup | **Degrade:** search reports unavailable until the indexer is ready, and admins get a system notice. |

@@ -21,6 +21,18 @@ world {
         wiki_unit_enabled(repo) = true
         can_write_wiki(ada, repo) = true
         wiki_quota_allows(repo) = true
+        -- (page edits count the page's size: every page written here fits)
+        wiki_quota_allows_content(repo, "Welcome") = true
+        wiki_quota_allows_content(repo, "Welcome to the project") = true
+        wiki_quota_allows_content(repo, "Run make install") = true
+        wiki_quota_allows_content(repo, "x") = true
+        wiki_quota_allows_content(repo, "dup") = true
+        wiki_quota_allows_content(repo, "vandalised") = true
+        wiki_quota_allows_content(repo, "Welcome!") = true
+        wiki_quota_allows_content(repo, "Welcome all") = true
+        wiki_quota_allows_content(repo, "Welcome everyone") = true
+        wiki_quota_allows_content(repo, "") = true
+        wiki_quota_allows_content(repo, "Run make") = true
 }
 
 -- The happy path: first page, then an edit, then history.

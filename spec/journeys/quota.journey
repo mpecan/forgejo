@@ -79,8 +79,8 @@ journey APushOverQuotaIsRefused {
           push is refused before anything is written.
 
     1. the push asks the gate
-        stipulate quota_allows(acct, size_repos_all) = false
-        ada cannot do StorageConsumptionRequested(ada, acct, size_repos_all, git_push) on QuotaGateReference
+        stipulate quota_allows(acct, size_repos_all, null) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, size_repos_all, git_push, null) on QuotaGateReference
 
     ends: Nothing was stored; she is told her quota is exceeded.
 }
@@ -89,8 +89,8 @@ journey AnUploadUnderQuotaGoesThrough {
     goal: Under her limit, an attachment upload in her repository is admitted.
 
     1. the upload asks the gate
-        stipulate quota_allows(acct, size_assets_attachments_issues) = true
-        ada does StorageConsumptionRequested(ada, acct, size_assets_attachments_issues, upload_issue_attachment) on QuotaGateReference
+        stipulate quota_allows(acct, size_assets_attachments_issues, 2_000_000) = true
+        ada does StorageConsumptionRequested(ada, acct, size_assets_attachments_issues, upload_issue_attachment, 2_000_000) on QuotaGateReference
         then StorageConsumptionGated fires
 
     ends: The attachment is stored and charged to the repository owner.
@@ -111,12 +111,12 @@ journey PackageStorageIsLimitedByAQuotaRule {
         then rule.limit = 524_288_000
 
     2. Ada's package upload over the limit is refused by the gate
-        stipulate quota_allows(acct, size_assets_packages_all) = false
-        ada cannot do StorageConsumptionRequested(ada, acct, size_assets_packages_all, upload_package) on QuotaGateReference
+        stipulate quota_allows(acct, size_assets_packages_all, 10_000_000) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, size_assets_packages_all, upload_package, 10_000_000) on QuotaGateReference
 
-    3. under it, the upload is admitted
-        stipulate quota_allows(acct, size_assets_packages_all) = true
-        ada does StorageConsumptionRequested(ada, acct, size_assets_packages_all, upload_package) on QuotaGateReference
+    3. a smaller one that fits under it is admitted
+        stipulate quota_allows(acct, size_assets_packages_all, 1_000_000) = true
+        ada does StorageConsumptionRequested(ada, acct, size_assets_packages_all, upload_package, 1_000_000) on QuotaGateReference
         then StorageConsumptionGated fires
 
     ends: Package storage is limited by quota alone; packages has no limits of
@@ -148,7 +148,14 @@ journey DeletingARuleDetachesIt {
         then rule does not exist
         then group exists
 
-    ends: Ada's group no longer limits anything (and so denies uncovered subjects).
+    2. a subject no rule covers is allowed, so her push goes through
+        stipulate quota_allows(acct, size_repos_all, null) = true
+        ada does StorageConsumptionRequested(ada, acct, size_repos_all, git_push, null) on QuotaGateReference
+        then StorageConsumptionGated fires
+
+    ends: Ada's group no longer limits anything: only a rule that covers a subject
+          can deny it (decision quota 1; the journey used to say uncovered subjects
+          were denied).
 }
 
 journey AnAdminReplacesAdasGroups {
@@ -208,6 +215,36 @@ journey SignInGrantsAQuotaGroup {
     ends: Ada is in the supporter group because her identity provider says so.
 }
 
+journey AnUploadThatWouldOvershootIsRefused {
+    goal: Ada is 1 MB under her attachment limit. A 5 MB attachment would take her
+          past it, so it is refused before anything is stored; a 500 KB one fits
+          and goes through. The incoming size counts, not just what she uses now.
+
+    1. the 5 MB upload asks the gate with its size
+        stipulate quota_allows(acct, size_assets_attachments_issues, 5_000_000) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, size_assets_attachments_issues, upload_issue_attachment, 5_000_000) on QuotaGateReference
+        then StorageConsumptionGated does not fire
+
+    2. the 500 KB upload fits
+        stipulate quota_allows(acct, size_assets_attachments_issues, 500_000) = true
+        ada does StorageConsumptionRequested(ada, acct, size_assets_attachments_issues, upload_issue_attachment, 500_000) on QuotaGateReference
+        then StorageConsumptionGated fires
+
+    ends: No single upload takes Ada over her limit (decision quota 2).
+}
+
+journey AManualMirrorSyncIsGatedLikeAPush {
+    goal: Ada's pull mirror is over the git quota (repositories plus LFS plus
+          wikis). Her manual sync asks the gate on size:git:all, as a push does,
+          and is refused.
+
+    1. the sync asks the gate
+        stipulate quota_allows(acct, size_git_all, null) = false
+        ada cannot do StorageConsumptionRequested(ada, acct, size_git_all, sync_mirror_manually, null) on QuotaGateReference
+
+    ends: A mirror cannot grow past the limit a push respects (decision quota 6).
+}
+
 journey WithQuotaOffThereIsNothingToManage {
     goal: On an instance that never turned quota on, the site admin finds no
           quota administration: creating a rule is refused.
@@ -230,8 +267,8 @@ journey WithQuotaOffNothingIsGated {
         quota/config.enabled = false
 
     1. the push asks the gate and goes through
-        stipulate quota_allows(acct, size_repos_all) = false
-        ada does StorageConsumptionRequested(ada, acct, size_repos_all, git_push) on QuotaGateReference
+        stipulate quota_allows(acct, size_repos_all, null) = false
+        ada does StorageConsumptionRequested(ada, acct, size_repos_all, git_push, null) on QuotaGateReference
         then StorageConsumptionGated fires
 
     2. there is no storage overview

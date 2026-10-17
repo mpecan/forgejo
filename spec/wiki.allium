@@ -307,7 +307,7 @@ rule UserCreatesWikiPage {
     requires: content != ""              -- decided: empty page content is refused on every path
     requires: name not in {"_pages", "_new", "_edit", "raw"}
     requires: not exists WikiPage{wiki: wiki, name: name}
-    requires: wiki_quota_allows(wiki.repository)
+    requires: wiki_quota_allows_content(wiki.repository, content)   -- decided (quota 2): page size counted
     let commit_message = if message = "": "Add " + title else: message
     ensures: wiki.status = initialised
     ensures:
@@ -359,7 +359,7 @@ rule UserEditsWikiPage {
     requires: not wiki.repository.is_archived
     requires: new_name not in {"_pages", "_new", "_edit", "raw"}
     requires: new_name = page.name or not exists WikiPage{wiki: wiki, name: new_name}
-    requires: wiki_quota_allows(wiki.repository)
+    requires: wiki_quota_allows_content(wiki.repository, content)   -- decided (quota 2): page size counted
     let commit_message = if message = "": "Update " + page.title else: message
     ensures: page.name = new_name
     ensures:
@@ -592,7 +592,11 @@ deferred page_name_for    -- see: services/wiki/wiki_path.go (title -> page name
 -- external_wiki_url(repository)          = repositories/RepoUnit{kind: external_wiki}.external_wiki_url, or null
 --   (the "anyone may edit" option is repositories/RepoUnit.everyone_can_write; access applies it)
 -- repository_full_name(repository)       = "<owner>/<name>"
--- wiki_quota_allows(repository)          = quota subject size:wiki
+-- wiki_quota_allows(repository)          = quota subject size:wiki (current usage; a push is checked on receipt)
+-- wiki_quota_allows_content(repository, content) = quota subject size:wiki counting the page content's
+--                                          size (usage + size <= limit; decided quota 2). The wiki's git
+--                                          size is measured and counts as size:wiki, under size:git:all
+--                                          (decided quota 3).
 -- search_wiki(wiki, query)               = up to search_max_files pages whose content contains query literally
 -- kind_of_page(name)                     = sidebar for "_Sidebar", footer for "_Footer", else regular
 -- page_title_for(name)                   = the displayed title for a page path (reverse of page_name_for)
