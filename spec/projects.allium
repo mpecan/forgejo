@@ -14,8 +14,10 @@
 --   - The projects repository unit itself (enable/disable, global disable list):
 --     owned by repositories (RepoUnit, DISABLED_REPO_UNITS); referenced only.
 --   - The issue timeline Comment of kind `project`: owned by issues; this module
---     emits IssueProjectChanged and issues records the comment (including the
---     "deleted project" placeholder when the referenced board no longer exists).
+--     emits IssueProjectChanged and issues records the comment
+--     (issues/RecordProjectChange; a board deleted since is shown as a "deleted
+--     project" placeholder). Moving a card between columns of one board leaves
+--     no timeline entry (Forgejo never records `project_column`).
 --   - Issue list filtering by project ("in project X" / "in no project"):
 --     owned by issues/discovery; they read ProjectCard.
 --   - REST API routing details: Forgejo has no project endpoints in routers/api/v1
@@ -51,7 +53,7 @@
 --   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
 --       -- delete the user's own boards
 --   organizations/OrganizationDeleted(organization)  -- delete the organization's boards
---   issues/IssueDeleted(issue)                  -- remove the issue's card
+--   issues/IssueDeleted(issue, doer)            -- remove the issue's card
 --   issues/IssueCreatedWithProject(issue, poster, project)
 --       -- the new-issue / new-pull-request form may pick a board; issues emits
 --       -- this after creating the issue and this module places the card.
@@ -204,6 +206,7 @@ config {
 -- from: routers/web/repo/projects.go:164
 rule UserCreatesRepositoryProject {
     when: UserCreatesRepositoryProject(user, repo, title, description, template, card_type)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not config.projects_globally_disabled
     requires: can_write_projects(user, repo)
     requires: not repo.is_archived
@@ -231,6 +234,7 @@ rule UserCreatesRepositoryProject {
 -- from: routers/web/web.go:1268
 rule UserCreatesUserProject {
     when: UserCreatesUserProject(user, title, description, template, card_type)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     -- decided: the global switch disables user boards too
     requires: not config.projects_globally_disabled
     requires: user.kind = individual
@@ -258,6 +262,7 @@ rule UserCreatesUserProject {
 -- from: routers/web/org/projects.go:177
 rule UserCreatesOrgProject {
     when: UserCreatesOrgProject(user, org, title, description, template, card_type)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     -- decided: the global switch disables organization boards too
     requires: not config.projects_globally_disabled
     requires: can_write_org_projects(user, org)
@@ -324,6 +329,7 @@ rule SeedColumnsFromTemplate {
 -- from: services/project/project.go:192
 rule UserEditsProject {
     when: UserEditsProject(user, project, title, description, card_type)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage(user, project)
     requires: length(title) >= 1 and length(title) <= config.max_project_title_length
     ensures: project.title = title
@@ -338,6 +344,7 @@ rule UserEditsProject {
 -- from: models/project/project.go:260
 rule UserClosesProject {
     when: UserClosesProject(user, project)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage(user, project)
     requires: project.status = open
     ensures: project.status = closed
@@ -348,6 +355,7 @@ rule UserClosesProject {
 -- from: models/project/project.go:260
 rule UserReopensProject {
     when: UserReopensProject(user, project)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage(user, project)
     requires: project.status = closed
     ensures: project.status = open
@@ -362,6 +370,7 @@ rule UserReopensProject {
 -- from: models/project/project.go:284
 rule UserDeletesProject {
     when: UserDeletesProject(user, project)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage(user, project)
     ensures:
         for card in project.cards:
@@ -450,6 +459,7 @@ rule IssueDeletionRemovesCard {
 -- from: models/project/column.go:142
 rule UserCreatesColumn {
     when: UserCreatesColumn(user, project, title, color)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage(user, project)
     requires: project.has_room_for_column
     requires: length(title) >= 1 and length(title) <= config.max_column_title_length
@@ -472,6 +482,7 @@ rule UserCreatesColumn {
 -- from: models/project/column.go:226
 rule UserEditsColumn {
     when: UserEditsColumn(user, column, title, color)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage(user, column.project)
     requires: length(title) >= 1 and length(title) <= config.max_column_title_length
     requires: color = null or is_hex_colour(color)
@@ -484,6 +495,7 @@ rule UserEditsColumn {
 -- from: models/project/column.go:283
 rule UserSetsDefaultColumn {
     when: UserSetsDefaultColumn(user, column)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage(user, column.project)
     ensures:
         for other in column.project.columns where is_default = true:
@@ -496,6 +508,7 @@ rule UserSetsDefaultColumn {
 -- from: models/project/column.go:173
 rule UserDeletesColumn {
     when: UserDeletesColumn(user, column)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage(user, column.project)
     requires: not column.is_default
     let project = column.project
@@ -513,6 +526,7 @@ rule UserDeletesColumn {
 -- from: models/project/column.go:320
 rule UserReordersColumns {
     when: UserReordersColumns(user, project, ordering)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_manage(user, project)
     requires: ordering.count = project.columns.count
     requires: distinct(ordering)
@@ -538,6 +552,7 @@ rule UserReordersColumns {
 -- from: models/project/issue.go:94
 rule UserMovesCards {
     when: UserMovesCards(user, column, ordering)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let board = column.project
     requires: may_manage(user, board)
     requires: distinct(ordering)
@@ -570,6 +585,7 @@ rule UserMovesCards {
 -- from: models/issues/issue_project.go:103
 rule UserAssignsIssueToProject {
     when: UserAssignsIssueToProject(user, issue, project)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not config.projects_globally_disabled
     requires: not issue.repository.is_archived
     requires: may_write_issue(user, issue)
@@ -608,6 +624,7 @@ rule UserAssignsIssueToProject {
 -- from: models/issues/issue_project.go:134
 rule UserRemovesIssueFromProject {
     when: UserRemovesIssueFromProject(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not issue.repository.is_archived
     requires: may_write_issue(user, issue)
     let existing = ProjectCard{issue: issue}
@@ -628,6 +645,9 @@ rule IssueCreatedOnProject {
     requires: not config.projects_globally_disabled
     requires: project.status = open
     requires: project.accepts_issue(issue)
+    -- decided (projects 4): an organization board needs board write (issues
+    -- checks it before emitting; checked again here, a rule never trusts its caller)
+    requires: project.owner_kind != organization or can_write_org_projects(poster, project.owner_org)
     let target = ProjectColumn{project: project, is_default: true}
     let has_default = exists target
     let column_count = project.columns.count
@@ -658,6 +678,11 @@ rule IssueCreatedOnProject {
 -- (local names because qualified calls cannot be evaluated by the journey walker)
 --
 
+-- read-only gate: `requires: not (exists access/InstanceWriteGate{read_only: true})`
+--   decided (administration 3): every user-initiated write here is refused while
+--   the instance is read-only; reactions to other modules' events are not gated
+--   (the write that set them off was).
+--
 -- may_manage(user, project): never when config.projects_globally_disabled
 -- (decided: one switch disables all boards), and otherwise
 --   repository board:   access/can_write(user, project.owner_repository, projects)
@@ -964,11 +989,6 @@ surface IssueProjectPicker {
 
 -- REQUEST repositories/RepositoryDeleted(repository, doer): trigger emitted when a repository is deleted, so boards can be removed.
 -- REQUEST repositories/config.disabled_repo_units: the instance-wide disabled units list; this module mirrors "repo.projects" as config.projects_globally_disabled.
--- REQUEST issues/IssueDeleted(issue, doer): trigger emitted when an issue/PR is deleted, so its card is removed.
--- REQUEST issues/IssueCreatedWithProject(issue, poster, project): emitted by issue/PR creation when the form named a board (after the permission checks in may_assign_to pass).
--- REQUEST issues/Comment kind `project` with old_project/new_project: recorded in reaction to IssueProjectChanged; a deleted board renders as a placeholder title.
--- REQUEST issues filter "project = X / no project" reading ProjectCard: owned by issues/discovery.
 -- REQUEST organizations/can_read_unit(user, org, unit) and organizations/can_write_unit(user, org, unit): org-level unit access (max over the user's teams; read for non-members of public, or limited-and-signed-in, orgs).
 -- REQUEST can_write_projects(user, repository) must be false for archived repositories or callers must check is_archived (this spec checks it explicitly).
 -- REQUEST repositories: [repository] DISABLED_REPO_UNITS "repo.projects" now disables user and organization boards too (decision 3); the projects tab/unit and owner-profile project pages follow config.projects_globally_disabled.
--- REQUEST issues: emit IssueCreatedWithProject only for an open board, and for an organization board only when the poster can write the org projects unit and triage the issue (decisions 4, 7); the project sidebar/bulk action must not offer closed boards for new cards.

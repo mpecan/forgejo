@@ -60,10 +60,11 @@
 --     `/issues/{index}/comments/{id}` API paths — Gitea API compatibility.
 --
 -- Emits:
---   IssueOpened(issue, mentions)                       -- issue or PR conversation created (PR variant is emitted by pulls)
---   IssueClosed(issue, doer, comment)
---   IssueReopened(issue, doer, comment)
---   IssueDeleted(issue, doer)
+--   IssueOpened(issue, mentions)                       -- issues only: a PR conversation is announced by
+--                                                      -- pulls/PullRequestOpened, never by IssueOpened
+--   IssueClosed(issue, doer, comment)                  -- issues only: PRs close / reopen / merge through
+--   IssueReopened(issue, doer, comment)                -- pulls (PullRequestClosed / PullRequestReopened / PullRequestMerged)
+--   IssueDeleted(issue, doer)                          -- doer is null when an account purge removed it
 --   IssueTitleChanged(issue, doer, old_title)
 --   IssueContentChanged(issue, doer, old_content)
 --   IssueRefChanged(issue, doer, old_ref)
@@ -86,6 +87,17 @@
 --   pulls/IssueReopenedByPullRequest(issue, pull_request, doer)  -- apply reopening references
 --   repositories/RepositoryDeleted(repository, doer)   -- the tracker goes with the repository
 --   access/UserLostRepositoryAccess(user, repository)  -- issue subscriptions and assignments there are dropped
+--   repositories/CollaboratorRemoved(repository, user, doer)    -- unassign where the user may no longer be assigned
+--   repositories/LabelTemplateApplied(repository, template_name) -- create the template's labels
+--   repositories/RepositoryGeneratedFromTemplate(template, repository, doer, git_content, topics,
+--       git_hooks, webhooks, avatar, labels, protected_branches) -- copy the template's labels
+--   accounts/UserAccountDeleted(user, kind, purge, delete_contributions)  -- drop or remove the user's traces
+--   projects/IssueProjectChanged(issue, actor, old_project, new_project)  -- timeline `project` entry
+--   notifications/MailReplyReceived(author, issue, replied_to, replied_to_code, body, attachment_count)
+--                                                      -- a reply by mail becomes a comment
+--   notifications/MailUnsubscribeReceived(user, issue) -- an explicit unsubscribe
+--   moderation/ModeratorDeletesIssue(admin, issue)     -- delete an issue acting on an abuse report
+--   moderation/ModeratorDeletesComment(admin, comment) -- delete a comment acting on an abuse report
 
 use "./accounts.allium" as accounts
 use "./organizations.allium" as organizations
@@ -95,6 +107,8 @@ use "./code.allium" as code
 use "./pulls.allium" as pulls
 use "./projects.allium" as projects
 use "./releases.allium" as releases
+use "./notifications.allium" as notifications
+use "./moderation.allium" as moderation
 
 ------------------------------------------------------------
 -- Black-box predicates and functions used below
@@ -114,6 +128,26 @@ use "./releases.allium" as releases
 --                                        on any unit, or read on pull_requests
 --   is_blocked(blocker, user)          = an accounts/UserBlock from blocker to user exists
 --   is_blocked_by_owner(repository, user) = the repository's owner (user or org) blocks user
+--   read-only gate: `requires: not (exists access/InstanceWriteGate{read_only: true})`
+--       decided (administration 3): every user-initiated write below is refused
+--       while the instance is read-only; reads (and UserViewsIssue's read marker,
+--       part of reading) keep working. Reactions to other modules' events are not
+--       gated here: the write that set them off was.
+--   can_write_org_projects(user, organization) = organizations/can_write_unit(user, organization, projects)
+--       (the board-write check projects applies to organization boards)
+--   attachment_quota_allows(repository, size) = quota/quota_allows(<repository owner>,
+--       size_assets_attachments_issues, size) (QuotaGate gate_issue_attachment; decided
+--       quota 2: usage + size <= limit). Deleting or renaming an attachment never asks
+--       the gate (decided quota 7).
+--
+--   kind_watchers(repository, is_pull) = users whose repositories/Watch on the
+--       repository covers pull requests (is_pull) or issues (otherwise)
+--
+-- Exported for the migrations addon (decided: migrations 11):
+--   assignable_named(repository, names) -> Set<accounts/User>
+--       the local accounts with those names that satisfy can_be_assigned(_, repository)
+--   resolves_to_assignee(repository, name) = some local account of that name
+--       satisfies can_be_assigned(_, repository)
 --
 -- Repository issue-unit settings (REQUEST below):
 --   timetracker_enabled(repository), only_contributors_track_time(repository),
@@ -227,7 +261,8 @@ enum CommentKind {
     | review_request_removed      -- (pulls) review request withdrawn
     | merge_pull                  -- (pulls) conversation closed by merge
     | pull_push                   -- (pulls) commits pushed to head
-    | project | project_column    -- (projects)
+    | project                     -- issue put on, moved to another, or taken off a board
+    | project_column              -- reserved: Forgejo defines it but never records it
     | dismiss_review              -- (pulls)
     | change_issue_ref            -- issue branch/tag reference changed
     | pr_scheduled_to_auto_merge | pr_unscheduled_to_auto_merge   -- (pulls) auto-merge
@@ -286,6 +321,8 @@ entity Issue {
     watches: IssueWatch with issue = this
     pin: IssuePin with issue = this
     history: ContentHistory with issue = this
+    pull_request: pulls/PullRequest with issue = this     -- the PR whose conversation this is (is_pull only)
+    project_card: projects/ProjectCard with issue = this  -- the board card, at most one (projects/OneBoardPerIssue)
 
     -- Projections
     conversation: comments where kind = comment or kind = review
@@ -301,6 +338,11 @@ entity Issue {
     has_open_blockers: open_blockers.count > 0
     is_overdue: deadline != null and status = open and deadline <= now
     participants: comments.poster + { poster }
+    -- Who follows the thread: an explicit watch, a watch on the repository's
+    -- issues (or pull requests, for a PR), or having taken part; minus anyone
+    -- who explicitly unsubscribed. Read by notifications and discovery.
+    explicitly_unsubscribed: explicit_unwatchers.user
+    subscribers: explicit_watchers.user + participants + kind_watchers(repository, is_pull) - explicitly_unsubscribed
     num_tasks: task_count(content)
     num_tasks_done: tasks_done(content)
 
@@ -320,7 +362,10 @@ entity Comment {
     kind: CommentKind
     content: String                      -- Markdown for comment/code/review/dismiss_review;
                                          -- the lock reason for lock; the duration for time kinds;
-                                         -- the date(s) for deadline kinds
+                                         -- the date(s) for deadline kinds; the reviewer's or
+                                         -- team's name for review_request (removals too);
+                                         -- for pr_unscheduled_to_auto_merge, the failure reason
+                                         -- when pulls removed a failing auto-merge (pulls decision 3)
     content_version: Integer
     created_at: Timestamp
     updated_at: Timestamp
@@ -354,7 +399,9 @@ entity Comment {
     ref_issue: Issue?
     ref_comment: Comment?
     ref_action: XRefAction?
-    -- kind = project / project_column
+    -- kind = project: the board after and before (either may be null: added,
+    -- moved, removed); a board deleted since is shown as a "deleted project"
+    -- placeholder
     project: projects/Project?
     old_project: projects/Project?
     -- kind = code / review / dismiss_review
@@ -367,6 +414,8 @@ entity Comment {
 
     -- Derived
     has_content: kind = comment or kind = code or kind = review or kind = dismiss_review
+    -- the kinds that carry user text or attachments (reportable; moderation)
+    has_user_content: has_content
     accepts_attachments: kind = comment or kind = code or kind = review
     counts_as_conversation: kind = comment or kind = review
     is_edited: history.count > 1
@@ -625,6 +674,7 @@ default LabelTemplate advanced_labels = {
 -- from: routers/web/repo/issue.go:1033 (chooser redirect when blank issues are disabled)
 rule UserOpensIssue {
     when: UserOpensIssue(user, repository, title, content, labels, milestone, assignees, deadline, project, attachments, template)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_read_tracker(user, repository)
     requires: not repository.is_archived
     requires: not is_blocked_by_owner(repository, user)
@@ -661,7 +711,12 @@ rule UserOpensIssue {
         AttachmentsLinked(issue: issue, comment: null, doer: user, attachments: attachments)
         if is_manager:
             IssueMetadataInitialised(issue: issue, doer: user)
-        if is_manager and project != null:
+        -- decided (projects 4, 7): only an open board, and an organization board
+        -- only for a poster who can write the organization's projects unit (triage
+        -- on the issue is is_manager); otherwise the chosen board is dropped like
+        -- the rest of the metadata of someone who may not set it
+        if is_manager and project != null and project.status = open
+           and (project.owner_kind != organization or can_write_org_projects(user, project.owner_org)):
             IssueCreatedWithProject(issue: issue, poster: user, project: project)
 }
 
@@ -689,6 +744,7 @@ rule RecordInitialMetadata {
 -- from: services/issue/issue.go:64
 rule UserChangesIssueTitle {
     when: UserChangesIssueTitle(user, issue, title)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_read_issue(user, issue)
     requires: user = issue.poster or can_triage(user, issue)
     requires: not issue.repository.is_archived
@@ -713,6 +769,7 @@ rule UserChangesIssueTitle {
 -- from: models/issues/issue_update.go:257
 rule UserEditsIssueBody {
     when: UserEditsIssueBody(user, issue, content, seen_version)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_read_issue(user, issue)
     requires: user = issue.poster or can_triage(user, issue)
     requires: not issue.repository.is_archived
@@ -733,6 +790,7 @@ rule UserEditsIssueBody {
 -- from: routers/api/v1/permissions/req_edit_issue.go:42 (poster edits refused while locked)
 rule UserChangesIssueRef {
     when: UserChangesIssueRef(user, issue, ref)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not issue.is_pull
     requires: can_read_issue(user, issue)
     requires: user = issue.poster or can_triage(user, issue)
@@ -749,6 +807,7 @@ rule UserChangesIssueRef {
 -- from: models/issues/issue_update.go:459
 rule TriagerSetsDueDate {
     when: TriagerSetsDueDate(user, issue, deadline)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_triage(user, issue)
     requires: not issue.repository.is_archived
     requires: deadline != issue.deadline
@@ -765,6 +824,7 @@ rule TriagerSetsDueDate {
 -- from: models/issues/issue_update.go:459
 rule TriagerRemovesDueDate {
     when: TriagerRemovesDueDate(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_triage(user, issue)
     requires: not issue.repository.is_archived
     requires: issue.deadline != null
@@ -787,6 +847,7 @@ rule TriagerRemovesDueDate {
 -- from: routers/api/v1/permissions/req_edit_issue.go:42 (poster edits refused while locked)
 rule UserClosesIssue {
     when: UserClosesIssue(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not issue.is_pull                 -- PRs: pulls/UserClosesPullRequest
     requires: issue.status = open
     requires: can_read_issue(user, issue)
@@ -814,6 +875,7 @@ rule UserClosesIssue {
 -- from: models/issues/issue_update.go:46
 rule UserReopensIssue {
     when: UserReopensIssue(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not issue.is_pull                 -- PRs: pulls/UserReopensPullRequest
     requires: issue.status = closed
     requires: can_read_issue(user, issue)
@@ -837,8 +899,17 @@ rule UserReopensIssue {
 -- from: services/issue/issue.go:171
 rule RepoAdminDeletesIssue {
     when: RepoAdminDeletesIssue(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(user, issue.repository)
     requires: not issue.repository.is_archived
+    ensures: IssueRemoved(issue: issue, doer: user)
+}
+
+-- The removal itself, whoever asked for it (a repository admin, a site admin
+-- acting on an abuse report, an account purge). `doer` is null for a purge.
+-- from: services/issue/issue.go:171
+rule RemoveIssue {
+    when: IssueRemoved(issue, doer)
     ensures:
         for c in issue.comments:
             not exists c
@@ -865,7 +936,16 @@ rule RepoAdminDeletesIssue {
         for c in Comments where dependent_issue = issue:
             not exists c
         not exists issue
-        IssueDeleted(issue: issue, doer: user)
+        IssueDeleted(issue: issue, doer: doer)
+}
+
+-- A site admin deletes a reported issue or pull-request conversation from the
+-- moderation queue (moderation has already checked the admin and the report).
+-- from: routers/web/admin/reports.go:368
+rule ModeratorRemovesIssue {
+    when: moderation/ModeratorDeletesIssue(admin, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    ensures: IssueRemoved(issue: issue, doer: admin)
 }
 
 ------------------------------------------------------------
@@ -878,6 +958,7 @@ rule RepoAdminDeletesIssue {
 -- from: services/issue/comments.go:49
 rule UserComments {
     when: UserComments(user, issue, content, attachments)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_read_issue(user, issue)
     requires: not issue.repository.is_archived
     requires: not issue.is_locked or can_triage(user, issue) or user.is_admin
@@ -899,6 +980,7 @@ rule UserComments {
 -- from: services/issue/comments.go:78
 rule UserEditsComment {
     when: UserEditsComment(user, issue, comment, content, seen_version)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: comment.issue = issue
     requires: comment.has_content
     requires: can_read_issue(user, comment.issue)
@@ -918,11 +1000,21 @@ rule UserEditsComment {
 -- from: models/issues/comment.go:1394
 rule UserDeletesComment {
     when: UserDeletesComment(user, issue, comment)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: comment.issue = issue
     requires: comment.has_content
     requires: can_read_issue(user, comment.issue)
     requires: user = comment.poster or can_triage(user, comment.issue)
     requires: not comment.issue.repository.is_archived
+    ensures: CommentRemoved(comment: comment, doer: user)
+}
+
+-- The removal itself (by its poster or a triager, a site admin acting on an
+-- abuse report, or an account deletion that removes contributions; `doer` is
+-- null for the last).
+-- from: models/issues/comment.go:1394
+rule RemoveComment {
+    when: CommentRemoved(comment, doer)
     ensures:
         for r in comment.reactions:
             not exists r
@@ -931,7 +1023,48 @@ rule UserDeletesComment {
         for x in Comments where ref_comment = comment and ref_action != neutered:
             x.ref_action = neutered
         not exists comment
-        IssueCommentDeleted(comment: comment, doer: user)
+        IssueCommentDeleted(comment: comment, doer: doer)
+}
+
+-- A site admin deletes a reported comment from the moderation queue.
+-- from: routers/web/admin/reports.go:386
+rule ModeratorRemovesComment {
+    when: moderation/ModeratorDeletesComment(admin, comment)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    ensures: CommentRemoved(comment: comment, doer: admin)
+}
+
+-- A reply to a conversation mail becomes a plain comment by the token holder
+-- (notifications has checked the token, read access and the lock). A reply to
+-- a code comment (replied_to_code set) is pulls'. The mail's attachments
+-- (attachment_count of them) are stored as this comment's attachments when
+-- config.attachments_enabled and each is of an allowed type, like a web upload.
+-- from: services/mailer/incoming/incoming_handler.go:150
+rule CommentFromMailReply {
+    when: notifications/MailReplyReceived(author, issue, replied_to, replied_to_code, body, attachment_count)
+    requires: replied_to_code = null
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    -- the comment checks (archived repository, lock, blocks) are notifications'
+    -- can_comment_on_issue, checked before it raised the reply (AcceptReplyByMail)
+    let mentions = resolve_mentions(issue, author, body)
+    ensures:
+        let c = Comment.created(issue: issue, poster: author, kind: comment, content: body,
+                                content_version: 0, created_at: now, updated_at: now)
+        TextPosted(issue: issue, comment: c, doer: author, title: null, text: body)
+        IssueCommentCreated(issue: issue, comment: c, doer: author, mentions: mentions)
+    ensures: issue.updated_at = now
+}
+
+-- Mailing the unsubscribe address records an explicit unsubscribe.
+-- from: services/mailer/incoming/incoming_handler.go:178
+rule UnsubscribeByMail {
+    when: notifications/MailUnsubscribeReceived(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    ensures:
+        if exists IssueWatch{user: user, issue: issue}:
+            IssueWatch{user: user, issue: issue}.is_watching = false
+        else:
+            IssueWatch.created(user: user, issue: issue, is_watching: false, updated_at: now)
 }
 
 -- Content history: the first edit records the original text as the first
@@ -958,6 +1091,7 @@ rule RecordContentRevision {
 -- from: routers/web/repo/issue_content_history.go:95
 rule UserHidesContentRevision {
     when: UserHidesContentRevision(user, issue, revision)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: revision.issue = issue
     requires: can_read_issue(user, revision.issue)
     requires: not revision.issue.repository.is_archived
@@ -1076,10 +1210,12 @@ rule ApplyResolvedReference {
 -- (never a PR) when the pusher could close it manually and the commit is on
 -- the issue's ref branch, else on the default branch, unless the repository
 -- closes via commits in any branch. `Fixes #1 @1h30m` also logs the time.
+-- A deploy-key push (push.pusher null, decided code 4) references nothing:
+-- no reference is attributed to a user.
 -- from: services/issue/commit.go:106
 rule PushedCommitReferencesIssue {
     when: code/PushReceived(push)
-    for ref in commit_references(push) where can_read_issue(push.pusher, ref.target):
+    for ref in commit_references(push) where push.pusher != null and can_read_issue(push.pusher, ref.target):
         let target = ref.target
         let pusher = push.pusher
         ensures:
@@ -1109,6 +1245,7 @@ rule PushedCommitReferencesIssue {
 -- from: routers/web/repo/issue_lock.go:27 (reason validated against LOCK_REASONS)
 rule TriagerLocksIssue {
     when: TriagerLocksIssue(user, issue, reason)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_triage(user, issue)
     requires: not issue.repository.is_archived
     requires: not issue.is_locked
@@ -1121,6 +1258,7 @@ rule TriagerLocksIssue {
 -- from: models/issues/issue_lock.go:27
 rule TriagerUnlocksIssue {
     when: TriagerUnlocksIssue(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_triage(user, issue)
     requires: not issue.repository.is_archived
     requires: issue.is_locked
@@ -1133,6 +1271,7 @@ rule TriagerUnlocksIssue {
 -- from: models/issues/issue.go:773
 rule RepoAdminPinsIssue {
     when: RepoAdminPinsIssue(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(user, issue.repository)
     requires: not issue.repository.is_archived
     requires: issue.pin.count = 0
@@ -1146,6 +1285,7 @@ rule RepoAdminPinsIssue {
 -- from: models/issues/issue.go:814
 rule RepoAdminUnpinsIssue {
     when: RepoAdminUnpinsIssue(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(user, issue.repository)
     requires: not issue.repository.is_archived
     requires: issue.pin.count > 0
@@ -1171,6 +1311,7 @@ rule ClosePinGap {
 -- from: models/issues/issue.go:859
 rule RepoAdminMovesPin {
     when: RepoAdminMovesPin(user, repository, pin, position)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: pin.repository = repository
     requires: is_repo_admin(user, pin.repository)
     requires: not pin.repository.is_archived
@@ -1190,6 +1331,7 @@ rule RepoAdminMovesPin {
 -- from: models/issues/label.go:207
 rule TrackerManagerCreatesLabel {
     when: TrackerManagerCreatesLabel(user, repository, name, description, color, is_exclusive)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_manage_tracker(user, repository)
     requires: not repository.is_archived
     requires: trim(name) != "" and length(name) <= config.max_label_name_length
@@ -1204,6 +1346,7 @@ rule TrackerManagerCreatesLabel {
 -- from: models/issues/label.go:240
 rule TrackerManagerEditsLabel {
     when: TrackerManagerEditsLabel(user, repository, label, name, description, color, is_exclusive, is_archived)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: label.repository = repository
     requires: label.repository != null
     requires: can_manage_tracker(user, label.repository)
@@ -1227,6 +1370,7 @@ rule TrackerManagerEditsLabel {
 -- from: models/issues/label.go:292
 rule TrackerManagerDeletesLabel {
     when: TrackerManagerDeletesLabel(user, repository, label)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: label.repository = repository
     requires: label.repository != null
     requires: can_manage_tracker(user, label.repository)
@@ -1237,6 +1381,7 @@ rule TrackerManagerDeletesLabel {
 -- from: models/issues/label.go:207
 rule OrgOwnerCreatesLabel {
     when: OrgOwnerCreatesLabel(user, organization, name, description, color, is_exclusive)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(organization, user)
     requires: trim(name) != "" and length(name) <= config.max_label_name_length
     requires: length(description) <= config.max_label_description_length
@@ -1248,6 +1393,7 @@ rule OrgOwnerCreatesLabel {
 -- from: models/issues/label.go:240
 rule OrgOwnerEditsLabel {
     when: OrgOwnerEditsLabel(user, organization, label, name, description, color, is_exclusive, is_archived)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: label.organization = organization
     requires: label.organization != null
     requires: is_org_owner(label.organization, user)
@@ -1267,6 +1413,7 @@ rule OrgOwnerEditsLabel {
 -- from: models/issues/label.go:258
 rule OrgOwnerDeletesLabel {
     when: OrgOwnerDeletesLabel(user, organization, label)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: label.organization = organization
     requires: label.organization != null
     requires: is_org_owner(label.organization, user)
@@ -1294,6 +1441,7 @@ rule RemoveLabelEverywhere {
 -- from: modules/repository/init.go:146
 rule TrackerManagerInitialisesLabels {
     when: TrackerManagerInitialisesLabels(user, repository, template)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_manage_tracker(user, repository)
     requires: not repository.is_archived
     ensures:
@@ -1305,6 +1453,7 @@ rule TrackerManagerInitialisesLabels {
 -- from: routers/web/org/org_labels.go:1
 rule OrgOwnerInitialisesLabels {
     when: OrgOwnerInitialisesLabels(user, organization, template)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(organization, user)
     ensures:
         for spec in template.labels:
@@ -1318,6 +1467,7 @@ rule OrgOwnerInitialisesLabels {
 -- from: models/issues/issue_label.go:89
 rule TriagerAddsLabel {
     when: TriagerAddsLabel(user, issue, added)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_triage(user, issue)
     requires: not issue.repository.is_archived
     requires: added not in issue.labels
@@ -1336,6 +1486,7 @@ rule TriagerAddsLabel {
 -- from: services/issue/label.go:47
 rule TriagerRemovesLabel {
     when: TriagerRemovesLabel(user, issue, removed)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_triage(user, issue)
     requires: not issue.repository.is_archived
     requires: removed in issue.labels
@@ -1349,6 +1500,7 @@ rule TriagerRemovesLabel {
 -- from: models/issues/issue_label.go:447
 rule TriagerReplacesLabels {
     when: TriagerReplacesLabels(user, issue, labels)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_triage(user, issue)
     requires: not issue.repository.is_archived
     let wanted = without_scope_duplicates(labels_usable_in(labels, issue.repository))
@@ -1366,6 +1518,7 @@ rule TriagerReplacesLabels {
 -- from: models/issues/issue_label.go:374
 rule TriagerClearsLabels {
     when: TriagerClearsLabels(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_triage(user, issue)
     requires: not issue.repository.is_archived
     ensures: issue.labels = {}
@@ -1384,6 +1537,7 @@ rule TriagerClearsLabels {
 -- from: models/issues/milestone.go:116
 rule TrackerManagerCreatesMilestone {
     when: TrackerManagerCreatesMilestone(user, repository, name, description, deadline)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_manage_tracker(user, repository)
     requires: not repository.is_archived
     requires: trim(name) != "" and length(trim(name)) <= config.max_milestone_name_length
@@ -1394,6 +1548,7 @@ rule TrackerManagerCreatesMilestone {
 -- from: models/issues/milestone.go:166
 rule TrackerManagerEditsMilestone {
     when: TrackerManagerEditsMilestone(user, repository, milestone, name, description, deadline)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: milestone.repository = repository
     requires: can_manage_tracker(user, milestone.repository)
     requires: not milestone.repository.is_archived
@@ -1407,6 +1562,7 @@ rule TrackerManagerEditsMilestone {
 -- from: models/issues/milestone.go:228
 rule TrackerManagerClosesMilestone {
     when: TrackerManagerClosesMilestone(user, repository, milestone)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: milestone.repository = repository
     requires: can_manage_tracker(user, milestone.repository)
     requires: not milestone.repository.is_archived
@@ -1418,6 +1574,7 @@ rule TrackerManagerClosesMilestone {
 -- from: models/issues/milestone.go:228
 rule TrackerManagerReopensMilestone {
     when: TrackerManagerReopensMilestone(user, repository, milestone)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: milestone.repository = repository
     requires: can_manage_tracker(user, milestone.repository)
     requires: not milestone.repository.is_archived
@@ -1432,6 +1589,7 @@ rule TrackerManagerReopensMilestone {
 -- from: models/issues/milestone.go:245
 rule TrackerManagerDeletesMilestone {
     when: TrackerManagerDeletesMilestone(user, repository, milestone)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: milestone.repository = repository
     requires: can_manage_tracker(user, milestone.repository)
     requires: not milestone.repository.is_archived
@@ -1453,6 +1611,7 @@ rule TrackerManagerDeletesMilestone {
 -- from: services/issue/milestone.go:91
 rule TriagerSetsMilestone {
     when: TriagerSetsMilestone(user, issue, target)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_triage(user, issue)
     requires: not issue.repository.is_archived
     requires: target = null or target in (Milestones where repository = issue.repository)
@@ -1472,6 +1631,7 @@ rule TriagerSetsMilestone {
 -- from: services/issue/assignee.go:47
 rule TriagerTogglesAssignee {
     when: TriagerTogglesAssignee(user, issue, assignee)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_triage(user, issue)
     requires: not issue.repository.is_archived
     requires: can_be_assigned(assignee, issue.repository)
@@ -1492,6 +1652,7 @@ rule TriagerTogglesAssignee {
 -- from: services/issue/issue.go:124
 rule TriagerReplacesAssignees {
     when: TriagerReplacesAssignees(user, issue, wanted)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_triage(user, issue)
     requires: not issue.repository.is_archived
     requires: all_assignable(wanted, issue.repository)  -- every one satisfies can_be_assigned
@@ -1517,6 +1678,7 @@ rule TriagerReplacesAssignees {
 -- from: models/issues/dependency.go:130
 rule TriagerAddsDependency {
     when: TriagerAddsDependency(user, issue, blocker)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: dependencies_enabled(issue.repository)
     requires: can_triage(user, issue)
     requires: not issue.repository.is_archived
@@ -1535,6 +1697,7 @@ rule TriagerAddsDependency {
 -- from: models/issues/dependency.go:171
 rule TriagerRemovesDependency {
     when: TriagerRemovesDependency(user, issue, dependency)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: dependency.issue = issue
     requires: dependencies_enabled(dependency.issue.repository)
     requires: can_triage(user, dependency.issue)
@@ -1556,6 +1719,7 @@ rule TriagerRemovesDependency {
 -- from: models/issues/stopwatch.go:200
 rule UserStartsStopwatch {
     when: UserStartsStopwatch(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_track_time(user, issue)
     requires: not exists Stopwatch{user: user, issue: issue}
     ensures:
@@ -1569,6 +1733,7 @@ rule UserStartsStopwatch {
 -- from: models/issues/stopwatch.go:154
 rule UserStopsStopwatch {
     when: UserStopsStopwatch(user, issue, stopwatch)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: stopwatch.issue = issue
     requires: stopwatch.user = user
     requires: may_track_time(user, stopwatch.issue)
@@ -1595,6 +1760,7 @@ rule FinishStopwatch {
 -- from: models/issues/stopwatch.go:255
 rule UserCancelsStopwatch {
     when: UserCancelsStopwatch(user, issue, stopwatch)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: stopwatch.issue = issue
     requires: stopwatch.user = user
     requires: may_track_time(user, stopwatch.issue)
@@ -1608,6 +1774,7 @@ rule UserCancelsStopwatch {
 -- from: models/issues/tracked_time.go:170
 rule UserAddsTime {
     when: UserAddsTime(user, issue, amount)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_track_time(user, issue)
     requires: amount > 0.seconds
     requires: amount <= config.max_manual_time
@@ -1621,6 +1788,7 @@ rule UserAddsTime {
 -- from: routers/api/v1/repo/issue_tracked_time.go:201
 rule AdminAddsTimeForUser {
     when: AdminAddsTimeForUser(admin, issue, user, amount, at)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_track_time(admin, issue)
     requires: is_repo_admin(admin, issue.repository) or admin.is_admin
     requires: amount > 0.seconds
@@ -1643,6 +1811,7 @@ rule LogTime {
 -- from: models/issues/tracked_time.go:282
 rule UserDeletesTime {
     when: UserDeletesTime(user, issue, time)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: time.issue = issue
     requires: may_track_time(user, time.issue)
     requires: time.user = user or user.is_admin
@@ -1657,6 +1826,7 @@ rule UserDeletesTime {
 -- from: models/issues/tracked_time.go:243
 rule UserResetsOwnTime {
     when: UserResetsOwnTime(user, issue)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: may_track_time(user, issue)
     let mine = issue.tracked_times where user = user and is_deleted = false
     requires: mine.count > 0
@@ -1677,6 +1847,7 @@ rule UserResetsOwnTime {
 -- from: services/issue/reaction.go:14
 rule UserReactsToIssue {
     when: UserReactsToIssue(user, issue, emoji)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_read_issue(user, issue)
     requires: not issue.repository.is_archived
     requires: is_allowed_reaction(emoji)               -- emoji in config.allowed_reactions
@@ -1692,6 +1863,7 @@ rule UserReactsToIssue {
 -- from: services/issue/reaction.go:46
 rule UserReactsToComment {
     when: UserReactsToComment(user, issue, comment, emoji)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: comment.issue = issue
     requires: comment.has_content
     requires: can_read_issue(user, comment.issue)
@@ -1709,6 +1881,7 @@ rule UserReactsToComment {
 -- from: services/issue/reaction.go:36
 rule UserRemovesReaction {
     when: UserRemovesReaction(user, issue, reaction)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: reaction.issue = issue
     requires: reaction.user = user
     requires: not reaction.issue.repository.is_archived
@@ -1724,6 +1897,7 @@ rule UserRemovesReaction {
 -- from: models/issues/issue_watch.go:33
 rule UserSetsIssueSubscription {
     when: UserSetsIssueSubscription(user, issue, subscriber, watching)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_read_issue(user, issue)
     requires: subscriber = user or user.is_admin
     ensures:
@@ -1743,11 +1917,13 @@ rule UserSetsIssueSubscription {
 -- from: services/attachment/attachment.go:78
 rule UserUploadsAttachment {
     when: UserUploadsAttachment(user, repository, name, size, head_bytes)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.attachments_enabled
     requires: can_read_tracker(user, repository)
     requires: not repository.is_archived
     requires: is_allowed_file(name, head_bytes)   -- against config.attachment_allowed_types
     requires: size <= config.attachment_max_size_mb * 1048576
+    requires: attachment_quota_allows(repository, size)   -- decided (quota 2): usage + size <= limit
     ensures: Attachment.created(repository: repository, uploader: user, name: name, size: size,
                                 issue: null, comment: null, release: null, external_url: null,
                                 download_count: 0, created_at: now)
@@ -1786,6 +1962,7 @@ rule OrphanUploadExpires {
 -- from: routers/web/repo/attachment.go:63
 rule UserDeletesAttachment {
     when: UserDeletesAttachment(user, issue, attachment)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: attachment.issue = null or attachment.issue = issue   -- an upload not yet posted, or one on this issue
     requires: not attachment.repository.is_archived
     requires:
@@ -1800,6 +1977,7 @@ rule UserDeletesAttachment {
 -- from: routers/api/v1/repo/issue_attachment.go:234
 rule UserRenamesAttachment {
     when: UserRenamesAttachment(user, issue, attachment, name)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: attachment.issue = issue
     requires: attachment.issue != null
     requires: not attachment.repository.is_archived
@@ -1840,6 +2018,81 @@ rule ClearInvolvementOnLostAccess {
         for i in Issues where i.repository = repository and user in i.assignees:
             if not can_be_assigned(user, repository):
                 i.assignees = i.assignees - { user }
+}
+
+-- Removing a collaborator unassigns them from the repository's issues they
+-- may no longer be assigned (they may keep access through a team).
+-- from: models/repo/collaboration.go:98 (reconsiderRepoIssuesAssignee)
+rule UnassignRemovedCollaborator {
+    when: repositories/CollaboratorRemoved(repository, user, doer)
+    ensures:
+        for i in Issues where i.repository = repository and user in i.assignees:
+            if not can_be_assigned(user, repository):
+                i.assignees = i.assignees - { user }
+}
+
+-- A repository created with a label template gets that template's labels.
+-- from: modules/repository/init.go:146
+rule CreateLabelsFromTemplate {
+    when: repositories/LabelTemplateApplied(repository, template_name)
+    ensures:
+        for t in LabelTemplates where name = template_name:
+            for spec in t.labels:
+                Label.created(repository: repository, name: spec.name, description: spec.description ?? "",
+                              color: normalize_color(spec.color), is_exclusive: spec.is_exclusive, created_at: now)
+}
+
+-- A repository generated from a template with "labels" chosen gets a copy of
+-- the template repository's own labels (archived ones stay archived).
+-- from: services/repository/generate.go:61
+rule CopyTemplateLabels {
+    when: repositories/RepositoryGeneratedFromTemplate(template, repository, doer, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches)
+    requires: labels
+    ensures:
+        for l in Labels where repository = template:
+            Label.created(repository: repository, name: l.name, description: l.description, color: l.color,
+                          is_exclusive: l.is_exclusive, archived_at: l.archived_at, created_at: now)
+}
+
+-- A deleted account leaves no reactions, stopwatches, subscriptions,
+-- assignments or read markers; tracked time is kept (shown as the ghost
+-- user). When contributions are deleted (purge, or a young account) its plain
+-- comments go too, and a purge also removes every issue it opened (pull
+-- request conversations go with their pull request, pulls'). Otherwise its
+-- content stays and shows as the ghost user. `user` is already gone: only its
+-- identity is compared.
+-- from: services/user/delete.go:36
+rule ClearTracesOfDeletedAccount {
+    when: accounts/UserAccountDeleted(user, kind, purge, delete_contributions)
+    ensures:
+        for r in Reactions where r.user = user:
+            not exists r
+        for sw in Stopwatches where sw.user = user:
+            not exists sw
+        for w in IssueWatches where w.user = user:
+            not exists w
+        for i in Issues where user in i.assignees:
+            i.assignees = i.assignees - { user }
+        for i in Issues where user in i.read_by:
+            i.read_by = i.read_by - { user }
+    ensures:
+        if delete_contributions:
+            for c in Comments where c.poster = user and c.kind = comment:
+                CommentRemoved(comment: c, doer: null)
+    ensures:
+        if purge:
+            for i in Issues where i.poster = user and not i.is_pull:
+                IssueRemoved(issue: i, doer: null)
+}
+
+-- Putting an issue on a board, moving it to another or taking it off leaves a
+-- `project` entry on its timeline.
+-- from: models/issues/issue_project.go:134
+rule RecordProjectChange {
+    when: projects/IssueProjectChanged(issue, actor, old_project, new_project)
+    ensures: Comment.created(issue: issue, poster: actor, kind: project,
+                             old_project: old_project, project: new_project,
+                             content: "", content_version: 0, created_at: now, updated_at: now)
 }
 
 ------------------------------------------------------------
@@ -2191,6 +2444,14 @@ surface IssueConversation {
         -- On a locked issue a reader without write access is told the
         -- conversation is locked (with the reason) instead of a comment box.
 
+    @guarantee OriginalAuthorShown
+        -- Where the migrations addon recorded an original author for the
+        -- issue, a comment or a reaction (a migrations/ExternalAuthorship
+        -- pointing at it), the item renders "originally by <external_name> on
+        -- <source>"; assignees the source named that are not local accounts
+        -- (migrations/ExternalAssignee) are listed by name beside the
+        -- assignees. The core keeps no import fields of its own.
+
     @guarantee RoleBadges
         -- Each poster is badged poster / owner / member / collaborator /
         -- contributor (has a merged PR) / first-time contributor.
@@ -2447,11 +2708,9 @@ deferred is_allowed_file                  -- see: modules/upload (extensions, MI
 -- REQUEST pulls: issues_closed_by(pr) / issues_reopened_by(pr) should be the latest closes/reopens Comment (ref_issue = pr.issue, ref_action) per target issue, from issues' cross-reference entries
 -- REQUEST pulls: PR conversations are created as issues/Issue (is_pull = true) and must set index: next_issue_index(repository), content_version: 0, labels/assignees/mentioned_users/read_by, created_at/updated_at; pulls' Comment.created calls should also set content_version / created_at / updated_at
 -- REQUEST webhooks / actions: subscribe to this module's trigger names and arities as listed in the header (e.g. IssueCommentCreated(issue, comment, doer, mentions), IssueAssigneeChanged(issue, doer, assignee, removed, comment), IssueClosed(issue, doer, comment)); there is no IssueAssigneeAdded / CommentCreated / IssueEdited trigger
--- REQUEST projects: issues/IssueDeleted has two parameters (issue, doer)
 -- REQUEST access: an anonymous-visitor actor usable in TrackerReader / IssueReader surfaces for public repositories
 -- REQUEST accounts/UserBlock: is_blocked(blocker, user), including organizations blocking users
 -- REQUEST releases/Release: links Attachments via Attachment.release; release attachment type list is releases' config
--- REQUEST projects: creates project / project_column Comment entries when an issue's project or column changes
 -- REQUEST moderation: reacts to IssueContentChanged / IssueCommentEdited / IssueCommentDeleted / IssueDeleted to keep shadow copies of reported content
 -- REQUEST quota: attachment uploads are subject to the `size:assets:attachments:issues` quota subject
 -- REQUEST administration: register a cron task (e.g. `delete_orphaned_attachments`, owning module issues, default schedule "@every 1h", enabled) that runs issues/OrphanUploadExpires — unlinked uploads older than issues' config.orphan_attachment_expiry (default 24h) are deleted

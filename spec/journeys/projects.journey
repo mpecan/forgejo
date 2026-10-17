@@ -235,8 +235,13 @@ journey IssueGoesOntoABoardAndMoves {
         stipulate roadmap.accepts_issue(bug) = true
         ada does UserAssignsIssueToProject(ada, bug, roadmap) on IssueProjectPicker
             creating card: ProjectCard
+            creating entry: issues/Comment
         then UserAssignsIssueToProject fires
         then card.project = roadmap
+        then RecordProjectChange fires
+        then entry.kind = project
+        then entry.project = roadmap
+        then entry.old_project = null
 
     2. she moves it to the bugs board
         stipulate may_assign_to(ada, bug, bugs) = true
@@ -598,6 +603,7 @@ journey DeletingAnAccountDeletesItsBoards {
         col:   ProjectColumn
     given:
         bob.is_admin = false
+        repo.status = ready
         board.owner_kind = individual
         board.owner_user = bob
         col.project = board
@@ -682,4 +688,95 @@ journey TransferTakesIssuesOffTheOldOwnersBoards {
 
     ends: Ada's board no longer holds an issue it cannot accept; the
           repository's own board moved with the repository.
+}
+
+-- The new-issue form may name a board; issues hands the new issue over and the
+-- card lands in the board's default column, with a timeline entry. A closed
+-- board named in the form is dropped with the rest of the metadata.
+-- decided: projects 7 (a closed board accepts no new cards)
+journey NewIssueLandsOnTheChosenBoard {
+    goal: Ada triages the repository. She opens an issue and picks the open
+          roadmap board in the form: the issue arrives as a card in the
+          roadmap's default column and its timeline says so. Picking the
+          closed release board instead puts the next issue on no board.
+
+    cast:
+        roadmap: Project
+        release: Project
+        todo:    ProjectColumn
+    given:
+        roadmap.owner_kind = repository
+        roadmap.owner_repository = repo
+        roadmap.status = open
+        release.owner_kind = repository
+        release.owner_repository = repo
+        release.status = closed
+        todo.project = roadmap
+        todo.is_default = true
+        todo.position = 0
+
+    1. she opens an issue onto the roadmap board
+        stipulate can_read_tracker(ada, repo) = true
+        stipulate can_manage_tracker(ada, repo) = true
+        stipulate is_blocked_by_owner(repo, ada) = false
+        stipulate trim("Plan v2") = "Plan v2"
+        stipulate length("Plan v2") = 7
+        stipulate next_issue_index(repo) = 1
+        stipulate all_assignable({}, repo) = true
+        stipulate resolve_mentions_in(repo, ada, "Scope") = {}
+        stipulate cross_references(repo, ada, "Plan v2", "Scope") = {}
+        stipulate labels_usable_in({}, repo) = {}
+        stipulate without_scope_duplicates({}) = {}
+        ada does UserOpensIssue(ada, repo, "Plan v2", "Scope", {}, null, {}, null, roadmap, {}, null) on IssueTracker
+            creating issue: issues/Issue
+            where issue_notification_audience(issue, ada) = {}
+            creating card: ProjectCard
+            creating entry: issues/Comment
+        then IssueCreatedOnProject fires
+        then card.issue = issue
+        then card.column = todo
+        then entry.kind = project
+        then entry.project = roadmap
+
+    2. the closed board is not offered a card
+        stipulate trim("Ship it") = "Ship it"
+        stipulate length("Ship it") = 7
+        stipulate next_issue_index(repo) = 2
+        stipulate resolve_mentions_in(repo, ada, "Notes") = {}
+        stipulate cross_references(repo, ada, "Ship it", "Notes") = {}
+        ada does UserOpensIssue(ada, repo, "Ship it", "Notes", {}, null, {}, null, release, {}, null) on IssueTracker
+            creating later: issues/Issue
+            where issue_notification_audience(later, ada) = {}
+        then later.index = 2
+        then IssueCreatedOnProject does not fire
+
+    ends: Issue #1 is on the roadmap board; issue #2 is on no board.
+}
+
+-- Maintenance (read-only) mode refuses board changes.
+-- decided: administration 3 (every write is refused while read-only)
+journey ReadOnlyModeFreezesBoards {
+    goal: While the instance is read-only, Ada can still look at her board but
+          cannot add a column to it.
+
+    cast:
+        board: Project
+        gate:  access/InstanceWriteGate
+    given:
+        board.owner_kind = repository
+        board.owner_repository = repo
+        board.status = open
+        board.title = "Roadmap"
+        gate.read_only = true
+
+    1. she still sees the board
+        ada sees board.title on ProjectBoard in board
+
+    2. but cannot add a column while the instance is read-only
+        stipulate may_manage(ada, board) = true
+        stipulate board.has_room_for_column = true
+        stipulate length("Later") = 5
+        ada cannot do UserCreatesColumn(ada, board, "Later", null) on ProjectBoard
+
+    ends: The board is unchanged.
 }

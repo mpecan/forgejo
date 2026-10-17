@@ -40,6 +40,10 @@
 --   WikiPageEdited(repository, doer, page)           -- page: WikiPage; includes renames
 --   WikiPageDeleted(repository, doer, page)          -- page: the deleted page's name (String)
 --   WikiDeleted(wiki, deleter)                       -- repositories reacts by disabling the wiki unit
+--   WikiCommitSigningRequested(actor, repository, wiki_head_verified)
+--                                                    -- before every web/API commit to the wiki; keys
+--                                                    -- decides (SigningDecision, operation wiki_edit)
+--                                                    -- and the commit is signed when will_sign
 --   (the commit message of each change is the newest WikiRevision.message of the page)
 --   (a git push emits one WikiPageCreated / WikiPageEdited / WikiPageDeleted per page it
 --    added / changed / removed, attributed to the pusher)
@@ -86,6 +90,11 @@ entity Wiki {
 
     -- Derived
     is_empty: pages.count = 0
+    -- Bytes of the wiki's git repository, measured after every write and push;
+    -- quota sums it per repository owner as QuotaUsage.wiki (size:wiki, under
+    -- size:git:all). An uninitialised or deleted wiki measures 0.
+    -- decided: quota 3 (wiki storage is measured)
+    git_size: wiki_git_size(this)
 }
 
 -- One page = one Markdown file on the wiki branch, at the top or in a directory.
@@ -165,6 +174,7 @@ rule GitAccessInitialisesWiki {
 -- from: routers/web/repo/githttp.go:93
 rule UserPushesToWiki {
     when: UserPushesToWiki(user, wiki)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: wiki_unit_enabled(wiki.repository)
     requires: can_write_wiki(user, wiki.repository)
     requires: not wiki.repository.is_archived
@@ -259,6 +269,7 @@ rule PushDeletesWikiPage {
 -- from: services/wiki/wiki.go:381
 rule AdminDeletesWiki {
     when: AdminDeletesWiki(user, wiki, confirmation)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_admin_repository(user, wiki.repository)
     requires: confirmation = repository_full_name(wiki.repository)
     ensures:
@@ -280,6 +291,7 @@ rule AdminDeletesWiki {
 -- from: services/wiki/wiki.go:50
 rule AdminChangesWikiBranch {
     when: AdminChangesWikiBranch(user, wiki, new_branch)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_admin_repository(user, wiki.repository)
     requires: not wiki.repository.is_archived
     requires: new_branch != ""
@@ -299,6 +311,7 @@ rule AdminChangesWikiBranch {
 -- from: services/wiki/wiki.go:124
 rule UserCreatesWikiPage {
     when: UserCreatesWikiPage(user, wiki, title, content, message)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let name = page_name_for(title)
     requires: wiki_unit_enabled(wiki.repository)
     requires: can_write_wiki(user, wiki.repository)
@@ -330,6 +343,7 @@ rule UserCreatesWikiPage {
             created_at: now
         )
         WikiPageCreated(repository: wiki.repository, doer: user, page: page)
+    ensures: WikiCommitSigningRequested(actor: user, repository: wiki.repository, wiki_head_verified: wiki_head_verified(wiki))
     @guidance
         -- Web: GET/POST /{o}/{r}/wiki?action=_new (a missing wiki offers
         -- "Home" as the first title). API: POST /repos/{o}/{r}/wiki/new with
@@ -350,6 +364,7 @@ rule UserCreatesWikiPage {
 -- from: services/wiki/wiki.go:290
 rule UserEditsWikiPage {
     when: UserEditsWikiPage(user, wiki, page, base_revision, title, content, message)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: page.wiki = wiki
     requires: base_revision = page.revision
     requires: content != ""
@@ -379,6 +394,7 @@ rule UserEditsWikiPage {
         created_at: now
     )
     ensures: WikiPageEdited(repository: wiki.repository, doer: user, page: page)
+    ensures: WikiCommitSigningRequested(actor: user, repository: wiki.repository, wiki_head_verified: wiki_head_verified(wiki))
     @guidance
         -- Web: GET /{o}/{r}/wiki/{page}?action=_edit, POST /wiki/{page}.
         -- API: PATCH /repos/{o}/{r}/wiki/page/{pageName} (empty title keeps
@@ -390,6 +406,7 @@ rule UserEditsWikiPage {
 -- from: services/wiki/wiki.go:296
 rule UserDeletesWikiPage {
     when: UserDeletesWikiPage(user, wiki, page)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: page.wiki = wiki
     requires: wiki_unit_enabled(wiki.repository)
     requires: can_write_wiki(user, wiki.repository)
@@ -406,6 +423,7 @@ rule UserDeletesWikiPage {
         created_at: now
     )
     ensures: WikiPageDeleted(repository: the_wiki.repository, doer: user, page: page_name)
+    ensures: WikiCommitSigningRequested(actor: user, repository: the_wiki.repository, wiki_head_verified: wiki_head_verified(the_wiki))
     @guidance
         -- Web: POST /{o}/{r}/wiki/{page}?action=_delete.
         -- API: DELETE /repos/{o}/{r}/wiki/page/{pageName}.
@@ -585,6 +603,13 @@ deferred page_name_for    -- see: services/wiki/wiki_path.go (title -> page name
 ------------------------------------------------------------
 -- Black-box functions used (non-normative index)
 ------------------------------------------------------------
+-- read-only gate: `requires: not (exists access/InstanceWriteGate{read_only: true})`
+--   decided (administration 3): every web, API and git write to the wiki is refused
+--   while the instance is read-only. Opening the wiki over git for a clone
+--   (GitAccessInitialisesWiki) is a read and is not gated.
+-- wiki_git_size(wiki)                    = bytes of the wiki's git repository (0 when uninitialised)
+-- wiki_head_verified(wiki)               = the current head commit of the wiki branch has a
+--                                          verified signature (keys/CommitVerification); false when empty
 -- can_read_wiki(user, repository)        = access/can_read(user, repository, wiki)
 -- can_write_wiki(user, repository)       = access/can_write(user, repository, wiki)
 -- can_admin_repository(user, repository) = access/is_repo_admin(user, repository)
@@ -633,6 +658,9 @@ deferred page_name_for    -- see: services/wiki/wiki_path.go (title -> page name
 --   2-argument local functions (simulator limitation with enum-literal arguments).
 -- REQUEST keys: a wiki signing policy ([repository.signing] WIKI, default never)
 --   deciding whether wiki commits are signed and who appears as committer.
+-- REQUEST keys: react to wiki/WikiCommitSigningRequested(actor, repository, wiki_head_verified)
+--   with DecideWikiSigning (wiki emits it locally before each web/API commit, so keys
+--   reacts rather than wiki emitting keys/WikiEditSigningRequested).
 -- REQUEST notifications / webhooks: react to WikiPageCreated / WikiPageEdited /
 --   WikiPageDeleted (feed entries, `wiki` webhook event with created/edited/deleted).
 -- REQUEST code: git transport must route "<repo>.wiki" to the wiki repository with

@@ -495,6 +495,7 @@ journey AttachingALog {
     1. a log file is accepted
         stipulate can_read_tracker(ada, repo) = true
         stipulate is_allowed_file("crash.log", "...") = true
+        stipulate attachment_quota_allows(repo, 2048) = true
         ada does UserUploadsAttachment(ada, repo, "crash.log", 2048, "...") on IssueTracker
             creating log: Attachment
         then log.uploader = ada
@@ -629,6 +630,7 @@ journey AnUnpostedUploadExpires {
     1. she uploads a screenshot
         stipulate can_read_tracker(ada, repo) = true
         stipulate is_allowed_file("shot.png", "PNG") = true
+        stipulate attachment_quota_allows(repo, 4096) = true
         ada does UserUploadsAttachment(ada, repo, "shot.png", 4096, "PNG") on IssueTracker
             creating shot: Attachment
         then shot.issue = null
@@ -737,4 +739,68 @@ journey AnAdminLogsTimeForSomeoneElse {
         then entry.amount = 1.hour
 
     ends: Ada has an hour on the bug, recorded as logged by Tess.
+}
+
+-- Maintenance (read-only) mode freezes the tracker but not reading it.
+-- decided: administration 3 (every write is refused while read-only)
+journey ReadOnlyModeFreezesTheTracker {
+    goal: The site admin has put the instance in read-only mode for
+          maintenance. Ada can still read her issue, but she cannot comment
+          on it until the mode ends; then her comment goes through.
+
+    cast:
+        bug:  Issue
+        gate: access/InstanceWriteGate
+
+    given:
+        bug.repository = repo
+        bug.poster = ada
+        bug.status = open
+        bug.is_locked = false
+        bug.is_pull = false
+        gate.read_only = true
+
+    1. she still reads her issue
+        stipulate can_read_issue(ada, bug) = true
+        ada sees bug.title on IssueConversation in bug
+
+    2. but cannot comment while the instance is read-only
+        stipulate is_blocked(ada, ada) = false
+        stipulate is_blocked_by_owner(repo, ada) = false
+        ada cannot do UserComments(ada, bug, "Still broken on 1.4", {}) on IssueConversation
+
+    3. once maintenance is over, her comment is posted
+        stipulate gate.read_only = false
+        stipulate issue_notification_audience(bug, ada) = {}
+        stipulate resolve_mentions(bug, ada, "Still broken on 1.4") = {}
+        stipulate cross_references(repo, ada, null, "Still broken on 1.4") = {}
+        ada does UserComments(ada, bug, "Still broken on 1.4", {}) on IssueConversation
+            creating c: Comment
+        then c.poster = ada
+        then c.issue = bug
+
+    ends: One comment from Ada, posted after the read-only period.
+}
+
+-- An upload that would take the owner over quota is refused up front.
+-- decided: quota 2 (the incoming size is counted: usage + size <= limit)
+journey AnUploadOverQuotaIsRefused {
+    goal: Tess's account is close to its attachment quota. A small log still
+          fits; a large video that would take her over is refused before
+          anything is stored.
+
+    1. the small log fits
+        stipulate can_read_tracker(ada, repo) = true
+        stipulate is_allowed_file("small.log", "...") = true
+        stipulate attachment_quota_allows(repo, 1024) = true
+        ada does UserUploadsAttachment(ada, repo, "small.log", 1024, "...") on IssueTracker
+            creating log: Attachment
+        then log.uploader = ada
+
+    2. the large video does not
+        stipulate is_allowed_file("demo.mp4", "ftyp") = true
+        stipulate attachment_quota_allows(repo, 900000000) = false
+        ada cannot do UserUploadsAttachment(ada, repo, "demo.mp4", 900000000, "ftyp") on IssueTracker
+
+    ends: Only the small log was stored.
 }

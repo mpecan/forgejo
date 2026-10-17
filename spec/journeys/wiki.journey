@@ -457,3 +457,33 @@ journey AnAdminDeletesAllWikiData {
 
     ends: The wiki is empty and uninitialised; the wiki unit is switched off by repositories.
 }
+
+-- Maintenance (read-only) mode refuses wiki writes, on the web and over git.
+-- decided: administration 3 (every write is refused while read-only)
+journey ReadOnlyModeFreezesTheWiki {
+    goal: While the instance is read-only, Ada cannot write the wiki's first
+          page nor push to the wiki; once the mode ends, her page is saved.
+
+    cast:
+        gate: access/InstanceWriteGate
+    given:
+        gate.read_only = true
+
+    1. she cannot write a page while the instance is read-only
+        stipulate page_name_for("Home") = "Home"
+        ada cannot do UserCreatesWikiPage(ada, wiki, "Home", "Welcome", "") on WikiEditing
+
+    2. nor push to the wiki
+        stipulate push_leaves_empty_page(wiki) = false
+        ada cannot do UserPushesToWiki(ada, wiki) on WikiEditing
+
+    3. once maintenance is over, the page is saved
+        stipulate gate.read_only = false
+        stipulate kind_of_page("Home") = regular
+        ada does UserCreatesWikiPage(ada, wiki, "Home", "Welcome", "") on WikiEditing
+            creating home: WikiPage
+        then home.content = "Welcome"
+        then wiki.status = initialised
+
+    ends: The wiki has its Home page, written after the read-only period.
+}
