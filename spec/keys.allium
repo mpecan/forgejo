@@ -77,6 +77,8 @@
 --   GpgKeyDeleted(owner, key_id, actor)             -- a primary GPG key (with its subkeys) was removed
 --   SshKeyAuthenticated(connection, key)            -- code: the git client on `connection` holds `key`
 --   SignatureVerified(verification)                 -- internal chain: a signature verified, trust to be assessed
+--   ExternalSshKeyRefused(user, source, fingerprint) -- administration: a directory / OAuth2 key failed the
+--                                                   -- key policy and was skipped (record a system notice)
 --   (CommitVerification and SigningDecision entities are created for the
 --    requesting module to read; they are answers, not events.)
 --
@@ -147,6 +149,8 @@ enum VerificationReason {
     | signed_by_instance_key  -- the forge's own signing key produced the signature
     | probable_bad_signature  -- the signature names a key we know, but that key did not produce it
     | no_matching_key         -- no registered or instance key produced the signature
+    | key_expired             -- a registered key produced it, but the signature is dated after the key expired
+    | key_revoked             -- a registered key produced it, but that key has been revoked
 }
 
 -- The commits the forge creates itself and may sign.
@@ -245,6 +249,7 @@ entity GpgKey {
     identity_emails: Set<String>          -- emails of the primary key's non-revoked user ids (empty for subkeys)
     key_created_at: Timestamp             -- creation time recorded in the key
     expires_at: Timestamp?                -- absent when the key never expires
+    is_revoked: Boolean                   -- the uploaded key carries a revocation signature
     added_at: Timestamp
     is_verified: Boolean                  -- possession proven by signing a token
     can_sign: Boolean
@@ -318,10 +323,13 @@ entity CommitVerification {
 -- How one kind of forge-made commit is signed. One instance per operation,
 -- materialised from the [repository.signing] lists in config at start-up
 -- (INITIAL_COMMIT, CRUD_ACTIONS, MERGES, WIKI). A list containing "never"
--- gives mode never; one containing "always" gives mode always; an empty or
+-- gives mode never, whatever else it lists and in whatever order; otherwise
+-- one containing "always" gives mode always; an empty or
 -- unrecognised list gives mode never; otherwise mode conditional with one
 -- flag per listed condition. Conditions that do not apply to an operation are
 -- ignored (see invariant SigningConditionsApply).
+-- decided: "never" wins over "always" regardless of list order (Forgejo
+-- takes whichever comes first).
 -- from: services/asymkey/sign.go:39
 entity SigningPolicy {
     operation: SignedOperation
@@ -400,6 +408,8 @@ config {
 -- The key must parse as a single public key, use an allowed algorithm with
 -- enough bits, and have a fingerprint no other key (personal, deploy or
 -- otherwise) already uses. Titles are unique per owner.
+-- decided: personal SSH keys may still be added while SSH is disabled, since
+-- they also verify SSH commit signatures (deploy keys and principals may not).
 -- from: routers/web/user/setting/keys.go:163
 rule UserAddsSshKey {
     when: UserAddsSshKey(owner, title, content)
@@ -584,6 +594,8 @@ rule RemoveSshKeyOfUserByAdmin {
 ------------------------------------------------------------
 
 -- A user registers a principal so certificates naming it log them in.
+-- decided: principals only serve SSH access, so they are refused while SSH
+-- is disabled (as Forgejo already does).
 -- from: models/asymkey/ssh_key_principals.go:58
 rule UserAddsPrincipal {
     when: UserAddsPrincipal(owner, principal)
@@ -641,7 +653,11 @@ rule UserDeletesPrincipal {
 -- login) reports the SSH keys a user should have. Keys new to the user are
 -- added, named "<source name>-<fingerprint>" and tied to the source. Keys
 -- whose fingerprint is already registered anywhere, or which do not parse,
--- are skipped silently.
+-- are skipped silently. A key that parses but does not meet the algorithm and
+-- minimum-size policy is skipped and reported (ExternalSshKeyRefused), so an
+-- operator sees it as a system notice.
+-- decided: the key policy applies to externally supplied keys too; a
+-- non-compliant key is skipped and recorded as a system notice.
 -- from: models/asymkey/ssh_key.go:321
 rule AddExternallySuppliedSshKeys {
     when: authentication/ExternalSshKeysAsserted(user, source, keys)
@@ -651,25 +667,36 @@ rule AddExternallySuppliedSshKeys {
     ensures:
         for content in keys:
             if ssh_parse_outcome(content) = valid and not exists SshKey{fingerprint: ssh_fingerprint(content)}:
-                let key = SshKey.created(
-                    kind: personal,
-                    owner: user,
-                    name: source.name + "-" + ssh_fingerprint(content),
-                    content: ssh_normalised(content),
-                    fingerprint: ssh_fingerprint(content),
-                    algorithm: ssh_key_algorithm(content),
-                    bits: ssh_key_bits(content),
-                    auth_source: source,
-                    is_verified: false,
-                    created_at: now,
-                    last_used_at: null
-                )
-                SshKeyAdded(key: key, actor: user)
+                let algorithm = ssh_key_algorithm(content)
+                let bits = ssh_key_bits(content)
+                if not config.minimum_key_size_check
+                    or (algorithm = ed25519 and config.min_bits_ed25519 >= 0 and bits >= config.min_bits_ed25519)
+                    or (algorithm = ed25519_sk and config.min_bits_ed25519_sk >= 0 and bits >= config.min_bits_ed25519_sk)
+                    or (algorithm = ecdsa and config.min_bits_ecdsa >= 0 and bits >= config.min_bits_ecdsa)
+                    or (algorithm = ecdsa_sk and config.min_bits_ecdsa_sk >= 0 and bits >= config.min_bits_ecdsa_sk)
+                    or (algorithm = rsa and config.min_bits_rsa >= 0 and bits >= config.min_bits_rsa)
+                    or (algorithm = dsa and config.min_bits_dsa >= 0 and bits >= config.min_bits_dsa):
+                    let key = SshKey.created(
+                        kind: personal,
+                        owner: user,
+                        name: source.name + "-" + ssh_fingerprint(content),
+                        content: ssh_normalised(content),
+                        fingerprint: ssh_fingerprint(content),
+                        algorithm: algorithm,
+                        bits: bits,
+                        auth_source: source,
+                        is_verified: false,
+                        created_at: now,
+                        last_used_at: null
+                    )
+                    SshKeyAdded(key: key, actor: user)
+                else:
+                    ExternalSshKeyRefused(user: user, source: source, fingerprint: ssh_fingerprint(content))
 
     @guidance
-        -- Key size and algorithm policy is NOT applied to externally supplied
-        -- keys in Forgejo (see open questions). Keys already registered
-        -- (by fingerprint, to anyone) and unparseable entries are skipped.
+        -- Forgejo applies no algorithm or size policy here; the rebuild does
+        -- (decided). Keys already registered (by fingerprint, to anyone) and
+        -- unparseable entries are skipped without a notice.
 }
 
 -- Keys previously supplied by this source that it no longer reports are removed.
@@ -704,6 +731,10 @@ rule RemoveWithdrawnExternalSshKey {
 -- access to the repository. The key material may already be a deploy key of
 -- other repositories (it is then shared), but never a personal key or
 -- principal.
+-- decided: deploy keys only serve SSH access, so they are refused while SSH
+-- is disabled.
+-- decided: deploy keys are refused on archived repositories; a mirror only
+-- takes read-only deploy keys (nothing may push to it).
 -- from: models/asymkey/ssh_key_deploy.go:109
 rule RepoAdminAddsDeployKey {
     when: RepoAdminAddsDeployKey(admin, repository, title, content, access)
@@ -714,6 +745,9 @@ rule RepoAdminAddsDeployKey {
     let existing = SshKey{fingerprint: fingerprint}
 
     requires: is_repo_admin(admin, repository)
+    requires: not config.ssh_disabled
+    requires: not repository.is_archived
+    requires: not repository.is_mirror or access = read_only
     requires: title != "" and length(title) <= config.title_max_length
     requires: ssh_parse_outcome(content) = valid
     requires: not config.minimum_key_size_check
@@ -879,6 +913,7 @@ rule UserAddsGpgKeyMatchedByEmail {
             identity_emails: identities,
             key_created_at: gpg_key_created_at(armored, key_id),
             expires_at: gpg_key_expires_at(armored, key_id),
+            is_revoked: gpg_key_is_revoked(armored, key_id),
             added_at: now,
             is_verified: false,
             can_sign: gpg_key_can_sign(armored, key_id),
@@ -896,6 +931,7 @@ rule UserAddsGpgKeyMatchedByEmail {
                 identity_emails: {},
                 key_created_at: gpg_key_created_at(armored, sub_id),
                 expires_at: gpg_key_expires_at(armored, sub_id),
+                is_revoked: gpg_key_is_revoked(armored, sub_id),
                 added_at: now,
                 is_verified: false,
                 can_sign: gpg_key_can_sign(armored, sub_id),
@@ -941,6 +977,7 @@ rule UserAddsGpgKeyProvenBySignature {
             identity_emails: identities,
             key_created_at: gpg_key_created_at(armored, key_id),
             expires_at: gpg_key_expires_at(armored, key_id),
+            is_revoked: gpg_key_is_revoked(armored, key_id),
             added_at: now,
             is_verified: true,
             can_sign: gpg_key_can_sign(armored, key_id),
@@ -958,6 +995,7 @@ rule UserAddsGpgKeyProvenBySignature {
                 identity_emails: {},
                 key_created_at: gpg_key_created_at(armored, sub_id),
                 expires_at: gpg_key_expires_at(armored, sub_id),
+                is_revoked: gpg_key_is_revoked(armored, sub_id),
                 added_at: now,
                 is_verified: true,
                 can_sign: gpg_key_can_sign(armored, sub_id),
@@ -970,6 +1008,8 @@ rule UserAddsGpgKeyProvenBySignature {
 
 -- A user proves possession of an already registered primary key (or any of
 -- its subkeys) by signing the token.
+-- decided: verification stays available when the user may not manage their
+-- GPG keys (manage_gpg_keys disabled); it does not change the key set.
 -- from: models/asymkey/gpg_key_verify.go:33
 rule UserVerifiesGpgKey {
     when: UserVerifiesGpgKey(owner, key, challenge, signature)
@@ -985,7 +1025,7 @@ rule UserVerifiesGpgKey {
     @guidance
         -- Web: POST /user/settings/keys (type=verify_gpg, key_id, signature).
         -- API: POST /api/v1/user/gpg_key_verify. Neither checks the
-        -- manage_gpg_keys feature flag in Forgejo.
+        -- manage_gpg_keys feature flag.
 }
 
 -- A user removes one of their primary GPG keys; its subkeys and the original
@@ -1045,13 +1085,18 @@ rule VerifyUnsignedObject {
 
 -- OpenPGP signatures. In order:
 --   1. a registered key (primary or subkey) that may vouch for signatures
---      produced it: verified, credited to the key's owner;
+--      produced it: verified, credited to the key's owner -- unless that key
+--      is revoked (unverified, key_revoked) or the signature is dated after
+--      the key expired (unverified, key_expired);
 --   2. the instance signing key (or the repository's default key) produced it:
 --      verified, credited to the instance identity;
 --   3. the signature names a key id we know (registered, or the instance
 --      key) but that key did not produce it: warning (probable forgery);
 --   4. otherwise: unverified, no matching key.
 -- Committer and signer may differ; the trust model decides what that means.
+-- decided: verification is expiry-aware: a signature made while the key was
+-- valid stays verified after the key expires; one dated after expiry, or by a
+-- revoked key, is unverified with that reason.
 -- from: models/asymkey/gpg_key_object_verification.go:80
 rule VerifyOpenPgpSignature {
     when: SignatureVerificationRequested(repository, object_kind, object_id, committer_email, format?, signature?)
@@ -1071,6 +1116,23 @@ rule VerifyOpenPgpSignature {
                 result: unverified, reason: unreadable_signature,
                 signer: null, signed_by_instance: false, signing_email: null,
                 signing_gpg_key: null, signing_ssh_key: null, trust: null
+            )
+        else if signing_key != null and signing_key.is_usable_for_signatures and signing_key.is_revoked:
+            CommitVerification.created(
+                repository: repository, object_kind: object_kind, object_id: object_id,
+                committer_email: committer_email, committer: committer, format: openpgp,
+                result: unverified, reason: key_revoked,
+                signer: null, signed_by_instance: false, signing_email: null,
+                signing_gpg_key: signing_key, signing_ssh_key: null, trust: null
+            )
+        else if signing_key != null and signing_key.is_usable_for_signatures
+            and signing_key.expires_at != null and gpg_signature_created_at(signature) > signing_key.expires_at:
+            CommitVerification.created(
+                repository: repository, object_kind: object_kind, object_id: object_id,
+                committer_email: committer_email, committer: committer, format: openpgp,
+                result: unverified, reason: key_expired,
+                signer: null, signed_by_instance: false, signing_email: null,
+                signing_gpg_key: signing_key, signing_ssh_key: null, trust: null
             )
         else if signing_key != null and signing_key.is_usable_for_signatures:
             let verification = CommitVerification.created(
@@ -1117,6 +1179,10 @@ rule VerifyOpenPgpSignature {
         -- The instance key is config.signing_key when signing_format is
         -- openpgp and it is an explicit key id; otherwise the key the server's
         -- git configuration signs with in this repository (SIGNING_KEY=default).
+        -- Expiry and revocation are those of the returned primary key; a
+        -- rebuild also honours the expiry or revocation of the subkey that
+        -- produced the signature. gpg_signature_created_at is the creation
+        -- time recorded in the signature packet. Forgejo only displays expiry.
 }
 
 -- SSH signatures. Only verified personal keys of the committer count, and only
@@ -1176,6 +1242,8 @@ rule VerifySshSignature {
 --   collaborator_committer model: as collaborator, but a trusted signer who is
 --     not the committer becomes unmatched, and the instance key is untrusted
 --     unless the committer has no account and the emails agree.
+-- decided: SSH and GPG signatures are judged by the same trust model,
+-- collaborator check included (Forgejo skips it for SSH signing keys).
 -- from: models/asymkey/gpg_key_object_verification.go:458
 rule AssessSignatureTrust {
     when: SignatureVerified(verification)
@@ -1379,28 +1447,37 @@ rule AuthenticateSshPublicKey {
 }
 
 -- A git client offers a user certificate. It is accepted when it was signed
--- by a trusted CA and is valid for a principal some user has registered;
--- the client then authenticates as that principal's owner.
+-- by a trusted CA and one of the principals it lists is registered to an
+-- active user and passes the certificate checks; the client then
+-- authenticates as that principal's owner. Every listed principal is tried.
+-- decided: try every principal; a principal whose check fails no longer
+-- stops the attempt.
 -- from: modules/ssh/ssh.go:186
 rule AuthenticateSshCertificate {
     when: SshClientPresentsCertificate(connection, certificate)
 
-    let key = registered_principal_for(certificate)
+    let key = acceptable_principal_for(certificate)
 
     requires: not config.ssh_disabled
     requires: config.trusted_user_ca_keys_configured
     requires: is_user_certificate(certificate)
-    requires: key != null
     requires: certificate_signed_by_trusted_ca(certificate)
+    requires: key != null
+    requires: key.kind = principal
+    requires: key.owner.is_active and not key.owner.prohibit_login
     requires: certificate_valid_for(certificate, key.content)
 
     ensures: SshKeyAuthenticated(connection: connection, key: key)
 
     @guidance
-        -- Principals are tried in the order the certificate lists them; a
-        -- principal whose certificate check fails (expired, wrong principal,
-        -- critical options) stops the whole attempt rather than falling
-        -- through to the next.
+        -- acceptable_principal_for(certificate) is the first principal, in
+        -- the order the certificate lists them, that is registered
+        -- (SshKey kind principal with that content), whose owner is active
+        -- and not prohibited from logging in, and for which
+        -- certificate_valid_for holds (validity window, principal listed,
+        -- critical options). Principals failing any of these are skipped and
+        -- the next is tried; Forgejo instead stops at the first registered
+        -- principal whose check fails.
 }
 
 -- After a successful git operation over SSH, the key (and, for a deploy key,
@@ -1588,7 +1665,9 @@ surface VerificationTokenView {
         VerificationChallengeExpires
 }
 
--- One of the user's own personal SSH keys.
+-- One of the user's own personal SSH keys. Listing and getting keys by id
+-- (API GET /api/v1/user/keys, /api/v1/user/keys/{id}) return only these.
+-- decided: by-id and list lookups are limited to the caller's own keys.
 surface OwnSshKey {
     facing owner: access/SignedInUser
     context key: SshKey where owner = owner and kind = personal
@@ -1669,6 +1748,7 @@ surface RepositoryDeployKeys {
 
     provides:
         RepoAdminAddsDeployKey(admin, repository, title, content, access)
+            when not config.ssh_disabled and not repository.is_archived
 
     @guidance
         -- Web: GET/POST /{owner}/{repo}/settings/keys,
@@ -1715,6 +1795,30 @@ surface PublicSshKeys {
         -- API: GET /api/v1/users/{username}/keys; the owner and site admins
         -- also see key_type, read_only and the owner object.
         -- Anonymous visitors see what a public profile shows.
+}
+
+-- Looking up who owns an SSH key by its fingerprint (API:
+-- GET /api/v1/user/keys?fingerprint=...). The owning user is named only when
+-- the caller may see their profile; deploy keys and principals never match.
+-- Site administrators see every key, deploy keys included.
+-- decided: own keys plus a visibility-respecting fingerprint lookup; listing
+-- and getting by id return only the caller's own keys (OwnSshKey).
+-- from: routers/api/v1/user/key.go:59
+surface SshKeyFingerprintLookup {
+    facing viewer: accounts/User
+    context key: SshKey where (kind = personal and owner.visible_to(viewer)) or viewer.is_admin
+
+    exposes:
+        key.fingerprint
+        key.public_line
+        key.name
+        key.owner
+
+    @guidance
+        -- Forgejo searches every user's keys, deploy keys included, and
+        -- returns any user's key by id; the rebuild limits GET
+        -- /api/v1/user/keys and /api/v1/user/keys/{id} to the caller's own
+        -- keys (site administrators: any key).
 }
 
 -- A user's public GPG keys.
@@ -1809,15 +1913,7 @@ surface SigningService {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Adding personal SSH keys and deploy keys is allowed while DISABLE_SSH is set (only principals check it). Should a rebuild refuse key registration when SSH is disabled, or keep keys for commit signature verification?"
-open question "Externally supplied SSH keys (LDAP / OAuth2) bypass the algorithm and minimum-size policy. Should the policy apply to them too?"
-open question "Commit trust for SSH-signed commits: Forgejo only consults the collaborator check for GPG signing keys, so an SSH signature by a non-collaborator is 'trusted' under the collaborator models. The spec applies the same rule to both formats; confirm."
-open question "Signatures by expired or revoked GPG keys still verify (expiry is only displayed). Should verification take key expiry into account?"
-open question "GET /api/v1/user/keys/{id} returns any user's key by id and GET /api/v1/user/keys?fingerprint=... searches keys of all users including deploy keys. Is cross-user lookup intended (it is how 'who owns this key' works) or should it be limited to the caller's keys?"
-open question "The GPG verify endpoints ignore the manage_gpg_keys feature flag, while adding and deleting honour it. Intended?"
-open question "Deploy keys can be added to archived repositories and mirrors. Should that be refused like other settings changes on archived repositories?"
-open question "The signing policy lists are order-sensitive in Forgejo (the first of never/always wins); the spec says never wins over always. Confirm."
-open question "When several principals of one certificate are registered, Forgejo stops at the first one whose certificate check fails instead of trying the rest. Keep or fall through?"
+-- (all keys open questions decided; see spec/DECISIONS.md "## keys")
 
 ------------------------------------------------------------
 -- Requests to other modules
@@ -1835,3 +1931,6 @@ open question "When several principals of one certificate are registered, Forgej
 -- REQUEST code: raise SignatureVerificationRequested for commits/tags shown or checked (protected-branch "require signed commits"), raise SshClientPresents* / SshKeyUsedForRepository from the SSH transport, and react to SshKeyAuthenticated(connection, key) to decide repository access (deploy key access read_only < write request => refuse).
 -- REQUEST code / repositories / wiki / pulls: ask WebEditSigningRequested / InitialCommitSigningRequested / WikiEditSigningRequested / MergeSigningRequested before creating commits and sign when SigningDecision.will_sign.
 -- REQUEST pulls/PullRequest.base_repository: used to find the repository a merge is signed in.
+-- REQUEST administration: react to keys/ExternalSshKeyRefused(user, source, fingerprint) by recording a SystemNotice (as for SystemFailureReported): an LDAP / OAuth2 key failed the algorithm or minimum-size policy and was not added (decision keys 2).
+-- REQUEST code: SSH transport — certificate authentication tries every principal the certificate lists (keys/AuthenticateSshCertificate owns the lookup; nothing to change in code beyond raising SshClientPresentsCertificate) (decision keys 9).
+-- REQUEST code / access: SshKeyAuthenticated for a deploy key on a mirror can only be read_only (RepoAdminAddsDeployKey refuses read_write deploy keys on mirrors and any deploy key on archived repositories) (decision keys 7).
