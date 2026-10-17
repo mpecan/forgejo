@@ -969,3 +969,38 @@ journey TheSecondPrincipalLetsHerIn {
 
     ends: Ada is in as herself; the deactivated account's principal opens nothing.
 }
+
+-- Decided (administration 3): read-only mode refuses key changes too.
+journey ReadOnlyModeRefusesNewKeys {
+    goal: The instance is read-only for a backup. Ada tries to register a new
+          SSH key and is refused; her existing key stays listed.
+
+    cast:
+        gate:   access/InstanceWriteGate
+        laptop: SshKey
+
+    given:
+        gate.read_only = true
+        laptop.kind = personal
+        laptop.owner = ada
+        laptop.name = "laptop"
+        laptop.fingerprint = "SHA256:ada-laptop"
+        laptop.is_verified = false
+
+    1. she cannot add a key
+        stipulate manages_own_ssh_keys(ada) = true
+        stipulate length("desktop") = 7
+        stipulate ssh_parse_outcome("ssh-ed25519 AAAAdesk ada@desk") = valid
+        stipulate ssh_key_algorithm("ssh-ed25519 AAAAdesk ada@desk") = ed25519
+        stipulate ssh_key_bits("ssh-ed25519 AAAAdesk ada@desk") = 256
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAdesk ada@desk") = "SHA256:ada-desk"
+        ada cannot do UserAddsSshKey(ada, "desktop", "ssh-ed25519 AAAAdesk ada@desk") on KeySettings
+
+    2. nor delete the one she has
+        ada cannot do UserDeletesSshKey(ada, laptop) on OwnSshKey
+
+    3. her key is still listed
+        ada sees laptop.fingerprint on OwnSshKey in laptop
+
+    ends: Her keys are as they were before the instance went read-only.
+}

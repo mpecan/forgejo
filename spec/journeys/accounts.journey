@@ -278,7 +278,7 @@ journey AdminCannotDeleteThemselves {
         stipulate owns_packages(root) = false
         stipulate owns_repositories(root) = false
         stipulate belongs_to_organizations(root) = false
-        stipulate has_other_active_admin(root) = false
+        stipulate has_other_admin(root) = false
         root cannot do UserDeletesOwnAccount(root) on OwnAccountSettings
 
     ends: The instance keeps an admin; root has to appoint another first.
@@ -305,7 +305,7 @@ journey AnAdminLeavesWhileAnotherRemains {
         stipulate owns_packages(root) = false
         stipulate owns_repositories(root) = false
         stipulate belongs_to_organizations(root) = false
-        stipulate has_other_active_admin(root) = true
+        stipulate has_other_admin(root) = true
         root does UserDeletesOwnAccount(root) on OwnAccountSettings
         then DeleteUserAccount fires
         then root does not exist
@@ -416,6 +416,10 @@ journey AnOrganizationBlocksATroll {
             creating block: UserBlock
         then block.blocked = bob
         then block.blocker_organization = org
+
+    3. nor can she block herself on its behalf
+        stipulate organization_has_blocked(org, ada) = false
+        ada cannot do OrganizationBlocksUser(ada, org, ada) on OrganizationBlockList
 
     ends: The organization's block stands; repositories it owns now refuse Bob.
 }
@@ -572,3 +576,84 @@ journey APurgeThatFailsIsResumed {
     ends: The account is gone and the job's record says it took two runs.
 }
 
+
+-- Decided (administration 3): while the instance is read-only, account
+-- changes are refused like every other write; profiles stay readable.
+journey ReadOnlyModeFreezesAccounts {
+    goal: The instance is read-only for a backup. Ada can still look at Bob's
+          profile, but she cannot edit her own profile or follow him.
+
+    cast:
+        gate: access/InstanceWriteGate
+
+    given:
+        gate.read_only = true
+        gate.message = "Backup in progress"
+        bob.location = "Maribor"
+
+    1. reading a profile still works
+        ada sees bob.location on UserProfile in bob
+
+    2. she cannot edit her profile
+        stipulate length("Ada") = 3
+        stipulate length("") = 0
+        ada cannot do UserUpdatesProfile(ada, "Ada", "", "", "", "", false, false, false) on OwnProfileSettings
+
+    3. nor follow bob
+        ada cannot do UserFollowsUser(ada, bob) on UserProfile
+
+    ends: Nothing about the accounts changed while the instance was read-only.
+}
+
+-- Users and organizations share one namespace: an organization's old name
+-- keeps pointing at it after a rename, exactly as a user's does.
+journey AnOrganizationsOldNameRedirects {
+    goal: Ada owns the organization "acme" and renames it "acme-corp". Links
+          to "acme" keep reaching the organization.
+
+    cast:
+        org: organizations/Organization
+
+    given:
+        org.name = "acme"
+
+    1. ada renames the organization
+        stipulate is_org_owner(org, ada) = true
+        stipulate is_usable_owner_name("acme-corp") = true
+        stipulate length("acme-corp") = 9
+        stipulate owner_name_available("acme-corp") = true
+        stipulate owner_name_claimable("acme-corp", org) = true
+        stipulate same_name("acme", "acme-corp") = false
+        ada does OwnerRenamesOrganization(ada, org, "acme-corp") on OrganizationSettings
+            creating redirect: UserRedirect
+        then OrganizationRenameKeepsRedirect fires
+        then org.name = "acme-corp"
+
+    2. the old name points at the organization
+        then redirect.old_name = "acme"
+        then redirect.organization = org
+
+    ends: "acme" redirects to "acme-corp".
+}
+
+-- An account made by a site admin gets the same defaults as a self-registered
+-- one, and is announced as a new account like every other.
+journey AnAdminMadeAccountGetsTheDefaults {
+    goal: Root creates an account for Bea. It starts with the instance's
+          default theme and preferences, as if she had registered herself.
+
+    1. root creates the account
+        stipulate is_usable_username("bea") = true
+        stipulate username_taken("bea") = false
+        stipulate is_valid_email("bea@forge.example") = true
+        stipulate email_in_use("bea@forge.example") = false
+        stipulate password_acceptable("Temp-Passw0rd-1") = true
+        root does AdminCreatesUser(root, "bea", "bea@forge.example", "Temp-Passw0rd-1", null, null, public, true, false, false) on AdminUserDirectory
+            creating bea: User
+        then InitialiseAdminCreatedAccount fires
+        then bea.theme = "forgejo-auto"
+        then bea.avatar_email = "bea@forge.example"
+        then bea.diff_view_style = unified
+
+    ends: Bea's account looks like any other new account.
+}

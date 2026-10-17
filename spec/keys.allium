@@ -67,18 +67,36 @@
 --     commits: every new commit's result = verified), releases (tag badges), pulls
 --   SigningDecision (answer to the *SigningRequested triggers)       -- code (web edits,
 --     can_sign_as), pulls (merge_signing_satisfied), wiki, repositories (initial commit)
+--   Black boxes other modules call by these names, each standing for the keys
+--   value on the right:
+--     new_commits_verified(repository, old_sha, new_sha)  -- code: every commit reachable from
+--         new_sha and not from old_sha has a CommitVerification (SignatureVerificationRequested
+--         for that commit in repository) with result = verified
+--     can_sign_as(user, repository, branch)  -- code: the SigningDecision answering
+--         WebEditSigningRequested(actor: user, repository, parent_verified: <the branch head's
+--         CommitVerification result = verified>) has will_sign = true
+--     merge_signing_satisfied(pr, user, style)  -- pulls: style = fast_forward_only (no commit is
+--         created), or the SigningDecision answering MergeSigningRequested(actor: user, pull: pr, ...)
+--         has will_sign = true
+--     keys_of_repository(keys, repository)  -- code: the members of keys (a set of DeployKey) whose
+--         repository = repository
 --
 -- Emits:
 --   SshKeyAdded(key, actor)                         -- a user / admin / external source registered a personal key or principal
 --   SshKeyDeleted(owner, fingerprint, actor)        -- a personal key or principal was removed
 --   DeployKeyAdded(deploy_key, actor)               -- a key was attached to a repository
---   DeployKeyDeleted(repository, name, actor)       -- a key was detached from a repository
+--   DeployKeyDeleted(deploy_key, repository, name, actor) -- a key was detached from a repository;
+--                                                   -- deploy_key is the identity of the gone grant
+--                                                   -- (code drops it from branch / tag allowlists)
 --   GpgKeyAdded(key, actor)                         -- a primary GPG key (with its subkeys) was registered
 --   GpgKeyDeleted(owner, key_id, actor)             -- a primary GPG key (with its subkeys) was removed
 --   SshKeyAuthenticated(connection, key)            -- code: the git client on `connection` holds `key`
 --   SignatureVerified(verification)                 -- internal chain: a signature verified, trust to be assessed
 --   ExternalSshKeyRefused(user, source, fingerprint) -- administration: a directory / OAuth2 key failed the
 --                                                   -- key policy and was skipped (record a system notice)
+--   KeyFilesRewritten(kind)                         -- administration: a resync_all_sshkeys /
+--                                                   -- resync_all_sshprincipals run (or the operator's
+--                                                   -- regenerate command) is done; finish the cron run
 --   (CommitVerification and SigningDecision entities are created for the
 --    requesting module to read; they are answers, not events.)
 --
@@ -92,12 +110,13 @@
 --   administration/AuthorizedKeysRewriteDue(), AuthorizedPrincipalsRewriteDue():
 --   documented no-op reactions (AuthorizedKeysRewrite / AuthorizedPrincipalsRewrite)
 --   — rebuilding the SSH daemon's key files is implementation (see Excludes).
---   administration/AuthorizedKeysRegenerationRequested: likewise, no domain reaction.
+--   wiki/WikiCommitSigningRequested(actor, repository, wiki_head_verified) -- wiki_edit signing decision
+--   administration/AuthorizedKeysRegenerationRequested(operator): likewise (AuthorizedKeysRegeneration).
 --   Requests from other modules, modelled as external stimuli on the
 --   ForgeSubsystem surfaces below:
 --     SshClientPresentsPublicKey, SshClientPresentsCertificate, SshKeyUsedForRepository  (code: SSH transport)
 --     SignatureVerificationRequested  (code, pulls, releases, webhooks payloads, API)
---     InitialCommitSigningRequested, WebEditSigningRequested, WikiEditSigningRequested,
+--     InitialCommitSigningRequested, WebEditSigningRequested,
 --     MergeSigningRequested           (repositories, code, wiki, pulls)
 
 use "./accounts.allium" as accounts
@@ -106,6 +125,7 @@ use "./repositories.allium" as repositories
 use "./pulls.allium" as pulls
 use "./administration.allium" as administration
 use "./access.allium" as access
+use "./wiki.allium" as wiki
 
 ------------------------------------------------------------
 -- External Entities
@@ -413,6 +433,7 @@ config {
 -- from: routers/web/user/setting/keys.go:163
 rule UserAddsSshKey {
     when: UserAddsSshKey(owner, title, content)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let fingerprint = ssh_fingerprint(content)
     let algorithm = ssh_key_algorithm(content)
@@ -504,6 +525,7 @@ rule AddSshKeyForUserByAdmin {
 -- from: routers/api/v1/user/gpg_key.go:191
 rule UserRequestsVerificationToken {
     when: UserRequestsVerificationToken(owner)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     ensures: VerificationChallenge.created(
         owner: owner,
@@ -532,6 +554,7 @@ rule VerificationChallengeExpires {
 -- from: models/asymkey/ssh_key_verify.go:17
 rule UserVerifiesSshKey {
     when: UserVerifiesSshKey(owner, key, challenge, signature)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: manages_own_ssh_keys(owner)
     requires: key.kind = personal
@@ -553,6 +576,7 @@ rule UserVerifiesSshKey {
 -- from: services/asymkey/ssh_key.go:17
 rule UserDeletesSshKey {
     when: UserDeletesSshKey(actor, key)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     -- read before the record goes: an emission sees the resulting state
     let key_owner = key.owner
     let key_fingerprint = key.fingerprint
@@ -599,6 +623,7 @@ rule RemoveSshKeyOfUserByAdmin {
 -- from: models/asymkey/ssh_key_principals.go:58
 rule UserAddsPrincipal {
     when: UserAddsPrincipal(owner, principal)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let value = trimmed(principal)
 
@@ -635,6 +660,7 @@ rule UserAddsPrincipal {
 -- from: routers/web/user/setting/keys.go:277
 rule UserDeletesPrincipal {
     when: UserDeletesPrincipal(actor, key)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     -- read before the record goes: an emission sees the resulting state
     let key_owner = key.owner
 
@@ -738,6 +764,7 @@ rule RemoveWithdrawnExternalSshKey {
 -- from: models/asymkey/ssh_key_deploy.go:109
 rule RepoAdminAddsDeployKey {
     when: RepoAdminAddsDeployKey(admin, repository, title, content, access)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let fingerprint = ssh_fingerprint(content)
     let algorithm = ssh_key_algorithm(content)
@@ -807,6 +834,7 @@ rule RepoAdminAddsDeployKey {
 -- from: models/repo.go:278
 rule RepoAdminDeletesDeployKey {
     when: RepoAdminDeletesDeployKey(admin, deploy_key)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     -- read before the record goes: an emission sees the resulting state
     let key_repository = deploy_key.repository
     let key_name = deploy_key.name
@@ -820,7 +848,7 @@ rule RepoAdminDeletesDeployKey {
     ensures:
         if not shared:
             not exists material
-    ensures: DeployKeyDeleted(repository: key_repository, name: key_name, actor: admin)
+    ensures: DeployKeyDeleted(deploy_key: deploy_key, repository: key_repository, name: key_name, actor: admin)
 
     @guidance
         -- Web: POST /{owner}/{repo}/settings/keys/delete.
@@ -849,12 +877,12 @@ rule DetachDeployKeysOfDeletedRepository {
 
 -- administration's resync_all_sshkeys cron task. Rewriting the SSH daemon's
 -- authorized_keys file from SshKeys is an implementation detail (see
--- Excludes): the keys themselves do not change, so this reaction is a
--- documented no-op that only marks that the rewrite was asked for.
+-- Excludes): the keys themselves do not change, so this reaction only
+-- reports that the rewrite is done (administration finishes the cron run).
 -- from: services/cron/tasks_extended.go (resync_all_sshkeys)
 rule AuthorizedKeysRewrite {
     when: administration/AuthorizedKeysRewriteDue()
-    ensures: KeyFileRewriteRequested(kind: authorized_keys)
+    ensures: KeyFilesRewritten(kind: authorized_keys)
 }
 
 -- administration's resync_all_sshprincipals cron task; as above, for the
@@ -862,7 +890,15 @@ rule AuthorizedKeysRewrite {
 -- from: services/cron/tasks_extended.go (resync_all_sshprincipals)
 rule AuthorizedPrincipalsRewrite {
     when: administration/AuthorizedPrincipalsRewriteDue()
-    ensures: KeyFileRewriteRequested(kind: authorized_principals)
+    ensures: KeyFilesRewritten(kind: authorized_principals)
+}
+
+-- `forgejo admin regenerate keys`: the operator rebuilds authorized_keys by
+-- hand. As above, the key set is unchanged; the rewrite is reported done.
+-- from: cmd/admin_regenerate.go:20
+rule AuthorizedKeysRegeneration {
+    when: administration/AuthorizedKeysRegenerationRequested(operator)
+    ensures: KeyFilesRewritten(kind: authorized_keys)
 }
 
 ------------------------------------------------------------
@@ -895,6 +931,7 @@ rule RemoveKeysOfDeletedAccount {
 -- from: models/asymkey/gpg_key_add.go:349
 rule UserAddsGpgKeyMatchedByEmail {
     when: UserAddsGpgKey(owner, armored)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let key_id = gpg_primary_key_id(armored)
     let identities = gpg_identity_emails(armored)
@@ -957,6 +994,7 @@ rule UserAddsGpgKeyMatchedByEmail {
 -- from: models/asymkey/gpg_key_add.go:364
 rule UserAddsGpgKeyProvenBySignature {
     when: UserAddsSignedGpgKey(owner, armored, challenge, signature)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     let key_id = gpg_token_signer_key_id(armored, signature)
     let identities = gpg_identity_emails(armored)
@@ -1013,6 +1051,7 @@ rule UserAddsGpgKeyProvenBySignature {
 -- from: models/asymkey/gpg_key_verify.go:33
 rule UserVerifiesGpgKey {
     when: UserVerifiesGpgKey(owner, key, challenge, signature)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
 
     requires: key.owner = owner
     requires: key.is_primary
@@ -1033,6 +1072,7 @@ rule UserVerifiesGpgKey {
 -- from: models/asymkey/gpg_key.go:230
 rule UserDeletesGpgKey {
     when: UserDeletesGpgKey(owner, key)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     -- read before the record goes: an emission sees the resulting state
     let deleted_key_id = key.key_id
 
@@ -1349,7 +1389,7 @@ rule DecideWebEditSigning {
 -- Commits to a repository's wiki.
 -- from: services/asymkey/sign.go:175
 rule DecideWikiSigning {
-    when: WikiEditSigningRequested(actor, repository, wiki_head_verified)
+    when: wiki/WikiCommitSigningRequested(actor, repository, wiki_head_verified)
 
     let policy = SigningPolicy{operation: wiki_edit}
 
@@ -1905,7 +1945,6 @@ surface SigningService {
         SignatureVerificationRequested(repository, object_kind, object_id, committer_email, format?, signature?)
         InitialCommitSigningRequested(actor, repository)
         WebEditSigningRequested(actor, repository, parent_verified)
-        WikiEditSigningRequested(actor, repository, wiki_head_verified)
         MergeSigningRequested(actor, pull, base_verified, head_verified, all_commits_verified, has_approval)
 }
 
@@ -1925,11 +1964,11 @@ surface SigningService {
 -- REQUEST repositories/Repository.trust_model: keys/TrustModel, settable by repo admins (web settings, API create/edit `trust_model`) — used locally as black box repository_trust_model.
 -- REQUEST repositories: emit RepositoryDeleted(repository) so deploy keys are detached.
 -- REQUEST repositories / access: provide is_owner_member_or_collaborator(user, repository): owner, member of a team with code access to the repository, or collaborator.
--- REQUEST accounts: manages_own_ssh_keys(user) / manages_own_gpg_keys(user) = not user.feature_disabled(manage_ssh_keys / manage_gpg_keys); used locally as black boxes because parameterised derived values are not evaluated by the journey walker.
+-- (resolved: accounts' header maps manages_own_ssh_keys / manages_own_gpg_keys to not user.has_feature_disabled(manage_ssh_keys / manage_gpg_keys).)
 -- REQUEST access: is_repo_admin(user, repository) and can_read_code(user, repository) (access/is_repo_admin, access/can_read(user, repository, code)); used locally as black boxes because qualified black boxes are not evaluated by the journey walker.
--- REQUEST accounts: committer_account(email) — the user owning an activated address (or the user's no-reply address) equal to email, case-insensitive.
+-- (resolved: accounts' header defines committer_account(email).)
 -- REQUEST code: raise SignatureVerificationRequested for commits/tags shown or checked (protected-branch "require signed commits"), raise SshClientPresents* / SshKeyUsedForRepository from the SSH transport, and react to SshKeyAuthenticated(connection, key) to decide repository access (deploy key access read_only < write request => refuse).
--- REQUEST code / repositories / wiki / pulls: ask WebEditSigningRequested / InitialCommitSigningRequested / WikiEditSigningRequested / MergeSigningRequested before creating commits and sign when SigningDecision.will_sign.
+-- REQUEST code / repositories / pulls: ask WebEditSigningRequested / InitialCommitSigningRequested / MergeSigningRequested (wiki done: keys reacts to wiki/WikiCommitSigningRequested) before creating commits and sign when SigningDecision.will_sign.
 -- REQUEST pulls/PullRequest.base_repository: used to find the repository a merge is signed in.
 -- REQUEST administration: react to keys/ExternalSshKeyRefused(user, source, fingerprint) by recording a SystemNotice (as for SystemFailureReported): an LDAP / OAuth2 key failed the algorithm or minimum-size policy and was not added (decision keys 2).
 -- REQUEST code: SSH transport — certificate authentication tries every principal the certificate lists (keys/AuthenticateSshCertificate owns the lookup; nothing to change in code beyond raising SshClientPresentsCertificate) (decision keys 9).

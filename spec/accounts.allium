@@ -50,7 +50,7 @@
 --     follows (FederatedUserFollower): owned by federation.
 --   - "Wrong user type" doctor fix (CountWrongUserType/FixWrongUserType):
 --     data-repair accident of the legacy schema, not behaviour.
---   - LastRepoVisibility (form convenience), Rands/Salt rotation (security
+--   - Rands/Salt rotation (security
 --     implementation detail), LowerName columns (case-insensitivity is stated
 --     as an invariant instead).
 --   - The X-Gitea-Warning header on admin email-domain conflicts: Gitea API
@@ -63,8 +63,9 @@
 --   UserAccountCreated(user)                       -- any new account
 --   UserProfileUpdated(user)                       -- profile fields changed
 --   UserRenamed(user, old_name, new_name)          -- repositories update owner names,
---                                                  -- packages update container image names,
---                                                  -- code moves AGit refs
+--                                                  -- pulls / code move AGit refs; packages
+--                                                  -- need nothing (coordinates derive from
+--                                                  -- the owner's current name)
 --   UserVisibilityChanged(user, old_visibility, new_visibility)
 --   UserAvatarChanged(user)
 --   UserEmailAdded(user, address)                  -- notifications sends activation mail
@@ -81,7 +82,11 @@
 --                                                  -- actions: revoke trust
 --   OrganizationBlockedUser(organization, blocked) -- same consequences for org-owned repos
 --   UserUnblocked(blocker, blocked)
---   AccountStatusChanged(user)                     -- admin flags changed
+--   AccountStatusChanged(user)                     -- status flags (is_admin, is_restricted,
+--                                                  -- is_active, prohibit_login) may have changed:
+--                                                  -- an admin edit, an external source's flags,
+--                                                  -- a moderator's suspension, a purge starting;
+--                                                  -- access announces lost repository access
 --   UserPurged(user)                               -- purge began or was resumed (every step must be
 --                                                  -- idempotent); repositories delete owned repos,
 --                                                  -- organizations remove memberships and
@@ -94,6 +99,17 @@
 --   UserAccountDeleted(user, kind, purge, delete_contributions)  -- `user` is already gone; read nothing from it but identity
 --                                                  -- every module removes or ghosts the user's
 --                                                  -- rows (see DeleteUserAccount guidance)
+--   ReportableUserChanging(user, change)           -- moderation: a moderation-relevant profile
+--                                                  -- field (name, full name, primary email,
+--                                                  -- location, website, pronouns, description,
+--                                                  -- avatar, avatar email) is changing, or the
+--                                                  -- account is being deleted (change: update |
+--                                                  -- deletion, moderation's ContentChange); emitted
+--                                                  -- in the same step as the change
+--   InactiveAccountCleanupFinished(older_than)     -- administration: the delete_inactive_accounts
+--                                                  -- sweep is done (finish the cron run)
+--   AccountFilesLeftBehind(user_name, description) -- administration: removing a deleted account's
+--                                                  -- stored files failed (record a system notice)
 --
 -- Reacts to:
 --   authentication/UserSignedUp(user)              -- authentication created the account
@@ -109,11 +125,65 @@
 --   administration/UserAvatarChangedByAdmin(admin, user)
 --   administration/UserAvatarRemovedByAdmin(admin, user)
 --   administration/InactiveAccountCleanupDue(older_than)
+--   administration/UserCreatedByAdmin(admin, user, send_notification) -- apply creation defaults
+--   administration/UserEditedByAdmin(admin, user)  -- status flags may have changed
+--   authentication/ExternalAvatarAsserted(user, url) -- OAuth2 avatar (UPDATE_AVATAR)
+--   authentication/ExternalAdminFlagsAsserted(user, is_admin, is_restricted) -- LDAP / OAuth2 group flags
+--   moderation/ModeratorSuspendsAccount(admin, user)
+--   moderation/ModeratorDeletesAccount(admin, user) -- always a purge
+--   organizations/OrganizationCreated(organization, creator) -- drop a stale redirect for the name
+--   organizations/OrganizationRenamed(organization, old_name, new_name) -- keep a redirect
+--   organizations/OrganizationDeleted(organization) -- drop its follows, blocks and redirects
+--   repositories/RepositoryCreated(repository, doer) -- remember the owner's last privacy choice
+--
+-- Provides to other modules (black boxes they call by these names; each
+-- stands for the accounts value on the right):
+--   username_available(name)        -- authentication: is_usable_username(name), not name_taken(name),
+--                                   -- no ReservedName holds it, and no UserRedirect{old_name: name}
+--                                   -- is in_cooldown (all case-insensitive)
+--   is_usable_owner_name(name)      -- organizations: is_usable_username(name) and no ReservedName holds it
+--   name_taken(name) / owner_name_available(name)
+--                                   -- some User or organizations/Organization holds the name / none does
+--                                   -- (users and organizations share one namespace, invariant UniqueUserNames)
+--   owner_name_claimable(name, org) -- organizations: no UserRedirect{old_name: name} is in_cooldown,
+--                                   -- unless that redirect's organization is org
+--   email_available(email)          -- authentication: no EmailAddress{address: email} exists (any user,
+--                                   -- activated or not, case-insensitive)
+--   user_count()                    -- authentication: the number of stored Users
+--   user_by_email(email)            -- authentication: the user of the activated EmailAddress{address: email}, else null
+--   committer_account(email)        -- keys: user_by_email(email), else the user whose no_reply_email equals
+--                                   -- email (case-insensitive), else null
+--   has_other_admin(user)           -- administration, this module: some User other than user with
+--                                   -- is_admin, is_active, not prohibit_login and not being_purged
+--   is_blocked(blocker, user) / has_blocked(blocker, user)
+--                                   -- issues, notifications, repositories: exists UserBlock{blocker: blocker,
+--                                   -- blocked: user}, or, when blocker is an organization,
+--                                   -- UserBlock{blocker_organization: blocker, blocked: user}
+--   organization_has_blocked(org, user) -- exists UserBlock{blocker_organization: org, blocked: user}
+--   is_blocked_by_owner(repository, user) -- issues, pulls: is_blocked(repository.owner_user, user) or
+--                                   -- organization_has_blocked(repository.owner_org, user)
+--   owner_visibility_is_public(repository) -- code: repository.owner_user.visibility = public, or the
+--                                   -- owning organization's visibility is public
+--   profile_visible_to(user, viewer) -- moderation: user.visible_to(viewer) (a block does not hide a profile)
+--   owns_packages(user)             -- packages/OwnerRegistry{owner_user: user}.has_packages
+--   owns_repositories(user)         -- user.num_repos > 0
+--   may_import_local_paths(user)    -- migrations: user.can_import_local
+--   manages_own_ssh_keys(user) / manages_own_gpg_keys(user)
+--                                   -- keys: not user.has_feature_disabled(manage_ssh_keys / manage_gpg_keys)
+--   deletion_disabled_for(user)     -- user.has_feature_disabled(deletion)
+--   ghost_user()                    -- migrations, others: the built-in ghost identity (SystemIdentity
+--                                   -- ghost) as a User value: never stored, cannot sign in, stands in for
+--                                   -- deleted or unknown authors
+--   actions_bot() / is_actions_bot(user)
+--                                   -- actions: the built-in "forgejo-actions" identity (SystemIdentity
+--                                   -- actions) as a User value; is_actions_bot(user) = (user = actions_bot())
 
 use "./authentication.allium" as authentication
 use "./organizations.allium" as organizations
 use "./administration.allium" as administration
 use "./access.allium" as access
+use "./repositories.allium" as repositories
+use "./moderation.allium" as moderation
 
 ------------------------------------------------------------
 -- Enumerations
@@ -184,6 +254,7 @@ entity User {
     name: String                         -- unique (case-insensitive) handle, renamable
     kind: UserKind
     created_at: Timestamp
+    updated_at: Timestamp                -- last change to the account record (any field); discovery sorts by it
     last_login_at: Timestamp?
     login_source: authentication/AuthSource?   -- null for local accounts
 
@@ -218,6 +289,9 @@ entity User {
     allow_import_local: Boolean
     allow_create_organization: Boolean
     max_repo_creation: Integer?          -- null means use the instance default
+    -- The privacy of the last repository created for this user (true = private);
+    -- the new-repository form starts from it when repositories' DEFAULT_PRIVATE = last.
+    last_repo_visibility: Boolean
 
     -- Preferences
     language: String?                    -- null means use the browser / instance default
@@ -233,6 +307,7 @@ entity User {
     blocks_given: UserBlock with blocker = this
     blocks_received: UserBlock with blocked = this
     settings: UserSetting with user = this
+    owned_repositories: repositories/Repository with owner_user = this
 
     -- Projections
     followers: follows_received -> follower
@@ -243,6 +318,7 @@ entity User {
     -- Derived
     num_followers: follows_received.count
     num_following: follows_given.count
+    num_repos: owned_repositories.count  -- repositories and quota (count_repos) read it
     is_local: login_source = null
     is_system: false                     -- stored users are never system identities
     -- decided: a purge is a recorded job; while it runs the account cannot sign in
@@ -408,6 +484,8 @@ config {
     gravatar_source: String = "https://secure.gravatar.com/avatar/"  -- GRAVATAR_SOURCE ("gravatar" | "libravatar" | URL)
     disable_gravatar: Boolean = false                        -- DISABLE_GRAVATAR (true in OFFLINE_MODE); runtime-editable
     enable_federated_avatar: Boolean = false                 -- ENABLE_FEDERATED_AVATAR (Libravatar DNS lookup); runtime-editable
+    -- [oauth2_client] UPDATE_AVATAR is owned by authentication; read here, not redeclared.
+    update_avatar_from_source: Boolean = authentication/config.oauth2_client_update_avatar
 
     -- [ui]
     show_user_email: Boolean = true                          -- SHOW_USER_EMAIL
@@ -460,6 +538,7 @@ config {
 -- decided: admins can reserve names (anti re-registration)
 rule AdminReservesName {
     when: AdminReservesName(admin, name)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: admin.is_admin
     requires: is_usable_username(name)
     requires: not exists ReservedName{name: name}
@@ -470,6 +549,7 @@ rule AdminReservesName {
 -- decided: a reserved name stays reserved until an admin releases it
 rule AdminReleasesName {
     when: AdminReleasesName(admin, reservation)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: admin.is_admin
     requires: exists reservation
     ensures: not exists reservation
@@ -487,6 +567,8 @@ rule AdminReleasesName {
 rule InitialiseSelfRegisteredAccount {
     when: authentication/UserSignedUp(user)
     ensures: user.created_at = now
+    ensures: user.updated_at = now
+    ensures: user.last_repo_visibility = false
     ensures: user.full_name = ""
     ensures: user.keep_email_private = config.default_keep_email_private
     ensures: user.keep_pronouns_private = false
@@ -510,6 +592,36 @@ rule InitialiseSelfRegisteredAccount {
     ensures: UserAccountCreated(user: user)
 }
 
+-- A site admin created an account (administration owns the entry point, its
+-- checks, the primary EmailAddress and the UserLogin; it sets name, kind,
+-- primary email, status flags, visibility and creation time). This module
+-- applies the remaining creation defaults exactly as for self-registration and
+-- drops any stale redirect for the name, so every new account, however it was
+-- made, is announced once with UserAccountCreated.
+-- from: routers/web/admin/users.go:127
+rule InitialiseAdminCreatedAccount {
+    when: administration/UserCreatedByAdmin(admin, user, send_notification)
+    ensures: user.updated_at = now
+    ensures: user.last_repo_visibility = false
+    ensures: user.full_name = ""
+    ensures: user.keep_email_private = config.default_keep_email_private
+    ensures: user.keep_pronouns_private = false
+    ensures: user.keep_activity_private = false
+    ensures: user.use_custom_avatar = false
+    ensures: user.avatar_email = user.primary_email
+    ensures: user.email_notifications = config.default_email_notifications
+    ensures: user.allow_git_hook = false
+    ensures: user.allow_import_local = false
+    ensures: user.allow_create_organization = (config.default_allow_create_organization and not config.org_creation_disabled)
+    ensures: user.theme = config.default_theme
+    ensures: user.diff_view_style = unified
+    ensures: user.enable_repo_unit_hints = true
+    ensures:
+        for r in UserRedirects where same_name(old_name, user.name):
+            not exists r
+    ensures: UserAccountCreated(user: user)
+}
+
 -- A fediverse actor seen for the first time gets a local mirror account.
 -- from: services/federation/federation_service.go:232
 rule CreateActivityPubMirror {
@@ -522,6 +634,8 @@ rule CreateActivityPubMirror {
             name: handle,
             kind: activitypub,
             created_at: now,
+            updated_at: now,
+            last_repo_visibility: false,
             full_name: full_name,
             description: "", website: "", location: "", pronouns: "",
             keep_pronouns_private: false,
@@ -576,6 +690,7 @@ rule PromoteRemoteUser {
 -- from: services/user/user.go:69
 rule UserRenamesSelf {
     when: UserRenamesSelf(user, new_name)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: new_name != user.name
     requires: user.login_source = null or user.login_source.allows_username_change
     requires: is_usable_username(new_name)
@@ -605,6 +720,7 @@ rule AdminRenameKeepsRedirect {
 rule RenameNamespace {
     when: RenameNamespace(user, old_name, new_name)
     let case_only = same_name(old_name, new_name)
+    ensures: ReportableUserChanging(user: user, change: update)
     ensures: user.name = new_name
     ensures:
         if not case_only:
@@ -616,8 +732,9 @@ rule RenameNamespace {
         -- When MAX_USER_REDIRECTS > 0, delete this user's oldest redirects
         -- beyond that count (see LimitUserRedirects).
         -- Consumers of UserRenamed: repositories (owner name on every owned
-        -- repository and on-disk location), packages (container image names),
-        -- code (AGit refs that embed the user name).
+        -- repository and on-disk location), pulls and code (AGit refs that
+        -- embed the user name). packages needs no reaction: image and
+        -- registry coordinates derive from the owner's current name.
 }
 
 -- Keep only the newest MAX_USER_REDIRECTS redirects per user.
@@ -632,6 +749,43 @@ rule LimitUserRedirects {
             not exists r
 }
 
+-- The same limit for an organization's old names.
+-- from: models/user/redirect.go:97
+rule LimitOrganizationRedirects {
+    when: redirect: UserRedirect.created
+    requires: config.max_user_redirects > 0
+    requires: redirect.organization != null
+    requires: organization_redirect_count(redirect.organization) > config.max_user_redirects
+    ensures:
+        for r in oldest_organization_redirects(redirect.organization, organization_redirect_count(redirect.organization) - config.max_user_redirects):
+            not exists r
+    @guidance
+        -- organization_redirect_count(org): UserRedirects with organization = org.
+}
+
+-- An organization was renamed (organizations owns the rename and its name
+-- checks). Users and organizations share one namespace, so its old name is
+-- kept exactly as a user's is: any redirect holding the old or the new name
+-- is dropped and the old name becomes a redirect to the organization.
+-- from: services/user/user.go:70 (renameUser serves organizations too)
+rule OrganizationRenameKeepsRedirect {
+    when: organizations/OrganizationRenamed(organization, old_name, new_name)
+    requires: not same_name(old_name, new_name)
+    ensures:
+        for r in UserRedirects where same_name(r.old_name, old_name) or same_name(r.old_name, new_name):
+            not exists r
+        UserRedirect.created(old_name: old_name, organization: organization, created_at: now)
+}
+
+-- A new organization takes its name: a stale redirect holding that name goes.
+-- from: models/organization/org.go:330
+rule OrganizationCreationDropsStaleRedirect {
+    when: organizations/OrganizationCreated(organization, creator)
+    ensures:
+        for r in UserRedirects where same_name(old_name, organization.name):
+            not exists r
+}
+
 ------------------------------------------------------------
 -- Profile, preferences, avatar
 ------------------------------------------------------------
@@ -642,12 +796,14 @@ rule LimitUserRedirects {
 -- from: routers/web/user/setting/profile.go:72
 rule UserUpdatesProfile {
     when: UserUpdatesProfile(user, full_name, description, website, location, pronouns, keep_email_private, keep_pronouns_private, keep_activity_private)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: length(full_name) <= 100
     requires: length(description) <= 255
     requires: length(website) <= 255
     requires: website = "" or url_scheme(website) in config.valid_site_url_schemes
     requires: length(location) <= 50
     requires: length(pronouns) <= 50
+    ensures: ReportableUserChanging(user: user, change: update)
     ensures: user.full_name = full_name
     ensures: user.description = description
     ensures: user.website = website
@@ -664,6 +820,7 @@ rule UserUpdatesProfile {
 -- from: services/user/update.go:131
 rule UserChangesVisibility {
     when: UserChangesVisibility(user, visibility)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: visibility in config.allowed_user_visibility_modes
     requires: visibility != user.visibility
     ensures: user.visibility = visibility
@@ -674,6 +831,7 @@ rule UserChangesVisibility {
 -- from: routers/web/user/setting/profile.go:351
 rule UserChangesTheme {
     when: UserChangesTheme(user, theme)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: theme in config.themes
     ensures: user.theme = theme
 }
@@ -683,6 +841,7 @@ rule UserChangesTheme {
 -- from: routers/web/user/setting/profile.go:378
 rule UserChangesLanguage {
     when: UserChangesLanguage(user, language)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: language = null or language in config.languages
     ensures: user.language = language
 }
@@ -691,6 +850,7 @@ rule UserChangesLanguage {
 -- from: routers/web/user/setting/profile.go:408
 rule UserTogglesRepoUnitHints {
     when: UserTogglesRepoUnitHints(user, enabled)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     ensures: user.enable_repo_unit_hints = enabled
 }
 
@@ -698,6 +858,7 @@ rule UserTogglesRepoUnitHints {
 -- from: routers/web/repo/middlewares.go:39
 rule UserChangesDiffViewStyle {
     when: UserChangesDiffViewStyle(user, style)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     ensures: user.diff_view_style = style
 }
 
@@ -705,6 +866,7 @@ rule UserChangesDiffViewStyle {
 -- from: routers/web/user/setting/profile.go:426
 rule UserHidesTimelineEvents {
     when: UserHidesTimelineEvents(user, groups)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let existing = UserSetting{user: user, key: hidden_timeline_events}
     ensures:
         if exists existing:
@@ -717,6 +879,7 @@ rule UserHidesTimelineEvents {
 -- from: routers/web/repo/middlewares.go:83
 rule UserChangesDiffWhitespace {
     when: UserChangesDiffWhitespace(user, behaviour)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let existing = UserSetting{user: user, key: diff_whitespace_behaviour}
     ensures:
         if exists existing:
@@ -729,6 +892,7 @@ rule UserChangesDiffWhitespace {
 -- from: routers/web/repo/middlewares.go:109
 rule UserTogglesOutdatedComments {
     when: UserTogglesOutdatedComments(user, show)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let existing = UserSetting{user: user, key: show_outdated_review_comments}
     ensures:
         if exists existing:
@@ -741,6 +905,7 @@ rule UserTogglesOutdatedComments {
 -- from: routers/web/user/setting/account.go:186
 rule UserChangesEmailNotifications {
     when: UserChangesEmailNotifications(user, preference)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     ensures: user.email_notifications = preference
 }
 
@@ -752,10 +917,12 @@ rule UserChangesEmailNotifications {
 -- from: services/user/avatar.go:20
 rule UserUploadsAvatar {
     when: UserUploadsAvatar(user, image)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: image_format(image) in { "png", "jpeg", "gif", "webp" }
     requires: byte_size(image) <= config.avatar_max_file_size
     requires: image_width(image) <= config.avatar_max_width
     requires: image_height(image) <= config.avatar_max_height
+    ensures: ReportableUserChanging(user: user, change: update)
     ensures: user.use_custom_avatar = true
     ensures: user.custom_avatar = store_avatar(user, image)
     ensures: UserAvatarChanged(user: user)
@@ -767,7 +934,9 @@ rule UserUploadsAvatar {
 -- from: routers/web/user/setting/profile.go:126
 rule UserChoosesEmailAvatar {
     when: UserChoosesEmailAvatar(user, avatar_email)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_valid_email(avatar_email) and email_domain_allowed(avatar_email)
+    ensures: ReportableUserChanging(user: user, change: update)
     ensures: user.use_custom_avatar = false
     ensures: user.avatar_email = avatar_email
     ensures: UserAvatarChanged(user: user)
@@ -777,7 +946,9 @@ rule UserChoosesEmailAvatar {
 -- from: routers/web/user/setting/profile.go:146
 rule UserSwitchesToGeneratedAvatar {
     when: UserSwitchesToGeneratedAvatar(user)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: user.custom_avatar = null
+    ensures: ReportableUserChanging(user: user, change: update)
     ensures: user.use_custom_avatar = true
     ensures: user.custom_avatar = generate_identicon(user)
     ensures: UserAvatarChanged(user: user)
@@ -787,6 +958,8 @@ rule UserSwitchesToGeneratedAvatar {
 -- from: services/user/avatar.go:53
 rule UserDeletesAvatar {
     when: UserDeletesAvatar(user)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    ensures: ReportableUserChanging(user: user, change: update)
     ensures: user.use_custom_avatar = false
     ensures: user.custom_avatar = null
     ensures: UserAvatarChanged(user: user)
@@ -797,6 +970,7 @@ rule UserDeletesAvatar {
 -- from: routers/web/admin/users.go:542
 rule AdminAvatarChangeApplies {
     when: administration/UserAvatarChangedByAdmin(admin, user)
+    ensures: ReportableUserChanging(user: user, change: update)
     ensures: user.use_custom_avatar = true
     ensures: UserAvatarChanged(user: user)
 }
@@ -804,8 +978,30 @@ rule AdminAvatarChangeApplies {
 -- from: routers/web/admin/users.go:559
 rule AdminAvatarRemovalApplies {
     when: administration/UserAvatarRemovedByAdmin(admin, user)
+    ensures: ReportableUserChanging(user: user, change: update)
     ensures: user.use_custom_avatar = false
     ensures: user.custom_avatar = null
+    ensures: UserAvatarChanged(user: user)
+}
+
+-- An OAuth2 source handed over the user's avatar on sign-in. With
+-- [oauth2_client] UPDATE_AVATAR on, the image at that address replaces the
+-- avatar when it can be fetched and passes the upload limits; otherwise it is
+-- ignored without telling anyone.
+-- from: routers/web/auth/oauth.go:1288
+rule ExternalAvatarIsAdopted {
+    when: authentication/ExternalAvatarAsserted(user, url)
+    requires: config.update_avatar_from_source
+    requires: url != ""
+    let image = fetch_image(url)
+    requires: image != null
+    requires: image_format(image) in { "png", "jpeg", "gif", "webp" }
+    requires: byte_size(image) <= config.avatar_max_file_size
+    requires: image_width(image) <= config.avatar_max_width
+    requires: image_height(image) <= config.avatar_max_height
+    ensures: ReportableUserChanging(user: user, change: update)
+    ensures: user.use_custom_avatar = true
+    ensures: user.custom_avatar = store_avatar(user, image)
     ensures: UserAvatarChanged(user: user)
 }
 
@@ -820,6 +1016,7 @@ rule AdminAvatarRemovalApplies {
 -- from: services/user/email.go:120
 rule UserAddsEmail {
     when: UserAddsEmail(user, address)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: length(address) <= 254
     requires: is_valid_email(address) and email_domain_allowed(address)
     requires: not exists EmailAddress{address: address}
@@ -833,6 +1030,7 @@ rule UserAddsEmail {
 -- from: routers/web/user/setting/account.go:131
 rule UserResendsEmailActivation {
     when: UserResendsEmailActivation(user, address)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: address.user = user
     requires: not address.is_activated
     requires: not activation_mail_recently_sent(user)
@@ -876,10 +1074,12 @@ rule ActivatedAccountActivatesPrimaryAddress {
 -- decided: only an activated address can become primary
 rule UserMakesEmailPrimary {
     when: UserMakesEmailPrimary(user, address)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: address.user = user
     requires: address.is_activated
     requires: not address.is_primary
     let old_primary = user.primary_email
+    ensures: ReportableUserChanging(user: user, change: update)
     ensures:
         for e in user.email_addresses where is_primary:
             e.is_primary = false
@@ -895,6 +1095,7 @@ rule UserMakesEmailPrimary {
 -- from: services/user/email.go:168
 rule InactivePrimaryEmailReplaced {
     when: authentication/UnconfirmedPrimaryEmailReplaced(user, new_address)
+    ensures: ReportableUserChanging(user: user, change: update)
     ensures:
         for e in user.email_addresses where is_primary:
             not exists e
@@ -907,6 +1108,7 @@ rule InactivePrimaryEmailReplaced {
 -- from: services/user/email.go:194
 rule UserDeletesEmail {
     when: UserDeletesEmail(user, address)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: address.user = user
     requires: not address.is_primary
     ensures: not exists address
@@ -924,6 +1126,7 @@ rule UserDeletesEmail {
 -- decided: following requires being able to see the followee
 rule UserFollowsUser {
     when: UserFollowsUser(follower, followee)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: follower != followee
     requires: not exists Follow{follower: follower, followee: followee}
     requires: not exists UserBlock{blocker: follower, blocked: followee}
@@ -936,6 +1139,7 @@ rule UserFollowsUser {
 -- from: routers/web/user/profile.go:426
 rule UserFollowsOrganization {
     when: UserFollowsOrganization(follower, organization)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not exists Follow{follower: follower, followee_organization: organization}
     requires: not organization_has_blocked(organization, follower)
     ensures: Follow.created(follower: follower, followee_organization: organization, created_at: now)
@@ -946,6 +1150,7 @@ rule UserFollowsOrganization {
 -- from: models/user/follow.go:60
 rule UserUnfollowsUser {
     when: UserUnfollowsUser(follower, followee)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let follow = Follow{follower: follower, followee: followee}
     requires: exists follow
     ensures: not exists follow
@@ -955,6 +1160,7 @@ rule UserUnfollowsUser {
 -- from: models/user/follow.go:60
 rule UserUnfollowsOrganization {
     when: UserUnfollowsOrganization(follower, organization)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let follow = Follow{follower: follower, followee_organization: organization}
     requires: exists follow
     ensures: not exists follow
@@ -983,6 +1189,7 @@ rule UserUnfollowsOrganization {
 -- decided: a personal block covers only the blocker's own repositories
 rule UserBlocksUser {
     when: UserBlocksUser(blocker, blocked)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: blocker != blocked
     requires: not exists UserBlock{blocker: blocker, blocked: blocked}
     ensures: UserBlock.created(blocker: blocker, blocked: blocked, created_at: now)
@@ -996,6 +1203,7 @@ rule UserBlocksUser {
 -- from: models/user/block.go:47
 rule UserUnblocksUser {
     when: UserUnblocksUser(blocker, blocked)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let block = UserBlock{blocker: blocker, blocked: blocked}
     requires: exists block
     ensures: not exists block
@@ -1007,7 +1215,9 @@ rule UserUnblocksUser {
 -- from: routers/web/org/setting/blocked_users.go:62
 rule OrganizationBlocksUser {
     when: OrganizationBlocksUser(owner, organization, blocked)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_org_owner(organization, owner) or owner.is_admin
+    requires: blocked != owner   -- nobody blocks themselves on an organization's behalf
     requires: not organization_has_blocked(organization, blocked)
     ensures: UserBlock.created(blocker_organization: organization, blocked: blocked, created_at: now)
     ensures: not exists Follow{follower: blocked, followee_organization: organization}
@@ -1018,6 +1228,7 @@ rule OrganizationBlocksUser {
 -- from: routers/web/org/setting/blocked_users.go:80
 rule OrganizationUnblocksUser {
     when: OrganizationUnblocksUser(owner, organization, blocked)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let block = UserBlock{blocker_organization: organization, blocked: blocked}
     requires: is_org_owner(organization, owner) or owner.is_admin
     requires: exists block
@@ -1038,9 +1249,10 @@ rule OrganizationUnblocksUser {
 -- decided: admins may self-delete while another active admin remains (Forgejo refuses every admin)
 rule UserDeletesOwnAccount {
     when: UserDeletesOwnAccount(user)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not deletion_disabled_for(user)   -- = user.has_feature_disabled(deletion)
-    -- has_other_active_admin(user): some other site admin is active and may sign in
-    requires: not user.is_admin or has_other_active_admin(user)
+    -- has_other_admin(user): some other site admin is active and may sign in (see header)
+    requires: not user.is_admin or has_other_admin(user)
     requires: not owns_repositories(user)
     requires: not belongs_to_organizations(user)
     requires: not owns_packages(user)
@@ -1061,16 +1273,69 @@ rule AdminDeletionCascades {
     when: administration/UserDeletedByAdmin(admin, user, purge)
     ensures:
         if purge:
-            user.is_active = false
-            user.is_restricted = true
-            user.is_admin = false
-            user.prohibit_login = true
-            user.max_repo_creation = 0
-            let job = AccountPurge.created(user: user, user_name: user.name, requested_by: admin, status: running, attempts: 1, started_at: now)
-            UserPurged(user: user)
-            RunAccountPurge(purge: job)
+            StartAccountPurge(user: user, requested_by: admin)
         else:
             DeleteUserAccount(user: user, purge: false)
+}
+
+-- A moderator acting on an abuse report deleted the account; moderation's
+-- account deletion always purges (moderation owns the entry point and its
+-- checks: a reported individual, never an admin or the moderator themself).
+-- from: routers/web/admin/reports.go:306
+rule ModeratorDeletionPurges {
+    when: moderation/ModeratorDeletesAccount(admin, user)
+    ensures: StartAccountPurge(user: user, requested_by: admin)
+}
+
+-- The start of every purge: the account is disabled at once (it cannot sign
+-- in while it is being purged), the job is recorded, the owning modules are
+-- told to remove what the account owns, and the first run is attempted.
+-- decided: a purge is a resumable recorded job
+-- from: services/user/user.go:183
+rule StartAccountPurge {
+    when: StartAccountPurge(user, requested_by)
+    requires: not user.being_purged
+    ensures:
+        user.is_active = false
+        user.is_restricted = true
+        user.is_admin = false
+        user.prohibit_login = true
+        user.max_repo_creation = 0
+        let job = AccountPurge.created(user: user, user_name: user.name, requested_by: requested_by, status: running, attempts: 1, started_at: now)
+        AccountStatusChanged(user: user)
+        UserPurged(user: user)
+        RunAccountPurge(purge: job)
+}
+
+-- A moderator suspended the account (moderation sets prohibit_login in the
+-- same step); the status change is announced like any other.
+-- from: routers/web/admin/reports.go:259
+rule ModeratorSuspensionApplies {
+    when: moderation/ModeratorSuspendsAccount(admin, user)
+    ensures: user.prohibit_login = true
+    ensures: AccountStatusChanged(user: user)
+}
+
+-- A site admin edited the account (administration owns the edit and its
+-- guards: the self-edit guard, PurgingAccountStaysDisabled). Status flags may
+-- have changed, restricted among them, so the change is announced.
+rule AdminEditAnnouncesStatus {
+    when: administration/UserEditedByAdmin(admin, user)
+    ensures: AccountStatusChanged(user: user)
+}
+
+-- An LDAP or OAuth2 source asserted the account's admin and restricted flags
+-- from its group filters (authentication decides the values, keeping the
+-- current restricted flag when no filter applies). The source is
+-- authoritative for these two flags, as in Forgejo; an account being purged
+-- keeps its disabled flags (invariant PurgingAccountStaysDisabled).
+-- from: services/auth/source/ldap/source_sync.go:157
+rule ExternalSourceSetsStatusFlags {
+    when: authentication/ExternalAdminFlagsAsserted(user, is_admin, is_restricted)
+    requires: not user.being_purged
+    ensures: user.is_admin = is_admin
+    ensures: user.is_restricted = is_restricted
+    ensures: AccountStatusChanged(user: user)
 }
 
 -- A purge run in which every step finished: the account is removed and the
@@ -1109,6 +1374,7 @@ rule AccountPurgeStalls {
 -- decided: an admin can resume or retry a failed purge until it completes
 rule AdminResumesPurge {
     when: AdminResumesPurge(admin, purge)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: admin.is_admin
     requires: purge.status = failed
     ensures: purge.status = running
@@ -1128,6 +1394,7 @@ rule DeleteUserAccount {
     let young = config.user_delete_with_comments_max_time > 0.days
                 and user.created_at + config.user_delete_with_comments_max_time > now
     ensures:
+        ReportableUserChanging(user: user, change: deletion)
         for e in user.email_addresses: not exists e
         for f in user.follows_given: not exists f
         for f in user.follows_received: not exists f
@@ -1149,7 +1416,8 @@ rule DeleteUserAccount {
         --     purge, every issue/PR they opened is deleted; otherwise
         --     their content stays and shows as the ghost user.
         --   pulls: auto-merge requests, review state.
-        --   code: the user disappears from branch-protection allow-lists.
+        --   code: the user disappears from branch-protection and tag-protection
+        --     allow-lists (push, force-push, merge, approvals).
         --   keys: SSH keys (authorized_keys rewritten), GPG keys and imports.
         --   authentication: access tokens and their repo scopes, OAuth2
         --     grants/apps, external logins, OpenID URIs, authorization
@@ -1159,8 +1427,12 @@ rule DeleteUserAccount {
         --   actions: user-owned runners and runner tokens, action-user trust.
         --   notifications: the user's activity rows.
         --   moderation: a shadow copy is kept if the user was reported.
-        -- On-disk repository root and stored avatar are removed last;
-        -- failures there become a system notice (administration).
+        -- On-disk repository root and stored avatar are removed last; a
+        -- failure there is reported by the storage layer
+        -- (AccountFilesRemovalFailed) and becomes a system notice
+        -- (AccountFilesLeftBehind, administration).
+        -- moderation is told first (ReportableUserChanging with deletion),
+        -- in the same step, so a reported account keeps its evidence.
 }
 
 -- Unactivated individual accounts older than OLDER_THAN are removed when
@@ -1180,6 +1452,50 @@ rule DeleteInactiveAccounts {
             and not owns_packages(this)
             and not (is_admin and admin_count() <= 1):
         ensures: DeleteUserAccount(user: user, purge: false)
+}
+
+-- The sweep reports that it is done, so administration can finish the
+-- delete_inactive_accounts run (outcome finished) and record its result.
+-- from: services/cron/tasks_extended.go:26
+rule ReportInactiveAccountCleanup {
+    when: administration/InactiveAccountCleanupDue(older_than)
+    ensures: InactiveAccountCleanupFinished(older_than: older_than)
+}
+
+-- Removing a deleted account's stored files (its on-disk repository root and
+-- avatar) failed. The account is gone; the leftover is reported so an
+-- operator sees it as a system notice.
+-- from: services/user/user.go:346
+rule ReportAccountFilesLeftBehind {
+    when: AccountFilesRemovalFailed(user_name, description)
+    ensures: AccountFilesLeftBehind(user_name: user_name, description: description)
+}
+
+------------------------------------------------------------
+-- Reactions to organizations and repositories
+------------------------------------------------------------
+
+-- An organization is gone: its followers, its block list and its old names
+-- go with it (the name is free at once).
+-- from: models/organization/org.go:437
+rule ForgetDeletedOrganization {
+    when: organizations/OrganizationDeleted(organization)
+    ensures:
+        for f in Follows where f.followee_organization = organization:
+            not exists f
+        for b in UserBlocks where b.blocker_organization = organization:
+            not exists b
+        for r in UserRedirects where r.organization = organization:
+            not exists r
+}
+
+-- A repository created for a user remembers its privacy as that user's last
+-- choice (read by repositories when DEFAULT_PRIVATE = last).
+-- from: modules/repository/create.go:116
+rule RememberLastRepositoryPrivacy {
+    when: repositories/RepositoryCreated(repository, doer)
+    requires: repository.owner_user != null
+    ensures: repository.owner_user.last_repo_visibility = repository.is_private
 }
 
 ------------------------------------------------------------
@@ -1535,6 +1851,15 @@ surface AccountPurgeAdministration {
     provides:
         AdminResumesPurge(admin, purge)
             when purge.status = failed
+}
+
+-- The storage layer reporting that a deleted account's files could not be
+-- removed (in-process contract, not a network API).
+surface AccountStorageCleanup {
+    facing _: administration/BackgroundWork
+
+    provides:
+        AccountFilesRemovalFailed(user_name, description)
 }
 
 -- The block contract other modules must enforce. Stated here because the
