@@ -160,3 +160,4 @@ invariants or config. Numbers refer to the question's position in its module in
 | 7 | Attachment size limit | **Enforced on every upload path.** |
 | 8 | Release changes on archived repositories | **All frozen,** deletes included. |
 | 9 | Permission to create a bare tag | **Code write,** wherever it happens; protected-tag rules apply. |
+| 10 | Releases on pull mirrors | **Read-only.** A pull mirror's releases follow upstream tags only; creating, editing or deleting them is refused. |
