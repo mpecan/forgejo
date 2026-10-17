@@ -112,6 +112,8 @@ use "./actions.allium" as actions
 -- Other black boxes used below (pure; their owners are named in Requests):
 --   may_write_code(pusher, push)        = deploy key with write, or Actions token with write,
 --                                         or can_write_code(pusher, push.repository)
+--                                         (`pusher` is the user, or the deploy key for a
+--                                         deploy-key push; decided code 4)
 --   may_write_branch(pusher, push, b)   = may_write_code(pusher, push), or a maintainer
 --                                         allowed to edit an open PR whose head is b (pulls)
 --   may_write_branch_as_user(u, r, b)   = can_write_code(u, r) or that maintainer-edit case
@@ -125,6 +127,9 @@ use "./actions.allium" as actions
 --                                       = the web-editor form of the pre-receive checks:
 --                                         allowlisted (or only unprotected paths), no
 --                                         protected path, and signable when signing is required
+--   upload_count(changes), largest_upload_mb(changes), uploads_have_allowed_types(changes, types)
+--                                       = over the changes that are web uploads (FileChange.is_upload):
+--                                         how many, the largest size in MB, all of an allowed type
 --   member_of_any_team(user, teams)     = organizations team membership
 --   exceeds_git_quota(r), exceeds_lfs_quota(r)    = quota for the repository owner
 --   commit_exists, commit_summary, commit_body, commit_time, full_sha, divergence,
@@ -161,6 +166,7 @@ value FileChange {
     path: String
     from_path: String?               -- set for update-with-rename
     content_size: Integer?           -- bytes; absent for delete
+    is_upload: Boolean               -- the file came from the web upload widget / upload endpoint
     last_known_blob_sha: String?     -- optimistic-concurrency guard for update/delete (API)
 }
 
@@ -252,7 +258,8 @@ entity Branch {
     head_commit_sha: String
     head_commit_summary: String
     head_committed_at: Timestamp
-    pusher: accounts/User?            -- last user who moved the branch
+    pusher: accounts/User?            -- last user who moved the branch (null when a deploy key did)
+    pushed_by_key: keys/DeployKey?    -- set when the last move was a deploy-key push (decided code 4)
     created_at: Timestamp
     updated_at: Timestamp
     status: live | deleted
@@ -337,7 +344,13 @@ entity ProtectedBranch {
     push_allowlist_enabled: Boolean
     push_allowlist_users: Set<accounts/User>
     push_allowlist_teams: Set<organizations/Team>
-    push_allowlist_deploy_keys: Boolean
+    -- decided (code 4): allowlists name individual deploy keys of this repository
+    -- (Forgejo has one "allow deploy keys" switch).
+    push_allowlist_deploy_keys: Set<keys/DeployKey>
+    -- decided (code 5): optional force-push allowlist; empty means nobody may force-push.
+    force_push_allowlist_users: Set<accounts/User>
+    force_push_allowlist_teams: Set<organizations/Team>
+    force_push_allowlist_deploy_keys: Set<keys/DeployKey>
     require_signed_commits: Boolean
     protected_file_patterns: List<String>     -- case-insensitive globs; changes to these always blocked
     unprotected_file_patterns: List<String>   -- pushes touching only these bypass the push allowlist
@@ -366,7 +379,12 @@ entity ProtectedBranch {
     -- Who may push directly (CanUserPush).
     -- from: models/git/protected_branch.go:118
     allows_push_by(user): enable_push and (if push_allowlist_enabled: user in push_allowlist_users or member_of_any_team(user, push_allowlist_teams) else: can_write_code(user, repository))
-    allows_deploy_key_push: enable_push and (not push_allowlist_enabled or push_allowlist_deploy_keys)
+    allows_deploy_key_push(key): enable_push and (not push_allowlist_enabled or key in push_allowlist_deploy_keys)
+
+    -- Who may force-push (decided code 5): only those named on the force-push allowlist,
+    -- and only when they may push at all.
+    allows_force_push_by(user): user in force_push_allowlist_users or member_of_any_team(user, force_push_allowlist_teams)
+    allows_force_push_by_key(key): key in force_push_allowlist_deploy_keys
 
     -- Who may merge (IsUserMergeWhitelisted); used by pulls.
     -- from: models/git/protected_branch.go:154
@@ -379,28 +397,34 @@ entity ProtectedBranch {
 
 -- A tag protection rule. `name_pattern` is a glob, or a regular expression when written
 -- between slashes (`/^v[0-9]+/`). Matching tags may be created or deleted only by the
--- allowlisted users and teams — repository and site admins are not exempt.
+-- allowlisted users, teams and deploy keys — repository and site admins are not exempt.
+-- decided (code 6): no admin exemption; an admin who needs to changes the rule.
 -- from: models/git/protected_tag.go:20
 entity ProtectedTag {
     repository: repositories/Repository
     name_pattern: String
     allowlist_users: Set<accounts/User>
     allowlist_teams: Set<organizations/Team>
+    allowlist_deploy_keys: Set<keys/DeployKey>    -- decided (code 4)
     created_at: Timestamp
     updated_at: Timestamp
 
     matches(tag_name): tag_pattern_matches(name_pattern, tag_name)
     allows(user): user in allowlist_users or member_of_any_team(user, allowlist_teams)
+    allows_key(key): key in allowlist_deploy_keys
 }
 
 -- One push: a batch of ref updates sent together by one pusher. Git clients push over
 -- HTTP or SSH; the web UI and API push internally (branch creation, file edits, tag
 -- creation, merges) and go through the same checks.
+-- decided (code 4): a deploy key is a first-class pusher. A deploy-key push has no user
+-- pusher (Forgejo substitutes the repository owner); allowlists, the feed and every
+-- event name the key, never the owner.
 -- from: modules/private/hook.go:26
 entity Push {
     repository: repositories/Repository
-    pusher: accounts/User             -- for a deploy key: the repository owner
-    deploy_key: keys/SshKey?          -- set when authenticated by a deploy key
+    pusher: accounts/User?            -- the pushing user; null for a deploy-key push
+    deploy_key: keys/DeployKey?       -- the pusher when a deploy key authenticated
     by_actions_task: Boolean          -- pushed with an Actions job token
     protocol: GitProtocol
     merging_pull: pulls/PullRequest?  -- set when pulls is pushing a merge to the base branch
@@ -419,6 +443,7 @@ entity Push {
     }
 
     ref_updates: RefUpdate with push = this
+    by_deploy_key: deploy_key != null
     changes_settings: option_private != null or option_template != null
 }
 
@@ -470,6 +495,9 @@ config {
     enable_push_create_org: Boolean = false              -- [repository] ENABLE_PUSH_CREATE_ORG
     default_push_create_private: Boolean = true          -- [repository] DEFAULT_PUSH_CREATE_PRIVATE
     pull_request_push_message: Boolean = true            -- [git] PULL_REQUEST_PUSH_MESSAGE
+    -- decided (code 1): admin's choice. true = pushes to protected branches skip the git
+    -- quota check (Forgejo's behaviour); false = they are checked like every other push.
+    quota_exempts_protected_branches: Boolean = true
     disable_partial_clone: Boolean = false               -- [git] DISABLE_PARTIAL_CLONE
 
     -- refs
@@ -541,7 +569,7 @@ rule GitClientFetchesRepository {
 -- to refs/for/* only need read access. Per-ref write checks happen in pre-receive.
 -- from: routers/private/serv.go:310
 rule GitClientOpensPush {
-    when: GitClientPushes(pusher, repository, protocol, deploy_key, merging_pull, option_private, option_template, agit_topic, agit_title, agit_description, agit_force_push)
+    when: GitClientPushes(pusher, repository, protocol, merging_pull, option_private, option_template, agit_topic, agit_title, agit_description, agit_force_push)
     requires: (protocol = http and not config.disable_http_git) or (protocol = ssh and not config.disable_ssh) or protocol = internal
     requires: repository.status = ready
     requires: not repository.is_archived
@@ -549,15 +577,14 @@ rule GitClientOpensPush {
     requires: pusher.is_active and not pusher.prohibit_login
     -- decided (authentication): no password Basic auth on git; push over HTTP with a token.
     requires: protocol != http or not authenticated_by_password(pusher)
-    requires: deploy_key != null or can_read_code(pusher, repository)
-    requires: deploy_key = null or deploy_key.grants_read_on(repository)
+    requires: can_read_code(pusher, repository)
     -- push options that change repository settings need owner/admin, never on forks
     -- from: routers/private/hook_pre_receive.go:137
     requires: (option_private = null and option_template = null) or (is_repo_admin(pusher, repository) and not repository.is_fork)
     ensures: Push.created(
         repository: repository,
         pusher: pusher,
-        deploy_key: deploy_key,
+        deploy_key: null,
         by_actions_task: false,
         protocol: protocol,
         merging_pull: merging_pull,
@@ -573,6 +600,40 @@ rule GitClientOpensPush {
     @guidance
         -- Quota is checked per ref in pre-receive (deletions stay allowed when over quota).
         -- Mirrors are read-only; archived repositories refuse every push.
+        -- Deploy keys open their pushes through DeployKeyOpensPush.
+}
+
+-- Opening a push with a deploy key (SSH only). The key itself is the pusher (decided
+-- code 4): no user is substituted. A deploy key cannot change repository settings with
+-- push options and cannot propose AGit pull requests (there is no user to own them).
+-- from: routers/private/serv.go:310
+rule DeployKeyOpensPush {
+    when: DeployKeyPushes(deploy_key, repository)
+    requires: not config.disable_ssh
+    requires: repository.status = ready
+    requires: not repository.is_archived
+    requires: not repository.is_mirror
+    requires: deploy_key.repository = repository
+    ensures: Push.created(
+        repository: repository,
+        pusher: null,
+        deploy_key: deploy_key,
+        by_actions_task: false,
+        protocol: ssh,
+        merging_pull: null,
+        option_private: null,
+        option_template: null,
+        agit_topic: null,
+        agit_title: null,
+        agit_description: null,
+        agit_force_push: false,
+        received_at: now,
+        status: receiving
+    )
+    @guidance
+        -- Write per ref is decided in pre-receive (may_write_code: the key's access is
+        -- read_write). Mirrors and archived repositories refuse every push, so a deploy
+        -- key on a mirror is in effect read-only (keys decision 7).
 }
 
 -- Push-to-create: pushing to a repository that does not exist creates it, if enabled
@@ -630,19 +691,26 @@ rule AcceptProtectedBranchPush {
     requires: may_write_branch(pusher, push, ref_name)
     -- 1. never deleted  2. never force-pushed  3. signatures
     requires: new_sha != null
-    requires: old_sha = null or not is_force_push(repository, old_sha, new_sha)
+    -- decided (code 5): a force push needs the force-push allowlist (empty = nobody)
+    requires:
+        old_sha = null or not is_force_push(repository, old_sha, new_sha)
+        or (push.deploy_key = null and (pusher in rule.force_push_allowlist_users or member_of_any_team(pusher, rule.force_push_allowlist_teams)))
+        or (push.deploy_key != null and push.deploy_key in rule.force_push_allowlist_deploy_keys)
     requires: not rule.require_signed_commits or new_commits_verified(repository, old_sha, new_sha)
     -- 4. protected files are never changed by a direct push
     requires: not touches_protected_files(rule, repository, old_sha, new_sha)
     -- 5. allowlisted pusher, or a change confined to unprotected files
-    --    (same as ProtectedBranch.allows_deploy_key_push / allows_push_by, spelled out)
+    --    (same as ProtectedBranch.allows_deploy_key_push / allows_push_by, spelled out;
+    --    decided code 4: the allowlist names the deploy key itself)
     requires:
-        (push.deploy_key != null and rule.enable_push and (not rule.push_allowlist_enabled or rule.push_allowlist_deploy_keys))
+        (push.deploy_key != null and rule.enable_push and (not rule.push_allowlist_enabled or push.deploy_key in rule.push_allowlist_deploy_keys))
         or (push.deploy_key = null and rule.enable_push and rule.push_allowlist_enabled
             and (pusher in rule.push_allowlist_users or member_of_any_team(pusher, rule.push_allowlist_teams)))
         or (push.deploy_key = null and rule.enable_push and not rule.push_allowlist_enabled and can_write_code(pusher, repository))
         or touches_only_unprotected_files(rule, repository, old_sha, new_sha)
-    requires: not exceeds_git_quota(repository)
+    -- decided (code 1): exempt from quota unless the admin turned the exemption off
+    -- from: routers/private/hook_pre_receive.go:291 (Forgejo skips the check here)
+    requires: config.quota_exempts_protected_branches or not exceeds_git_quota(repository)
     ensures:
         let accepted = RefUpdate.created(push: push, ref_kind: branch_ref, ref_name: ref_name, old_sha: old_sha, new_sha: new_sha)
         RefUpdateAccepted(update: accepted)
@@ -666,6 +734,8 @@ rule AcceptProtectedBranchMergePush {
     requires: old_sha = null or not is_force_push(repository, old_sha, new_sha)
     requires: not rule.require_signed_commits or new_commits_verified(repository, old_sha, new_sha)
     requires: pull.may_merge(pusher)
+    -- decided (code 1): as for direct pushes to a protected branch
+    requires: config.quota_exempts_protected_branches or not exceeds_git_quota(repository)
     requires:
         pusher.is_admin
         or ((not touches_protected_files(rule, repository, old_sha, new_sha) or (is_repo_admin(pusher, repository) and not rule.apply_to_admins))
@@ -688,9 +758,16 @@ rule AcceptTagUpdate {
     requires: push.status = receiving
     let repository = push.repository
     requires: may_write_code(pusher, push)
+    -- decided (code 6): no admin exemption — only the allowlist (users, teams and, per
+    -- decision code 4, deploy keys) may create, move or delete a protected tag.
     let matching = ProtectedTags where repository = repository and tag_pattern_matches(name_pattern, ref_name)
-    let allowing = matching where pusher in allowlist_users or member_of_any_team(pusher, allowlist_teams)
+    let allowing = matching where
+        (push.deploy_key = null and (pusher in allowlist_users or member_of_any_team(pusher, allowlist_teams)))
+        or (push.deploy_key != null and push.deploy_key in allowlist_deploy_keys)
     requires: matching.count = 0 or allowing.count > 0
+    -- decided (code 7): a push may not delete a tag that carries a published release;
+    -- delete the release first. Draft releases do not block.
+    requires: new_sha != null or not has_published_release(repository, ref_name)
     requires: new_sha = null or not exceeds_git_quota(repository)
     ensures:
         let accepted = RefUpdate.created(push: push, ref_kind: tag_ref, ref_name: ref_name, old_sha: old_sha, new_sha: new_sha)
@@ -705,6 +782,7 @@ rule AcceptReviewRefPush {
     requires: ref_kind = for_review
     requires: push.status = receiving
     let repository = push.repository
+    requires: push.deploy_key = null       -- decided (code 4): an AGit PR needs a user poster
     requires: can_read_pulls(pusher, repository)
     requires: not repository.is_empty
     requires: review_target_branch(repository, ref_name) != null
@@ -767,6 +845,7 @@ rule BranchCreatedByPush {
             existing.deleted_at = null
             existing.head_commit_sha = update.new_sha
             existing.pusher = update.push.pusher
+            existing.pushed_by_key = update.push.deploy_key
             existing.updated_at = now
             BranchCreated(branch: existing, by: update.push.pusher)
         else:
@@ -777,6 +856,7 @@ rule BranchCreatedByPush {
                 head_commit_summary: commit_summary(repository, update.new_sha),
                 head_committed_at: commit_time(repository, update.new_sha),
                 pusher: update.push.pusher,
+                pushed_by_key: update.push.deploy_key,
                 created_at: now,
                 updated_at: now,
                 status: live
@@ -806,6 +886,7 @@ rule BranchUpdatedByPush {
     requires: exists branch
     ensures: branch.head_commit_sha = update.new_sha
     ensures: branch.pusher = update.push.pusher
+    ensures: branch.pushed_by_key = update.push.deploy_key
     ensures: branch.updated_at = now
     ensures: CommitsPushed(repository: repository, branch_name: update.ref_name, pusher: update.push.pusher, old_sha: update.old_sha, new_sha: update.new_sha, is_force: is_force_push(repository, update.old_sha, update.new_sha))
 }
@@ -930,7 +1011,7 @@ rule AgitPushUpdatesPullRequestHead {
 rule PushCompletes {
     when: GitClientFinishesPush(pusher, push)
     requires: push.status = receiving
-    requires: push.pusher = pusher
+    requires: push.pusher = pusher or push.deploy_key = pusher
     ensures: push.status = completed
     ensures:
         if push.option_private != null:
@@ -948,6 +1029,9 @@ rule PushCompletes {
         -- non-default branch either the open PRs from it or a compare link to open one.
         -- For AGit refs the PR link is shown. Repository size and "updated" time are
         -- refreshed (repositories reacts to PushReceived).
+        -- For a deploy-key push every event's pusher / by is null and the push names the
+        -- key (push.deploy_key); consumers attribute it to the key, never the owner
+        -- (decided code 4).
 }
 
 ------------------------------------------------------------
@@ -1038,6 +1122,7 @@ rule UserRestoresBranch {
     ensures: branch.deleted_by = null
     ensures: branch.deleted_at = null
     ensures: branch.pusher = user
+    ensures: branch.pushed_by_key = null
     ensures: branch.updated_at = now
     ensures: BranchCreated(branch: branch, by: user)
     ensures: CommitsPushed(repository: repository, branch_name: branch.name, pusher: user, old_sha: null, new_sha: branch.head_commit_sha, is_force: false)
@@ -1051,6 +1136,9 @@ rule UserRenamesBranch {
     when: UserRenamesBranch(user, branch, new_name)
     let repository = branch.repository
     requires: can_write_code(user, repository)
+    -- decided (code 2): code write suffices, except for the default branch and protected
+    -- branches, which need repository admin (web and API alike).
+    requires: (not branch.is_default and protection_for(repository, branch.name) = null) or is_repo_admin(user, repository)
     requires: not repository.is_archived
     requires: not repository.is_mirror
     requires: not repository.is_empty
@@ -1074,8 +1162,8 @@ rule UserRenamesBranch {
     ensures: RefDeleted(repository: repository, pusher: user, ref_kind: branch_ref, ref_name: old_name)
     ensures: RefCreated(repository: repository, pusher: user, ref_kind: branch_ref, ref_name: new_name, commit_sha: branch.head_commit_sha)
     @guidance
-        -- Web: POST /settings/rename_branch (repo admins); API: PATCH
-        -- /repos/{o}/{r}/branches/{name} (code writers). A deleted-branch record with the
+        -- Web: POST /settings/rename_branch; API: PATCH /repos/{o}/{r}/branches/{name}
+        -- (same permission on both). A deleted-branch record with the
         -- target name is discarded. Old-name URLs redirect via RenamedBranch.
 }
 
@@ -1169,7 +1257,10 @@ rule AdminCreatesBranchProtection {
             push_allowlist_enabled: settings.push_allowlist_enabled,
             push_allowlist_users: writers_only(settings.push_allowlist_users, repository),
             push_allowlist_teams: teams_with_access(settings.push_allowlist_teams, repository),
-            push_allowlist_deploy_keys: settings.push_allowlist_deploy_keys,
+            push_allowlist_deploy_keys: keys_of_repository(settings.push_allowlist_deploy_keys, repository),
+            force_push_allowlist_users: writers_only(settings.force_push_allowlist_users, repository),
+            force_push_allowlist_teams: teams_with_access(settings.force_push_allowlist_teams, repository),
+            force_push_allowlist_deploy_keys: keys_of_repository(settings.force_push_allowlist_deploy_keys, repository),
             require_signed_commits: settings.require_signed_commits,
             protected_file_patterns: settings.protected_file_patterns,
             unprotected_file_patterns: settings.unprotected_file_patterns,
@@ -1195,7 +1286,9 @@ rule AdminCreatesBranchProtection {
         -- Allowlisted users without write access (read access for approvals) and teams
         -- without access to the repository are silently dropped. Teams only apply to
         -- organization-owned repositories. Unknown user names are an error in the API.
-        -- Enabling status checks with no valid pattern is refused.
+        -- Enabling status checks with no valid pattern is refused. Deploy keys on the push
+        -- and force-push allowlists must be attached to this repository (keys_of_repository
+        -- drops the rest; decided code 4/5). The force-push allowlist starts empty.
 }
 
 -- from: routers/api/v1/repo/branch.go:753
@@ -1212,7 +1305,11 @@ rule AdminEditsBranchProtection {
     ensures: rule.push_allowlist_enabled = settings.push_allowlist_enabled
     ensures: rule.push_allowlist_users = writers_only(settings.push_allowlist_users, repository)
     ensures: rule.push_allowlist_teams = teams_with_access(settings.push_allowlist_teams, repository)
-    ensures: rule.push_allowlist_deploy_keys = settings.push_allowlist_deploy_keys
+    ensures: rule.push_allowlist_deploy_keys = keys_of_repository(settings.push_allowlist_deploy_keys, repository)
+    -- decided (code 5): the force-push allowlist; empty means nobody
+    ensures: rule.force_push_allowlist_users = writers_only(settings.force_push_allowlist_users, repository)
+    ensures: rule.force_push_allowlist_teams = teams_with_access(settings.force_push_allowlist_teams, repository)
+    ensures: rule.force_push_allowlist_deploy_keys = keys_of_repository(settings.force_push_allowlist_deploy_keys, repository)
     ensures: rule.require_signed_commits = settings.require_signed_commits
     ensures: rule.protected_file_patterns = settings.protected_file_patterns
     ensures: rule.unprotected_file_patterns = settings.unprotected_file_patterns
@@ -1247,14 +1344,15 @@ rule AdminDeletesBranchProtection {
 
 -- from: routers/web/repo/setting/protected_tag.go:36
 rule AdminCreatesTagProtection {
-    when: AdminCreatesTagProtection(admin, repository, name_pattern, users, teams)
+    when: AdminCreatesTagProtection(admin, repository, name_pattern, users, teams, deploy_keys)
     requires: is_repo_admin(admin, repository)
     requires: not repository.is_archived
     requires: name_pattern != ""
     requires: valid_tag_pattern(name_pattern)
     requires: not exists ProtectedTag{repository: repository, name_pattern: name_pattern}
-    requires: users.count + teams.count > 0
-    ensures: ProtectedTag.created(repository: repository, name_pattern: name_pattern, allowlist_users: users, allowlist_teams: teams, created_at: now, updated_at: now)
+    requires: users.count + teams.count + deploy_keys.count > 0
+    -- decided (code 4): tag allowlists may name deploy keys of this repository
+    ensures: ProtectedTag.created(repository: repository, name_pattern: name_pattern, allowlist_users: users, allowlist_teams: teams, allowlist_deploy_keys: keys_of_repository(deploy_keys, repository), created_at: now, updated_at: now)
     @guidance
         -- Web: /settings/tags; API: POST /repos/{o}/{r}/tag_protections. Teams only on
         -- organization repositories.
@@ -1262,7 +1360,7 @@ rule AdminCreatesTagProtection {
 
 -- from: routers/web/repo/setting/protected_tag.go:91
 rule AdminEditsTagProtection {
-    when: AdminEditsTagProtection(admin, protected_tag, name_pattern, users, teams)
+    when: AdminEditsTagProtection(admin, protected_tag, name_pattern, users, teams, deploy_keys)
     requires: is_repo_admin(admin, protected_tag.repository)
     requires: not protected_tag.repository.is_archived
     requires: name_pattern != ""
@@ -1270,6 +1368,7 @@ rule AdminEditsTagProtection {
     ensures: protected_tag.name_pattern = name_pattern
     ensures: protected_tag.allowlist_users = users
     ensures: protected_tag.allowlist_teams = teams
+    ensures: protected_tag.allowlist_deploy_keys = keys_of_repository(deploy_keys, protected_tag.repository)
     ensures: protected_tag.updated_at = now
 }
 
@@ -1301,6 +1400,12 @@ rule UserCommitsFileChanges {
     requires: none_locked_by_other(repository, changes, user) -- no path holds another user's LFS lock
     requires: author_email = null or is_activated_email_of(user, author_email)
     requires: not exceeds_git_quota(repository)
+    -- decided (code 3): upload limits are enforced on the server, whatever the client
+    -- (Forgejo only checks them in the browser widget).
+    requires: upload_count(changes) = 0 or config.upload_enabled
+    requires: upload_count(changes) <= config.upload_max_files
+    requires: largest_upload_mb(changes) <= config.upload_file_max_size_mb
+    requires: uploads_have_allowed_types(changes, config.upload_allowed_types)
     requires: choice = direct or (new_branch_name != null and not exists Branch{repository: repository, name: new_branch_name, status: live})
     requires: choice = new_branch or protection_allows_files(branch, user, changes)
     let target_name = if choice = new_branch: new_branch_name else: branch.name
@@ -1687,6 +1792,12 @@ actor GitClient {
     identified_by: accounts/User where is_active and not prohibit_login
 }
 
+-- A git client authenticated with a deploy key over SSH (decided code 4: the key is
+-- the pusher, not the repository owner).
+actor DeployKeyClient {
+    identified_by: keys/DeployKey where key.kind = deploy
+}
+
 -- A CI service or Actions reporting statuses with a token that has code write.
 actor StatusReporter {
     within: repositories/Repository
@@ -1757,7 +1868,7 @@ surface BranchView {
         UserDeletesBranch(viewer, branch)
             when can_write_code(viewer, branch.repository) and not branch.is_default and not branch.is_protected
         UserRenamesBranch(viewer, branch, new_name)
-            when can_write_code(viewer, branch.repository)
+            when can_write_code(viewer, branch.repository) and ((not branch.is_default and not branch.is_protected) or is_repo_admin(viewer, branch.repository))
         UserCommitsFileChanges(viewer, branch, choice, new_branch_name, changes, message, author_email, signoff)
             when may_write_branch_as_user(viewer, branch.repository, branch.name)
         UserAppliesPatch(viewer, branch, choice, new_branch_name, patch_kind, message)
@@ -1887,6 +1998,9 @@ surface BranchProtectionView {
         rule.push_allowlist_users
         rule.push_allowlist_teams
         rule.push_allowlist_deploy_keys
+        rule.force_push_allowlist_users
+        rule.force_push_allowlist_teams
+        rule.force_push_allowlist_deploy_keys
         rule.require_signed_commits
         rule.protected_file_patterns
         rule.unprotected_file_patterns
@@ -1929,9 +2043,10 @@ surface TagProtectionView {
         protected_tag.name_pattern
         protected_tag.allowlist_users
         protected_tag.allowlist_teams
+        protected_tag.allowlist_deploy_keys
 
     provides:
-        AdminEditsTagProtection(admin, protected_tag, name_pattern, users, teams)
+        AdminEditsTagProtection(admin, protected_tag, name_pattern, users, teams, deploy_keys)
             when is_repo_admin(admin, protected_tag.repository)
         AdminDeletesTagProtection(admin, protected_tag)
             when is_repo_admin(admin, protected_tag.repository)
@@ -1995,7 +2110,7 @@ surface CodeSettings {
             when not repo.is_archived and not repo.is_empty
         AdminCreatesBranchProtection(admin, repo, rule_name, settings)
             when not repo.is_archived
-        AdminCreatesTagProtection(admin, repo, name_pattern, users, teams)
+        AdminCreatesTagProtection(admin, repo, name_pattern, users, teams, deploy_keys)
             when not repo.is_archived
         AdminAssociatesLfsPointers(admin, repo, pointers)
 
@@ -2016,7 +2131,7 @@ surface GitTransport {
 
     provides:
         GitClientFetches(client, repo, protocol)
-        GitClientPushes(client, repo, protocol, deploy_key, merging_pull, option_private, option_template, agit_topic, agit_title, agit_description, agit_force_push)
+        GitClientPushes(client, repo, protocol, merging_pull, option_private, option_template, agit_topic, agit_title, agit_description, agit_force_push)
             when not repo.is_archived and not repo.is_mirror
         PusherProposesRefUpdate(client, push, ref_kind, ref_name, old_sha, new_sha)
         GitClientFinishesPush(client, push)
@@ -2040,6 +2155,28 @@ surface GitTransport {
         -- Push options: repo.private, repo.template (admin/owner, not forks), topic,
         -- title, description, force-push (AGit). The client is shown PR hints after a
         -- push (config.pull_request_push_message).
+}
+
+-- Git over SSH with a deploy key (decided code 4). Fetching with a deploy key is the
+-- transport's concern (keys/SshKey.grants_read_on); pushes are modelled here.
+surface DeployKeyTransport {
+    facing key: DeployKeyClient
+    context repo: repositories/Repository
+
+    exposes:
+        repo.default_branch
+
+    provides:
+        DeployKeyPushes(key, repo)
+            when key.repository = repo and not repo.is_archived and not repo.is_mirror
+        PusherProposesRefUpdate(key, push, ref_kind, ref_name, old_sha, new_sha)
+            when push.deploy_key = key
+        GitClientFinishesPush(key, push)
+            when push.deploy_key = key
+
+    @guidance
+        -- SSH git-receive-pack against `{o}/{r}.git` with a key attached as a deploy key.
+        -- Refusals explain themselves as on GitTransport.
 }
 
 -- Git LFS API.
@@ -2108,13 +2245,6 @@ deferred LfsGarbageCollection.batch       -- see: services/repository/lfs.go —
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Quota is not checked for pushes to protected branches in Forgejo (only unprotected branches, tags, other refs). This spec applies it uniformly — confirm."
-open question "Branch rename needs repository admin in the web UI but only code write in the API. This spec requires code write — which is intended?"
-open question "Upload FILE_MAX_SIZE and MAX_FILES are only enforced by the browser upload widget; should the server enforce them?"
-open question "A deploy key push is attributed to the repository owner (protected tag allowlists, feed). Should deploy keys be first-class pushers?"
-open question "Force-push to a protected branch is refused for everyone, with no force-push allowlist. Should a rebuild add one?"
-open question "Protected tags do not exempt repository or site admins, while branch protection exempts site admins on merge. Intended asymmetry?"
-open question "Deleting a tag through the API is refused when a release uses it, but a git push may delete it freely. Should pushes also be refused?"
 
 ------------------------------------------------------------
 -- Requests to other modules
@@ -2140,3 +2270,8 @@ open question "Deleting a tag through the API is refused when a release uses it,
 -- REQUEST quota/exceeds_git_quota(repository), quota/exceeds_lfs_quota(repository): owner over size quota for git / LFS.
 -- REQUEST issues: react to CommitsPushed for close/reopen keywords and commit references.
 -- REQUEST actions: react to DefaultBranchChanged / BranchRenamed (cancel schedules). Job results arrive as actions/JobCommitStatusReported (done).
+-- REQUEST keys: keys_of_repository(keys, repository) = the given DeployKeys attached to repository (allowlist filtering, decided code 4/5).
+-- REQUEST notifications: a deploy-key push (code/PushReceived with push.pusher = null, push.deploy_key set) is shown in the feed as by the deploy key (its name), never the repository owner (decided code 4); BranchCreated/BranchDeleted then carry by = null.
+-- REQUEST actions / webhooks / issues / repositories / discovery / pulls / releases: code/Push.pusher, CommitsPushed.pusher, RefCreated/RefDeleted.pusher, BranchCreated/BranchDeleted.by and TagCreated/TagUpdated/TagDeleted.by are null for a deploy-key push; use push.deploy_key (doer/sender = the key; no auto-watch; no issue references attributed to a user) (decided code 4).
+-- REQUEST organizations / accounts / keys: on team or user deletion also clear force_push_allowlist_teams/users; on deploy-key deletion remove the key from ProtectedBranch push/force-push allowlists and ProtectedTag.allowlist_deploy_keys.
+-- REQUEST keys: SshKeyAuthenticated for a deploy key on git-receive-pack leads to code/DeployKeyPushes(deploy_key, repository) with the DeployKey grant (not the SshKey).

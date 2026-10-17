@@ -73,3 +73,44 @@ invariants or config. Numbers refer to the question's position in its module in
 | 5 | Site admins with a fine-grained token | **The token limits everything.** Scope and repository restrictions always apply; admin powers need a token with the admin scope. |
 | 6 | Actions job tokens on organization endpoints | **Repository-scoped only.** A job token reaches its own repository and packages linked to it; organization endpoints refuse it. |
 | 7 | Watches and subscriptions after losing access | **Cleared immediately** whenever a user loses read access to a repository, for any reason. |
+
+## repositories
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Who can archive a repository | **Any repository admin** may archive or unarchive, on every path. |
+| 2 | Changing a fork's visibility | **Refused with a reason** when it would make a fork of a private repository public; a fork of a public repository may be made private. |
+| 3 | Stars when a repository goes private | **Stars of people who keep read access stay;** the others are removed (consistent with clearing on lost access). |
+| 4 | Adding collaborators | **Invitation and acceptance.** Adding a collaborator sends an invitation; access starts when they accept. Site admins can add directly. |
+| 5 | Failing pull mirrors | **Back-off and a failing state.** Retries back off exponentially up to the mirror interval; after a configurable number of consecutive failures the mirror is marked failing, shown to repository admins, and paused until someone syncs it. |
+| 6 | Who can trigger a pull-mirror sync | **Code write**, on every path. |
+| 7 | Push-mirror sync on an archived repository | **Allowed** on every path; pushing unchanged content keeps backups current. |
+| 8 | Transfers and the repository count limit | **Checked.** Accepting a transfer is refused if it would exceed the recipient's repository limit; site admins are exempt. |
+| 9 | Forks after the forker loses access | **Kept, like Forgejo.** The fork stays the forker's, private and linked. |
+| 10 | Transferring into an organization | **Immediate when the doer may create repositories there,** like Forgejo; the org owners are notified. |
+
+## code
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Quota on pushes to protected branches | **Admin's choice.** A config setting decides whether pushes to protected branches are exempt from the quota check (Forgejo's behaviour) or checked like every other push. |
+| 2 | Renaming a branch | **Code write, except protected branches and the default branch,** which need repository admin. |
+| 3 | Web upload limits | **Enforced on the server.** Upload rules refuse too many or too-large files whatever the client. |
+| 4 | Deploy-key pushes | **First-class pusher.** The deploy key is the pusher; allowlists can name deploy keys, and the feed shows the key, never the owner. |
+| 5 | Force-push to protected branches | **Optional force-push allowlist** on branch protection (users, teams, deploy keys); empty means nobody. |
+| 6 | Admins and protected tags | **No exemptions.** Only the allowlist may create or delete a protected tag; an admin who needs to changes the rule. |
+| 7 | Deleting a tag that has a release | **Refused on push too** when the release is published; delete the release first. Draft releases don't block. |
+
+## issues
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Editing a locked issue | **The poster may still edit the title and description;** triagers may edit everything. Locking stops the conversation, not corrections. |
+| 2 | Reactions on a locked issue | **Anyone who can read may react;** the lock doesn't affect reactions. |
+| 3 | Lock reasons | **Validated on every path:** empty or one of the configured reasons. |
+| 4 | Blank issues when disabled | **Refused on every path;** repository writers excepted. |
+| 5 | Orphan uploads | **Expire** when not linked to an issue, comment or release within a configurable time (default 24 hours), via a scheduled task. |
+| 6 | Metadata from non-triagers | **All dropped:** labels, milestone, assignees and project are ignored for someone who can't triage. |
+| 7 | Timeline events of deleted labels and milestones | **Kept for both,** showing the name at the time, marked deleted. |
+| 8 | Logging time for someone else | **Repository admins may,** on every path, with a chosen date; the entry records who logged it. |
+| 9 | Issue priority | **Dropped.** Priority is expressed with scoped labels. |
