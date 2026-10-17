@@ -377,6 +377,8 @@ journey AReaderProposesAChangeWithAGit {
         stipulate open_pull_request_exists(repo, "bob/fix-typo", repo, "main") = false
         stipulate truncate("Fix typo", 255) = "Fix typo"
         stipulate has_wip_prefix("Fix typo") = false
+        -- the owner has not blocked bob
+        stipulate is_blocked_by_owner(repo, bob) = false
         -- alice owns the repository and watches its pull requests
         stipulate repository_watchers(repo, pull_requests) = {alice}
         bob does PusherProposesRefUpdate(bob, push, for_review, "main/fix-typo", null, "ddd444") on GitTransport
@@ -866,4 +868,89 @@ journey OverQuotaAWriterCanStillDeleteFiles {
         then UserCommitsFileChanges fires
 
     ends: The repository shrank; nothing grew past the limit.
+}
+
+-- Read-only mode (decided administration 3): git pushes over HTTP and SSH are refused,
+-- web writes too; clones keep working.
+journey ReadOnlyModeRefusesPushes {
+    goal: The site administrator put the instance into read-only mode for a backup.
+          Alice can still clone her repository, but her push is refused on both
+          transports, and so is creating a branch on the web.
+
+    cast:
+        gate: access/InstanceWriteGate
+
+    given:
+        gate.read_only = true
+        gate.message = "Backup in progress"
+
+    1. cloning still works
+        stipulate must_have_two_factor(alice) = false
+        stipulate authenticated_by_password(alice) = false
+        alice does GitClientFetches(alice, repo, ssh) on GitTransport
+        then GitClientFetchesRepository fires
+
+    2. pushing is refused over SSH and HTTP
+        alice cannot do GitClientPushes(alice, repo, ssh, null, null, null, null, null, null, false) on GitTransport
+        alice cannot do GitClientPushes(alice, repo, http, null, null, null, null, null, null, false) on GitTransport
+
+    3. so is creating a branch on the web
+        stipulate valid_ref_name("feature") = true
+        stipulate length("feature") = 7
+        stipulate branch_name_conflicts(repo, "feature") = false
+        stipulate commit_exists(repo, "c0ffee") = true
+        alice cannot do UserCreatesBranch(alice, repo, "feature", "c0ffee") on CodeWriting
+
+    ends: Nothing in the repository changed while the instance was read-only.
+}
+
+-- A deploy key over SSH: its grant decides whether it may open a push (decided code 4,
+-- keys 7). A read-only grant never pushes; a read-write grant pushes as the key.
+journey ADeployKeyPushesOnlyWithAWriteGrant {
+    goal: Two deploy keys are attached to the repository: `docs`, read-only, and `ci`,
+          read-write. Both authenticate over SSH and ask for git-receive-pack; only
+          `ci` gets a push, and that push has no user behind it.
+
+    cast:
+        forge:     keys/ForgeSubsystem
+        docs_key:  keys/SshKey
+        ci_key:    keys/SshKey
+        docs:      keys/DeployKey
+        ci:        keys/DeployKey
+
+    given:
+        forge.name = "ssh"
+        docs_key.kind = deploy
+        docs_key.fingerprint = "SHA256:docs"
+        ci_key.kind = deploy
+        ci_key.fingerprint = "SHA256:ci"
+        docs.repository = repo
+        docs.key = docs_key
+        docs.name = "docs"
+        docs.access = read_only
+        ci.repository = repo
+        ci.key = ci_key
+        ci.name = "ci"
+        ci.access = read_write
+
+    1. the read-only key authenticates, but no push is opened for it
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAdocs") = "SHA256:docs"
+        stipulate ssh_requests_push("conn-docs") = true
+        stipulate ssh_target_repository("conn-docs") = repo
+        forge does SshClientPresentsPublicKey("conn-docs", "ssh-ed25519 AAAAdocs") on SshKeyResolution
+        then AuthenticateSshPublicKey fires
+        then DeployKeySessionOpensPush does not fire
+
+    2. the read-write key gets a push of its own
+        stipulate ssh_fingerprint("ssh-ed25519 AAAAci") = "SHA256:ci"
+        stipulate ssh_requests_push("conn-ci") = true
+        stipulate ssh_target_repository("conn-ci") = repo
+        forge does SshClientPresentsPublicKey("conn-ci", "ssh-ed25519 AAAAci") on SshKeyResolution
+            creating push: Push
+        then DeployKeySessionOpensPush fires
+        then DeployKeyOpensPush fires
+        then push.deploy_key = ci
+        then push.pusher = null
+
+    ends: Only the read-write grant opened a push, and it pushes as the key.
 }

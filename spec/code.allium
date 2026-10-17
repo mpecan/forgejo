@@ -78,6 +78,28 @@
 --   BranchProtectionChanged(rule)                      -- pulls re-checks open PRs targeting matched branches
 --   PushToCreateRequested(pusher, owner_name, repository_name, is_private) -- repositories creates the repo
 --   LfsObjectStored(object, by)                        -- quota (usage accounting)
+--   WikiFetchRequested(client, repository, protocol)   -- wiki: a git client authenticated for `<repo>.wiki` wants to fetch
+--                                                      -- (wiki decides wiki-unit read, as UserOpensWikiOverGit)
+--   WikiPushReceived(pusher, repository)               -- wiki: a git client authenticated for `<repo>.wiki` pushes; wiki's
+--                                                      -- checks are the pre-receive and its pushed_* diff the post-receive
+--                                                      -- (as UserPushesToWiki)
+--
+-- Provides to other modules (functions; their owners call them as local black boxes):
+--   protection_for(repository, branch_name)  = the first ProtectedBranch of repository whose
+--                                              rule matches (exact case-insensitive names before
+--                                              globs, then the oldest); null when none -- pulls
+--   rule_matches_branch(rule, branch_name)   = rule.matches_branch(branch_name)       -- pulls
+--   may_control_tag(user, repository, tag_name)
+--                                            = no ProtectedTag of repository matching tag_name, or
+--                                              one that allows(user) — the check UserCreatesTag and
+--                                              UserDeletesTag make (no admin exemption, decided code 6)
+--                                                                                     -- releases
+--   fork_branch_can_fast_forward(repository, branch_name)
+--                                            = the fork's branch head is an ancestor of the same
+--                                              branch of repository.fork_of (branch_contains)
+--                                                                                     -- repositories
+--   RefUpdate.full_ref_name                  = refs/heads/<b>, refs/tags/<t>, refs/for/<t>,
+--                                              refs/pull/<n>/head, or the name as pushed -- actions
 --
 -- Reacts to:
 --   actions/JobCommitStatusReported(repository, commit_sha, context, state, target_url, description, creator)
@@ -88,6 +110,17 @@
 --   administration/DeletedBranchCleanupDue(older_than) -- purge expired deleted-branch records
 --   administration/LfsGarbageCollectionDue(older_than, last_updated_more_than_ago,
 --       number_to_check_per_repo, proportion_to_check_per_repo) -- collect orphaned LFS objects
+--   administration/AllRepositoryBranchesResyncRequested(admin) -- re-read every repository's branches from git
+--   repositories/PullMirrorSynced(mirror), RepositoryAdopted(repository, doer),
+--       RepositoryForked(source, fork, doer)            -- branch records re-read from the git data
+--   repositories/RepositoryGeneratedFromTemplate(template, repository, doer, git_content, topics,
+--       git_hooks, webhooks, avatar, labels, protected_branches) -- branch records (git content) and
+--                                                      -- protection rules copied from the template
+--   repositories/ForkBranchFastForwarded(repository, base, branch, doer) -- the fork branch is moved
+--                                                      -- to the base branch's head as a push by doer
+--   releases/ReleaseTagRequested(release, doer)        -- publishing a release creates its tag as an internal tag push
+--   keys/SshKeyAuthenticated(connection, key)          -- a deploy key on git-receive-pack opens a deploy-key push
+--   organizations/TeamDeleted(team)                    -- the team leaves every branch / tag protection allowlist
 --   `pulls` performs merges by sending a Push whose merging_pull is set.
 
 use "./accounts.allium" as accounts
@@ -99,6 +132,7 @@ use "./pulls.allium" as pulls
 use "./quota.allium" as quota
 use "./administration.allium" as administration
 use "./actions.allium" as actions
+use "./releases.allium" as releases
 
 -- Permission functions (black boxes from access/AuthorizationPolicy, VOCABULARY.md):
 --   can_read_code(user, repository)   = access/can_read(user, repository, code)
@@ -131,13 +165,27 @@ use "./actions.allium" as actions
 --                                       = over the changes that are web uploads (FileChange.is_upload):
 --                                         how many, the largest size in MB, all of an allowed type
 --   member_of_any_team(user, teams)     = organizations team membership
---   exceeds_git_quota(r), exceeds_lfs_quota(r)    = quota for the repository owner (current usage;
---                                         size not known up front, e.g. a push checked on receipt)
+--   exceeds_git_quota(r), exceeds_lfs_quota(r)    = not quota/quota_allows(<repository owner>, size:repos:all)
+--                                         / (…, size:git:lfs): current usage (size not known up front,
+--                                         e.g. a push checked on receipt). These are the QuotaGate
+--                                         defaults gate_git_push, gate_create_branch, gate_create_tag,
+--                                         gate_apply_diff_patch, gate_cherry_pick, gate_lfs_upload
 --   exceeds_git_quota_with(r, changes)  = quota size:repos:all for the repository owner counting
 --                                         the changes' incoming content size (usage + size <= limit);
 --                                         false for a change set that only deletes files
 --   exceeds_lfs_quota_with(r, pointers) = quota size:git:lfs for the repository owner counting
 --                                         the sizes of the objects not already stored
+--   ssh_requests_push(connection), ssh_target_repository(connection)
+--                                       = what the SSH client on `connection` asked for: git-receive-pack
+--                                         (else upload-pack / upload-archive) and the repository addressed
+--   git_branches(repository) -> Set<BranchSnapshot>, git_branch_exists(repository, name) = git facts
+--   qualified_ref(ref_kind, ref_name)   = the full ref name (see RefUpdate.full_ref_name)
+--   read-only mode: not (exists access/InstanceWriteGate{read_only: true})
+--                                         decided (administration 3): every user-initiated write
+--                                         below is refused while the instance is read-only, git
+--                                         pushes over HTTP and SSH included; fetches and browsing are
+--                                         not. Reactions to other modules' events are not gated
+--                                         here: the act that started them was.
 --   commit_exists, commit_summary, commit_body, commit_time, full_sha, divergence,
 --   branch_contains, branch_name_conflicts, valid_ref_name, lfs_* , normalise_path  = git facts
 
@@ -181,6 +229,15 @@ value FileChange {
 value LfsPointer {
     oid: String                      -- sha256 of the content, 64 hex chars
     size: Integer
+}
+
+-- What git says about one branch when a repository's branches are re-read.
+-- from: modules/repository/branch.go:39
+value BranchSnapshot {
+    name: String
+    commit_sha: String
+    commit_summary: String
+    committed_at: Timestamp
 }
 
 -- How far a branch has diverged from the default branch (branch list).
@@ -380,6 +437,7 @@ entity ProtectedBranch {
 
     -- Derived
     is_glob: is_glob_pattern(rule_name)
+    matches_branch(branch_name): branch_rule_matches(rule_name, branch_name)
     matched_branches: Branches where repository = repository and status = live and branch_rule_matches(rule_name, name)
 
     -- Who may push directly (CanUserPush).
@@ -466,6 +524,8 @@ entity RefUpdate {
 
     is_creation: old_sha = null
     is_deletion: new_sha = null
+    -- refs/heads/<b>, refs/tags/<t>, refs/for/<t>, refs/pull/<n>/head, or the name as pushed
+    full_ref_name: qualified_ref(ref_kind, ref_name)
 }
 
 -- An LFS object associated with a repository. The content itself lives in a shared
@@ -576,6 +636,7 @@ rule GitClientFetchesRepository {
 -- from: routers/private/serv.go:310
 rule GitClientOpensPush {
     when: GitClientPushes(pusher, repository, protocol, merging_pull, option_private, option_template, agit_topic, agit_title, agit_description, agit_force_push)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: (protocol = http and not config.disable_http_git) or (protocol = ssh and not config.disable_ssh) or protocol = internal
     requires: repository.status = ready
     requires: not repository.is_archived
@@ -605,7 +666,8 @@ rule GitClientOpensPush {
     )
     @guidance
         -- Quota is checked per ref in pre-receive (deletions stay allowed when over quota).
-        -- Mirrors are read-only; archived repositories refuse every push.
+        -- Mirrors are read-only; archived repositories refuse every push; while the
+        -- instance is read-only every push is refused with the gate's message.
         -- Deploy keys open their pushes through DeployKeyOpensPush.
 }
 
@@ -615,6 +677,7 @@ rule GitClientOpensPush {
 -- from: routers/private/serv.go:310
 rule DeployKeyOpensPush {
     when: DeployKeyPushes(deploy_key, repository)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not config.disable_ssh
     requires: repository.status = ready
     requires: not repository.is_archived
@@ -647,6 +710,7 @@ rule DeployKeyOpensPush {
 -- from: services/repository/repository.go:70
 rule GitClientPushCreatesRepository {
     when: GitClientPushesToMissingRepository(pusher, owner_user, owner_org, repository_name, protocol, uses_deploy_key)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: not uses_deploy_key
     requires: (protocol = http and not config.disable_http_git) or (protocol = ssh and not config.disable_ssh)
     requires: owner_org != null implies config.enable_push_create_org
@@ -662,6 +726,62 @@ rule GitClientPushCreatesRepository {
         -- The repository is private when DEFAULT_PUSH_CREATE_PRIVATE or FORCE_PRIVATE.
         -- A wiki (`<repo>.wiki`) cannot be push-created. A fetch of a missing repository
         -- is simply "not found".
+}
+
+-- An SSH client authenticated with a deploy key asks for git-receive-pack: the key's
+-- grant on the addressed repository (not the SshKey) is the pusher (decided code 4).
+-- A read-only grant never opens a push; deploy keys on mirrors are read-only and
+-- archived repositories have none (keys decision 7), and DeployKeyOpensPush refuses
+-- both anyway.
+-- from: routers/private/serv.go:310
+rule DeployKeySessionOpensPush {
+    when: keys/SshKeyAuthenticated(connection, key)
+    requires: key.kind = deploy
+    requires: ssh_requests_push(connection)
+    let repository = ssh_target_repository(connection)
+    let grant = keys/DeployKey{repository: repository, key: key}
+    requires: exists grant
+    requires: grant.access = read_write
+    ensures: DeployKeyPushes(deploy_key: grant, repository: repository)
+    @guidance
+        -- A personal key or a certificate principal continues as its owner through
+        -- GitClientFetches / GitClientPushes with protocol ssh (every principal the
+        -- certificate lists is tried by keys/AuthenticateSshCertificate, keys decision 9).
+        -- A deploy key fetching (git-upload-pack, git-upload-archive) needs only
+        -- keys/SshKey.grants_read_on(repository). After a successful operation the
+        -- transport reports keys/SshKeyUsedForRepository on keys' SshKeyResolution surface.
+}
+
+-- `{repo}.wiki.git`: a git client fetching the wiki repository. The transport checks
+-- the client as for the code repository; whether the wiki unit is enabled and readable
+-- is wiki's decision (wiki reacts with its UserOpensWikiOverGit checks).
+-- from: routers/web/repo/githttp.go:130
+rule GitClientFetchesWiki {
+    when: GitClientFetchesWiki(client, repository, protocol)
+    requires: (protocol = http and not config.disable_http_git) or (protocol = ssh and not config.disable_ssh)
+    requires: repository.status = ready
+    requires: client = null implies (not repository.is_private and owner_visibility_is_public(repository) and not config.require_signin_view)
+    requires: client != null implies (client.is_active and not client.prohibit_login)
+    requires: (client != null and protocol = http) implies not authenticated_by_password(client)
+    requires: client != null and protocol = ssh and must_have_two_factor(client) implies has_two_factor(client)
+    ensures: WikiFetchRequested(client: client, repository: repository, protocol: protocol)
+}
+
+-- `{repo}.wiki.git`: a git client pushing to the wiki repository. The transport checks
+-- the client; wiki decides the rest when it reacts (wiki-unit write, archived and
+-- mirror refusal, quota, no empty page file: the pre-receive) and turns the pushed diff
+-- of the wiki branch into page events by the pusher (the post-receive). There is no
+-- AGit flow, no push-to-create and no deploy-key push on a wiki.
+-- from: routers/private/hook_pre_receive.go:137
+rule GitClientPushesToWiki {
+    when: GitClientPushesToWiki(pusher, repository, protocol)
+    requires: (protocol = http and not config.disable_http_git) or (protocol = ssh and not config.disable_ssh)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
+    requires: repository.status = ready
+    requires: not repository.is_empty
+    requires: pusher.is_active and not pusher.prohibit_login
+    requires: protocol != http or not authenticated_by_password(pusher)
+    ensures: WikiPushReceived(pusher: pusher, repository: repository)
 }
 
 ------------------------------------------------------------
@@ -742,10 +862,17 @@ rule AcceptProtectedBranchMergePush {
     requires: pull.may_merge(pusher)
     -- decided (code 1): as for direct pushes to a protected branch
     requires: config.quota_exempts_protected_branches or not exceeds_git_quota(repository)
+    -- The pull request's protection checks, except protected files, which this rule
+    -- checks against the pushed commits itself (pulls/PullRequest.protection_satisfied
+    -- minus blocked_by_protected_files).
+    let merge_requirements_met =
+        pull.required_checks_pass and pull.has_enough_approvals
+        and not pull.blocked_by_rejection and not pull.blocked_by_official_requests
+        and not pull.blocked_by_outdated_branch
     requires:
         pusher.is_admin
         or ((not touches_protected_files(rule, repository, old_sha, new_sha) or (is_repo_admin(pusher, repository) and not rule.apply_to_admins))
-            and (merge_requirements_met(pull) or (is_repo_admin(pusher, repository) and not rule.apply_to_admins)))
+            and (merge_requirements_met or (is_repo_admin(pusher, repository) and not rule.apply_to_admins)))
     ensures:
         let accepted = RefUpdate.created(push: push, ref_kind: branch_ref, ref_name: ref_name, old_sha: old_sha, new_sha: new_sha)
         RefUpdateAccepted(update: accepted)
@@ -753,7 +880,8 @@ rule AcceptProtectedBranchMergePush {
         -- If the merger is also on the push allowlist (and touches no protected file) the
         -- push is accepted as a direct push; this rule covers everyone else. Required
         -- approvals, status checks, rejected reviews and outdated-branch blocking are
-        -- evaluated by pulls (merge_requirements_met) — they never block direct pushes.
+        -- evaluated by pulls (the PullRequest's derived checks read above) — they never
+        -- block direct pushes.
 }
 
 -- Tag creation, move or deletion.
@@ -1048,6 +1176,7 @@ rule PushCompletes {
 -- from: services/repository/branch.go:343
 rule UserCreatesBranch {
     when: UserCreatesBranch(user, repository, name, from_sha)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_code(user, repository)
     requires: not repository.is_archived
     requires: not repository.is_mirror
@@ -1075,6 +1204,7 @@ rule UserCreatesBranch {
 -- from: services/repository/branch.go:436
 rule UserDeletesBranch {
     when: UserDeletesBranch(user, branch)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let repository = branch.repository
     requires: can_write_code(user, repository)
     requires: not repository.is_archived
@@ -1119,6 +1249,7 @@ rule DeleteBranch {
 -- from: routers/web/repo/branch.go:116
 rule UserRestoresBranch {
     when: UserRestoresBranch(user, branch)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let repository = branch.repository
     requires: can_write_code(user, repository)
     requires: not repository.is_archived
@@ -1140,6 +1271,7 @@ rule UserRestoresBranch {
 -- from: models/git/branch.go:309
 rule UserRenamesBranch {
     when: UserRenamesBranch(user, branch, new_name)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let repository = branch.repository
     requires: can_write_code(user, repository)
     -- decided (code 2): code write suffices, except for the default branch and protected
@@ -1177,6 +1309,7 @@ rule UserRenamesBranch {
 -- from: services/repository/branch.go:578
 rule AdminChangesDefaultBranch {
     when: AdminChangesDefaultBranch(admin, repository, branch_name)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(admin, repository)
     requires: not repository.is_archived
     requires: not repository.is_empty
@@ -1198,6 +1331,7 @@ rule AdminChangesDefaultBranch {
 -- from: services/release/release.go:203
 rule UserCreatesTag {
     when: UserCreatesTag(user, repository, name, target_sha, message)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_code(user, repository)
     requires: not repository.is_archived
     requires: not repository.is_mirror
@@ -1218,6 +1352,9 @@ rule UserCreatesTag {
         -- Web: "create tag" in the branch/tag dropdown (/branches/_new/... with create_tag);
         -- API: POST /repos/{o}/{r}/tags {tag_name, target, message}. Annotated tags are
         -- signed by the instance key when the signing policy allows.
+        -- decided (releases 9): this is also the release form's "tag only" button — a
+        -- bare tag needs code write and obeys protected-tag rules wherever it is made;
+        -- releases gives the new tag its tag-only record when TagCreated arrives.
 }
 
 -- Delete a tag. A tag that carries a (non tag-only) release must be removed through
@@ -1225,6 +1362,7 @@ rule UserCreatesTag {
 -- from: services/release/release.go:377
 rule UserDeletesTag {
     when: UserDeletesTag(user, tag)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let repository = tag.repository
     requires: can_write_code(user, repository)
     requires: not repository.is_archived
@@ -1240,6 +1378,27 @@ rule UserDeletesTag {
         -- Web: POST /{o}/{r}/tags/delete; API: DELETE /repos/{o}/{r}/tags/{tag}.
 }
 
+-- Publishing a release whose tag does not exist yet creates the tag at the commit the
+-- release resolved its target to, as an internal tag push by the publisher: TagCreated
+-- and RefCreated follow (releases sees its own record arrive through TagCreated).
+-- releases has already checked releases write and may_control_tag (this module's
+-- protected-tag check).
+-- from: services/release/release.go:38
+rule ReleaseTagIsCreated {
+    when: releases/ReleaseTagRequested(release, doer)
+    let repository = release.repository
+    requires: release.commit_sha != null
+    requires: not exists Tag{repository: repository, name: release.tag_name}
+    ensures:
+        let push = Push.created(repository: repository, pusher: doer, deploy_key: null, by_actions_task: false, protocol: internal, merging_pull: null, option_private: null, option_template: null, agit_topic: null, agit_title: null, agit_description: null, agit_force_push: false, received_at: now, status: completed)
+        let accepted = RefUpdate.created(push: push, ref_kind: tag_ref, ref_name: release.tag_name, old_sha: null, new_sha: release.commit_sha)
+        RefUpdateAccepted(update: accepted)
+    @guidance
+        -- The tag is annotated with "<title>\n\n<note>" when the web form asked for a
+        -- tag message, else lightweight; annotated tags are signed by the instance key
+        -- when the signing policy allows.
+}
+
 ------------------------------------------------------------
 -- Rules: branch and tag protection settings (repository admins)
 ------------------------------------------------------------
@@ -1247,6 +1406,7 @@ rule UserDeletesTag {
 -- from: routers/web/repo/setting/protected_branch.go:104
 rule AdminCreatesBranchProtection {
     when: AdminCreatesBranchProtection(admin, repository, rule_name, settings)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(admin, repository)
     requires: not repository.is_archived
     requires: rule_name != ""
@@ -1300,6 +1460,7 @@ rule AdminCreatesBranchProtection {
 -- from: routers/api/v1/repo/branch.go:753
 rule AdminEditsBranchProtection {
     when: AdminEditsBranchProtection(admin, rule, new_rule_name, settings)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let repository = rule.repository
     requires: is_repo_admin(admin, repository)
     requires: not repository.is_archived
@@ -1341,6 +1502,7 @@ rule AdminEditsBranchProtection {
 -- from: models/git/protected_branch.go:458
 rule AdminDeletesBranchProtection {
     when: AdminDeletesBranchProtection(admin, rule)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(admin, rule.repository)
     requires: not rule.repository.is_archived
     ensures: not exists rule
@@ -1351,6 +1513,7 @@ rule AdminDeletesBranchProtection {
 -- from: routers/web/repo/setting/protected_tag.go:36
 rule AdminCreatesTagProtection {
     when: AdminCreatesTagProtection(admin, repository, name_pattern, users, teams, deploy_keys)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(admin, repository)
     requires: not repository.is_archived
     requires: name_pattern != ""
@@ -1367,6 +1530,7 @@ rule AdminCreatesTagProtection {
 -- from: routers/web/repo/setting/protected_tag.go:91
 rule AdminEditsTagProtection {
     when: AdminEditsTagProtection(admin, protected_tag, name_pattern, users, teams, deploy_keys)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(admin, protected_tag.repository)
     requires: not protected_tag.repository.is_archived
     requires: name_pattern != ""
@@ -1381,9 +1545,26 @@ rule AdminEditsTagProtection {
 -- from: routers/web/repo/setting/protected_tag.go:124
 rule AdminDeletesTagProtection {
     when: AdminDeletesTagProtection(admin, protected_tag)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: is_repo_admin(admin, protected_tag.repository)
     requires: not protected_tag.repository.is_archived
     ensures: not exists protected_tag
+}
+
+-- A deleted team leaves every branch and tag protection allowlist it was on.
+-- from: models/git/protected_branch.go:499
+rule DeletedTeamLeavesProtectionAllowlists {
+    when: organizations/TeamDeleted(team)
+    ensures:
+        for p in ProtectedBranches where team in push_allowlist_teams or team in force_push_allowlist_teams
+                or team in merge_allowlist_teams or team in approvals_allowlist_teams:
+            p.push_allowlist_teams = p.push_allowlist_teams - { team }
+            p.force_push_allowlist_teams = p.force_push_allowlist_teams - { team }
+            p.merge_allowlist_teams = p.merge_allowlist_teams - { team }
+            p.approvals_allowlist_teams = p.approvals_allowlist_teams - { team }
+    ensures:
+        for t in ProtectedTags where team in allowlist_teams:
+            t.allowlist_teams = t.allowlist_teams - { team }
 }
 
 ------------------------------------------------------------
@@ -1396,6 +1577,7 @@ rule AdminDeletesTagProtection {
 -- from: services/repository/files/update.go:76
 rule UserCommitsFileChanges {
     when: UserCommitsFileChanges(user, branch, choice, new_branch_name, changes, message, author_email, signoff)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let repository = branch.repository
     requires: may_write_branch_as_user(user, repository, branch.name)
     requires: not repository.is_archived
@@ -1442,6 +1624,7 @@ rule UserCommitsFileChanges {
 -- from: services/repository/files/patch.go:99
 rule UserAppliesPatch {
     when: UserAppliesPatch(user, branch, choice, new_branch_name, patch_kind, message)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let repository = branch.repository
     requires: may_write_branch_as_user(user, repository, branch.name)
     requires: not repository.is_archived
@@ -1467,6 +1650,7 @@ rule UserAppliesPatch {
 -- from: routers/web/repo/commit.go:505
 rule UserSetsCommitNote {
     when: UserSetsCommitNote(user, repository, commit_sha, text)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_code(user, repository)
     requires: not repository.is_archived
     requires: commit_exists(repository, commit_sha)
@@ -1486,6 +1670,7 @@ rule UserSetsCommitNote {
 -- from: modules/git/notes.go:118
 rule UserRemovesCommitNote {
     when: UserRemovesCommitNote(user, note)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_code(user, note.repository)
     requires: not note.repository.is_archived
     ensures: not exists note
@@ -1501,6 +1686,165 @@ rule MirrorBranchUpdateIsAPush {
 }
 
 ------------------------------------------------------------
+-- Rules: branch records re-read from git
+------------------------------------------------------------
+
+-- The branch records of a repository are brought in line with its git branches: a
+-- branch with no record gets one, a record whose branch moved is refreshed (a deleted
+-- record of a branch that is back becomes live), and a live record whose branch is gone
+-- is marked deleted. Nothing is announced: the pushes that moved the refs were, and a
+-- mirror's moves arrive as MirrorBranchUpdated.
+-- from: modules/repository/branch.go:39
+rule RepositoryBranchesResynchronised {
+    when: RepositoryBranchSyncRequested(repository, doer)
+    requires: not repository.is_empty
+    ensures:
+        for snapshot in git_branches(repository):
+            BranchObserved(repository: repository, snapshot: snapshot, doer: doer)
+    ensures:
+        for b in Branches where repository = repository and status = live:
+            if not git_branch_exists(repository, b.name):
+                b.status = deleted
+                b.deleted_by = doer
+                b.deleted_at = now
+}
+
+-- from: modules/repository/branch.go:83
+rule BranchObservedWithoutRecord {
+    when: BranchObserved(repository, snapshot, doer)
+    requires: not exists Branch{repository: repository, name: snapshot.name}
+    ensures: Branch.created(
+        repository: repository,
+        name: snapshot.name,
+        head_commit_sha: snapshot.commit_sha,
+        head_commit_summary: snapshot.commit_summary,
+        head_committed_at: snapshot.committed_at,
+        pusher: doer,
+        pushed_by_key: null,
+        created_at: now,
+        updated_at: now,
+        status: live
+    )
+}
+
+-- from: modules/repository/branch.go:92
+rule BranchRecordRefreshed {
+    when: BranchObserved(repository, snapshot, doer)
+    let existing = Branch{repository: repository, name: snapshot.name}
+    requires: exists existing
+    requires: existing.head_commit_sha != snapshot.commit_sha
+    ensures: existing.head_commit_sha = snapshot.commit_sha
+    ensures: existing.head_commit_summary = snapshot.commit_summary
+    ensures: existing.head_committed_at = snapshot.committed_at
+    ensures: existing.pusher = doer
+    ensures: existing.pushed_by_key = null
+    ensures: existing.updated_at = now
+    ensures:
+        if existing.status = deleted:
+            existing.status = live
+            existing.deleted_by = null
+            existing.deleted_at = null
+}
+
+-- Site admin dashboard "synchronise branches from git data to database": every
+-- non-empty repository, queued one at a time.
+-- from: services/repository/branch.go:569
+rule AdministrationResyncsAllBranches {
+    when: administration/AllRepositoryBranchesResyncRequested(admin)
+    ensures:
+        for repository in repositories/Repositories where not is_empty:
+            RepositoryBranchSyncRequested(repository: repository, doer: null)
+}
+
+-- After a pull-mirror sync the mirror's branch records follow the fetched branches.
+-- from: services/mirror/mirror_pull.go:439
+rule MirrorSyncResyncsBranches {
+    when: repositories/PullMirrorSynced(mirror)
+    ensures: RepositoryBranchSyncRequested(repository: mirror.repository, doer: null)
+}
+
+-- from: services/repository/adopt.go:145
+rule AdoptionResyncsBranches {
+    when: repositories/RepositoryAdopted(repository, doer)
+    ensures: RepositoryBranchSyncRequested(repository: repository, doer: null)
+}
+
+-- from: services/repository/fork.go:173
+rule ForkResyncsBranches {
+    when: repositories/RepositoryForked(source, fork, doer)
+    ensures: RepositoryBranchSyncRequested(repository: fork, doer: doer)
+}
+
+-- A repository generated from a template: with git content, its branch records are
+-- read from the generated git data and the template's LFS objects are associated with
+-- it; with protected branches, the template's protection rules are copied. Allowlists
+-- are filtered against the new repository as when a rule is created (users who cannot
+-- write it, teams without access and deploy keys of other repositories are dropped).
+-- Server-side git hooks are not copied: this spec does not have them (see Excludes).
+-- from: services/repository/template.go:42
+-- from: services/repository/generate.go:178
+rule TemplateGitContentIsCopied {
+    when: repositories/RepositoryGeneratedFromTemplate(template, repository, doer, git_content, topics, git_hooks, webhooks, avatar, labels, protected_branches)
+    ensures:
+        if git_content and not template.is_empty:
+            RepositoryBranchSyncRequested(repository: repository, doer: doer)
+            for o in LfsObjects where repository = template:
+                LfsObject.created(repository: repository, oid: o.oid, size: o.size, created_at: now, last_checked_at: now)
+    ensures:
+        if protected_branches:
+            for p in ProtectedBranches where repository = template:
+                ProtectedBranch.created(
+                    repository: repository,
+                    rule_name: p.rule_name,
+                    created_at: now,
+                    updated_at: now,
+                    enable_push: p.enable_push,
+                    push_allowlist_enabled: p.push_allowlist_enabled,
+                    push_allowlist_users: writers_only(p.push_allowlist_users, repository),
+                    push_allowlist_teams: teams_with_access(p.push_allowlist_teams, repository),
+                    push_allowlist_deploy_keys: keys_of_repository(p.push_allowlist_deploy_keys, repository),
+                    force_push_allowlist_users: writers_only(p.force_push_allowlist_users, repository),
+                    force_push_allowlist_teams: teams_with_access(p.force_push_allowlist_teams, repository),
+                    force_push_allowlist_deploy_keys: keys_of_repository(p.force_push_allowlist_deploy_keys, repository),
+                    require_signed_commits: p.require_signed_commits,
+                    protected_file_patterns: p.protected_file_patterns,
+                    unprotected_file_patterns: p.unprotected_file_patterns,
+                    merge_allowlist_enabled: p.merge_allowlist_enabled,
+                    merge_allowlist_users: writers_only(p.merge_allowlist_users, repository),
+                    merge_allowlist_teams: teams_with_access(p.merge_allowlist_teams, repository),
+                    status_check_enabled: p.status_check_enabled,
+                    status_check_contexts: p.status_check_contexts,
+                    required_approvals: p.required_approvals,
+                    approvals_allowlist_enabled: p.approvals_allowlist_enabled,
+                    approvals_allowlist_users: readers_only(p.approvals_allowlist_users, repository),
+                    approvals_allowlist_teams: teams_with_access(p.approvals_allowlist_teams, repository),
+                    block_on_rejected_reviews: p.block_on_rejected_reviews,
+                    block_on_official_review_requests: p.block_on_official_review_requests,
+                    block_on_outdated_branch: p.block_on_outdated_branch,
+                    dismiss_stale_approvals: p.dismiss_stale_approvals,
+                    ignore_stale_approvals: p.ignore_stale_approvals,
+                    apply_to_admins: p.apply_to_admins
+                )
+}
+
+-- "Sync fork": the fork's branch is moved to the head of the same branch of its base,
+-- as a push by the user who asked (repositories checked code write and that the move
+-- is a fast-forward, fork_branch_can_fast_forward).
+-- from: services/repository/sync_fork.go:20
+rule ForkBranchIsFastForwarded {
+    when: repositories/ForkBranchFastForwarded(repository, base, branch, doer)
+    let fork_branch = Branch{repository: repository, name: branch, status: live}
+    let base_branch = Branch{repository: base, name: branch, status: live}
+    requires: exists fork_branch
+    requires: exists base_branch
+    ensures:
+        let push = Push.created(repository: repository, pusher: doer, deploy_key: null, by_actions_task: false, protocol: internal, merging_pull: null, option_private: null, option_template: null, agit_topic: null, agit_title: null, agit_description: null, agit_force_push: false, received_at: now, status: completed)
+        let accepted = RefUpdate.created(push: push, ref_kind: branch_ref, ref_name: branch, old_sha: fork_branch.head_commit_sha, new_sha: base_branch.head_commit_sha)
+        RefUpdateAccepted(update: accepted)
+        PushReceived(push: push)
+}
+
+------------------------------------------------------------
 -- Rules: commit statuses
 ------------------------------------------------------------
 
@@ -1509,6 +1853,7 @@ rule MirrorBranchUpdateIsAPush {
 -- from: routers/api/v1/repo/status.go:52
 rule ReporterPostsCommitStatus {
     when: ReporterPostsCommitStatus(reporter, repository, commit_sha, state, context, target_url, description)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_code(reporter, repository)
     requires: commit_exists(repository, commit_sha)
     ensures: CommitStatusReported(repository: repository, commit_sha: commit_sha, context: context, state: state,
@@ -1561,6 +1906,7 @@ rule CommitStatusIsReported {
 -- from: services/lfs/server.go:146
 rule LfsClientRequestsUpload {
     when: LfsClientRequestsUpload(user, repository, pointers)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.lfs_start_server
     requires: can_write_code(user, repository)
     -- decided (quota 2): the announced sizes of the objects to upload are counted
@@ -1581,6 +1927,7 @@ rule LfsClientRequestsUpload {
 -- from: services/lfs/server.go:281
 rule LfsClientUploadsObject {
     when: LfsClientUploadsObject(user, repository, pointer, content_sha256, content_size)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.lfs_start_server
     requires: can_write_code(user, repository)
     -- decided (quota 2): the object's size is counted
@@ -1603,6 +1950,7 @@ rule LfsClientUploadsObject {
 -- from: models/git/lfs_lock.go:72
 rule UserLocksLfsPath {
     when: UserLocksLfsPath(user, repository, path)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.lfs_start_server
     requires: can_write_code(user, repository)
     requires: path != ""
@@ -1617,6 +1965,7 @@ rule UserLocksLfsPath {
 -- from: models/git/lfs_lock.go:165
 rule UserUnlocksLfsPath {
     when: UserUnlocksLfsPath(user, lock, force)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.lfs_start_server
     requires: can_write_code(user, lock.repository)
     requires: force or lock.owner = user
@@ -1631,6 +1980,7 @@ rule UserUnlocksLfsPath {
 -- from: models/git/lfs.go:259
 rule AdminAssociatesLfsPointers {
     when: AdminAssociatesLfsPointers(admin, repository, pointers)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.lfs_start_server
     requires: is_repo_admin(admin, repository)
     requires: admin.is_admin or pointers.all(p => lfs_object_accessible(admin, p.oid))
@@ -1647,6 +1997,7 @@ rule AdminAssociatesLfsPointers {
 -- from: routers/web/repo/setting/lfs.go:354
 rule AdminDeletesLfsObject {
     when: AdminDeletesLfsObject(admin, object)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: config.lfs_start_server
     requires: is_repo_admin(admin, object.repository)
     ensures: not exists object
@@ -2146,13 +2497,18 @@ surface GitTransport {
         PusherProposesRefUpdate(client, push, ref_kind, ref_name, old_sha, new_sha)
         GitClientFinishesPush(client, push)
         GitClientPushesToMissingRepository(client, owner_user, owner_org, repository_name, protocol, uses_deploy_key)
+        GitClientFetchesWiki(client, repo, protocol)
+        GitClientPushesToWiki(client, repo, protocol)
 
     @guarantee RejectionsExplainThemselves
         -- Every refused ref update reports a reason to the git client: not allowed to
         -- push (with an AGit `refs/for/<branch>` hint when the pusher could open a PR),
         -- default branch cannot be deleted, protected from deletion / force push /
         -- unverified commit <sha> / changing file <path>, tag is protected, quota
-        -- exceeded, repository archived, mirror is read-only.
+        -- exceeded, repository archived, mirror is read-only, and — while the instance
+        -- is in read-only mode — the gate's message (access/InstanceWriteGate.message),
+        -- shown on the client's terminal for HTTP and SSH pushes alike (decided
+        -- administration 3). Fetches keep working in read-only mode.
 
     @guidance
         -- The ref advertisement lists live branches and tags (and refs/pull/*).

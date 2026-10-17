@@ -60,6 +60,8 @@
 --   repositories/RepositoryAdopted(repository, doer)
 --   repositories/RepositoryForked(source, fork, doer)
 --   migrations/RepositoryMigrated(repository)
+--   administration/AllRepositoryTagsResyncRequested(admin)      -- dashboard "sync_repo_tags"
+--   administration/ReleasesSyncWithTagsRequested(operator)      -- `forgejo admin repo-sync-releases`
 
 use "./accounts.allium" as accounts
 use "./repositories.allium" as repositories
@@ -67,6 +69,7 @@ use "./access.allium" as access
 use "./code.allium" as code
 use "./issues.allium" as issues
 use "./migrations.allium" as migrations
+use "./administration.allium" as administration
 
 ------------------------------------------------------------
 -- Value Types
@@ -170,6 +173,7 @@ config {
 -- from: services/release/release.go:137
 rule UserCreatesDraftRelease {
     when: UserCreatesRelease(user, repository, tag_name, target, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
     requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
@@ -177,6 +181,9 @@ rule UserCreatesDraftRelease {
     requires: is_valid_tag_name(tag_name)
     requires: not exists Release{repository: repository, tag_name: tag_name}
     requires: is_draft
+    -- quota gate_create_release holds for drafts too (the create endpoint is gated)
+    -- from: routers/api/v1/api.go:989
+    requires: release_quota_allows(repository)
     ensures: Release.created(
         repository: repository,
         tag_name: tag_name,
@@ -205,6 +212,7 @@ rule UserCreatesDraftRelease {
 -- from: services/release/release.go:38
 rule UserCreatesPublishedRelease {
     when: UserCreatesRelease(user, repository, tag_name, target, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
     requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
@@ -250,6 +258,7 @@ rule UserCreatesPublishedRelease {
 -- from: routers/web/repo/release.go:634
 rule UserCreatesReleaseOnExistingTag {
     when: UserCreatesRelease(user, repository, tag_name, target, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     let existing = Release{repository: repository, tag_name: tag_name}
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
@@ -284,6 +293,7 @@ rule UserCreatesReleaseOnExistingTag {
 -- from: services/release/release.go:248
 rule UserEditsDraftRelease {
     when: UserEditsRelease(user, repository, release, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
@@ -303,6 +313,7 @@ rule UserEditsDraftRelease {
 -- from: services/release/release.go:248
 rule UserPublishesDraftRelease {
     when: UserEditsRelease(user, repository, release, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
@@ -331,6 +342,7 @@ rule UserPublishesDraftRelease {
 -- from: services/release/release.go:368
 rule UserEditsPublishedRelease {
     when: UserEditsRelease(user, repository, release, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
@@ -349,12 +361,16 @@ rule UserEditsPublishedRelease {
 -- from: routers/web/repo/release.go:817
 rule UserUnpublishesRelease {
     when: UserEditsRelease(user, repository, release, title, note, is_draft, is_prerelease, hide_archive_links)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
     requires: not repository.is_mirror      -- decided (releases 10): pull mirrors' releases are read-only
     requires: release.state = published
     requires: is_draft
+    -- quota gate_edit_release: every edit is gated, un-publishing included
+    -- from: routers/api/v1/api.go:993
+    requires: release_quota_allows(repository)
     ensures: release.title = title
     ensures: release.note = note
     ensures: release.is_prerelease = is_prerelease
@@ -373,6 +389,7 @@ rule UserUnpublishesRelease {
 -- from: routers/api/v1/repo/release.go:353
 rule UserRetargetsDraftRelease {
     when: UserRetargetsRelease(user, repository, release, tag_name, target)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
@@ -380,6 +397,9 @@ rule UserRetargetsDraftRelease {
     requires: release.state = draft
     requires: is_valid_tag_name(tag_name)
     requires: tag_name = release.tag_name or not exists Release{repository: repository, tag_name: tag_name}
+    -- quota gate_edit_release (the API edit endpoint)
+    -- from: routers/api/v1/api.go:993
+    requires: release_quota_allows(repository)
     let old_tag_name = release.tag_name
     let old_commit_sha = release.commit_sha
     let old_num_commits = release.num_commits
@@ -423,6 +443,7 @@ rule UserRetargetsDraftRelease {
 -- from: services/release/release.go:390
 rule UserDeletesRelease {
     when: UserDeletesRelease(user, repository, release)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
@@ -461,6 +482,7 @@ rule UserDeletesRelease {
 -- from: routers/api/v1/repo/release_attachment.go:190
 rule UserUploadsReleaseAsset {
     when: UserUploadsReleaseAsset(user, repository, release, name, size, head_bytes)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: release.repository = repository
     requires: config.attachments_enabled
     requires: can_write_releases(user, repository)
@@ -472,7 +494,8 @@ rule UserUploadsReleaseAsset {
     -- decided (releases 7): the size limit holds on every upload path (web and
     -- API), not only in the web upload widget
     requires: size <= config.max_asset_size_mb * 1048576
-    requires: asset_quota_allows(repository)
+    -- decided (quota 2): the incoming size is counted (usage + size <= limit)
+    requires: asset_quota_allows(repository, size)
     ensures: issues/Attachment.created(
         repository: repository,
         uploader: user,
@@ -499,6 +522,7 @@ rule UserUploadsReleaseAsset {
 -- from: models/repo/release.go:235
 rule UserLinksUploadToRelease {
     when: UserLinksUploadToRelease(user, repository, release, file)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: release.repository = repository
     requires: can_write_releases(user, repository)
     requires: not repository.is_archived
@@ -508,12 +532,17 @@ rule UserLinksUploadToRelease {
     requires: file.uploader = user
     requires: not file.is_linked
     ensures: file.release = release
+    @guidance
+        -- An upload that is never saved into a release stays unlinked and expires
+        -- like any unlinked upload: issues/OrphanUploadExpires deletes it after
+        -- issues' config.orphan_attachment_expiry.
 }
 
 -- Adding a link to a file hosted elsewhere.
 -- from: services/attachment/attachment.go:50
 rule UserAddsExternalAsset {
     when: UserAddsExternalAsset(user, repository, release, name, url)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: release.repository = repository
     requires: config.attachments_enabled
     requires: can_write_releases(user, repository)
@@ -544,6 +573,7 @@ rule UserAddsExternalAsset {
 -- from: services/release/release.go:340
 rule UserRenamesReleaseAsset {
     when: UserRenamesReleaseAsset(user, repository, asset, name)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: asset.repository = repository
     requires: asset.release != null
     requires: can_write_releases(user, repository)
@@ -558,6 +588,7 @@ rule UserRenamesReleaseAsset {
 -- from: routers/api/v1/repo/release_attachment.go:395
 rule UserChangesExternalAssetUrl {
     when: UserChangesExternalAssetUrl(user, repository, asset, url)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: asset.repository = repository
     requires: asset.release != null
     requires: can_write_releases(user, repository)
@@ -574,6 +605,7 @@ rule UserChangesExternalAssetUrl {
 -- from: routers/api/v1/repo/release_attachment.go:460
 rule UserDeletesReleaseAsset {
     when: UserDeletesReleaseAsset(user, repository, asset)
+    requires: not (exists access/InstanceWriteGate{read_only: true})   -- decided: administration 3 (read-only mode refuses every write)
     requires: asset.repository = repository
     requires: asset.release != null
     requires: can_write_releases(user, repository)
@@ -779,11 +811,20 @@ rule MigrationReconcilesTags {
 }
 
 -- Site admin dashboard: "Synchronise tags from git data to database" for
--- every non-empty repository (queued, one repository at a time).
+-- every non-empty repository (queued, one repository at a time). The
+-- operation itself is administration's (AdminStartsTagResync).
 -- from: routers/web/admin/admin.go:198
-rule AdminResynchronisesAllTags {
-    when: AdminResynchronisesAllTags(admin)
-    requires: admin.is_admin
+rule AdministrationResyncsAllTags {
+    when: administration/AllRepositoryTagsResyncRequested(admin)
+    ensures:
+        for repository in repositories/Repositories where not is_empty:
+            RepositoryTagSyncRequested(repository: repository)
+}
+
+-- `forgejo admin repo-sync-releases`: the same, from the command line.
+-- from: cmd/admin.go:109
+rule OperatorResyncsAllTags {
+    when: administration/ReleasesSyncWithTagsRequested(operator)
     ensures:
         for repository in repositories/Repositories where not is_empty:
             RepositoryTagSyncRequested(repository: repository)
@@ -992,17 +1033,6 @@ surface TagReconciliation {
         -- is gone is a draft.
 }
 
-surface ReleaseSyncAdministration {
-    facing admin: access/SiteAdmin
-
-    provides:
-        AdminResynchronisesAllTags(admin)
-
-    @guidance
-        -- Site admin dashboard operation "sync_repo_tags"; also
-        -- `forgejo admin repo-sync-releases` on the command line.
-}
-
 ------------------------------------------------------------
 -- Deferred Specifications
 ------------------------------------------------------------
@@ -1015,6 +1045,8 @@ deferred file_type_allowed    -- see: issues.allium (is_allowed_file: extension 
 ------------------------------------------------------------
 -- release_exists(repository, tag_name)        = exists Release{repository, tag_name} where is_release
 -- has_published_release(repository, tag_name) = exists Release{repository, tag_name} where state = published
+-- release_of_tag(repository, tag_name)        = Release{repository, tag_name} (any state; null when none):
+--                                               the record repositories' archive downloads count against
 -- latest_release_of(repository)               = newest Release where is_latest_candidate (by created_at, then creation order)
 
 ------------------------------------------------------------
@@ -1032,8 +1064,16 @@ deferred file_type_allowed    -- see: issues.allium (is_allowed_file: extension 
 --                                       = first line / remainder of a tag annotation ("" when none)
 -- same_tag_name(a, b)                   = case-insensitive equality
 -- commits_since(release)                = commits on target (or default branch) since the tag
--- release_quota_allows(repository)      = quota subject size:repos:all
--- asset_quota_allows(repository)        = quota subject size:assets:attachments:releases
+-- release_quota_allows(repository)      = quota/quota_allows(<repository owner>, size:repos:all)
+--                                         (gate_create_release, gate_edit_release)
+-- asset_quota_allows(repository, size)  = quota/quota_allows(<repository owner>, size:assets:attachments:releases, size):
+--                                         usage + the incoming size within the limit (decided quota 2;
+--                                         gate_release_attachment). Deleting a release or an asset never
+--                                         asks quota (decided quota 7).
+-- read-only mode: not (exists access/InstanceWriteGate{read_only: true})
+--                                         decided (administration 3): every user-initiated release and
+--                                         asset change is refused while the instance is read-only;
+--                                         reading, downloading (and its counter) and tag reconciliation are not
 -- is_valid_url(url)                     = absolute http(s) URL
 
 ------------------------------------------------------------

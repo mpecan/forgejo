@@ -20,6 +20,9 @@ world {
         can_write_releases(ada, repo) = true
         can_read_releases(bob, repo) = true
         release_quota_allows(repo) = true
+        -- main's head, where releases cut from main are tagged
+        commit_of(repo, "main") = "m41n00"
+        commit_count_of(repo, "main") = 10
 }
 
 -- The happy path: a maintainer cuts v1.0 straight from main.
@@ -37,6 +40,10 @@ journey MaintainerPublishesAReleaseOnANewTag {
         then UserCreatesPublishedRelease fires
         then rel.state = published
         then rel.publisher = ada
+        then rel.commit_sha = "m41n00"
+        -- code creates the tag on main's head as an internal tag push by ada
+        then ReleaseTagIsCreated fires
+        then TagCreatedByPush fires
 
     2. a reader finds it
         bob sees rel.tag_name on ReleaseCatalogue in repo
@@ -450,11 +457,12 @@ journey AnOversizedAssetIsRefusedOnEveryPath {
 
     1. the oversized upload is refused
         stipulate file_type_allowed("disk.img", "", "") = true
-        stipulate asset_quota_allows(repo) = true
+        stipulate asset_quota_allows(repo, 3221225472) = true
         ada cannot do UserUploadsReleaseAsset(ada, repo, rel, "disk.img", 3221225472, "") on ReleaseManagement
 
     2. a small one is accepted
         stipulate file_type_allowed("app.zip", "", "") = true
+        stipulate asset_quota_allows(repo, 1048576) = true
         ada does UserUploadsReleaseAsset(ada, repo, rel, "app.zip", 1048576, "") on ReleaseManagement
             creating zip: issues/Attachment
         then UserUploadsReleaseAsset fires
