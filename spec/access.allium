@@ -76,7 +76,7 @@
 --   - organizations/TeamMemberRemoved(team, user)
 --   - organizations/TeamRepositoryAdded(team, repository)
 --   - organizations/TeamRepositoryRemoved(team, repository)
---   - organizations/TeamAccessChanged(team)   (access mode, unit access, includes-all)
+--   - organizations/TeamAccessChanged(team)   (team kind, unit access, includes-all)
 --   - organizations/TeamDeleted(team)
 --   - organizations/OrganizationVisibilityChanged(organization)
 --   - accounts/AccountStatusChanged(user)          (restricted flag may have changed)
@@ -212,10 +212,12 @@ use "./actions.allium" as actions
 --   2. Signed-in x who cannot see R's owner (can_see_owner) and is not a
 --      collaborator on R -> none.
 --   3. x is site admin, or x is the owning user -> owner on every enabled unit.
---   4. Explicit grant E = strongest of: x's collaboration mode on R; the access
---      mode of every team of R's owning organization that includes R
---      (explicitly or via includes-all) and contains x.
---      If any such team's mode is admin/owner -> that mode on every unit.
+--   4. Explicit grant E = strongest of: x's collaboration mode on R; for
+--      every team of R's owning organization that includes R (explicitly or
+--      via includes-all) and contains x: owner/admin for an owner/admin team
+--      (organizations/Team.kind), else the strongest of its unit grants (a
+--      unit-grants team has no summary mode; organizations decision 4).
+--      If any such team is an owner/admin team -> that mode on every unit.
 --   5. Owning user (not org): every enabled unit gets E, or read when R is
 --      public and x is not restricted and E is none; a unit marked
 --      everyone-writable gives write to those same non-restricted users.
@@ -881,9 +883,10 @@ rule SiteAdminSudo {
 -- Rules: explicit-access index recalculation
 ------------------------------------------------------------
 -- The index row for (user, repository) always equals explicit_mode(user,
--- repository): the strongest of the user's collaboration mode and the access
--- mode of each team of the owning organization that includes the repository
--- and contains the user. It is recalculated whenever an input changes.
+-- repository): the strongest of the user's collaboration mode and, for each
+-- team of the owning organization that includes the repository and contains
+-- the user, owner/admin for an owner/admin team or else the strongest of its
+-- unit grants (step 4 above). It is recalculated whenever an input changes.
 
 -- from: models/perm/access/access.go:277
 rule RecalculateOneUsersAccess {

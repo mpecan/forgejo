@@ -13,7 +13,7 @@
 --     while it still owns repositories or packages), purge on behalf of the
 --     system (owner account deletion, moderation).
 --   - OrgMembership (public/concealed), leaving, removal by owners.
---   - Team create/edit/delete, access mode (read/write/admin/owner), per-unit
+--   - Team create/edit/delete, team kind (owner/admin/unit grants), per-unit
 --     access, includes-all-repositories, can-create-org-repo.
 --   - The Owners team: exists from creation, cannot be deleted or renamed,
 --     always owner access over all repositories, never empties.
@@ -100,6 +100,15 @@ enum MembershipReason {
     org_creator | added_by_user | added_by_auth_source
 }
 
+-- What a team is. The Owners team is the one owner team; an admin team holds
+-- admin on every unit; any other team is exactly its per-unit grants
+-- (TeamUnitAccess) and carries no summary mode of its own.
+-- decided: a team's summary access mode is dropped; any summary is computed for display only.
+-- from: models/organization/team.go:66 (AccessMode owner/admin; read/write become unit_grants)
+enum TeamKind {
+    owner | admin | unit_grants
+}
+
 ------------------------------------------------------------
 -- Entities and Variants
 ------------------------------------------------------------
@@ -124,6 +133,7 @@ entity Organization {
     teams: Team with organization = this
     memberships: OrgMembership with organization = this
     invites: TeamInvite with organization = this
+    followers: accounts/Follow with followee_organization = this
 
     -- Projections
     members: memberships -> user
@@ -135,6 +145,7 @@ entity Organization {
     is_public: visibility = public
     member_count: memberships.count
     team_count: teams.count
+    follower_count: followers.count
     owner_count: owners.count
 
     has_member(u): u in members
@@ -142,10 +153,10 @@ entity Organization {
     -- Owner, or member of any team with admin access.
     has_admin(u): teams.any(t => t.is_admin_team and u in t.members)
     -- May create repositories owned by the org.
-    lets_create_repo(u): u.is_admin or teams.any(t => (t.can_create_org_repo or t.access_mode = owner) and u in t.members)
+    lets_create_repo(u): u.is_admin or teams.any(t => (t.can_create_org_repo or t.kind = owner) and u in t.members)
     -- Sees every team (not only the ones they are on).
     sees_all_teams(u): u.is_admin or u in owners
-        or teams.any(t => t.includes_all_repositories and t.access_mode in {admin, owner} and u in t.members)
+        or teams.any(t => t.includes_all_repositories and t.kind in {admin, owner} and u in t.members)
     -- Which signed-in people can see that the organization exists at all.
     -- from: models/organization/org.go:526
     is_visible_to(u): u.is_admin or u in members
@@ -173,7 +184,7 @@ entity Team {
     organization: Organization
     name: String                              -- AlphaDashDot, max 255, unique per org ignoring case, not "new"
     description: String?                      -- max 255
-    access_mode: access/AccessMode            -- read | write (summary of unit grants) | admin | owner
+    kind: TeamKind                            -- owner | admin | unit_grants (no summary mode)
     includes_all_repositories: Boolean        -- covers every current and future org repository
     can_create_org_repo: Boolean
     is_owners_team: Boolean
@@ -193,7 +204,7 @@ entity Team {
     -- Derived
     member_count: memberships.count
     repository_count: repository_links.count
-    is_admin_team: access_mode in {admin, owner}
+    is_admin_team: kind in {admin, owner}
     has_member(u): u in members
     covers(r): r in repositories
     -- Who may open the team page and list its members and repositories.
@@ -306,7 +317,7 @@ rule UserCreatesOrganization {
         let owners = Team.created(
             organization: org,
             name: "Owners",
-            access_mode: owner,
+            kind: owner,
             includes_all_repositories: true,
             can_create_org_repo: true,
             is_owners_team: true
@@ -350,8 +361,8 @@ rule CreateOrganizationForUserByAdmin {
 
     let owner = user
     requires: owner.kind in {individual, bot}
-    requires: owner.is_admin
-        or (owner.allow_create_organization and not config.disable_regular_org_creation)
+    -- decided: the admin's right governs; the owner's own creation right is not checked.
+    requires: admin.is_admin
     requires: is_usable_owner_name(name)
     requires: length(name) <= config.max_org_name_length
     requires: owner_name_available(name)
@@ -367,7 +378,7 @@ rule CreateOrganizationForUserByAdmin {
         let owners = Team.created(
             organization: org,
             name: "Owners",
-            access_mode: owner,
+            kind: owner,
             includes_all_repositories: true,
             can_create_org_repo: true,
             is_owners_team: true
@@ -393,7 +404,10 @@ rule CreateOrganizationForUserByAdmin {
         OrganizationCreated(organization: org, creator: owner)
 
     @guidance
-        -- API: POST /admin/users/{username}/orgs.
+        -- API: POST /admin/users/{username}/orgs. Forgejo checks the target
+        -- owner's CanCreateOrganization; this spec lets a site admin create
+        -- an organization for any person, whatever their own creation right
+        -- or DISABLE_REGULAR_ORG_CREATION.
 }
 
 ------------------------------------------------------------
@@ -598,16 +612,15 @@ rule ModeratorPurgesOrganization {
 -- Rules: organization membership
 ------------------------------------------------------------
 
--- A member shows or hides their own membership; owners may change it for any
--- member.
--- from: routers/web/org/members.go:93
+-- A member shows or hides their own membership. Nobody else, owners
+-- included, may change it.
+-- from: routers/api/v1/org/member.go:216
 rule MemberChangesMembershipVisibility {
     when: MemberChangesMembershipVisibility(actor, org, membership, is_public)
 
     requires: membership.organization = org
+    -- decided: the member only; owners cannot publicize or conceal someone else's membership.
     requires: actor = membership.user
-        or is_org_owner(membership.organization, actor)
-        or actor.is_admin
     requires: membership.is_public != is_public
 
     ensures: membership.is_public = is_public
@@ -615,8 +628,8 @@ rule MemberChangesMembershipVisibility {
 
     @guidance
         -- Web: POST /org/{org}/members/action/{public|private}?uid=
-        -- (self or owner). API: PUT/DELETE /orgs/{org}/public_members/{username}
-        -- (self only — see open question).
+        -- API: PUT/DELETE /orgs/{org}/public_members/{username}. Both paths
+        -- are self only (Forgejo's web path also let owners change others).
 }
 
 -- A member leaves the organization, which takes them off every team.
@@ -746,49 +759,65 @@ rule OwnerCreatesTeam {
     requires: access_mode in {read, write, admin}
     requires: access_mode = admin or grants_some_unit(grants)
 
-    let effective_mode = team_mode_for(access_mode, grants)
-
+    -- decided: no summary mode; an admin request makes an admin team, a
+    -- read/write request a unit-grants team defined by its grants alone.
     ensures:
-        let team = Team.created(
-            organization: org,
-            name: name,
-            description: description,
-            access_mode: effective_mode,
-            includes_all_repositories: includes_all_repositories,
-            can_create_org_repo: can_create_org_repo,
-            is_owners_team: false
-        )
         if access_mode = admin:
+            let admin_team = Team.created(
+                organization: org,
+                name: name,
+                description: description,
+                kind: admin,
+                includes_all_repositories: includes_all_repositories,
+                can_create_org_repo: can_create_org_repo,
+                is_owners_team: false
+            )
             -- every unit at admin; the external wiki and tracker at read
             for u in {code, issues, pull_requests, releases, wiki, projects, packages, actions}:
-                TeamUnitAccess.created(team: team, unit: u, access_mode: admin)
+                TeamUnitAccess.created(team: admin_team, unit: u, access_mode: admin)
             for u in {external_wiki, external_tracker}:
-                TeamUnitAccess.created(team: team, unit: u, access_mode: read)
+                TeamUnitAccess.created(team: admin_team, unit: u, access_mode: read)
+            if includes_all_repositories:
+                for r in repositories/Repositories where r.owner_org = org:
+                    TeamRepository.created(team: admin_team, repository: r)
+            TeamCreated(team: admin_team, actor: actor)
         else:
+            let grants_team = Team.created(
+                organization: org,
+                name: name,
+                description: description,
+                kind: unit_grants,
+                includes_all_repositories: includes_all_repositories,
+                can_create_org_repo: can_create_org_repo,
+                is_owners_team: false
+            )
             for g in grants:
                 if g.unit in {external_wiki, external_tracker}:
                     if g.access_mode != none:
-                        TeamUnitAccess.created(team: team, unit: g.unit, access_mode: read)
+                        TeamUnitAccess.created(team: grants_team, unit: g.unit, access_mode: read)
                 else:
                     if g.access_mode in {read, write}:
-                        TeamUnitAccess.created(team: team, unit: g.unit, access_mode: g.access_mode)
+                        TeamUnitAccess.created(team: grants_team, unit: g.unit, access_mode: g.access_mode)
                     if g.access_mode in {admin, owner}:
-                        TeamUnitAccess.created(team: team, unit: g.unit, access_mode: write)
-        if includes_all_repositories:
-            for r in repositories/Repositories where r.owner_org = org:
-                TeamRepository.created(team: team, repository: r)
-        TeamCreated(team: team, actor: actor)
+                        TeamUnitAccess.created(team: grants_team, unit: g.unit, access_mode: write)
+            if includes_all_repositories:
+                for r in repositories/Repositories where r.owner_org = org:
+                    TeamRepository.created(team: grants_team, repository: r)
+            TeamCreated(team: grants_team, actor: actor)
 
     @guidance
         -- Web: GET/POST /org/{org}/teams/new. API: POST /orgs/{org}/teams
         -- (units_map: unit key -> none|read|write|admin).
         -- Normalisation: an admin team gets admin on every unit and read on
-        -- external wiki/tracker; a read/write team keeps its per-unit
-        -- choices clamped to write, external units to read, and its
-        -- summary access_mode is the lowest non-none unit grant.
+        -- external wiki/tracker; a read/write request makes a unit-grants
+        -- team that keeps its per-unit choices clamped to write, external
+        -- units to read. Forgejo also stores a summary mode (the lowest
+        -- non-none grant); this spec has none — a display may compute one.
 }
 
 -- Editing any team except Owners.
+-- decided: renaming the Owners team is forbidden on every path (web and API);
+-- the Owners team is identified by is_owners_team, never by its name.
 -- from: routers/web/org/teams.go:530
 rule OwnerEditsTeam {
     when: OwnerEditsTeam(actor, team, name, description, access_mode, grants, includes_all_repositories, can_create_org_repo)
@@ -803,12 +832,16 @@ rule OwnerEditsTeam {
     requires: access_mode in {read, write, admin}
     requires: access_mode = admin or grants_some_unit(grants)
 
-    let effective_mode = team_mode_for(access_mode, grants)
     let was_includes_all = team.includes_all_repositories
 
     ensures: team.name = name
     ensures: team.description = description
-    ensures: team.access_mode = effective_mode
+    -- decided: no summary mode; a read/write request makes a unit-grants team.
+    ensures:
+        if access_mode = admin:
+            team.kind = admin
+        else:
+            team.kind = unit_grants
     ensures: team.includes_all_repositories = includes_all_repositories
     ensures: team.can_create_org_repo = can_create_org_repo
     ensures:
@@ -840,7 +873,7 @@ rule OwnerEditsTeam {
 
     @guidance
         -- Web: GET/POST /org/{org}/teams/{team}/edit. API: PATCH
-        -- /teams/{id} (all fields optional). Any edit of mode, unit grants or
+        -- /teams/{id} (all fields optional). Any edit of kind, unit grants or
         -- includes-all is an access change for access.allium. Switching
         -- includes-all off keeps the repositories already linked.
 }
@@ -864,6 +897,7 @@ rule OwnerDeletesTeam {
     when: OwnerDeletesTeam(actor, team)
 
     requires: is_org_owner(team.organization, actor) or actor.is_admin
+    -- decided: deleting the Owners team is forbidden on every path (Forgejo only hides the button).
     requires: not team.is_owners_team
 
     ensures:
@@ -893,6 +927,8 @@ rule OwnerDeletesTeam {
 -- An owner puts a person on a team. With ADD_MEMBERS_BY_INVITATIONS and a
 -- person who is not yet an org member (and is not the owner themself), an
 -- invitation is sent instead so the person consents to joining.
+-- decided: an org block is not checked here, like Forgejo; it limits the
+-- blocked user's own interactions, not owners adding them to teams or inviting them.
 -- from: services/org/team_invite.go:34
 rule OwnerAddsTeamMember {
     when: OwnerAddsTeamMember(actor, team, user)
@@ -1206,6 +1242,7 @@ rule OwnerRevokesTeamInvite {
 
 -- An invitation stops being usable once its expiry passes. It stays listed
 -- (as expired) until revoked or replaced by a new invitation.
+-- decided: expired invitations are kept, like Forgejo; nothing purges them automatically.
 -- from: models/organization/team_invite.go:405
 rule TeamInviteExpires {
     when: invite: TeamInvite.expires_at <= now
@@ -1232,10 +1269,14 @@ rule OwnerAddsRepositoryToTeam {
 
     @guidance
         -- Web: POST /org/{org}/teams/{team}/action/repo/add (repo_name).
-        -- API: PUT /teams/{id}/repos/{org}/{repo} (owner of the org, or
-        -- admin of the repository — see RepoAdminAddsTeamToRepository).
+        -- API: PUT /teams/{id}/repos/{org}/{repo}. Forgejo's API asks for
+        -- repository admin plus team membership instead; this spec applies
+        -- the same rule on every path: org owners here, repository admins
+        -- (when the org allows it) through RepoAdminAddsTeamToRepository.
 }
 
+-- decided: adding a team to a repository needs an org owner, or a repository
+-- admin when the org allows it (repo_admin_change_team_access), on every path.
 -- from: routers/web/repo/setting/collaboration.go:152
 rule RepoAdminAddsTeamToRepository {
     when: RepoAdminAddsTeamToRepository(actor, repository, team)
@@ -1390,19 +1431,19 @@ invariant OrganizationAlwaysHasAnOwner {
 -- The Owners team has owner access over every repository and may create repos.
 invariant OwnersTeamShape {
     for t in Teams where is_owners_team = true:
-        t.access_mode = owner and t.includes_all_repositories and t.can_create_org_repo
+        t.kind = owner and t.includes_all_repositories and t.can_create_org_repo
 }
 
 -- Only the Owners team carries owner access.
 invariant OnlyOwnersTeamHasOwnerMode {
     for t in Teams:
-        t.access_mode = owner implies t.is_owners_team
+        t.kind = owner implies t.is_owners_team
 }
 
--- A team never grants "none" overall.
+-- A unit-grants team grants at least one unit.
 invariant TeamGrantsSomething {
-    for t in Teams:
-        t.access_mode != none
+    for t in Teams where kind = unit_grants:
+        t.unit_accesses.any(u => u.access_mode != none)
 }
 
 -- Team names are unique within an organization, ignoring case.
@@ -1452,10 +1493,10 @@ invariant ExternalUnitsReadOnly {
         tu.unit in {external_wiki, external_tracker} implies tu.access_mode in {none, read}
 }
 
--- Read/write teams grant at most write on any unit.
+-- Unit-grants teams grant at most write on any unit.
 invariant NonAdminTeamsCapUnitsAtWrite {
     for tu in TeamUnitAccesses:
-        tu.team.access_mode in {read, write} implies tu.access_mode in {none, read, write}
+        tu.team.kind = unit_grants implies tu.access_mode in {none, read, write}
 }
 
 -- At most one pending invitation per team and address.
@@ -1625,7 +1666,7 @@ surface OrganizationMembersArea {
         for t in org.teams:
             t.name
             t.description
-            t.access_mode
+            t.kind
             t.member_count
             t.repository_count
             is_team_member(t, member)
@@ -1634,7 +1675,7 @@ surface OrganizationMembersArea {
 
     provides:
         MemberChangesMembershipVisibility(member, org, membership, is_public)
-            when membership.organization = org and (membership.user = member or is_org_owner(org, member))
+            when membership.organization = org and membership.user = member
         MemberLeavesOrganization(member, org)
             when not is_org_owner(org, member) or owner_count(org) > 1
 
@@ -1658,7 +1699,7 @@ surface TeamPage {
     exposes:
         team.name
         team.description
-        team.access_mode
+        team.kind
         team.includes_all_repositories
         team.can_create_org_repo
         for u in team.unit_accesses:
@@ -1766,7 +1807,7 @@ surface TeamSettings {
     exposes:
         team.name
         team.description
-        team.access_mode
+        team.kind
         team.includes_all_repositories
         team.can_create_org_repo
         for i in team.pending_invites:
@@ -1854,7 +1895,10 @@ surface RepositoryTeamAccess {
         repository.owner_org.repo_admin_change_team_access
         for t in repository.owner_org.teams:
             t.name when team_covers(t, repository)
-            t.access_mode when team_covers(t, repository)
+            t.kind when team_covers(t, repository)
+            for u in t.unit_accesses:
+                u.unit when team_covers(t, repository)
+                u.access_mode when team_covers(t, repository)
 
     provides:
         RepoAdminAddsTeamToRepository(admin, repository, team)
@@ -1900,14 +1944,7 @@ deferred Organization.unit_permission    -- see: access.allium (org-level read o
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Forgejo's API lets an owner rename the Owners team (PATCH /teams/{id} with a name), which breaks owner detection by name; the web UI does not. This spec forbids it — confirm."
-open question "Forgejo does not refuse deleting the Owners team in the backend (only the UI hides the button). This spec refuses it — confirm."
-open question "Membership visibility: the web lets owners publicize/conceal other members, the API only lets members change their own. Which should a rebuild keep? (Spec: self or owner.)"
-open question "A read/write team's summary access_mode is the lowest non-none unit grant (team_mode_for). Is a summary needed at all, or should read/write teams be defined purely by their unit grants?"
-open question "AdminCreatesOrganizationForUser checks the target owner's permission to create organizations rather than the admin's. Intended?"
-open question "Team-repository add via API requires repository admin (reqAdmin) plus team membership, while the web requires org ownership. Spec treats the API path as the repo-side RepoAdminAddsTeamToRepository (honouring repo_admin_change_team_access). Confirm."
-open question "Should a user block at org level prevent the blocked user from being added to or invited into the org's teams? Forgejo does not check."
-open question "Expired invitations are never cleaned up automatically; they stay listed until revoked or replaced. Should a rebuild purge them after some time?"
+-- None: the eight organizations questions are decided (see DECISIONS.md, "## organizations").
 
 -- Black-box functions used above (implementation-defined, pure).
 -- Membership predicates offered to other modules; each equals the derived
@@ -1934,17 +1971,17 @@ open question "Expired invitations are never cleaned up automatically; they stay
 --                                      -- (or owner) mode on the repository
 --   team_name_taken(org, name)         -- some team of org has this name, ignoring case
 --   team_name_taken_by_other(team, name)
---   grants_some_unit(grants)           -- at least one grant above none
+--   grants_some_unit(grants)           -- at least one grant above none;
+--                                      -- `grants` is a set of {unit: repositories/UnitKind,
+--                                      -- access_mode: access/AccessMode} pairs (API units_map)
 --   has_pending_team_invite(team, user), has_pending_team_invite_for_email(team, email),
 --   has_pending_org_invite(org, user), has_member_with_email(team, email)
---   is_usable_owner_name(name)       -- accounts' user-name rules: charset, reserved names and patterns
+--   is_usable_owner_name(name)       -- accounts' user-name rules: charset, reserved names and patterns,
+--                                    -- and no accounts/ReservedName holds it (case-insensitive)
 --   owner_name_available(name)       -- no user or organization holds this name (ignoring case)
 --   owner_name_claimable(name, org)  -- not within accounts' USERNAME_COOLDOWN_PERIOD of another owner's release
 --   owned_repository_count(org)      -- repositories with owner_org = org
 --   owned_package_count(org)         -- packages owned by org
---   team_mode_for(mode, grants)      -- see OwnerCreatesTeam guidance;
---                                      -- `grants` is a set of {unit: repositories/UnitKind,
---                                      -- access_mode: access/AccessMode} pairs (API units_map)
 --   new_invite_token()               -- unguessable, unique
 --   mail_service_enabled()           -- [mailer] ENABLED (notifications' outbound mail is configured)
 --   is_alpha_dash_dot(s), is_valid_email(s), is_valid_site_url(s), is_acceptable_avatar(img), lower(s), length(s)
@@ -1957,7 +1994,7 @@ open question "Expired invitations are never cleaned up automatically; they stay
 -- REQUEST accounts: react to OrganizationRenamed(organization, old_name, new_name) with RenameNamespace semantics (UserRedirect with organization set, MAX_USER_REDIRECTS); react to OrganizationCreated by dropping any redirect holding the new name; follows and blocks of an org removed on OrganizationDeleted.
 -- REQUEST accounts: OrganizationBlocksUser should also require that the blocked user is not the acting owner (Forgejo refuses blocking yourself).
 -- REQUEST accounts: owner-name namespace — a name may be held by a User or an Organization, never both (is_usable_owner_name, owner_name_available, owner_name_claimable as black boxes over accounts' rules).
--- REQUEST access: derive repository permission for org repositories from TeamRepository + TeamUnitAccess + Team.access_mode (owner/admin teams: all units), and org-level unit read (projects/packages/code) from team units or org visibility.
+-- REQUEST access: derive repository permission for org repositories from TeamRepository + TeamUnitAccess + Team.kind (owner/admin teams: that mode on all units; unit_grants teams: their TeamUnitAccess rows only — there is no team summary mode), and org-level unit read (projects/packages/code) from team units or org visibility.
 -- REQUEST repositories: emit OrgRepositoryArrived(repository) after a transfer into an org, and OrgRepositoryDeparted(repository, organization) when an org repository is transferred out or deleted.
 -- REQUEST repositories: when an org repository is created and no team gives its creator admin, add the creator as an admin Collaboration; check can_create_repository_in(user, org) and Organization.max_repo_creation for creation, forks, transfers and push-to-create.
 -- REQUEST repositories: react to TeamMemberAdded / TeamRepositoryAdded with auto-watch when AUTO_WATCH_NEW_REPOS; react to TeamMemberRemoved / OrgMemberRemoved / TeamRepositoryRemoved by unwatching repositories the user can no longer read; react to OrganizationPurgeStarted by deleting all org repositories.

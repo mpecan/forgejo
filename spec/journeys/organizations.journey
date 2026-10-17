@@ -34,15 +34,16 @@ world {
         owners.organization = org
         owners.name = "Owners"
         owners.is_owners_team = true
-        owners.access_mode = owner
+        owners.kind = owner
         owners.includes_all_repositories = true
         owners.can_create_org_repo = true
         devs.organization = org
         devs.name = "devs"
         devs.is_owners_team = false
-        devs.access_mode = write
+        devs.kind = unit_grants
         devs.includes_all_repositories = false
         devs.can_create_org_repo = false
+        devs_code: TeamUnitAccess { team: devs, unit: code, access_mode: write }
         -- Alice owns the organization in every story here.
         is_org_owner(org, alice) = true
 }
@@ -116,11 +117,10 @@ journey AliceBuildsATeam {
         stipulate lower("leads") = "leads"
         stipulate team_name_taken(org, "leads") = false
         stipulate length("Tech leads") = 10
-        stipulate team_mode_for(admin, {}) = admin
         alice does OwnerCreatesTeam(alice, org, "leads", "Tech leads", admin, {}, true, false) on OrganizationSettings
             creating docs: Team
         then OwnerCreatesTeam fires
-        then docs.access_mode = admin
+        then docs.kind = admin
         then docs.includes_all_repositories = true
         then docs.is_owners_team = false
 
@@ -430,4 +430,127 @@ journey PrivateOrganizationIsInvisibleAnonymously {
         stranger cannot see org.name on AnonymousOrganizationProfile in org
 
     ends: acme is hidden from everyone who is not a member.
+}
+
+-- Decided: the Owners team keeps its name on every path, and is never deleted.
+journey TheOwnersTeamCannotBeRenamed {
+    goal: Alice tries to rename the Owners team through the general team edit
+          (the API's PATCH /teams/{id}); it is refused. Only its description
+          can change.
+
+    1. renaming the Owners team is refused
+        stipulate is_alpha_dash_dot("bosses") = true
+        stipulate length("bosses") = 6
+        stipulate lower("bosses") = "bosses"
+        stipulate team_name_taken_by_other(owners, "bosses") = false
+        stipulate grants_some_unit({}) = false
+        alice cannot do OwnerEditsTeam(alice, owners, "bosses", "", admin, {}, true, true) on TeamSettings
+
+    2. its description can change
+        stipulate length("Those who decide") = 16
+        alice does OwnerEditsOwnersTeamDescription(alice, owners, "Those who decide") on TeamSettings
+        then owners.description = "Those who decide"
+        then owners.name = "Owners"
+
+    ends: The Owners team is still called Owners.
+}
+
+-- Decided: a team is owner, admin, or a set of unit grants; there is no summary mode.
+journey DevsBecomeAnAdminTeam {
+    goal: devs is defined by its unit grants. Alice turns it into an admin team;
+          she cannot turn it back into a team that grants no unit at all.
+
+    1. alice makes devs an admin team
+        stipulate is_alpha_dash_dot("devs") = true
+        stipulate length("devs") = 4
+        stipulate lower("devs") = "devs"
+        stipulate team_name_taken_by_other(devs, "devs") = false
+        stipulate length("Developers") = 10
+        alice does OwnerEditsTeam(alice, devs, "devs", "Developers", admin, {}, false, false) on TeamSettings
+        then OwnerEditsTeam fires
+        then devs.kind = admin
+        then devs_code does not exist
+
+    2. a write team with no unit grants is refused
+        stipulate grants_some_unit({}) = false
+        alice cannot do OwnerEditsTeam(alice, devs, "devs", "Developers", write, {}, false, false) on TeamSettings
+
+    ends: devs is an admin team.
+}
+
+-- Decided: only the member changes their own membership visibility.
+journey AliceCannotPublicizeBob {
+    goal: Bob's membership is concealed. Alice, an owner, cannot make it
+          public; only Bob can.
+
+    given:
+        alice_owner:  TeamMembership { team: owners, organization: org, user: alice, reason: org_creator }
+        alice_in_org: OrgMembership { organization: org, user: alice, is_public: true }
+        bob_on_devs:  TeamMembership { team: devs, organization: org, user: bob, reason: added_by_user }
+        bob_in_org:   OrgMembership { organization: org, user: bob, is_public: false }
+
+    1. alice is refused
+        stipulate is_org_member(org, alice) = true
+        alice cannot do MemberChangesMembershipVisibility(alice, org, bob_in_org, true) on OrganizationMembersArea
+
+    2. bob publicizes himself
+        stipulate is_org_member(org, bob) = true
+        bob does MemberChangesMembershipVisibility(bob, org, bob_in_org, true) on OrganizationMembersArea
+        then bob_in_org.is_public = true
+
+    ends: Bob's membership is public because Bob chose it.
+}
+
+-- Decided: the admin's right governs creating an organization for a user.
+journey AdminFoundsAnOrganizationForCarol {
+    world: none
+
+    goal: Carol may not create organizations herself, but a site admin
+          creates one for her and she becomes its owner.
+
+    cast:
+        root:  accounts/User
+        carol: accounts/User
+
+    given:
+        root.kind = individual
+        root.is_admin = true
+        root.prohibit_login = false
+        root.is_active = true
+        carol.kind = individual
+        carol.is_admin = false
+        carol.allow_create_organization = false
+        carol.prohibit_login = false
+        carol.is_active = true
+
+    1. the admin creates the organization on Carol's behalf
+        stipulate is_usable_owner_name("carol-co") = true
+        stipulate owner_name_available("carol-co") = true
+        stipulate length("carol-co") = 8
+        stipulate is_usable_username("carol-co") = true
+        stipulate username_taken("carol-co") = false
+        root does AdminCreatesOrganizationForUser(root, carol, "carol-co", public) on AdminUserAccount
+            creating org: Organization
+        then CreateOrganizationForUserByAdmin fires
+        then org.name = "carol-co"
+
+    ends: carol-co exists with Carol as its first owner.
+}
+
+-- Decided: an org block does not stop owners adding the blocked person to a team.
+journey BlockedBobCanStillBeAdded {
+    goal: acme has blocked Bob. Alice can still put him on devs, like Forgejo.
+
+    given:
+        block: accounts/UserBlock { blocker_organization: org, blocked: bob }
+
+    1. alice adds bob to devs
+        stipulate is_org_member(org, bob) = false
+        stipulate is_team_member(devs, bob) = false
+        stipulate has_pending_team_invite(devs, bob) = false
+        alice does OwnerAddsTeamMember(alice, devs, bob) on TeamSettings
+            creating bob_on_devs: TeamMembership
+        then bob_on_devs.team = devs
+
+    ends: Bob is on devs despite the block.
 }

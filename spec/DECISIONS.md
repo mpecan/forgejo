@@ -61,3 +61,15 @@ invariants or config. Numbers refer to the question's position in its module in
 | 6 | Adding a team to a repository | **Org owners, or repository admins when the org allows it,** on every path. |
 | 7 | Org blocks and team membership | **Not checked, like Forgejo.** An org block limits the blocked user's own interactions; it doesn't stop owners adding them to teams. |
 | 8 | Expired team invitations | **Kept, like Forgejo.** They stay listed as expired until an owner removes them or a new invitation replaces them. |
+
+## access
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | The access index | **Permission is computed live.** The spec defines it purely from current state; any index or cache is an implementation detail that must give the same answers. The recalculation rules leave the spec. |
+| 2 | Collaborator who is also on a team | **Per-unit strongest.** On each unit the mode is the maximum of the collaboration mode and that unit's team grant. |
+| 3 | Public units of a private repository | **Supported.** A repository admin can make individual units public on a private repository; visitors get read on those units only. |
+| 4 | Default permission for signed-in users | **Generalised to every unit.** Each unit can set a default for signed-in users (none/read/write) and for anonymous visitors (none/read). |
+| 5 | Site admins with a fine-grained token | **The token limits everything.** Scope and repository restrictions always apply; admin powers need a token with the admin scope. |
+| 6 | Actions job tokens on organization endpoints | **Repository-scoped only.** A job token reaches its own repository and packages linked to it; organization endpoints refuse it. |
+| 7 | Watches and subscriptions after losing access | **Cleared immediately** whenever a user loses read access to a repository, for any reason. |
